@@ -9042,6 +9042,22 @@ mod tests {
         );
     }
 
+    fn spawn_named_crash_child(path: &std::path::Path, case: &str, point: &str) {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .arg("--exact")
+            .arg(PROCESS_CRASH_CHILD_TEST)
+            .arg("--nocapture");
+        crash_test::configure_named_child(&mut command, case, path, point);
+        let status = command.status().expect("start named crash-test child");
+        assert_eq!(
+            status.code(),
+            Some(crash_test::EXIT_CODE),
+            "child `{case}` did not terminate at crash point {point}: {status}"
+        );
+    }
+
     fn only_row(storage: &mut HeapStorage) -> (netbadb_types::RowId, String) {
         let rows = storage.scan().expect("scan crash-test heap");
         assert_eq!(rows.len(), 1, "crash recovery changed row cardinality");
@@ -9348,6 +9364,36 @@ mod tests {
             "page-generation-reserve" | "page-generation-reuse" | "page-generation-rollback" => {
                 maintenance::generation_crash_child(case, path)
             }
+            "prepared-commit-batch" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open batch heap");
+                let mut transactions = Vec::new();
+                for id in 1..=3_i64 {
+                    let mut transaction = storage.begin_transaction().expect("begin batch member");
+                    storage
+                        .insert_in(
+                            &mut transaction,
+                            &[
+                                ScalarValue::Int64(id),
+                                ScalarValue::Text(format!("member-{id}")),
+                            ],
+                        )
+                        .expect("write batch member");
+                    let database_txn_id = DatabaseTxnId(900 + id as u64);
+                    transaction
+                        .prepare(database_txn_id)
+                        .expect("prepare member");
+                    transaction
+                        .park_prepared(database_txn_id)
+                        .expect("park member");
+                    transactions.push((transaction, database_txn_id));
+                }
+                let mut batch = transactions
+                    .iter_mut()
+                    .map(|(transaction, database_txn_id)| (transaction, *database_txn_id))
+                    .collect::<Vec<_>>();
+                crate::Transaction::commit_prepared_batch(&mut batch)
+                    .expect("commit batch until crash");
+            }
             other => panic!("unknown process crash case `{other}`"),
         }
         panic!("process crash child `{case}` returned without reaching its crash point");
@@ -9387,6 +9433,60 @@ mod tests {
         );
         assert_reopens_twice_with(&path, "after");
         cleanup(&path);
+    }
+
+    #[test]
+    fn prepared_commit_batch_crash_matrix_recovers_every_decided_member() {
+        for point in [
+            "heap-group-after-commit-append-1",
+            "heap-group-after-commit-append-2",
+            "heap-group-after-commit-append-3",
+            "heap-group-before-commit-sync",
+            "heap-group-after-commit-sync",
+            "heap-group-after-runtime-finalize-1",
+            "heap-group-after-runtime-finalize-2",
+        ] {
+            let path = test_path(&format!("prepared-batch-{point}"));
+            cleanup(&path);
+            HeapStorage::create(&path, table())
+                .unwrap()
+                .close()
+                .unwrap();
+            spawn_named_crash_child(&path, "prepared-commit-batch", point);
+            let resolutions = (1..=3_u64)
+                .map(|id| PreparedTxnResolution {
+                    database_txn_id: DatabaseTxnId(900 + id),
+                    physical_txn_id: netbadb_types::TxnId(id),
+                    decision: PreparedDecision::Commit,
+                })
+                .collect::<Vec<_>>();
+            for pass in 0..2 {
+                let mut reopened = if pass == 0 {
+                    HeapStorage::open_with_prepared_resolutions(&path, table(), &resolutions)
+                        .unwrap()
+                } else {
+                    HeapStorage::open(&path, table()).unwrap()
+                };
+                let mut ids = reopened
+                    .scan()
+                    .unwrap()
+                    .into_iter()
+                    .map(|(_, row)| row[0].clone())
+                    .collect::<Vec<_>>();
+                ids.sort_by(|left, right| left.database_cmp(right).unwrap());
+                assert_eq!(
+                    ids,
+                    vec![
+                        ScalarValue::Int64(1),
+                        ScalarValue::Int64(2),
+                        ScalarValue::Int64(3),
+                    ],
+                    "point {point}, pass {pass}"
+                );
+                reopened.close().unwrap();
+            }
+            cleanup(&path);
+        }
     }
 
     #[test]

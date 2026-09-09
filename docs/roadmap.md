@@ -1,5 +1,20 @@
 # NetbaDB roadmap
 
+## Batched participant commit barriers (Phase 3D complete)
+
+- retained per-member durable Prepare and the CORD v5 GroupDecision protocol;
+- added storage-owned Heap and LSM prepared-prefix commit batches that append
+  existing Commit records, issue one WAL barrier, and finalize every member in
+  local commit order;
+- changed Core group finalization to group participants by stable `StorageId`,
+  while preserving retry-only partial-storage failure and final block
+  publication;
+- retained per-transaction NBCL finalize durability and frontier transitions;
+- added live sync counters, batch reports, crash/retry coverage and the
+  `global_group_storage_barrier_phase3d` benchmark matrix.
+
+See [`phase3d-batched-participant-commit.md`](phase3d-batched-participant-commit.md).
+
 ## Explicit synchronous group commit (Phase 3C complete)
 
 - added a Global-only embedded group builder with consumed parked members, one

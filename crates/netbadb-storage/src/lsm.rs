@@ -484,6 +484,9 @@ struct Runtime {
     parked_prepared: RefCell<VecDeque<TxnId>>,
     parked_writes: RefCell<BTreeMap<LsmRowId, (TxnId, LsmCommitSeq)>>,
     prepared_write_conflict_count: Cell<u64>,
+    prepare_sync_count: Cell<u64>,
+    single_commit_sync_count: Cell<u64>,
+    group_commit_barrier_sync_count: Cell<u64>,
     amplification: AmplificationCounters,
 }
 
@@ -584,6 +587,8 @@ struct LsmWal {
     end: u64,
     #[cfg(test)]
     fail_next_sync: bool,
+    #[cfg(test)]
+    fail_append_after_calls: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -626,6 +631,15 @@ pub struct LsmTransaction {
     registered: bool,
     prepared_change: Option<PreparedChange>,
     shared: Rc<RefCell<LsmShared>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedCommitBatchReport {
+    pub(crate) member_count: usize,
+    pub(crate) commit_records_staged: usize,
+    pub(crate) wal_syncs: u64,
+    pub(crate) first_local_boundary: u64,
+    pub(crate) last_local_boundary: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -739,6 +753,10 @@ impl LsmStorage {
             parked_prepared_count: chain.len(),
             active_group_chain: chain,
             prepared_write_conflict_count: shared.runtime.prepared_write_conflict_count.get(),
+            prepare_sync_count: shared.runtime.prepare_sync_count.get(),
+            single_commit_sync_count: shared.runtime.single_commit_sync_count.get(),
+            group_commit_barrier_sync_count: shared.runtime.group_commit_barrier_sync_count.get(),
+            change_stream_sync_count: shared.change_stream.sync_count(),
         }
     }
 
@@ -826,6 +844,9 @@ impl LsmStorage {
                 parked_prepared: RefCell::new(VecDeque::new()),
                 parked_writes: RefCell::new(BTreeMap::new()),
                 prepared_write_conflict_count: Cell::new(0),
+                prepare_sync_count: Cell::new(0),
+                single_commit_sync_count: Cell::new(0),
+                group_commit_barrier_sync_count: Cell::new(0),
                 amplification: AmplificationCounters::default(),
             });
             let change_stream = ChangeStreamManager::disabled(
@@ -967,6 +988,9 @@ impl LsmStorage {
             parked_prepared: RefCell::new(VecDeque::new()),
             parked_writes: RefCell::new(BTreeMap::new()),
             prepared_write_conflict_count: Cell::new(0),
+            prepare_sync_count: Cell::new(0),
+            single_commit_sync_count: Cell::new(0),
+            group_commit_barrier_sync_count: Cell::new(0),
             amplification: AmplificationCounters::default(),
         });
         let change_stream = ChangeStreamManager::open(
@@ -1920,7 +1944,7 @@ impl LsmTransaction {
                     .ok_or(LsmError::InvalidWal("pending commit sequence is missing"))?;
                 let mut shared = self.shared.borrow_mut();
                 self.last_lsn =
-                    ensure_commit_record(&mut shared, self.id, expected, self.last_lsn)?;
+                    ensure_commit_record(&mut shared, self.id, expected, self.last_lsn)?.0;
                 expected
             }
             state => {
@@ -1936,6 +1960,7 @@ impl LsmTransaction {
             #[cfg(test)]
             maybe_lsm_crash("before-commit-sync");
             shared.wal.sync()?;
+            increment(&shared.runtime.single_commit_sync_count, 1);
             #[cfg(test)]
             maybe_lsm_crash("after-commit-sync");
             let batch = self
@@ -2026,6 +2051,7 @@ impl LsmTransaction {
             }
         }
         self.shared.borrow_mut().wal.sync()?;
+        increment(&self.shared.borrow().runtime.prepare_sync_count, 1);
         self.state = TransactionState::Prepared;
         Ok(())
     }
@@ -2100,7 +2126,7 @@ impl LsmTransaction {
                 ))?;
                 let mut shared = self.shared.borrow_mut();
                 self.last_lsn =
-                    ensure_commit_record(&mut shared, self.id, expected, self.last_lsn)?;
+                    ensure_commit_record(&mut shared, self.id, expected, self.last_lsn)?.0;
                 expected
             }
             TransactionState::Committed => return Ok(()),
@@ -2115,6 +2141,7 @@ impl LsmTransaction {
         {
             let mut shared = self.shared.borrow_mut();
             shared.wal.sync()?;
+            increment(&shared.runtime.single_commit_sync_count, 1);
             let batch = self
                 .durable_batch
                 .as_ref()
@@ -2130,6 +2157,137 @@ impl LsmTransaction {
         }
         self.finish_terminal(TransactionState::Committed);
         Ok(())
+    }
+
+    pub(crate) fn commit_prepared_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<PreparedCommitBatchReport, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedCommitBatch.into());
+        };
+        let shared_handle = first.shared.clone();
+        let expected_prefix = shared_handle
+            .borrow()
+            .runtime
+            .parked_prepared
+            .borrow()
+            .iter()
+            .take(participants.len())
+            .copied()
+            .collect::<Vec<_>>();
+        if expected_prefix.len() != participants.len() {
+            return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+        }
+        for (position, (participant, database_txn_id)) in participants.iter().enumerate() {
+            if !Rc::ptr_eq(&participant.shared, &shared_handle) {
+                return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+            }
+            participant.ensure_recovery_not_required()?;
+            participant.validate_database_txn(*database_txn_id)?;
+            if !matches!(
+                participant.state,
+                TransactionState::ParkedPrepared | TransactionState::CommitPending
+            ) {
+                return Err(TransactionError::NotPrepared {
+                    txn_id: participant.id,
+                    state: participant.state,
+                }
+                .into());
+            }
+            if expected_prefix[position] != participant.id {
+                return Err(TransactionError::PreparedResolutionOrder {
+                    txn_id: participant.id,
+                    expected: expected_prefix[position],
+                }
+                .into());
+            }
+        }
+
+        let mut staged = 0_usize;
+        let mut first_seq = None;
+        let mut last_seq = None;
+        {
+            let mut shared = shared_handle.borrow_mut();
+            for (position, (participant, _)) in participants.iter_mut().enumerate() {
+                let commit_seq = match participant.state {
+                    TransactionState::ParkedPrepared => {
+                        let seq = LsmCommitSeq(shared.allocate_commit_seq()?);
+                        participant.pending_commit_seq = Some(seq);
+                        participant.state = TransactionState::CommitPending;
+                        participant.last_lsn = shared.wal.append(&WalRecord::Commit {
+                            txn_id: participant.id,
+                            commit_seq: seq,
+                        })?;
+                        staged = staged.saturating_add(1);
+                        #[cfg(test)]
+                        maybe_lsm_crash(&format!("group-after-commit-append-{}", position + 1));
+                        #[cfg(not(test))]
+                        let _ = position;
+                        seq
+                    }
+                    TransactionState::CommitPending => {
+                        let expected = participant.pending_commit_seq.ok_or(
+                            LsmError::InvalidWal("prepared pending commit sequence is missing"),
+                        )?;
+                        let (lsn, appended) = ensure_commit_record(
+                            &mut shared,
+                            participant.id,
+                            expected,
+                            participant.last_lsn,
+                        )?;
+                        participant.last_lsn = lsn;
+                        if appended {
+                            staged = staged.saturating_add(1);
+                        }
+                        expected
+                    }
+                    _ => unreachable!("validated prepared batch state"),
+                };
+                first_seq.get_or_insert(commit_seq);
+                last_seq = Some(commit_seq);
+            }
+            #[cfg(test)]
+            maybe_lsm_crash("group-before-commit-sync");
+            shared.wal.sync()?;
+            increment(&shared.runtime.group_commit_barrier_sync_count, 1);
+            #[cfg(test)]
+            maybe_lsm_crash("group-after-commit-sync");
+        }
+
+        for (position, (participant, _)) in participants.iter_mut().enumerate() {
+            let commit_seq = participant.pending_commit_seq.ok_or(LsmError::InvalidWal(
+                "prepared pending commit sequence is missing",
+            ))?;
+            {
+                let mut shared = shared_handle.borrow_mut();
+                let batch = participant
+                    .durable_batch
+                    .as_ref()
+                    .ok_or(LsmError::InvalidWal("prepared mutation batch is missing"))?;
+                apply_mutations(&mut shared.memtable, batch, commit_seq)?;
+                shared.memtable_bytes = estimate_memtable_bytes(&shared.memtable)?;
+                shared.visible_commit_seq = shared.visible_commit_seq.max(commit_seq);
+                if let Some(prepared) = participant.prepared_change {
+                    shared
+                        .change_stream
+                        .publish(participant.id, prepared, Some(commit_seq))?;
+                }
+            }
+            participant.finish_terminal(TransactionState::Committed);
+            #[cfg(test)]
+            maybe_lsm_crash(&format!("group-after-runtime-finalize-{}", position + 1));
+            #[cfg(not(test))]
+            let _ = position;
+        }
+        let first_seq = first_seq.ok_or(TransactionError::EmptyPreparedCommitBatch)?;
+        let last_seq = last_seq.ok_or(TransactionError::EmptyPreparedCommitBatch)?;
+        Ok(PreparedCommitBatchReport {
+            member_count: participants.len(),
+            commit_records_staged: staged,
+            wal_syncs: 1,
+            first_local_boundary: first_seq.0,
+            last_local_boundary: last_seq.0,
+        })
     }
 
     pub fn rollback_prepared(
@@ -3785,6 +3943,8 @@ impl LsmWal {
             end: WAL_HEADER_SIZE as u64,
             #[cfg(test)]
             fail_next_sync: false,
+            #[cfg(test)]
+            fail_append_after_calls: None,
         })
     }
 
@@ -3818,6 +3978,8 @@ impl LsmWal {
                 end: valid_end,
                 #[cfg(test)]
                 fail_next_sync: false,
+                #[cfg(test)]
+                fail_append_after_calls: None,
             },
             records,
         ))
@@ -3843,6 +4005,14 @@ impl LsmWal {
     }
 
     fn append(&mut self, record: &WalRecord) -> Result<Lsn, StorageError> {
+        #[cfg(test)]
+        if let Some(remaining) = self.fail_append_after_calls.as_mut() {
+            if *remaining == 0 {
+                self.fail_append_after_calls = None;
+                return Err(io::Error::other("injected LSM WAL append failure").into());
+            }
+            *remaining -= 1;
+        }
         let bytes = encode_wal_record(record, self.storage_id)?;
         let lsn = Lsn(self.end);
         self.file.seek(SeekFrom::Start(self.end))?;
@@ -4358,7 +4528,7 @@ fn ensure_commit_record(
     txn_id: TxnId,
     expected: LsmCommitSeq,
     current_lsn: Lsn,
-) -> Result<Lsn, StorageError> {
+) -> Result<(Lsn, bool), StorageError> {
     if let Some(existing) = find_commit_seq(
         &shared.wal.path,
         shared.manifest.storage_id,
@@ -4368,12 +4538,15 @@ fn ensure_commit_record(
         if existing != expected {
             return Err(LsmError::InvalidWal("retry commit sequence changed").into());
         }
-        return Ok(current_lsn);
+        return Ok((current_lsn, false));
     }
-    shared.wal.append(&WalRecord::Commit {
-        txn_id,
-        commit_seq: expected,
-    })
+    shared
+        .wal
+        .append(&WalRecord::Commit {
+            txn_id,
+            commit_seq: expected,
+        })
+        .map(|lsn| (lsn, true))
 }
 
 fn ensure_prepare_record(
@@ -6516,9 +6689,10 @@ mod tests {
         StorageId, TableId, TxnId,
     };
 
-    use super::{LsmObservedVersion, LsmStorage};
+    use super::{LsmObservedVersion, LsmStorage, LsmTransaction};
     use crate::{
-        PreparedDecision, PreparedTxnResolution, RecoveryError, StorageError, TransactionState,
+        PreparedDecision, PreparedTransactionState, PreparedTxnResolution, RecoveryError,
+        StorageError, TransactionState,
     };
 
     fn table() -> TableDef {
@@ -6898,6 +7072,166 @@ mod tests {
         );
         drop(view);
         reopened.close().expect("close reopened");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn prepared_batch_preserves_commit_sequences_and_uses_one_wal_sync() {
+        let root = root("prepared-batch");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let mut first = storage.begin_transaction().unwrap();
+        storage.insert_in(&mut first, &row(1, "one")).unwrap();
+        first.prepare(DatabaseTxnId(801)).unwrap();
+        first.park_prepared(DatabaseTxnId(801)).unwrap();
+        let mut second = storage.begin_transaction().unwrap();
+        storage.insert_in(&mut second, &row(2, "two")).unwrap();
+        second.prepare(DatabaseTxnId(802)).unwrap();
+        second.park_prepared(DatabaseTxnId(802)).unwrap();
+        let mut third = storage.begin_transaction().unwrap();
+        storage.insert_in(&mut third, &row(3, "three")).unwrap();
+        third.prepare(DatabaseTxnId(803)).unwrap();
+        third.park_prepared(DatabaseTxnId(803)).unwrap();
+
+        let report = LsmTransaction::commit_prepared_batch(&mut [
+            (&mut first, DatabaseTxnId(801)),
+            (&mut second, DatabaseTxnId(802)),
+            (&mut third, DatabaseTxnId(803)),
+        ])
+        .unwrap();
+        assert_eq!(report.member_count, 3);
+        assert_eq!(report.commit_records_staged, 3);
+        assert_eq!(report.wal_syncs, 1);
+        assert_eq!(report.last_local_boundary - report.first_local_boundary, 2);
+        let inspection = storage.prepared_runtime_inspection();
+        assert_eq!(inspection.prepare_sync_count, 3);
+        assert_eq!(inspection.single_commit_sync_count, 0);
+        assert_eq!(inspection.group_commit_barrier_sync_count, 1);
+        assert!(inspection.active_group_chain.is_empty());
+        let view = storage.read_view().unwrap();
+        assert_eq!(
+            storage
+                .scan_columns_with_view(&[ColumnId(1)], &view)
+                .unwrap()
+                .len(),
+            3
+        );
+        drop(view);
+        drop(first);
+        drop(second);
+        drop(third);
+        storage.close().unwrap();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn prepared_batch_sync_retry_reuses_lsm_commit_sequences() {
+        let root = root("prepared-batch-retry");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let mut first = storage.begin_transaction().unwrap();
+        storage.insert_in(&mut first, &row(1, "one")).unwrap();
+        first.prepare(DatabaseTxnId(811)).unwrap();
+        first.park_prepared(DatabaseTxnId(811)).unwrap();
+        let mut second = storage.begin_transaction().unwrap();
+        storage.insert_in(&mut second, &row(2, "two")).unwrap();
+        second.prepare(DatabaseTxnId(812)).unwrap();
+        second.park_prepared(DatabaseTxnId(812)).unwrap();
+
+        first.shared.borrow_mut().wal.fail_next_sync = true;
+        assert!(
+            LsmTransaction::commit_prepared_batch(&mut [
+                (&mut first, DatabaseTxnId(811)),
+                (&mut second, DatabaseTxnId(812)),
+            ])
+            .is_err()
+        );
+        let first_seq = first.pending_commit_seq.unwrap();
+        let second_seq = second.pending_commit_seq.unwrap();
+        let report = LsmTransaction::commit_prepared_batch(&mut [
+            (&mut first, DatabaseTxnId(811)),
+            (&mut second, DatabaseTxnId(812)),
+        ])
+        .unwrap();
+        assert_eq!(report.commit_records_staged, 0);
+        assert_eq!(first.pending_commit_seq, Some(first_seq));
+        assert_eq!(second.pending_commit_seq, Some(second_seq));
+        assert_eq!(
+            storage
+                .prepared_runtime_inspection()
+                .group_commit_barrier_sync_count,
+            1
+        );
+        let manifest = super::read_manifest(&root).unwrap();
+        let (_, records) =
+            super::LsmWal::open(&root, manifest.storage_id, manifest.wal_generation).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, super::WalRecord::Commit { .. }))
+                .count(),
+            2
+        );
+        drop(first);
+        drop(second);
+        storage.close().unwrap();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn prepared_batch_mid_append_retry_preserves_lsm_sequence_identity() {
+        let root = root("prepared-batch-append-retry");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let mut first = storage.begin_transaction().unwrap();
+        storage.insert_in(&mut first, &row(1, "one")).unwrap();
+        first.prepare(DatabaseTxnId(821)).unwrap();
+        first.park_prepared(DatabaseTxnId(821)).unwrap();
+        let mut second = storage.begin_transaction().unwrap();
+        storage.insert_in(&mut second, &row(2, "two")).unwrap();
+        second.prepare(DatabaseTxnId(822)).unwrap();
+        second.park_prepared(DatabaseTxnId(822)).unwrap();
+        let mut third = storage.begin_transaction().unwrap();
+        storage.insert_in(&mut third, &row(3, "three")).unwrap();
+        third.prepare(DatabaseTxnId(823)).unwrap();
+        third.park_prepared(DatabaseTxnId(823)).unwrap();
+        first.shared.borrow_mut().wal.fail_append_after_calls = Some(1);
+        assert!(
+            LsmTransaction::commit_prepared_batch(&mut [
+                (&mut first, DatabaseTxnId(821)),
+                (&mut second, DatabaseTxnId(822)),
+                (&mut third, DatabaseTxnId(823)),
+            ])
+            .is_err()
+        );
+        let first_seq = first.pending_commit_seq.unwrap();
+        let second_seq = second.pending_commit_seq.unwrap();
+        assert_eq!(second.state(), TransactionState::CommitPending);
+        assert_eq!(third.state(), TransactionState::ParkedPrepared);
+
+        let report = LsmTransaction::commit_prepared_batch(&mut [
+            (&mut first, DatabaseTxnId(821)),
+            (&mut second, DatabaseTxnId(822)),
+            (&mut third, DatabaseTxnId(823)),
+        ])
+        .unwrap();
+        assert_eq!(report.commit_records_staged, 2);
+        assert_eq!(first.pending_commit_seq, Some(first_seq));
+        assert_eq!(second.pending_commit_seq, Some(second_seq));
+        let manifest = super::read_manifest(&root).unwrap();
+        let (_, records) =
+            super::LsmWal::open(&root, manifest.storage_id, manifest.wal_generation).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, super::WalRecord::Commit { .. }))
+                .count(),
+            3
+        );
+        drop(first);
+        drop(second);
+        drop(third);
+        storage.close().unwrap();
         cleanup(&root);
     }
 
@@ -7389,6 +7723,34 @@ mod tests {
     }
 
     #[test]
+    fn lsm_group_commit_crash_child() {
+        if std::env::var_os("NETBADB_LSM_GROUP_CRASH_CHILD").is_none() {
+            return;
+        }
+        let root = std::env::var_os("NETBADB_LSM_CRASH_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("group crash root");
+        let mut storage = LsmStorage::open(&root, table()).expect("open group fixture");
+        let mut transactions = Vec::new();
+        for id in 1..=3_i64 {
+            let mut transaction = storage.begin_transaction().unwrap();
+            storage
+                .insert_in(&mut transaction, &row(id, &format!("member-{id}")))
+                .unwrap();
+            let database_txn_id = DatabaseTxnId(950 + id as u64);
+            transaction.prepare(database_txn_id).unwrap();
+            transaction.park_prepared(database_txn_id).unwrap();
+            transactions.push((transaction, database_txn_id));
+        }
+        let mut batch = transactions
+            .iter_mut()
+            .map(|(transaction, database_txn_id)| (transaction, *database_txn_id))
+            .collect::<Vec<_>>();
+        LsmTransaction::commit_prepared_batch(&mut batch).expect("commit group until crash");
+        panic!("group commit returned without reaching configured crash point");
+    }
+
+    #[test]
     fn single_lsm_commit_crash_matrix_recovers_durable_decision_idempotently() {
         for point in [
             "before-commit-sync",
@@ -7426,6 +7788,61 @@ mod tests {
                 }
                 drop(view);
                 reopened.close().expect("close recovered");
+            }
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn lsm_prepared_commit_batch_crash_matrix_recovers_every_decided_member() {
+        for point in [
+            "group-after-commit-append-1",
+            "group-after-commit-append-2",
+            "group-after-commit-append-3",
+            "group-before-commit-sync",
+            "group-after-commit-sync",
+            "group-after-runtime-finalize-1",
+            "group-after-runtime-finalize-2",
+        ] {
+            let root = root(&format!("group-commit-crash-{point}"));
+            cleanup(&root);
+            LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("lsm::tests::lsm_group_commit_crash_child")
+                .arg("--nocapture")
+                .env("NETBADB_LSM_GROUP_CRASH_CHILD", "1")
+                .env("NETBADB_LSM_CRASH_CHILD", "1")
+                .env("NETBADB_LSM_CRASH_ROOT", &root)
+                .env("NETBADB_LSM_CRASH_POINT", point)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(86), "point {point}");
+            let resolutions = LsmStorage::inspect_recovery(&root, &table())
+                .unwrap()
+                .prepared_transactions
+                .into_iter()
+                .filter(|transaction| transaction.state == PreparedTransactionState::Prepared)
+                .map(|transaction| PreparedTxnResolution {
+                    database_txn_id: transaction.database_txn_id,
+                    physical_txn_id: transaction.physical_txn_id,
+                    decision: PreparedDecision::Commit,
+                })
+                .collect::<Vec<_>>();
+            for pass in 0..2 {
+                let mut reopened = if pass == 0 {
+                    LsmStorage::open_with_prepared_resolutions(&root, table(), &resolutions)
+                        .unwrap()
+                } else {
+                    LsmStorage::open(&root, table()).unwrap()
+                };
+                let view = reopened.read_view().unwrap();
+                let rows = reopened
+                    .scan_columns_with_view(&[ColumnId(1)], &view)
+                    .unwrap();
+                assert_eq!(rows.len(), 3, "point {point}, pass {pass}");
+                drop(view);
+                reopened.close().unwrap();
             }
             cleanup(&root);
         }

@@ -114,6 +114,14 @@ their consecutive G range, and Core finishes all participants before one block
 publication. Per-storage parked chains preserve single-writer dirty-write
 exclusion and reverse Heap abort safety; no background worker or timer is used.
 
+[Phase 3D](docs/phase3d-batched-participant-commit.md) lets an explicit group
+share one post-decision participant-WAL durability barrier per physical
+`StorageId`. Each member is still durably prepared separately and retains its
+own local version, database transaction ID, G, and Change Stream transition.
+Heap and LSM stage existing Commit records, synchronize once per participating
+storage, then finalize members in parked order; this is not fully batched WAL,
+async commit, or active multi-writer execution.
+
 [Columnar Phase 2A](docs/columnar-phase2a-change-stream.md) adds an opt-in,
 durable per-storage committed change stream for Heap and LSM, with exact
 row-version identities, transaction coalescing, bounded replay, gap detection,

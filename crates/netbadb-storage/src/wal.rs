@@ -344,6 +344,8 @@ pub struct WalManager {
     #[cfg(test)]
     fail_next_append_after: Option<usize>,
     #[cfg(test)]
+    fail_append_after_calls: Option<usize>,
+    #[cfg(test)]
     fail_next_rotation_after: Option<usize>,
 }
 
@@ -531,6 +533,8 @@ impl WalManager {
             #[cfg(test)]
             fail_next_append_after: None,
             #[cfg(test)]
+            fail_append_after_calls: None,
+            #[cfg(test)]
             fail_next_rotation_after: None,
         })
     }
@@ -629,6 +633,15 @@ impl WalManager {
             .checked_add(bytes.len() as u64)
             .ok_or(WalError::LsnOverflow)?;
         self.file.seek(SeekFrom::Start(self.next_offset))?;
+        #[cfg(test)]
+        if let Some(remaining) = self.fail_append_after_calls.as_mut() {
+            if *remaining == 0 {
+                self.fail_append_after_calls = None;
+                self.fail_next_append_after = Some(0);
+            } else {
+                *remaining -= 1;
+            }
+        }
         #[cfg(test)]
         if let Some(prefix_len) = self.fail_next_append_after.take() {
             let prefix_len = prefix_len.min(bytes.len());
@@ -792,6 +805,11 @@ impl WalManager {
     #[cfg(test)]
     pub(crate) fn inject_partial_append_failure(&mut self, after_bytes: usize) {
         self.fail_next_append_after = Some(after_bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_append_failure_after_calls(&mut self, successful_calls: usize) {
+        self.fail_append_after_calls = Some(successful_calls);
     }
 
     #[cfg(test)]

@@ -61,9 +61,9 @@ pub use recovery::{
 };
 pub use table::{
     AccessPathCapabilities, CommittedReadAnchor, HeapResourceComponent, HeapResourceComponentKind,
-    HeapRewriteIndex, HeapRewriteIndexes, StorageAccessCostHints, StorageAccessPath, StorageKind,
-    StorageReadView, StorageRowHandle, StorageTransaction, StorageVisibilityBoundary,
-    StorageVisibilityPin, TableStorage, heap_resource_components,
+    HeapRewriteIndex, HeapRewriteIndexes, StorageAccessCostHints, StorageAccessPath,
+    StorageCommitBatchReport, StorageKind, StorageReadView, StorageRowHandle, StorageTransaction,
+    StorageVisibilityBoundary, StorageVisibilityPin, TableStorage, heap_resource_components,
 };
 pub use transaction::{Transaction, TransactionState};
 pub use txn_status::{TxnStatus, TxnStatusError, txn_status_path};
@@ -418,6 +418,8 @@ pub enum TransactionError {
         txn_id: netbadb_types::TxnId,
         expected: netbadb_types::TxnId,
     },
+    EmptyPreparedCommitBatch,
+    PreparedCommitBatchStorageMismatch,
     WriterBusy {
         txn_id: netbadb_types::TxnId,
     },
@@ -444,6 +446,14 @@ pub struct PreparedRuntimeInspection {
     pub parked_prepared_count: usize,
     pub active_group_chain: Vec<netbadb_types::TxnId>,
     pub prepared_write_conflict_count: u64,
+    /// Durable prepare barriers issued by this live storage runtime.
+    pub prepare_sync_count: u64,
+    /// Commit barriers issued by ordinary or individually resolved commits.
+    pub single_commit_sync_count: u64,
+    /// Post-decision barriers shared by explicit group members.
+    pub group_commit_barrier_sync_count: u64,
+    /// NBCL prepare and finalize barriers. Phase 3D deliberately does not batch these.
+    pub change_stream_sync_count: u64,
 }
 
 impl fmt::Display for TransactionError {
@@ -491,6 +501,9 @@ impl fmt::Display for TransactionError {
                 "parked prepared transaction {} cannot resolve before transaction {}",
                 txn_id.0, expected.0
             ),
+            Self::EmptyPreparedCommitBatch => formatter.write_str("prepared commit batch is empty"),
+            Self::PreparedCommitBatchStorageMismatch => formatter
+                .write_str("prepared commit batch mixes physical storage identities or kinds"),
             Self::WriterBusy { txn_id } => {
                 write!(formatter, "transaction {} is the active writer", txn_id.0)
             }

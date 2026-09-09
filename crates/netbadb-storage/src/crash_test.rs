@@ -190,6 +190,19 @@ pub(crate) fn maybe_crash(point: TestCrashPoint) {
     }
 }
 
+pub(crate) fn maybe_crash_named(point: &str) {
+    if !SUPPRESSED.get()
+        && std::env::var_os(CHILD_ENV).as_deref() == Some(OsStr::new("1"))
+        && std::env::var_os(POINT_ENV).as_deref() == Some(OsStr::new(point))
+    {
+        crash_now();
+    }
+}
+
+pub(crate) fn maybe_crash_indexed(prefix: &str, position: usize) {
+    maybe_crash_named(&format!("{prefix}-{position}"));
+}
+
 pub(crate) fn crash_now() -> ! {
     // `process::exit` does not unwind or run Rust destructors, so live
     // HeapStorage and Transaction values cannot flush or repair state.
@@ -207,4 +220,17 @@ pub(crate) fn configure_child(
         .env(CASE_ENV, case)
         .env(DATABASE_PATH_ENV, path)
         .env(POINT_ENV, point.as_str());
+}
+
+pub(crate) fn configure_named_child(
+    command: &mut std::process::Command,
+    case: &str,
+    path: &std::path::Path,
+    point: &str,
+) {
+    command
+        .env(CHILD_ENV, "1")
+        .env(CASE_ENV, case)
+        .env(DATABASE_PATH_ENV, path)
+        .env(POINT_ENV, point);
 }

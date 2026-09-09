@@ -428,6 +428,20 @@ pub struct StorageTransaction {
     inner: StorageTransactionKind,
 }
 
+/// Result of durably resolving one ordered prepared prefix for one storage.
+///
+/// Every member retains its own transaction and local commit identity. The
+/// report describes the one shared post-decision WAL barrier only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageCommitBatchReport {
+    pub storage_id: StorageId,
+    pub member_count: usize,
+    pub commit_records_staged: usize,
+    pub wal_syncs: u64,
+    pub first_local_boundary: u64,
+    pub last_local_boundary: u64,
+}
+
 #[derive(Debug)]
 enum StorageTransactionKind {
     Heap(Transaction),
@@ -643,6 +657,70 @@ impl StorageTransaction {
         match &mut self.inner {
             StorageTransactionKind::Heap(txn) => txn.commit_prepared(database_txn_id),
             StorageTransactionKind::Lsm(txn) => txn.commit_prepared(database_txn_id),
+        }
+    }
+
+    /// Commits an exact parked prefix with one post-decision WAL barrier.
+    ///
+    /// This deliberately exposes a complete stage/sync/finalize operation,
+    /// never a generally callable "commit without sync" primitive.
+    pub fn commit_prepared_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<StorageCommitBatchReport, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedCommitBatch.into());
+        };
+        let storage_id = first.storage_id;
+        let table_id = first.table_id;
+        let heap = matches!(first.inner, StorageTransactionKind::Heap(_));
+        if heap {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Heap(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Lsm(_) => {
+                        return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                    }
+                }
+            }
+            let report = Transaction::commit_prepared_batch(&mut batch)?;
+            Ok(StorageCommitBatchReport {
+                storage_id,
+                member_count: report.member_count,
+                commit_records_staged: report.commit_records_staged,
+                wal_syncs: report.wal_syncs,
+                first_local_boundary: report.first_local_boundary,
+                last_local_boundary: report.last_local_boundary,
+            })
+        } else {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Lsm(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Heap(_) => {
+                        return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                    }
+                }
+            }
+            let report = LsmTransaction::commit_prepared_batch(&mut batch)?;
+            Ok(StorageCommitBatchReport {
+                storage_id,
+                member_count: report.member_count,
+                commit_records_staged: report.commit_records_staged,
+                wal_syncs: report.wal_syncs,
+                first_local_boundary: report.first_local_boundary,
+                last_local_boundary: report.last_local_boundary,
+            })
         }
     }
 

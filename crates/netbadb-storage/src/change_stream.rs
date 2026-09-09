@@ -467,6 +467,7 @@ pub(crate) struct ChangeStreamManager {
     table_id: TableId,
     fingerprint: SchemaFingerprint,
     state: State,
+    sync_count: u64,
 }
 
 impl ChangeStreamManager {
@@ -485,6 +486,7 @@ impl ChangeStreamManager {
             state: State::Disabled {
                 generation: ChangeStreamGeneration(0),
             },
+            sync_count: 0,
         })
     }
 
@@ -518,6 +520,7 @@ impl ChangeStreamManager {
                 table_id: table.id,
                 fingerprint,
                 state,
+                sync_count: 0,
             });
         }
         let state = match load_file(&path, table, &outcome, true) {
@@ -578,7 +581,12 @@ impl ChangeStreamManager {
             table_id: table.id,
             fingerprint,
             state,
+            sync_count: 0,
         })
+    }
+
+    pub(crate) const fn sync_count(&self) -> u64 {
+        self.sync_count
     }
 
     pub(crate) fn requires_changes(&self) -> bool {
@@ -689,7 +697,15 @@ impl ChangeStreamManager {
         database_txn_id: Option<DatabaseTxnId>,
         changes: &[StorageChange],
     ) -> Result<Option<PreparedChange>, StorageError> {
+        let will_sync = !changes.is_empty()
+            && matches!(
+                &self.state,
+                State::Enabled { unresolved, .. } if !unresolved.contains_key(&txn_id)
+            );
         let result = prepare_enabled(&mut self.state, txn_id, database_txn_id, changes);
+        if result.is_ok() && will_sync {
+            self.sync_count = self.sync_count.saturating_add(1);
+        }
         if let Err(error) = &result {
             self.poison_after_io_error(error);
         }
@@ -702,7 +718,15 @@ impl ChangeStreamManager {
         prepared: PreparedChange,
         lsm_commit: Option<LsmCommitSeq>,
     ) -> Result<(), StorageError> {
+        let will_sync = matches!(
+            &self.state,
+            State::Enabled { batches, .. }
+                if !batches.iter().any(|batch| batch.physical_txn_id == txn_id)
+        );
         let result = publish_enabled(&mut self.state, txn_id, prepared, lsm_commit);
+        if result.is_ok() && will_sync {
+            self.sync_count = self.sync_count.saturating_add(1);
+        }
         if let Err(error) = &result {
             self.poison_after_io_error(error);
         }

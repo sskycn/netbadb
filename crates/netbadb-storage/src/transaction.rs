@@ -30,6 +30,18 @@ struct TransactionRuntime {
     outstanding: Cell<u64>,
     parked_prepared: RefCell<VecDeque<TxnId>>,
     prepared_write_conflict_count: Cell<u64>,
+    prepare_sync_count: Cell<u64>,
+    single_commit_sync_count: Cell<u64>,
+    group_commit_barrier_sync_count: Cell<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedCommitBatchReport {
+    pub(crate) member_count: usize,
+    pub(crate) commit_records_staged: usize,
+    pub(crate) wal_syncs: u64,
+    pub(crate) first_local_boundary: u64,
+    pub(crate) last_local_boundary: u64,
 }
 
 type SharedRuntime = Rc<TransactionRuntime>;
@@ -210,6 +222,9 @@ impl Transaction {
             .try_borrow_mut()
             .map_err(|_| TransactionError::WalBusy)?
             .flush_through(prepare_lsn)?;
+        self.runtime
+            .prepare_sync_count
+            .set(self.runtime.prepare_sync_count.get().saturating_add(1));
         self.state = TransactionState::Prepared;
         Ok(())
     }
@@ -264,6 +279,131 @@ impl Transaction {
         };
         self.finish_commit(commit_lsn)?;
         self.publish_changes(None)
+    }
+
+    pub(crate) fn commit_prepared_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<PreparedCommitBatchReport, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedCommitBatch.into());
+        };
+        let wal = first.wal.clone();
+        let runtime = first.runtime.clone();
+        let statuses = first.statuses.clone();
+        let expected_prefix = runtime
+            .parked_prepared
+            .borrow()
+            .iter()
+            .take(participants.len())
+            .copied()
+            .collect::<Vec<_>>();
+        if expected_prefix.len() != participants.len() {
+            return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+        }
+        for (position, (participant, database_txn_id)) in participants.iter().enumerate() {
+            if !Rc::ptr_eq(&participant.wal, &wal)
+                || !Rc::ptr_eq(&participant.runtime, &runtime)
+                || !Rc::ptr_eq(&participant.statuses, &statuses)
+            {
+                return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+            }
+            participant.validate_prepared_database_txn(*database_txn_id)?;
+            if !matches!(
+                participant.state,
+                TransactionState::ParkedPrepared | TransactionState::CommitPending
+            ) {
+                return Err(TransactionError::NotPrepared {
+                    txn_id: participant.id,
+                    state: participant.state,
+                }
+                .into());
+            }
+            if expected_prefix[position] != participant.id {
+                return Err(TransactionError::PreparedResolutionOrder {
+                    txn_id: participant.id,
+                    expected: expected_prefix[position],
+                }
+                .into());
+            }
+        }
+
+        let mut staged = 0_usize;
+        let mut first_lsn = None;
+        let mut last_lsn = None;
+        for (position, (participant, _)) in participants.iter_mut().enumerate() {
+            let commit_lsn = match participant.state {
+                TransactionState::ParkedPrepared => {
+                    let lsn = wal
+                        .try_borrow_mut()
+                        .map_err(|_| TransactionError::WalBusy)?
+                        .append(
+                            participant.id,
+                            Some(participant.last_lsn),
+                            WalRecordKind::Commit,
+                        )?;
+                    participant.last_lsn = lsn;
+                    participant.state = TransactionState::CommitPending;
+                    staged = staged.saturating_add(1);
+                    #[cfg(test)]
+                    crate::crash_test::maybe_crash_indexed(
+                        "heap-group-after-commit-append",
+                        position + 1,
+                    );
+                    #[cfg(not(test))]
+                    let _ = position;
+                    lsn
+                }
+                TransactionState::CommitPending => participant.last_lsn,
+                _ => unreachable!("validated prepared batch state"),
+            };
+            first_lsn.get_or_insert(commit_lsn);
+            last_lsn = Some(commit_lsn);
+        }
+        let first_lsn = first_lsn.ok_or(TransactionError::EmptyPreparedCommitBatch)?;
+        let last_lsn = last_lsn.ok_or(TransactionError::EmptyPreparedCommitBatch)?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash_named("heap-group-before-commit-sync");
+        wal.try_borrow_mut()
+            .map_err(|_| TransactionError::WalBusy)?
+            .flush_through(last_lsn)?;
+        runtime.group_commit_barrier_sync_count.set(
+            runtime
+                .group_commit_barrier_sync_count
+                .get()
+                .saturating_add(1),
+        );
+        #[cfg(test)]
+        crate::crash_test::maybe_crash_named("heap-group-after-commit-sync");
+
+        for (position, (participant, _)) in participants.iter_mut().enumerate() {
+            let commit_lsn = participant.last_lsn;
+            statuses
+                .try_borrow_mut()
+                .map_err(|_| TransactionError::StatusBusy)?
+                .record_committed(participant.id, CommitSeq(commit_lsn.0))?;
+            participant.state = TransactionState::Committed;
+            if !participant.retired_btree_pages.is_empty() {
+                participant.buffer.invalidate_reuse_inventory();
+            }
+            participant.release_writer();
+            participant.remove_parked_resolution(false)?;
+            participant.unregister();
+            participant.publish_changes(None)?;
+            #[cfg(test)]
+            crate::crash_test::maybe_crash_indexed(
+                "heap-group-after-runtime-finalize",
+                position + 1,
+            );
+            #[cfg(not(test))]
+            let _ = position;
+        }
+        Ok(PreparedCommitBatchReport {
+            member_count: participants.len(),
+            commit_records_staged: staged,
+            wal_syncs: 1,
+            first_local_boundary: first_lsn.0,
+            last_local_boundary: last_lsn.0,
+        })
     }
 
     /// Rolls back a prepared participant only while no durable global commit
@@ -397,6 +537,12 @@ impl Transaction {
             .try_borrow_mut()
             .map_err(|_| TransactionError::WalBusy)?
             .flush_through(commit_lsn)?;
+        self.runtime.single_commit_sync_count.set(
+            self.runtime
+                .single_commit_sync_count
+                .get()
+                .saturating_add(1),
+        );
         #[cfg(test)]
         crate::crash_test::maybe_crash(crate::crash_test::TestCrashPoint::CommitAfterWalSync);
         self.statuses
@@ -1066,6 +1212,13 @@ impl TransactionManager {
             parked_prepared_count: chain.len(),
             active_group_chain: chain,
             prepared_write_conflict_count: self.runtime.prepared_write_conflict_count.get(),
+            prepare_sync_count: self.runtime.prepare_sync_count.get(),
+            single_commit_sync_count: self.runtime.single_commit_sync_count.get(),
+            group_commit_barrier_sync_count: self.runtime.group_commit_barrier_sync_count.get(),
+            change_stream_sync_count: self
+                .change_stream
+                .as_ref()
+                .map_or(0, |stream| stream.borrow().sync_count()),
         }
     }
 
@@ -1089,6 +1242,9 @@ impl TransactionManager {
                 outstanding: Cell::new(0),
                 parked_prepared: RefCell::new(VecDeque::new()),
                 prepared_write_conflict_count: Cell::new(0),
+                prepare_sync_count: Cell::new(0),
+                single_commit_sync_count: Cell::new(0),
+                group_commit_barrier_sync_count: Cell::new(0),
             }),
             statuses,
             change_stream,
@@ -1218,7 +1374,7 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    use super::{TransactionManager, TransactionState};
+    use super::{Transaction, TransactionManager, TransactionState};
     use crate::txn_status::TxnStatusStore;
 
     use crate::{
@@ -1611,6 +1767,160 @@ mod tests {
         ));
         drop(committed);
         drop(rolled_back);
+        drop(manager);
+        drop(wal);
+        cleanup(page_path, wal_path);
+    }
+
+    #[test]
+    fn prepared_batch_stages_one_ordered_prefix_and_uses_one_commit_barrier() {
+        let (page_path, wal_path, wal, mut manager) = test_manager("txn-prepared-batch");
+        let mut first = manager.begin().unwrap();
+        first.prepare(DatabaseTxnId(11)).unwrap();
+        first.park_prepared(DatabaseTxnId(11)).unwrap();
+        let mut second = manager.begin().unwrap();
+        second.prepare(DatabaseTxnId(12)).unwrap();
+        second.park_prepared(DatabaseTxnId(12)).unwrap();
+        let mut third = manager.begin().unwrap();
+        third.prepare(DatabaseTxnId(13)).unwrap();
+        third.park_prepared(DatabaseTxnId(13)).unwrap();
+
+        assert!(matches!(
+            Transaction::commit_prepared_batch(&mut [
+                (&mut second, DatabaseTxnId(12)),
+                (&mut first, DatabaseTxnId(11)),
+            ]),
+            Err(StorageError::Transaction(
+                TransactionError::PreparedResolutionOrder { .. }
+            ))
+        ));
+        assert_eq!(first.state(), TransactionState::ParkedPrepared);
+        assert_eq!(second.state(), TransactionState::ParkedPrepared);
+
+        let report = Transaction::commit_prepared_batch(&mut [
+            (&mut first, DatabaseTxnId(11)),
+            (&mut second, DatabaseTxnId(12)),
+            (&mut third, DatabaseTxnId(13)),
+        ])
+        .unwrap();
+        assert_eq!(report.member_count, 3);
+        assert_eq!(report.commit_records_staged, 3);
+        assert_eq!(report.wal_syncs, 1);
+        assert!(report.first_local_boundary < report.last_local_boundary);
+        assert_eq!(first.state(), TransactionState::Committed);
+        assert_eq!(second.state(), TransactionState::Committed);
+        assert_eq!(third.state(), TransactionState::Committed);
+        let inspection = manager.prepared_runtime_inspection();
+        assert_eq!(inspection.prepare_sync_count, 3);
+        assert_eq!(inspection.single_commit_sync_count, 0);
+        assert_eq!(inspection.group_commit_barrier_sync_count, 1);
+        assert!(inspection.active_group_chain.is_empty());
+
+        drop(first);
+        drop(second);
+        drop(third);
+        drop(manager);
+        drop(wal);
+        cleanup(page_path, wal_path);
+    }
+
+    #[test]
+    fn prepared_batch_sync_retry_reuses_staged_commit_records() {
+        let (page_path, wal_path, wal, mut manager) = test_manager("txn-prepared-batch-retry");
+        let mut first = manager.begin().unwrap();
+        first.prepare(DatabaseTxnId(21)).unwrap();
+        first.park_prepared(DatabaseTxnId(21)).unwrap();
+        let mut second = manager.begin().unwrap();
+        second.prepare(DatabaseTxnId(22)).unwrap();
+        second.park_prepared(DatabaseTxnId(22)).unwrap();
+
+        wal.borrow_mut().inject_flush_failure();
+        assert!(
+            Transaction::commit_prepared_batch(&mut [
+                (&mut first, DatabaseTxnId(21)),
+                (&mut second, DatabaseTxnId(22)),
+            ])
+            .is_err()
+        );
+        assert_eq!(first.state(), TransactionState::CommitPending);
+        assert_eq!(second.state(), TransactionState::CommitPending);
+        let first_lsn = first.last_lsn();
+        let second_lsn = second.last_lsn();
+
+        let report = Transaction::commit_prepared_batch(&mut [
+            (&mut first, DatabaseTxnId(21)),
+            (&mut second, DatabaseTxnId(22)),
+        ])
+        .unwrap();
+        assert_eq!(report.commit_records_staged, 0);
+        assert_eq!(first.last_lsn(), first_lsn);
+        assert_eq!(second.last_lsn(), second_lsn);
+        assert_eq!(
+            manager
+                .prepared_runtime_inspection()
+                .group_commit_barrier_sync_count,
+            1
+        );
+        let commit_count = wal
+            .borrow_mut()
+            .scan()
+            .unwrap()
+            .into_iter()
+            .filter(|record| matches!(record.kind, WalRecordKind::Commit))
+            .count();
+        assert_eq!(commit_count, 2);
+
+        drop(first);
+        drop(second);
+        drop(manager);
+        drop(wal);
+        cleanup(page_path, wal_path);
+    }
+
+    #[test]
+    fn prepared_batch_mid_append_retry_appends_only_missing_heap_commits() {
+        let (page_path, wal_path, wal, mut manager) = test_manager("txn-batch-append-retry");
+        let mut first = manager.begin().unwrap();
+        first.prepare(DatabaseTxnId(31)).unwrap();
+        first.park_prepared(DatabaseTxnId(31)).unwrap();
+        let mut second = manager.begin().unwrap();
+        second.prepare(DatabaseTxnId(32)).unwrap();
+        second.park_prepared(DatabaseTxnId(32)).unwrap();
+        let mut third = manager.begin().unwrap();
+        third.prepare(DatabaseTxnId(33)).unwrap();
+        third.park_prepared(DatabaseTxnId(33)).unwrap();
+        wal.borrow_mut().inject_append_failure_after_calls(1);
+        assert!(
+            Transaction::commit_prepared_batch(&mut [
+                (&mut first, DatabaseTxnId(31)),
+                (&mut second, DatabaseTxnId(32)),
+                (&mut third, DatabaseTxnId(33)),
+            ])
+            .is_err()
+        );
+        assert_eq!(first.state(), TransactionState::CommitPending);
+        assert_eq!(second.state(), TransactionState::ParkedPrepared);
+        assert_eq!(third.state(), TransactionState::ParkedPrepared);
+
+        let report = Transaction::commit_prepared_batch(&mut [
+            (&mut first, DatabaseTxnId(31)),
+            (&mut second, DatabaseTxnId(32)),
+            (&mut third, DatabaseTxnId(33)),
+        ])
+        .unwrap();
+        assert_eq!(report.commit_records_staged, 2);
+        assert_eq!(
+            wal.borrow_mut()
+                .scan()
+                .unwrap()
+                .into_iter()
+                .filter(|record| matches!(record.kind, WalRecordKind::Commit))
+                .count(),
+            3
+        );
+        drop(first);
+        drop(second);
+        drop(third);
         drop(manager);
         drop(wal);
         cleanup(page_path, wal_path);

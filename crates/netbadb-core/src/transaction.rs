@@ -679,7 +679,7 @@ impl DatabaseTransaction {
         })
     }
 
-    pub(crate) fn apply_group_commit(
+    pub(crate) fn begin_group_participant_apply(
         &mut self,
         commit_seq: DatabaseCommitSeq,
     ) -> Result<(), CoordinatorError> {
@@ -695,28 +695,73 @@ impl DatabaseTransaction {
                 state: self.state,
             });
         }
+        if self.pending_commit_seq.is_some() && self.pending_commit_seq != Some(commit_seq) {
+            return Err(CoordinatorError::InvalidGroupCommit);
+        }
         self.pending_commit_seq = Some(commit_seq);
         self.state = TransactionState::ApplyingCommit;
-        for (position, storage_id) in self.write_participants.iter().copied().enumerate() {
-            let participant = self.participants.get_mut(&storage_id).ok_or(
+        Ok(())
+    }
+
+    pub(crate) fn has_group_write_participant(&self, storage_id: StorageId) -> bool {
+        self.write_participants.contains(&storage_id)
+    }
+
+    pub(crate) fn group_write_storage_ids(&self) -> Vec<StorageId> {
+        self.write_participants.iter().copied().collect()
+    }
+
+    pub(crate) fn group_write_participant_mut(
+        &mut self,
+        storage_id: StorageId,
+    ) -> Result<&mut StorageTransaction, CoordinatorError> {
+        if self.state != TransactionState::ApplyingCommit
+            || !self.write_participants.contains(&storage_id)
+        {
+            return Err(CoordinatorError::ParticipantStateViolation {
+                storage_id,
+                reason: "group participant is not awaiting commit application",
+            });
+        }
+        self.participants
+            .get_mut(&storage_id)
+            .map(|participant| &mut participant.context)
+            .ok_or(CoordinatorError::ParticipantStateViolation {
+                storage_id,
+                reason: "group decided participant identity has no context",
+            })
+    }
+
+    pub(crate) fn finish_group_participant_apply(
+        &mut self,
+        commit_seq: DatabaseCommitSeq,
+    ) -> Result<(), CoordinatorError> {
+        if self.state == TransactionState::FinalizePending
+            && self.pending_commit_seq == Some(commit_seq)
+        {
+            return Ok(());
+        }
+        if self.state != TransactionState::ApplyingCommit
+            || self.pending_commit_seq != Some(commit_seq)
+        {
+            return Err(CoordinatorError::NotActive {
+                transaction_id: self.id,
+                state: self.state,
+            });
+        }
+        for storage_id in self.write_participants.iter().copied() {
+            let participant = self.participants.get(&storage_id).ok_or(
                 CoordinatorError::ParticipantStateViolation {
                     storage_id,
                     reason: "group decided participant identity has no context",
                 },
             )?;
-            #[cfg(test)]
-            crate::coordinator_crash::maybe_crash_indexed(
-                "group-before-participant-commit",
-                position + 1,
-            );
-            commit_prepared_participant(self.id, storage_id, participant)?;
-            #[cfg(test)]
-            crate::coordinator_crash::maybe_crash_indexed(
-                "group-after-participant-commit",
-                position + 1,
-            );
-            #[cfg(not(test))]
-            let _ = position;
+            if participant.context.state() != StorageTransactionState::Committed {
+                return Err(CoordinatorError::ParticipantStateViolation {
+                    storage_id,
+                    reason: "group participant commit is not durable",
+                });
+            }
         }
         self.state = TransactionState::FinalizePending;
         Ok(())

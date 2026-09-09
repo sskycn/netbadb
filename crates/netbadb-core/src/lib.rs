@@ -53,6 +53,7 @@ mod staged_index_evacuation_tests;
 mod transaction;
 
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -177,8 +178,8 @@ pub use netbadb_storage::{
     HistoricalOrphanAdoptionReport, IndexDefinition, IndexMaintenanceReport, IndexReclaimReport,
     IndexStatistics, IndexTailReclaimReport, IsolationLevel, LsmInspection, LsmLevelInspection,
     LsmReadAmplification, LsmWriteAmplification, PageReuseClass, PageReuseInspection,
-    PreparedRuntimeInspection, ReusablePageInspection, StorageChange, StorageError, StorageKind,
-    StorageSnapshotToken, StorageVersionKey, TableStatistics,
+    PreparedRuntimeInspection, ReusablePageInspection, StorageChange, StorageCommitBatchReport,
+    StorageError, StorageKind, StorageSnapshotToken, StorageVersionKey, TableStatistics,
 };
 pub use netbadb_types::{
     ChangeStreamGeneration, SchemaGeneration, StorageDataVersion, TableSchemaVersion,
@@ -320,6 +321,7 @@ pub struct GroupCommitBatch {
     members: Vec<Transaction>,
     resolving_member: Option<Transaction>,
     commit_sequences: Option<Vec<DatabaseCommitSeq>>,
+    storage_commit_batches: BTreeMap<StorageId, StorageCommitBatchReport>,
     completed: bool,
 }
 
@@ -329,6 +331,8 @@ pub struct GroupCommitReport {
     pub first_commit_seq: DatabaseCommitSeq,
     pub last_commit_seq: DatabaseCommitSeq,
     pub participating_storage_count: usize,
+    pub storage_commit_batches: Vec<StorageCommitBatchReport>,
+    pub storage_commit_wal_syncs: u64,
 }
 
 /// Result of one explicit, synchronous coordinator-history compaction.
@@ -2394,6 +2398,7 @@ impl Database {
             members: Vec::new(),
             resolving_member: None,
             commit_sequences: None,
+            storage_commit_batches: BTreeMap::new(),
             completed: false,
         })
     }
@@ -2563,6 +2568,59 @@ impl Database {
             .commit_sequences
             .as_ref()
             .ok_or(CoordinatorError::InvalidGroupCommit)?;
+        let storage_ids = group
+            .members
+            .iter()
+            .flat_map(Transaction::group_write_storage_ids)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        let storage_ids = {
+            let mut storage_ids = storage_ids;
+            if std::env::var_os("NETBADB_REVERSE_GROUP_STORAGE_COMMIT").is_some() {
+                storage_ids.reverse();
+            }
+            storage_ids
+        };
+        for (member, sequence) in group.members.iter_mut().zip(sequences.iter().copied()) {
+            if member.state() != TransactionState::Committed {
+                member.begin_group_participant_apply(sequence)?;
+            }
+        }
+        for (position, storage_id) in storage_ids.into_iter().enumerate() {
+            let mut participants = Vec::new();
+            for member in &mut group.members {
+                if member.state() == TransactionState::Committed
+                    || !member.has_group_write_participant(storage_id)
+                {
+                    continue;
+                }
+                let database_txn_id = member.id();
+                let participant = member.group_write_participant_mut(storage_id)?;
+                if participant.state() != netbadb_storage::TransactionState::Committed {
+                    participants.push((participant, database_txn_id));
+                }
+            }
+            if participants.is_empty() {
+                continue;
+            }
+            #[cfg(test)]
+            crate::coordinator_crash::maybe_crash_indexed(
+                "group-before-participant-commit",
+                position + 1,
+            );
+            let report =
+                netbadb_storage::StorageTransaction::commit_prepared_batch(&mut participants)?;
+            group.storage_commit_batches.insert(storage_id, report);
+            #[cfg(test)]
+            crate::coordinator_crash::maybe_crash_indexed(
+                "group-after-participant-commit",
+                position + 1,
+            );
+            #[cfg(not(test))]
+            let _ = position;
+        }
         for (position, (member, sequence)) in group
             .members
             .iter_mut()
@@ -2572,7 +2630,7 @@ impl Database {
             if member.state() == TransactionState::Committed {
                 continue;
             }
-            member.apply_group_commit(sequence)?;
+            member.finish_group_participant_apply(sequence)?;
             #[cfg(test)]
             crate::coordinator_crash::maybe_crash_indexed("group-after-member-apply", position + 1);
             #[cfg(not(test))]
@@ -2609,6 +2667,15 @@ impl Database {
             .inspection
             .participating_storage_count;
         let member_count = group.members.len();
+        let storage_commit_batches = group
+            .storage_commit_batches
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let storage_commit_wal_syncs = storage_commit_batches
+            .iter()
+            .map(|report| report.wal_syncs)
+            .sum();
         group.completed = true;
         group.members.clear();
         self.group_barrier.set(None);
@@ -2618,6 +2685,8 @@ impl Database {
             first_commit_seq,
             last_commit_seq,
             participating_storage_count,
+            storage_commit_batches,
+            storage_commit_wal_syncs,
         })
     }
 
@@ -4793,6 +4862,26 @@ impl Database {
                     storage_id: *storage_id,
                 })?
                 .kind()),
+            TablePlacement::RangePartitioned { .. } => {
+                Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into())
+            }
+        }
+    }
+
+    /// Reports live prepared-commit ordering and durability-barrier counters.
+    /// Counters start at zero on each open and are not reconstructed from WAL.
+    pub fn inspect_prepared_runtime(
+        &self,
+        table_id: TableId,
+    ) -> Result<PreparedRuntimeInspection, DatabaseError> {
+        match self.bindings.placement(table_id)? {
+            TablePlacement::Single { storage_id, .. } => Ok(self
+                .registry
+                .get(*storage_id)
+                .ok_or(StorageRegistryError::UnknownStorageId {
+                    storage_id: *storage_id,
+                })?
+                .prepared_runtime_inspection()),
             TablePlacement::RangePartitioned { .. } => {
                 Err(PartitionError::PartitionedIndexCreationNotSupported(table_id).into())
             }
@@ -10257,6 +10346,14 @@ mod tests {
         let report = database.commit_group(&mut group).expect("commit group");
         assert_eq!(report.first_commit_seq, DatabaseCommitSeq(1));
         assert_eq!(report.last_commit_seq, DatabaseCommitSeq(3));
+        assert_eq!(report.storage_commit_wal_syncs, 1);
+        assert_eq!(report.storage_commit_batches.len(), 1);
+        assert_eq!(report.storage_commit_batches[0].member_count, 3);
+        assert_eq!(report.storage_commit_batches[0].commit_records_staged, 3);
+        let storage_runtime = database.inspect_prepared_runtime(TableId(1)).unwrap();
+        assert_eq!(storage_runtime.prepare_sync_count, 3);
+        assert_eq!(storage_runtime.single_commit_sync_count, 0);
+        assert_eq!(storage_runtime.group_commit_barrier_sync_count, 1);
         assert_eq!(database.inspect_group_commit(), None);
         let visibility = database.inspect_global_visibility().unwrap();
         assert_eq!(visibility.group_decision_sync_count, 1);
@@ -10289,6 +10386,66 @@ mod tests {
         );
         reopened.close().unwrap();
         cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn phase3d_group_sizes_one_and_ten_use_one_heap_barrier_per_group() {
+        for member_count in [1_i64, 10] {
+            let root = std::env::temp_dir().join(format!(
+                "netbadb-phase3d-count-{member_count}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            cleanup_coordinator_fixture(&root);
+            let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+            let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+            let mut database = Database::create_tables_with_coordinator(tables, config).unwrap();
+            let cursor = database.enable_change_stream(TableId(1)).unwrap();
+            let mut group = database.begin_group_commit().unwrap();
+            for id in 1..=member_count {
+                let mut member = database.begin_group_member(&group).unwrap();
+                database
+                    .execute_in(
+                        &mut member,
+                        &format!("INSERT INTO users (id, name) VALUES ({id}, 'phase3d')"),
+                    )
+                    .unwrap();
+                database.park_group_member(&mut group, member).unwrap();
+            }
+            let report = database.commit_group(&mut group).unwrap();
+            assert_eq!(report.member_count, member_count as usize);
+            assert_eq!(report.storage_commit_wal_syncs, 1);
+            assert_eq!(
+                report.storage_commit_batches[0].member_count,
+                member_count as usize
+            );
+            let runtime = database.inspect_prepared_runtime(TableId(1)).unwrap();
+            assert_eq!(runtime.prepare_sync_count, member_count as u64);
+            assert_eq!(runtime.single_commit_sync_count, 0);
+            assert_eq!(runtime.group_commit_barrier_sync_count, 1);
+            assert_eq!(runtime.change_stream_sync_count, member_count as u64 * 2);
+            let changes = database
+                .read_changes(TableId(1), cursor, 20, 1_000_000)
+                .unwrap();
+            assert_eq!(changes.batches.len(), member_count as usize);
+            assert!(
+                changes
+                    .batches
+                    .windows(2)
+                    .all(|pair| pair[0].after == pair[1].before)
+            );
+            assert_eq!(
+                database
+                    .current_database_snapshot()
+                    .unwrap()
+                    .unwrap()
+                    .commit_seq(),
+                DatabaseCommitSeq(member_count as u64)
+            );
+            drop(group);
+            database.close().unwrap();
+            cleanup_coordinator_fixture(&root);
+        }
     }
 
     #[test]
@@ -10412,6 +10569,23 @@ mod tests {
         let report = database.commit_group(&mut group).unwrap();
         assert_eq!(report.member_count, 2);
         assert_eq!(report.participating_storage_count, 2);
+        assert_eq!(report.storage_commit_wal_syncs, 2);
+        assert_eq!(report.storage_commit_batches.len(), 2);
+        assert_eq!(
+            report
+                .storage_commit_batches
+                .iter()
+                .map(|batch| batch.member_count)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let heap_runtime = database.inspect_prepared_runtime(TableId(1)).unwrap();
+        assert_eq!(heap_runtime.prepare_sync_count, 1);
+        assert_eq!(heap_runtime.group_commit_barrier_sync_count, 1);
+        let lsm_runtime = database.inspect_prepared_runtime(TableId(2)).unwrap();
+        assert_eq!(lsm_runtime.prepare_sync_count, 3);
+        assert_eq!(lsm_runtime.single_commit_sync_count, 1);
+        assert_eq!(lsm_runtime.group_commit_barrier_sync_count, 1);
         assert_eq!(
             database
                 .query("SELECT id FROM lsm_items ORDER BY id")
@@ -10531,96 +10705,101 @@ mod tests {
             ("group-after-all-completes-before-publication", true),
             ("group-after-publication-before-complete-sync", true),
         ];
-        for (point, committed) in cases {
-            let root = std::env::temp_dir().join(format!(
-                "netbadb-phase3c-crash-{point}-{}",
-                std::process::id()
-            ));
-            cleanup_mixed_crash_fixture(&root);
-            let (_, _, coordinator) = mixed_crash_paths(&root);
-            let mut initial = Database::create_storages_with_coordinator(
-                mixed_create_specs(&root),
-                DatabaseCoordinatorConfig::new(&coordinator).with_global_visibility(),
-            )
-            .unwrap();
-            let heap_cursor = initial.enable_change_stream(TableId(1)).unwrap();
-            let lsm_cursor = initial.enable_change_stream(TableId(2)).unwrap();
-            initial.close().unwrap();
-
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command
-                .arg("--exact")
-                .arg("tests::coordinator_crash_child_entrypoint")
-                .arg("--nocapture");
-            crate::coordinator_crash::configure_child(
-                &mut command,
-                &format!("group:{point}"),
-                &root,
-                point,
-            );
-            let status = command.status().expect("start group crash child");
-            assert_eq!(status.code(), Some(crate::coordinator_crash::EXIT_CODE));
-
-            for pass in 0..2 {
-                let mut recovered = Database::open_storages_with_coordinator(
-                    mixed_open_specs(&root),
-                    DatabaseCoordinatorConfig::new(&coordinator),
+        for reverse_storage_order in [false, true] {
+            for (point, committed) in cases {
+                let root = std::env::temp_dir().join(format!(
+                    "netbadb-phase3d-crash-{reverse_storage_order}-{point}-{}",
+                    std::process::id()
+                ));
+                cleanup_mixed_crash_fixture(&root);
+                let (_, _, coordinator) = mixed_crash_paths(&root);
+                let mut initial = Database::create_storages_with_coordinator(
+                    mixed_create_specs(&root),
+                    DatabaseCoordinatorConfig::new(&coordinator).with_global_visibility(),
                 )
-                .expect("recover group crash fixture");
-                let expected = if committed {
-                    vec![
-                        vec![ScalarValue::Int64(1)],
-                        vec![ScalarValue::Int64(2)],
-                        vec![ScalarValue::Int64(3)],
-                    ]
-                } else {
-                    Vec::new()
-                };
-                assert_eq!(
-                    recovered
-                        .query("SELECT id FROM users ORDER BY id")
-                        .unwrap()
-                        .rows,
-                    expected,
-                    "Heap pass {pass}, point {point}"
-                );
-                assert_eq!(
-                    recovered
-                        .query("SELECT id FROM lsm_items ORDER BY id")
-                        .unwrap()
-                        .rows,
-                    expected,
-                    "LSM pass {pass}, point {point}"
-                );
-                let heap = recovered
-                    .read_changes(TableId(1), heap_cursor, 10, 1_000_000)
-                    .unwrap();
-                let lsm = recovered
-                    .read_changes(TableId(2), lsm_cursor, 10, 1_000_000)
-                    .unwrap();
-                let batch_count = if committed { 3 } else { 0 };
-                assert_eq!(heap.batches.len(), batch_count, "Heap stream {point}");
-                assert_eq!(lsm.batches.len(), batch_count, "LSM stream {point}");
-                for batches in [&heap.batches, &lsm.batches] {
-                    assert!(
-                        batches
-                            .windows(2)
-                            .all(|pair| pair[0].after == pair[1].before),
-                        "change stream gap at {point}"
-                    );
+                .unwrap();
+                let heap_cursor = initial.enable_change_stream(TableId(1)).unwrap();
+                let lsm_cursor = initial.enable_change_stream(TableId(2)).unwrap();
+                initial.close().unwrap();
+
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .arg("--exact")
+                    .arg("tests::coordinator_crash_child_entrypoint")
+                    .arg("--nocapture");
+                if reverse_storage_order {
+                    command.env("NETBADB_REVERSE_GROUP_STORAGE_COMMIT", "1");
                 }
-                assert_eq!(
-                    recovered
-                        .current_database_snapshot()
-                        .unwrap()
-                        .unwrap()
-                        .commit_seq(),
-                    DatabaseCommitSeq(if committed { 3 } else { 0 }),
-                    "published G pass {pass}, point {point}"
+                crate::coordinator_crash::configure_child(
+                    &mut command,
+                    &format!("group:{point}"),
+                    &root,
+                    point,
                 );
-                recovered.close().unwrap();
+                let status = command.status().expect("start group crash child");
+                assert_eq!(status.code(), Some(crate::coordinator_crash::EXIT_CODE));
+
+                for pass in 0..2 {
+                    let mut recovered = Database::open_storages_with_coordinator(
+                        mixed_open_specs(&root),
+                        DatabaseCoordinatorConfig::new(&coordinator),
+                    )
+                    .expect("recover group crash fixture");
+                    let expected = if committed {
+                        vec![
+                            vec![ScalarValue::Int64(1)],
+                            vec![ScalarValue::Int64(2)],
+                            vec![ScalarValue::Int64(3)],
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(
+                        recovered
+                            .query("SELECT id FROM users ORDER BY id")
+                            .unwrap()
+                            .rows,
+                        expected,
+                        "Heap pass {pass}, point {point}"
+                    );
+                    assert_eq!(
+                        recovered
+                            .query("SELECT id FROM lsm_items ORDER BY id")
+                            .unwrap()
+                            .rows,
+                        expected,
+                        "LSM pass {pass}, point {point}"
+                    );
+                    let heap = recovered
+                        .read_changes(TableId(1), heap_cursor, 10, 1_000_000)
+                        .unwrap();
+                    let lsm = recovered
+                        .read_changes(TableId(2), lsm_cursor, 10, 1_000_000)
+                        .unwrap();
+                    let batch_count = if committed { 3 } else { 0 };
+                    assert_eq!(heap.batches.len(), batch_count, "Heap stream {point}");
+                    assert_eq!(lsm.batches.len(), batch_count, "LSM stream {point}");
+                    for batches in [&heap.batches, &lsm.batches] {
+                        assert!(
+                            batches
+                                .windows(2)
+                                .all(|pair| pair[0].after == pair[1].before),
+                            "change stream gap at {point}"
+                        );
+                    }
+                    assert_eq!(
+                        recovered
+                            .current_database_snapshot()
+                            .unwrap()
+                            .unwrap()
+                            .commit_seq(),
+                        DatabaseCommitSeq(if committed { 3 } else { 0 }),
+                        "published G pass {pass}, point {point}"
+                    );
+                    recovered.close().unwrap();
+                }
+                cleanup_mixed_crash_fixture(&root);
             }
-            cleanup_mixed_crash_fixture(&root);
         }
     }
 

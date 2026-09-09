@@ -559,6 +559,15 @@ Structural transactions keep immediate Complete synchronization. No persistent
 format, async runtime, background worker, group commit, or multi-writer model is
 introduced.
 
+[Phase 3D](phase3d-batched-participant-commit.md) changes only explicit group
+resolution after the durable CORD v5 GroupDecision. Core restricts global
+member order per `StorageId`; each storage stages its existing prepared Commit
+records, performs one WAL durability barrier, and finalizes that exact parked
+prefix in order. Publication still waits for every participating storage.
+Prepare durability, local commit identities, NBCL frontiers, ordinary Phase 3B
+commits, single-active-writer ownership and every persistent format are
+unchanged.
+
 [Round 20](core-drop-table-round20.md) adds Core-only transactional DROP for one
 exact active Single Heap. `DropTableTarget` binds TableId/version/fingerprint;
 the transaction materializes NBSC G+1 with that identity removed, invalidating old
