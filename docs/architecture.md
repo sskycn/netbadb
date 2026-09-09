@@ -156,6 +156,15 @@ evidence remain unchanged, every apply/revert advances the runtime epoch, and
 neither G, durable formats, Columnar suppression, nor Inspection JSON v7 is
 modified.
 
+[Adaptive Operations Phase 5](adaptive-operations-phase5.md) adds an explicit
+synchronous safe-mode coordinator with deterministic Columnar-then-calibration
+lane order and one global automatic-trial slot. It reuses the Phase 1 mutation,
+Phase 3 hysteresis, and Phase 4 advisor/shadow/apply/revert APIs; an active
+receipt- or exact-generation-bound trial blocks every other automatic change
+until Keep, Revert, Stale, or explicit abandon resolves it. The coordinator has
+no background execution, automatic workload collection, generic-maintenance
+lane, persistence, protocol surface, or Inspection JSON change.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

@@ -6,6 +6,9 @@ mod adaptive_tests;
 mod adaptive_workload;
 #[cfg(test)]
 mod adaptive_workload_tests;
+mod automatic_safe_mode;
+#[cfg(test)]
+mod automatic_safe_mode_tests;
 mod columnar;
 #[cfg(test)]
 mod columnar_tests;
@@ -100,6 +103,14 @@ pub use adaptive_workload::{
     AdaptiveWorkloadRecordError, AdaptiveWorkloadRecordOutcome, AdaptiveWorkloadStaleReason,
     AdaptiveWorkloadTarget, AdaptiveWorkloadWindow, AggregatedCalibrationEvidence,
     CalibrationVisibilityEvidence,
+};
+pub use automatic_safe_mode::{
+    AutomaticCalibrationTrialEvaluationReport, AutomaticCalibrationTrialPolicy,
+    AutomaticCalibrationTrialStaleReason, AutomaticColumnarTrial, AutomaticPlannerCalibrationTrial,
+    AutomaticSafeModeError, AutomaticSafeModeInput, AutomaticSafeModeLane,
+    AutomaticSafeModeMutation, AutomaticSafeModeNoAction, AutomaticSafeModeOutcome,
+    AutomaticSafeModePolicy, AutomaticSafeModeReport, AutomaticSafeModeState, AutomaticSafeTrial,
+    AutomaticTrialAwaitingReason,
 };
 pub use columnar::{
     ChangeStreamGcReport, ColumnarAdvanceBudget, ColumnarAdvanceReport, ColumnarCompactionReport,
@@ -1191,6 +1202,7 @@ pub struct Database {
     schema_writer: schema_mutation::SchemaWriter,
     maintenance_cursor: Option<maintenance::MaintenanceCursor>,
     adaptive_runtime: adaptive::AdaptiveRuntimeState,
+    automatic_safe_mode: automatic_safe_mode::AutomaticSafeModeRuntimeState,
     planner_calibration: PlannerCalibrationProfile,
     group_barrier: Rc<Cell<Option<u64>>>,
     active_group: Option<ActiveGroupCommit>,
@@ -2108,6 +2120,7 @@ impl Database {
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
             adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
+            automatic_safe_mode: automatic_safe_mode::AutomaticSafeModeRuntimeState::default(),
             planner_calibration: netbadb_planner::PlannerCalibrationProfile::IDENTITY,
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
@@ -2141,6 +2154,7 @@ impl Database {
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
             adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
+            automatic_safe_mode: automatic_safe_mode::AutomaticSafeModeRuntimeState::default(),
             planner_calibration: PlannerCalibrationProfile::IDENTITY,
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
@@ -2191,6 +2205,7 @@ impl Database {
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
             adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
+            automatic_safe_mode: automatic_safe_mode::AutomaticSafeModeRuntimeState::default(),
             planner_calibration: PlannerCalibrationProfile::IDENTITY,
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
@@ -2266,6 +2281,7 @@ impl Database {
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
             adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
+            automatic_safe_mode: automatic_safe_mode::AutomaticSafeModeRuntimeState::default(),
             planner_calibration: PlannerCalibrationProfile::IDENTITY,
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
@@ -7861,6 +7877,8 @@ mod tests {
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
             adaptive_runtime: crate::adaptive::AdaptiveRuntimeState::default(),
+            automatic_safe_mode: crate::automatic_safe_mode::AutomaticSafeModeRuntimeState::default(
+            ),
             planner_calibration: netbadb_planner::PlannerCalibrationProfile::IDENTITY,
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,

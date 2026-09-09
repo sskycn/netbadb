@@ -13,13 +13,13 @@ use crate::{
     PlannerCalibrationShadowDecision,
 };
 
-const SHAPES: [&str; 3] = [
+pub(super) const SHAPES: [&str; 3] = [
     "SELECT id FROM events",
     "SELECT id FROM events LIMIT 10",
     "SELECT id FROM events WHERE category = 1",
 ];
 
-fn permissive_policy() -> PlannerCalibrationPolicy {
+pub(super) fn permissive_policy() -> PlannerCalibrationPolicy {
     PlannerCalibrationPolicy {
         minimum_samples: 3,
         minimum_actual_work_units: 1,
@@ -36,7 +36,7 @@ fn permissive_policy() -> PlannerCalibrationPolicy {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn calibration_report(
+pub(super) fn calibration_report(
     database: &mut Database,
     target: AdaptiveWorkloadTarget,
     sql: &str,
@@ -74,7 +74,7 @@ fn calibration_report(
     report
 }
 
-fn systematic_window(
+pub(super) fn systematic_window(
     database: &mut Database,
     target: AdaptiveWorkloadTarget,
     epoch: PlannerCalibrationEpoch,

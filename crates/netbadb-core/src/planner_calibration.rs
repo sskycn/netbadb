@@ -322,7 +322,7 @@ impl Database {
             });
         }
         let profile = self.planner_calibration;
-        let mut evidence = aggregate_evidence(
+        let mut evidence = aggregate_calibration_evidence(
             window,
             calibration_class,
             profile.epoch,
@@ -425,52 +425,31 @@ impl Database {
         &self,
         proposal: &PlannerCalibrationProposal,
     ) -> PlannerCalibrationShadowDecision {
-        let mut old_error = 0_u64;
-        let mut new_error = 0_u64;
-        let mut incomplete = proposal.evidence.incomplete
-            || proposal.evidence.overflowed
-            || proposal.evidence.truncated;
-        for shape in &proposal.evidence.query_shapes {
-            let Some(old_effective) = apply_calibration_ratio(
-                shape.total_base_estimated_work_units,
-                proposal.current_ratio,
-            ) else {
-                incomplete = true;
-                continue;
-            };
-            let Some(new_effective) = apply_calibration_ratio(
-                shape.total_base_estimated_work_units,
-                proposal.proposed_ratio,
-            ) else {
-                incomplete = true;
-                continue;
-            };
-            incomplete |= checked_add(
-                &mut old_error,
-                absolute_difference(old_effective, shape.total_actual_work_units),
-            );
-            incomplete |= checked_add(
-                &mut new_error,
-                absolute_difference(new_effective, shape.total_actual_work_units),
-            );
-        }
-        let improvement = old_error.saturating_sub(new_error);
-        let accepted = !incomplete
-            && old_error >= new_error
-            && old_error - new_error >= proposal.policy.minimum_shadow_error_improvement_work_units;
+        let replay = replay_calibration_ratio_errors(
+            &proposal.evidence,
+            proposal.current_ratio,
+            proposal.proposed_ratio,
+        );
+        let improvement = replay
+            .old_error_work_units
+            .saturating_sub(replay.new_error_work_units);
+        let accepted = !replay.incomplete
+            && replay.old_error_work_units >= replay.new_error_work_units
+            && replay.old_error_work_units - replay.new_error_work_units
+                >= proposal.policy.minimum_shadow_error_improvement_work_units;
         let report = PlannerCalibrationShadowReport {
             proposal: proposal.clone(),
-            total_old_error_work_units: old_error,
-            total_new_error_work_units: new_error,
+            total_old_error_work_units: replay.old_error_work_units,
+            total_new_error_work_units: replay.new_error_work_units,
             improvement_work_units: improvement,
-            incomplete,
+            incomplete: replay.incomplete,
             accepted,
         };
         if accepted {
             PlannerCalibrationShadowDecision::Accepted(report)
         } else {
             PlannerCalibrationShadowDecision::Rejected {
-                reason: if incomplete {
+                reason: if replay.incomplete {
                     PlannerCalibrationNoAction::IncompleteEvidence
                 } else {
                     PlannerCalibrationNoAction::NoShadowImprovement
@@ -583,7 +562,7 @@ fn direction_is_consistent(
     supporting >= opposing && supporting - opposing >= policy.minimum_directional_query_shape_margin
 }
 
-fn aggregate_evidence(
+pub(crate) fn aggregate_calibration_evidence(
     window: &AdaptiveWorkloadWindow,
     class: PlannerCalibrationClass,
     epoch: PlannerCalibrationEpoch,
@@ -679,6 +658,53 @@ fn aggregate_evidence(
     }
     output.incomplete |= output.overflowed;
     output
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlannerCalibrationRatioReplay {
+    pub(crate) old_error_work_units: u64,
+    pub(crate) new_error_work_units: u64,
+    pub(crate) incomplete: bool,
+}
+
+/// Replays two ratios over the same per-query-shape base estimate and actual
+/// evidence. Both Phase 4 shadowing and Phase 5 probation use this function so
+/// their counterfactual arithmetic cannot drift apart.
+pub(crate) fn replay_calibration_ratio_errors(
+    evidence: &PlannerCalibrationEvidence,
+    old_ratio: CalibrationRatio,
+    new_ratio: CalibrationRatio,
+) -> PlannerCalibrationRatioReplay {
+    let mut old_error = 0_u64;
+    let mut new_error = 0_u64;
+    let mut incomplete = evidence.incomplete || evidence.overflowed || evidence.truncated;
+    for shape in &evidence.query_shapes {
+        let Some(old_effective) =
+            apply_calibration_ratio(shape.total_base_estimated_work_units, old_ratio)
+        else {
+            incomplete = true;
+            continue;
+        };
+        let Some(new_effective) =
+            apply_calibration_ratio(shape.total_base_estimated_work_units, new_ratio)
+        else {
+            incomplete = true;
+            continue;
+        };
+        incomplete |= checked_add(
+            &mut old_error,
+            absolute_difference(old_effective, shape.total_actual_work_units),
+        );
+        incomplete |= checked_add(
+            &mut new_error,
+            absolute_difference(new_effective, shape.total_actual_work_units),
+        );
+    }
+    PlannerCalibrationRatioReplay {
+        old_error_work_units: old_error,
+        new_error_work_units: new_error,
+        incomplete,
+    }
 }
 
 fn absolute_difference(left: u64, right: u64) -> u64 {
