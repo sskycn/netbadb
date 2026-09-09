@@ -3,7 +3,8 @@ use netbadb_executor::{
 };
 use netbadb_planner::{
     PlanVariant, PlannerAccessEstimate, PlannerAccessKind, PlannerActualAccessEvidence,
-    PlannerCalibrationSample, PlannerColumnarExecutionEvidence, evaluate_actual_access_work,
+    PlannerCalibrationEpoch, PlannerCalibrationSample, PlannerColumnarExecutionEvidence,
+    evaluate_actual_access_work,
 };
 use netbadb_rel::LogicalQueryShape;
 use netbadb_types::{
@@ -31,6 +32,7 @@ pub struct AccessExecutionFeedback {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionFeedbackReport {
     pub anchor: ExecutionFeedbackAnchor,
+    pub calibration_epoch: PlannerCalibrationEpoch,
     pub query_shape: LogicalQueryShape,
     pub plan_variant: PlanVariant,
     pub accesses: Vec<AccessExecutionFeedback>,
@@ -92,6 +94,7 @@ pub struct AdaptiveExecutionFeedbackReport {
 
 pub(crate) fn correlate_execution_feedback(
     anchor: ExecutionFeedbackAnchor,
+    calibration_epoch: PlannerCalibrationEpoch,
     query_shape: LogicalQueryShape,
     plan_variant: PlanVariant,
     estimates: &[PlannerAccessEstimate],
@@ -108,7 +111,12 @@ pub(crate) fn correlate_execution_feedback(
             let calibration = planner.as_ref().and_then(|estimate| {
                 let estimated = estimate.estimated_work_units?;
                 let actual_work = evaluate_actual_access_work(estimate, planner_evidence(&actual));
-                Some(PlannerCalibrationSample::new(estimated, actual_work))
+                Some(PlannerCalibrationSample::with_effective(
+                    estimated,
+                    estimate.effective_work_units,
+                    estimate.calibration_epoch,
+                    actual_work,
+                ))
             });
             AccessExecutionFeedback {
                 planner,
@@ -119,6 +127,7 @@ pub(crate) fn correlate_execution_feedback(
         .collect();
     ExecutionFeedbackReport {
         anchor,
+        calibration_epoch,
         query_shape,
         plan_variant,
         accesses,

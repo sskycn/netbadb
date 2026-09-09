@@ -1,7 +1,10 @@
 use std::error::Error;
 use std::fmt;
 
-use netbadb_planner::{PlanVariant, PlannerAccessKind, PlannerEstimateDirection};
+use netbadb_planner::{
+    PlanVariant, PlannerCalibrationClass, PlannerCalibrationEpoch, PlannerCalibrationSample,
+    PlannerEstimateDirection,
+};
 use netbadb_rel::LogicalQueryShape;
 use netbadb_types::{
     ColumnarGeneration, ColumnarProjectionId, DatabaseCommitSeq, SchemaGeneration, StorageId,
@@ -9,6 +12,8 @@ use netbadb_types::{
 };
 
 use crate::{AdaptiveError, Database, ExecutionFeedbackReport};
+
+const MAX_CALIBRATION_EPOCH_CLASS_GROUPS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdaptiveWorkloadTarget {
@@ -43,58 +48,121 @@ impl Default for AdaptiveWorkloadLimits {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggregatedCalibrationEvidence {
-    pub access_kind: PlannerAccessKind,
+    pub calibration_class: PlannerCalibrationClass,
+    pub calibration_epoch: PlannerCalibrationEpoch,
     pub sample_count: u64,
-    pub total_estimated_work_units: u64,
+    pub total_base_estimated_work_units: u64,
+    pub total_effective_estimated_work_units: u64,
     pub total_actual_work_units: u64,
-    pub total_absolute_error_work_units: u64,
-    pub exact_samples: u64,
-    pub underestimated_samples: u64,
-    pub overestimated_samples: u64,
+    pub total_base_absolute_error_work_units: u64,
+    pub total_effective_absolute_error_work_units: u64,
+    pub base_exact_samples: u64,
+    pub base_underestimated_samples: u64,
+    pub base_overestimated_samples: u64,
+    pub effective_exact_samples: u64,
+    pub effective_underestimated_samples: u64,
+    pub effective_overestimated_samples: u64,
     pub overflowed: bool,
     pub incomplete: bool,
 }
 
 impl AggregatedCalibrationEvidence {
-    fn new(access_kind: PlannerAccessKind) -> Self {
+    fn new(
+        calibration_class: PlannerCalibrationClass,
+        calibration_epoch: PlannerCalibrationEpoch,
+    ) -> Self {
         Self {
-            access_kind,
+            calibration_class,
+            calibration_epoch,
             sample_count: 0,
-            total_estimated_work_units: 0,
+            total_base_estimated_work_units: 0,
+            total_effective_estimated_work_units: 0,
             total_actual_work_units: 0,
-            total_absolute_error_work_units: 0,
-            exact_samples: 0,
-            underestimated_samples: 0,
-            overestimated_samples: 0,
+            total_base_absolute_error_work_units: 0,
+            total_effective_absolute_error_work_units: 0,
+            base_exact_samples: 0,
+            base_underestimated_samples: 0,
+            base_overestimated_samples: 0,
+            effective_exact_samples: 0,
+            effective_underestimated_samples: 0,
+            effective_overestimated_samples: 0,
             overflowed: false,
             incomplete: false,
         }
     }
 
-    fn record(
-        &mut self,
-        estimated: u64,
-        actual: u64,
-        absolute_error: u64,
-        direction: PlannerEstimateDirection,
-    ) {
+    fn record(&mut self, sample: PlannerCalibrationSample) {
+        let (
+            Some(effective),
+            Some(actual),
+            Some(base_absolute_error),
+            Some(effective_absolute_error),
+        ) = (
+            sample.effective_estimated_work_units,
+            sample.actual_work_units,
+            sample.absolute_error_work_units,
+            sample.effective_absolute_error_work_units,
+        )
+        else {
+            self.incomplete = true;
+            return;
+        };
         let mut overflowed = false;
         overflowed |= checked_accumulate(&mut self.sample_count, 1);
-        overflowed |= checked_accumulate(&mut self.total_estimated_work_units, estimated);
+        overflowed |= checked_accumulate(
+            &mut self.total_base_estimated_work_units,
+            sample.estimated_work_units,
+        );
+        overflowed |= checked_accumulate(&mut self.total_effective_estimated_work_units, effective);
         overflowed |= checked_accumulate(&mut self.total_actual_work_units, actual);
-        overflowed |= checked_accumulate(&mut self.total_absolute_error_work_units, absolute_error);
-        let direction_total = match direction {
-            PlannerEstimateDirection::Exact => Some(&mut self.exact_samples),
-            PlannerEstimateDirection::Underestimated => Some(&mut self.underestimated_samples),
-            PlannerEstimateDirection::Overestimated => Some(&mut self.overestimated_samples),
-            PlannerEstimateDirection::ActualUnavailable => None,
-        };
-        if let Some(total) = direction_total {
-            overflowed |= checked_accumulate(total, 1);
-        }
+        overflowed |= checked_accumulate(
+            &mut self.total_base_absolute_error_work_units,
+            base_absolute_error,
+        );
+        overflowed |= checked_accumulate(
+            &mut self.total_effective_absolute_error_work_units,
+            effective_absolute_error,
+        );
+        overflowed |= record_direction(
+            sample.direction,
+            &mut self.base_exact_samples,
+            &mut self.base_underestimated_samples,
+            &mut self.base_overestimated_samples,
+        );
+        overflowed |= record_direction(
+            sample.effective_direction,
+            &mut self.effective_exact_samples,
+            &mut self.effective_underestimated_samples,
+            &mut self.effective_overestimated_samples,
+        );
         self.overflowed |= overflowed;
         self.incomplete |= overflowed;
     }
+}
+
+fn record_direction(
+    direction: PlannerEstimateDirection,
+    exact: &mut u64,
+    underestimated: &mut u64,
+    overestimated: &mut u64,
+) -> bool {
+    let total = match direction {
+        PlannerEstimateDirection::Exact => Some(exact),
+        PlannerEstimateDirection::Underestimated => Some(underestimated),
+        PlannerEstimateDirection::Overestimated => Some(overestimated),
+        PlannerEstimateDirection::ActualUnavailable => None,
+    };
+    total.is_some_and(|total| checked_accumulate(total, 1))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibrationVisibilityEvidence {
+    pub calibration_class: PlannerCalibrationClass,
+    pub calibration_epoch: PlannerCalibrationEpoch,
+    pub first_global_commit_seq: DatabaseCommitSeq,
+    pub last_global_commit_seq: DatabaseCommitSeq,
+    pub distinct_visibility_points: u64,
+    pub overflowed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,12 +171,14 @@ pub struct AdaptivePlanVariantAggregate {
     pub report_count: u64,
     pub target_query_samples: u64,
     pub target_access_count: u64,
+    /// Phase 3 target base estimate; calibration never changes this meaning.
     pub total_estimated_work_units: u64,
     pub total_actual_work_units: u64,
     pub total_source_alternative_work_units: u64,
     pub target_overflowed: bool,
     pub target_incomplete: bool,
     pub calibration: Vec<AggregatedCalibrationEvidence>,
+    pub calibration_truncated: bool,
 }
 
 impl AdaptivePlanVariantAggregate {
@@ -124,6 +194,7 @@ impl AdaptivePlanVariantAggregate {
             target_overflowed: false,
             target_incomplete: false,
             calibration: Vec::new(),
+            calibration_truncated: false,
         }
     }
 }
@@ -186,10 +257,13 @@ pub struct AdaptiveWorkloadWindow {
     pub distinct_visibility_points: u64,
     pub total_samples: u64,
     pub total_target_accesses: u64,
+    /// Phase 3 target base estimate; retained for physical hysteresis.
     pub total_estimated_work_units: u64,
     pub total_actual_work_units: u64,
     pub total_source_alternative_work_units: u64,
     pub query_shapes: Vec<AdaptiveQueryShapeAggregate>,
+    pub calibration_visibility: Vec<CalibrationVisibilityEvidence>,
+    pub calibration_truncated: bool,
     pub overflowed: bool,
     pub incomplete: bool,
     pub truncated: bool,
@@ -212,6 +286,8 @@ impl AdaptiveWorkloadWindow {
             total_actual_work_units: 0,
             total_source_alternative_work_units: 0,
             query_shapes: Vec::new(),
+            calibration_visibility: Vec::new(),
+            calibration_truncated: false,
             overflowed: false,
             incomplete: false,
             truncated: false,
@@ -288,6 +364,7 @@ impl AdaptiveWorkloadWindow {
 
         self.last_recorded_global_commit_seq = Some(global_commit_seq);
         let target = collect_target_query_evidence(report, self.target);
+        self.record_calibration_visibility(report, global_commit_seq);
         let group = &mut self.query_shapes[shape_index].plan_variants[variant_index];
         let report_count_overflow = checked_accumulate(&mut group.report_count, 1);
         if report_count_overflow {
@@ -304,6 +381,50 @@ impl AdaptiveWorkloadWindow {
         Ok(AdaptiveWorkloadRecordOutcome::RecordedRelevant {
             target_access_count: target.access_count,
         })
+    }
+
+    fn record_calibration_visibility(
+        &mut self,
+        report: &ExecutionFeedbackReport,
+        global_commit_seq: DatabaseCommitSeq,
+    ) {
+        let mut seen = Vec::new();
+        for access in &report.accesses {
+            let (Some(planner), Some(sample)) = (&access.planner, access.calibration) else {
+                continue;
+            };
+            let key = (planner.kind.calibration_class(), sample.calibration_epoch);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let index = self.calibration_visibility.iter().position(|evidence| {
+                evidence.calibration_class == key.0 && evidence.calibration_epoch == key.1
+            });
+            match index {
+                Some(index) => {
+                    let evidence = &mut self.calibration_visibility[index];
+                    if evidence.last_global_commit_seq != global_commit_seq {
+                        let overflowed =
+                            checked_accumulate(&mut evidence.distinct_visibility_points, 1);
+                        evidence.overflowed |= overflowed;
+                        evidence.last_global_commit_seq = global_commit_seq;
+                    }
+                }
+                None if self.calibration_visibility.len() < MAX_CALIBRATION_EPOCH_CLASS_GROUPS => {
+                    self.calibration_visibility
+                        .push(CalibrationVisibilityEvidence {
+                            calibration_class: key.0,
+                            calibration_epoch: key.1,
+                            first_global_commit_seq: global_commit_seq,
+                            last_global_commit_seq: global_commit_seq,
+                            distinct_visibility_points: 1,
+                            overflowed: false,
+                        });
+                }
+                None => self.calibration_truncated = true,
+            }
+        }
     }
 
     fn mark_truncated(&mut self, global_commit_seq: DatabaseCommitSeq) {
@@ -432,28 +553,29 @@ fn record_calibration(group: &mut AdaptivePlanVariantAggregate, report: &Executi
         let (Some(planner), Some(calibration)) = (&access.planner, access.calibration) else {
             continue;
         };
-        let (Some(actual), Some(absolute_error)) = (
-            calibration.actual_work_units,
-            calibration.absolute_error_work_units,
-        ) else {
-            continue;
-        };
+        let class = planner.kind.calibration_class();
         let index = group
             .calibration
             .iter()
-            .position(|aggregate| aggregate.access_kind == planner.kind)
+            .position(|aggregate| {
+                aggregate.calibration_class == class
+                    && aggregate.calibration_epoch == calibration.calibration_epoch
+            })
             .unwrap_or_else(|| {
-                group
-                    .calibration
-                    .push(AggregatedCalibrationEvidence::new(planner.kind));
+                if group.calibration.len() >= MAX_CALIBRATION_EPOCH_CLASS_GROUPS {
+                    group.calibration_truncated = true;
+                    return group.calibration.len();
+                }
+                group.calibration.push(AggregatedCalibrationEvidence::new(
+                    class,
+                    calibration.calibration_epoch,
+                ));
                 group.calibration.len() - 1
             });
-        group.calibration[index].record(
-            calibration.estimated_work_units,
-            actual,
-            absolute_error,
-            calibration.direction,
-        );
+        if let Some(aggregate) = group.calibration.get_mut(index) {
+            aggregate.record(calibration);
+            aggregate.incomplete |= calibration.calibration_epoch != report.calibration_epoch;
+        }
     }
 }
 
@@ -521,6 +643,7 @@ pub struct AdaptiveWorkloadEvaluationReport {
     pub target: AdaptiveWorkloadTarget,
     pub sample_count: u64,
     pub distinct_visibility_points: u64,
+    /// Phase 3 target base estimate, not the effective calibration overlay.
     pub total_estimated_work_units: u64,
     pub total_actual_work_units: u64,
     pub total_source_alternative_work_units: u64,

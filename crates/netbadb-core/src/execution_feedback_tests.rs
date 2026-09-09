@@ -119,6 +119,10 @@ fn feedback_is_transparent_and_measures_seq_filter_point_and_range_access() {
         .query_with_feedback(sql)
         .expect("observed seq query");
     assert_eq!(observed, normal);
+    assert_eq!(
+        feedback.calibration_epoch,
+        netbadb_planner::PlannerCalibrationEpoch(0)
+    );
     assert_eq!(feedback.accesses.len(), 1);
     assert_eq!(
         feedback.accesses[0].actual.kind,
@@ -130,7 +134,25 @@ fn feedback_is_transparent_and_measures_seq_filter_point_and_range_access() {
     assert_eq!(feedback.filters[0].work.filter_rows_evaluated, 512);
     assert_eq!(feedback.filters[0].work.filter_rows_passed, 192);
     assert_eq!(feedback.filters[0].work.filter_rows_rejected, 320);
-    assert!(feedback.accesses[0].calibration.is_some());
+    let planner = feedback.accesses[0]
+        .planner
+        .as_ref()
+        .expect("seq planner estimate");
+    assert_eq!(planner.estimated_work_units, planner.effective_work_units);
+    assert_eq!(
+        planner.calibration_epoch,
+        netbadb_planner::PlannerCalibrationEpoch(0)
+    );
+    let calibration = feedback.accesses[0].calibration.expect("seq calibration");
+    assert_eq!(
+        Some(calibration.estimated_work_units),
+        calibration.effective_estimated_work_units
+    );
+    assert_eq!(calibration.direction, calibration.effective_direction);
+    assert_eq!(
+        calibration.absolute_error_work_units,
+        calibration.effective_absolute_error_work_units
+    );
     assert_eq!(
         fixture
             .database

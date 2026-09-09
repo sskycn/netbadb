@@ -12,6 +12,14 @@ use netbadb_types::{
     RelationBindingId, ScalarValue, StorageId, TableId,
 };
 
+mod calibration;
+#[cfg(test)]
+mod calibration_integration_tests;
+use calibration::effective_planning_cost;
+pub use calibration::{
+    CalibrationRatio, CalibrationRatioError, PlannerCalibrationClass, PlannerCalibrationEpoch,
+    PlannerCalibrationProfile, apply_calibration_ratio,
+};
 mod plan_variant;
 pub use plan_variant::{
     PlanIndexBoundShape, PlanIndexRangeShape, PlanPartitionAccessVariant, PlanPartitionVariant,
@@ -137,6 +145,18 @@ pub enum PlannerAccessKind {
     PartitionedIndexRange,
 }
 
+impl PlannerAccessKind {
+    #[must_use]
+    pub const fn calibration_class(self) -> PlannerCalibrationClass {
+        match self {
+            Self::SeqScan | Self::PartitionedSeqScan => PlannerCalibrationClass::SeqScan,
+            Self::IndexPoint | Self::PartitionedIndexPoint => PlannerCalibrationClass::IndexPoint,
+            Self::IndexRange | Self::PartitionedIndexRange => PlannerCalibrationClass::IndexRange,
+            Self::Columnar => PlannerCalibrationClass::Columnar,
+        }
+    }
+}
+
 /// Parameters retained from the canonical planning formula so actual evidence
 /// can be evaluated in the same unit system without consulting newer stats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,10 +182,17 @@ pub struct PlannerAccessEstimate {
     pub access_path: Option<AccessPathId>,
     pub projection_id: Option<ColumnarProjectionId>,
     pub projection_generation: Option<ColumnarGeneration>,
+    /// Uncalibrated estimate produced by the canonical base cost model.
     pub estimated_work_units: Option<u64>,
+    /// Calibration overlay applied to `estimated_work_units` for this plan.
+    pub effective_work_units: Option<u64>,
+    pub calibration_epoch: PlannerCalibrationEpoch,
     /// Selected Columnar scans retain the authoritative source alternative
     /// used at planning time. Other access kinds have no Phase 2 alternative.
     pub source_alternative_work_units: Option<u64>,
+    /// Calibrated diagnostic counterpart. Phase 2/3 physical regression
+    /// continues to use the uncalibrated source alternative above.
+    pub effective_source_alternative_work_units: Option<u64>,
     pub work_model: PlannerWorkModel,
 }
 
@@ -202,10 +229,16 @@ pub struct PlannerColumnarExecutionEvidence {
 /// domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlannerCalibrationSample {
+    /// Base model estimate; this preserves the Phase 2 field semantics.
     pub estimated_work_units: u64,
+    pub effective_estimated_work_units: Option<u64>,
+    pub calibration_epoch: PlannerCalibrationEpoch,
     pub actual_work_units: Option<u64>,
+    /// Direction and error of the base estimate.
     pub direction: PlannerEstimateDirection,
     pub absolute_error_work_units: Option<u64>,
+    pub effective_direction: PlannerEstimateDirection,
+    pub effective_absolute_error_work_units: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,26 +252,58 @@ pub enum PlannerEstimateDirection {
 impl PlannerCalibrationSample {
     #[must_use]
     pub fn new(estimated_work_units: u64, actual_work_units: Option<u64>) -> Self {
-        let (direction, absolute_error_work_units) = match actual_work_units {
-            None => (PlannerEstimateDirection::ActualUnavailable, None),
-            Some(actual) if actual == estimated_work_units => {
-                (PlannerEstimateDirection::Exact, Some(0))
-            }
-            Some(actual) if actual > estimated_work_units => (
-                PlannerEstimateDirection::Underestimated,
-                Some(actual - estimated_work_units),
-            ),
-            Some(actual) => (
-                PlannerEstimateDirection::Overestimated,
-                Some(estimated_work_units - actual),
-            ),
-        };
+        Self::with_effective(
+            estimated_work_units,
+            Some(estimated_work_units),
+            PlannerCalibrationEpoch(0),
+            actual_work_units,
+        )
+    }
+
+    #[must_use]
+    pub fn with_effective(
+        estimated_work_units: u64,
+        effective_estimated_work_units: Option<u64>,
+        calibration_epoch: PlannerCalibrationEpoch,
+        actual_work_units: Option<u64>,
+    ) -> Self {
+        let (direction, absolute_error_work_units) =
+            estimate_error(estimated_work_units, actual_work_units);
+        let (effective_direction, effective_absolute_error_work_units) =
+            match effective_estimated_work_units {
+                Some(effective) => estimate_error(effective, actual_work_units),
+                None => (PlannerEstimateDirection::ActualUnavailable, None),
+            };
         Self {
             estimated_work_units,
+            effective_estimated_work_units,
+            calibration_epoch,
             actual_work_units,
             direction,
             absolute_error_work_units,
+            effective_direction,
+            effective_absolute_error_work_units,
         }
+    }
+}
+
+fn estimate_error(
+    estimated_work_units: u64,
+    actual_work_units: Option<u64>,
+) -> (PlannerEstimateDirection, Option<u64>) {
+    match actual_work_units {
+        None => (PlannerEstimateDirection::ActualUnavailable, None),
+        Some(actual) if actual == estimated_work_units => {
+            (PlannerEstimateDirection::Exact, Some(0))
+        }
+        Some(actual) if actual > estimated_work_units => (
+            PlannerEstimateDirection::Underestimated,
+            Some(actual - estimated_work_units),
+        ),
+        Some(actual) => (
+            PlannerEstimateDirection::Overestimated,
+            Some(estimated_work_units - actual),
+        ),
     }
 }
 
@@ -475,7 +540,32 @@ pub fn plan_with_partition_snapshots(
     access_paths: &[AccessPath],
     range_tables: &[RangeTablePlanningSnapshot],
 ) -> PhysicalPlan {
-    let raw = plan_raw_with_statistics(logical, table_statistics, access_paths, range_tables);
+    plan_with_partition_snapshots_and_calibration(
+        logical,
+        table_statistics,
+        access_paths,
+        range_tables,
+        &PlannerCalibrationProfile::IDENTITY,
+    )
+}
+
+/// Calibration-aware variant. The immutable profile is used exactly once at
+/// each canonical access-cost comparison.
+#[must_use]
+pub fn plan_with_partition_snapshots_and_calibration(
+    logical: &LogicalPlan,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+    calibration: &PlannerCalibrationProfile,
+) -> PhysicalPlan {
+    let raw = plan_raw_with_statistics(
+        logical,
+        table_statistics,
+        access_paths,
+        range_tables,
+        calibration,
+    );
     let required = raw
         .output_fields()
         .into_iter()
@@ -493,8 +583,33 @@ pub fn plan_with_columnar_snapshots(
     range_tables: &[RangeTablePlanningSnapshot],
     projections: &[ColumnarProjectionPlanningSnapshot],
 ) -> PhysicalPlan {
-    let plan = plan_with_partition_snapshots(logical, table_statistics, access_paths, range_tables);
-    select_columnar_scans(plan, table_statistics, projections, true, &[])
+    plan_with_columnar_snapshots_and_calibration(
+        logical,
+        table_statistics,
+        access_paths,
+        range_tables,
+        projections,
+        &PlannerCalibrationProfile::IDENTITY,
+    )
+}
+
+#[must_use]
+pub fn plan_with_columnar_snapshots_and_calibration(
+    logical: &LogicalPlan,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+    projections: &[ColumnarProjectionPlanningSnapshot],
+    calibration: &PlannerCalibrationProfile,
+) -> PhysicalPlan {
+    let plan = plan_with_partition_snapshots_and_calibration(
+        logical,
+        table_statistics,
+        access_paths,
+        range_tables,
+        calibration,
+    );
+    select_columnar_scans(plan, table_statistics, projections, calibration, true, &[])
 }
 
 /// Evaluates one existing projection with the same storage-neutral work model
@@ -522,6 +637,7 @@ fn select_columnar_scans(
     plan: PhysicalPlan,
     table_statistics: &[TableAccessStatistics],
     projections: &[ColumnarProjectionPlanningSnapshot],
+    calibration: &PlannerCalibrationProfile,
     eligible_context: bool,
     constraints: &[ColumnarPlanningConstraint],
 ) -> PhysicalPlan {
@@ -547,6 +663,10 @@ fn select_columnar_scans(
                 .max()
                 .unwrap_or(0);
             let source_work = source_scan_work_units(source_statistics, fallback_rows);
+            let effective_source_work = effective_planning_cost(
+                u128::from(source_work),
+                calibration.ratio(PlannerCalibrationClass::SeqScan),
+            );
             let selected = projections
                 .iter()
                 .filter(|projection| {
@@ -555,10 +675,19 @@ fn select_columnar_scans(
                             .iter()
                             .all(|column| projection.projected_columns.contains(column))
                 })
-                .min_by_key(|projection| columnar_work_units(projection, &required, constraints));
+                .min_by_key(|projection| {
+                    effective_planning_cost(
+                        u128::from(columnar_work_units(projection, &required, constraints)),
+                        calibration.ratio(PlannerCalibrationClass::Columnar),
+                    )
+                });
             if let Some(projection) = selected {
                 let columnar_work = columnar_work_units(projection, &required, constraints);
-                if columnar_work <= source_work {
+                let effective_columnar_work = effective_planning_cost(
+                    u128::from(columnar_work),
+                    calibration.ratio(PlannerCalibrationClass::Columnar),
+                );
+                if effective_columnar_work <= effective_source_work {
                     return PhysicalPlan::ColumnarScan {
                         binding_id,
                         table_id,
@@ -585,6 +714,7 @@ fn select_columnar_scans(
                     *input,
                     table_statistics,
                     projections,
+                    calibration,
                     eligible_context,
                     &pushed,
                 )
@@ -596,6 +726,7 @@ fn select_columnar_scans(
                 *input,
                 table_statistics,
                 projections,
+                calibration,
                 eligible_context,
                 constraints,
             )),
@@ -606,6 +737,7 @@ fn select_columnar_scans(
                 *input,
                 table_statistics,
                 projections,
+                calibration,
                 eligible_context,
                 constraints,
             )),
@@ -620,6 +752,7 @@ fn select_columnar_scans(
                 *input,
                 table_statistics,
                 projections,
+                calibration,
                 eligible_context,
                 constraints,
             )),
@@ -631,6 +764,7 @@ fn select_columnar_scans(
                 *input,
                 table_statistics,
                 projections,
+                calibration,
                 eligible_context,
                 constraints,
             )),
@@ -641,6 +775,7 @@ fn select_columnar_scans(
                 *input,
                 table_statistics,
                 projections,
+                calibration,
                 false,
                 &[],
             )),
@@ -657,6 +792,7 @@ fn select_columnar_scans(
                 *left,
                 table_statistics,
                 projections,
+                calibration,
                 false,
                 &[],
             )),
@@ -664,6 +800,7 @@ fn select_columnar_scans(
                 *right,
                 table_statistics,
                 projections,
+                calibration,
                 false,
                 &[],
             )),
@@ -684,6 +821,7 @@ fn select_columnar_scans(
                 *left,
                 table_statistics,
                 projections,
+                calibration,
                 false,
                 &[],
             )),
@@ -691,6 +829,7 @@ fn select_columnar_scans(
                 *right,
                 table_statistics,
                 projections,
+                calibration,
                 false,
                 &[],
             )),
@@ -717,6 +856,7 @@ fn select_columnar_scans(
                 *left,
                 table_statistics,
                 projections,
+                calibration,
                 false,
                 &[],
             )),
@@ -799,6 +939,25 @@ pub fn estimate_execution_accesses(
     range_tables: &[RangeTablePlanningSnapshot],
     projections: &[ColumnarProjectionPlanningSnapshot],
 ) -> Vec<PlannerAccessEstimate> {
+    estimate_execution_accesses_with_calibration(
+        plan,
+        table_statistics,
+        access_paths,
+        range_tables,
+        projections,
+        &PlannerCalibrationProfile::IDENTITY,
+    )
+}
+
+#[must_use]
+pub fn estimate_execution_accesses_with_calibration(
+    plan: &PhysicalPlan,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+    projections: &[ColumnarProjectionPlanningSnapshot],
+    calibration: &PlannerCalibrationProfile,
+) -> Vec<PlannerAccessEstimate> {
     let mut estimates = Vec::new();
     let mut next_node = 0_u32;
     collect_access_estimates(
@@ -807,6 +966,7 @@ pub fn estimate_execution_accesses(
         access_paths,
         range_tables,
         projections,
+        calibration,
         &[],
         &mut next_node,
         &mut estimates,
@@ -821,6 +981,7 @@ fn collect_access_estimates(
     access_paths: &[AccessPath],
     range_tables: &[RangeTablePlanningSnapshot],
     projections: &[ColumnarProjectionPlanningSnapshot],
+    calibration: &PlannerCalibrationProfile,
     constraints: &[ColumnarPlanningConstraint],
     next_node: &mut u32,
     output: &mut Vec<PlannerAccessEstimate>,
@@ -845,6 +1006,7 @@ fn collect_access_estimates(
                 .map(|projection| projection.row_count)
                 .max()
                 .unwrap_or(0);
+            let base = source_scan_work_units(table_stats(*table_id), fallback_rows);
             output.push(PlannerAccessEstimate {
                 node,
                 binding_id: *binding_id,
@@ -854,11 +1016,14 @@ fn collect_access_estimates(
                 access_path: None,
                 projection_id: None,
                 projection_generation: None,
-                estimated_work_units: Some(source_scan_work_units(
-                    table_stats(*table_id),
-                    fallback_rows,
-                )),
+                estimated_work_units: Some(base),
+                effective_work_units: apply_calibration_ratio(
+                    base,
+                    calibration.ratio(PlannerCalibrationClass::SeqScan),
+                ),
+                calibration_epoch: calibration.epoch,
                 source_alternative_work_units: None,
+                effective_source_alternative_work_units: None,
                 work_model: PlannerWorkModel::SequentialRows,
             });
         }
@@ -879,6 +1044,7 @@ fn collect_access_estimates(
             None,
             table_stats(*table_id),
             access_paths,
+            calibration,
         )),
         PhysicalPlan::RangeIndexScan {
             binding_id,
@@ -897,6 +1063,7 @@ fn collect_access_estimates(
             Some(range),
             table_stats(*table_id),
             access_paths,
+            calibration,
         )),
         PhysicalPlan::ColumnarScan {
             binding_id,
@@ -916,6 +1083,11 @@ fn collect_access_estimates(
                 .iter()
                 .map(|column| column.column_id)
                 .collect::<Vec<_>>();
+            let base = projection
+                .map(|projection| columnar_work_units(projection, &required, constraints));
+            let source_base = projection.map(|projection| {
+                source_scan_work_units(table_stats(*table_id), projection.row_count)
+            });
             output.push(PlannerAccessEstimate {
                 node,
                 binding_id: *binding_id,
@@ -925,10 +1097,20 @@ fn collect_access_estimates(
                 access_path: None,
                 projection_id: Some(*projection_id),
                 projection_generation: Some(*generation),
-                estimated_work_units: projection
-                    .map(|projection| columnar_work_units(projection, &required, constraints)),
-                source_alternative_work_units: projection.map(|projection| {
-                    source_scan_work_units(table_stats(*table_id), projection.row_count)
+                estimated_work_units: base,
+                effective_work_units: base.and_then(|base| {
+                    apply_calibration_ratio(
+                        base,
+                        calibration.ratio(PlannerCalibrationClass::Columnar),
+                    )
+                }),
+                calibration_epoch: calibration.epoch,
+                source_alternative_work_units: source_base,
+                effective_source_alternative_work_units: source_base.and_then(|base| {
+                    apply_calibration_ratio(
+                        base,
+                        calibration.ratio(PlannerCalibrationClass::SeqScan),
+                    )
                 }),
                 work_model: PlannerWorkModel::Columnar {
                     projected_column_count: u64::try_from(required.len()).unwrap_or(u64::MAX),
@@ -952,22 +1134,31 @@ fn collect_access_estimates(
                         .find(|candidate| candidate.storage_id == partition.storage_id)
                 });
                 match &partition.access {
-                    PartitionAccessPlan::SeqScan => output.push(PlannerAccessEstimate {
-                        node,
-                        binding_id: *binding_id,
-                        table_id: *table_id,
-                        storage_id: Some(partition.storage_id),
-                        kind: PlannerAccessKind::PartitionedSeqScan,
-                        access_path: None,
-                        projection_id: None,
-                        projection_generation: None,
-                        estimated_work_units: Some(source_scan_work_units(
+                    PartitionAccessPlan::SeqScan => {
+                        let base = source_scan_work_units(
                             snapshot.and_then(|snapshot| snapshot.statistics),
                             0,
-                        )),
-                        source_alternative_work_units: None,
-                        work_model: PlannerWorkModel::SequentialRows,
-                    }),
+                        );
+                        output.push(PlannerAccessEstimate {
+                            node,
+                            binding_id: *binding_id,
+                            table_id: *table_id,
+                            storage_id: Some(partition.storage_id),
+                            kind: PlannerAccessKind::PartitionedSeqScan,
+                            access_path: None,
+                            projection_id: None,
+                            projection_generation: None,
+                            estimated_work_units: Some(base),
+                            effective_work_units: apply_calibration_ratio(
+                                base,
+                                calibration.ratio(PlannerCalibrationClass::SeqScan),
+                            ),
+                            calibration_epoch: calibration.epoch,
+                            source_alternative_work_units: None,
+                            effective_source_alternative_work_units: None,
+                            work_model: PlannerWorkModel::SequentialRows,
+                        })
+                    }
                     PartitionAccessPlan::IndexScan {
                         access_path, key, ..
                     } => output.push(index_access_estimate(
@@ -981,6 +1172,7 @@ fn collect_access_estimates(
                         None,
                         snapshot.and_then(|snapshot| snapshot.statistics),
                         snapshot.map_or(&[], |snapshot| snapshot.access_paths.as_slice()),
+                        calibration,
                     )),
                     PartitionAccessPlan::RangeIndexScan {
                         access_path, range, ..
@@ -995,6 +1187,7 @@ fn collect_access_estimates(
                         Some(range),
                         snapshot.and_then(|snapshot| snapshot.statistics),
                         snapshot.map_or(&[], |snapshot| snapshot.access_paths.as_slice()),
+                        calibration,
                     )),
                 }
             }
@@ -1008,6 +1201,7 @@ fn collect_access_estimates(
                 access_paths,
                 range_tables,
                 projections,
+                calibration,
                 &pushed,
                 next_node,
                 output,
@@ -1021,6 +1215,7 @@ fn collect_access_estimates(
                 access_paths,
                 range_tables,
                 projections,
+                calibration,
                 &[],
                 next_node,
                 output,
@@ -1031,6 +1226,7 @@ fn collect_access_estimates(
                 access_paths,
                 range_tables,
                 projections,
+                calibration,
                 &[],
                 next_node,
                 output,
@@ -1059,6 +1255,12 @@ fn collect_access_estimates(
                     point.checked_mul(u128::from(left_rows?))
                 })
                 .and_then(|work| u64::try_from(work).ok());
+            let effective_work_units = estimated_work_units.and_then(|base| {
+                apply_calibration_ratio(
+                    base,
+                    calibration.ratio(PlannerCalibrationClass::IndexPoint),
+                )
+            });
             output.push(PlannerAccessEstimate {
                 node,
                 binding_id: *right_binding_id,
@@ -1069,7 +1271,10 @@ fn collect_access_estimates(
                 projection_id: None,
                 projection_generation: None,
                 estimated_work_units,
+                effective_work_units,
+                calibration_epoch: calibration.epoch,
                 source_alternative_work_units: None,
+                effective_source_alternative_work_units: None,
                 work_model: path
                     .and_then(|path| index_work_model(path, PlannerAccessKind::IndexPoint))
                     .unwrap_or(PlannerWorkModel::Index {
@@ -1083,6 +1288,7 @@ fn collect_access_estimates(
                 access_paths,
                 range_tables,
                 projections,
+                calibration,
                 constraints,
                 next_node,
                 output,
@@ -1098,6 +1304,7 @@ fn collect_access_estimates(
             access_paths,
             range_tables,
             projections,
+            calibration,
             constraints,
             next_node,
             output,
@@ -1135,6 +1342,7 @@ fn index_access_estimate(
     range: Option<&IndexRange>,
     table: Option<TableStatistics>,
     access_paths: &[AccessPath],
+    calibration: &PlannerCalibrationProfile,
 ) -> PlannerAccessEstimate {
     let path = access_paths
         .iter()
@@ -1171,7 +1379,12 @@ fn index_access_estimate(
         projection_id: None,
         projection_generation: None,
         estimated_work_units,
+        effective_work_units: estimated_work_units.and_then(|base| {
+            apply_calibration_ratio(base, calibration.ratio(kind.calibration_class()))
+        }),
+        calibration_epoch: calibration.epoch,
         source_alternative_work_units: None,
+        effective_source_alternative_work_units: None,
         work_model: model,
     }
 }
@@ -1336,6 +1549,7 @@ fn plan_raw_with_statistics(
     table_statistics: &[TableAccessStatistics],
     access_paths: &[AccessPath],
     range_tables: &[RangeTablePlanningSnapshot],
+    calibration: &PlannerCalibrationProfile,
 ) -> PhysicalPlan {
     match logical {
         LogicalPlan::OneRow => PhysicalPlan::OneRow,
@@ -1348,7 +1562,15 @@ fn plan_raw_with_statistics(
             .iter()
             .find(|placement| placement.table_id == *table_id)
             .map(|placement| {
-                build_partitioned_scan(None, *binding_id, *table_id, table_name, columns, placement)
+                build_partitioned_scan(
+                    None,
+                    *binding_id,
+                    *table_id,
+                    table_name,
+                    columns,
+                    placement,
+                    calibration,
+                )
             })
             .unwrap_or_else(|| PhysicalPlan::SeqScan {
                 binding_id: *binding_id,
@@ -1368,6 +1590,7 @@ fn plan_raw_with_statistics(
                 table_statistics,
                 access_paths,
                 range_tables,
+                calibration,
             ));
             match choose_direct_inner_join(
                 *kind,
@@ -1377,6 +1600,7 @@ fn plan_raw_with_statistics(
                 table_statistics,
                 access_paths,
                 range_tables,
+                calibration,
             ) {
                 DirectInnerJoin::Index {
                     left_key,
@@ -1397,6 +1621,7 @@ fn plan_raw_with_statistics(
                                 table_statistics,
                                 access_paths,
                                 range_tables,
+                                calibration,
                             )),
                             kind: *kind,
                             predicate: predicate.clone(),
@@ -1427,6 +1652,7 @@ fn plan_raw_with_statistics(
                         table_statistics,
                         access_paths,
                         range_tables,
+                        calibration,
                     )),
                     kind: *kind,
                     left_key,
@@ -1441,6 +1667,7 @@ fn plan_raw_with_statistics(
                         table_statistics,
                         access_paths,
                         range_tables,
+                        calibration,
                     )),
                     kind: *kind,
                     predicate: predicate.clone(),
@@ -1466,6 +1693,7 @@ fn plan_raw_with_statistics(
                             table_name,
                             columns,
                             placement,
+                            calibration,
                         )
                     })
                     .or_else(|| {
@@ -1477,6 +1705,7 @@ fn plan_raw_with_statistics(
                             columns,
                             table_statistics,
                             access_paths,
+                            calibration,
                         )
                     })
                     .unwrap_or_else(|| {
@@ -1485,9 +1714,16 @@ fn plan_raw_with_statistics(
                             table_statistics,
                             access_paths,
                             range_tables,
+                            calibration,
                         )
                     }),
-                _ => plan_raw_with_statistics(input, table_statistics, access_paths, range_tables),
+                _ => plan_raw_with_statistics(
+                    input,
+                    table_statistics,
+                    access_paths,
+                    range_tables,
+                    calibration,
+                ),
             };
             PhysicalPlan::Filter {
                 input: Box::new(input),
@@ -1500,6 +1736,7 @@ fn plan_raw_with_statistics(
                 table_statistics,
                 access_paths,
                 range_tables,
+                calibration,
             )),
             keys: keys.clone(),
         },
@@ -1509,6 +1746,7 @@ fn plan_raw_with_statistics(
                 table_statistics,
                 access_paths,
                 range_tables,
+                calibration,
             )),
             columns: columns.clone(),
         },
@@ -1518,6 +1756,7 @@ fn plan_raw_with_statistics(
                 table_statistics,
                 access_paths,
                 range_tables,
+                calibration,
             )),
             expressions: expressions.clone(),
         },
@@ -1531,6 +1770,7 @@ fn plan_raw_with_statistics(
                 table_statistics,
                 access_paths,
                 range_tables,
+                calibration,
             )),
             group_keys: group_keys.clone(),
             outputs: outputs.clone(),
@@ -1541,6 +1781,7 @@ fn plan_raw_with_statistics(
                 table_statistics,
                 access_paths,
                 range_tables,
+                calibration,
             )),
             limit: *limit,
         },
@@ -1916,6 +2157,7 @@ enum DirectInnerJoin {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn choose_direct_inner_join(
     kind: JoinKind,
     left: &LogicalPlan,
@@ -1924,6 +2166,7 @@ fn choose_direct_inner_join(
     table_statistics: &[TableAccessStatistics],
     access_paths: &[AccessPath],
     range_tables: &[RangeTablePlanningSnapshot],
+    calibration: &PlannerCalibrationProfile,
 ) -> DirectInnerJoin {
     if !matches!(kind, JoinKind::Inner) {
         return DirectInnerJoin::NestedLoop;
@@ -1951,7 +2194,10 @@ fn choose_direct_inner_join(
     // Point access and SeqScan must stay in the storage-neutral units already
     // used by Filter planning. Row count remains the existing Hash-vs-Nested
     // CPU-work comparison, but is not a full-scan access cost.
-    let hash_join_right_work = seq_scan_cost(right_statistics);
+    let hash_join_right_work = effective_planning_cost(
+        seq_scan_cost(right_statistics),
+        calibration.ratio(PlannerCalibrationClass::SeqScan),
+    );
 
     if let Some((right_table_id, right_access_path, point_cost)) = eligible_right_point_access(
         right,
@@ -1965,7 +2211,12 @@ fn choose_direct_inner_join(
                 .iter()
                 .any(|placement| placement.table_id == left_table_id)
         {
-            if let Some(index_join_inner_work) = u128::from(left_rows).checked_mul(point_cost) {
+            if let Some(index_join_inner_base_work) = u128::from(left_rows).checked_mul(point_cost)
+            {
+                let index_join_inner_work = effective_planning_cost(
+                    index_join_inner_base_work,
+                    calibration.ratio(PlannerCalibrationClass::IndexPoint),
+                );
                 if index_join_inner_work < nested_loop_work
                     && index_join_inner_work < hash_join_right_work
                 {
@@ -2126,6 +2377,7 @@ fn build_partitioned_scan(
     table_name: &str,
     columns: &[ColumnRef],
     placement: &RangeTablePlanningSnapshot,
+    calibration: &PlannerCalibrationProfile,
 ) -> PhysicalPlan {
     let constraint = predicate.map(|predicate| {
         let mut constraint = PartitionConstraint::default();
@@ -2160,6 +2412,7 @@ fn build_partitioned_scan(
                     columns,
                     &local_statistics,
                     &partition.access_paths,
+                    calibration,
                 )
             });
             let access = match selected {
@@ -2356,6 +2609,7 @@ fn scalar_order(left: &ScalarValue, right: &ScalarValue) -> Option<Ordering> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn choose_index_access(
     predicate: &Expr,
     binding_id: RelationBindingId,
@@ -2364,6 +2618,7 @@ fn choose_index_access(
     columns: &[ColumnRef],
     table_statistics: &[TableAccessStatistics],
     access_paths: &[AccessPath],
+    calibration: &PlannerCalibrationProfile,
 ) -> Option<PhysicalPlan> {
     let mut eligible = Vec::new();
     for access_path in access_paths {
@@ -2411,7 +2666,7 @@ fn choose_index_access(
                 let Some(index) = candidate.access_path.statistics.as_ref() else {
                     continue;
                 };
-                let Some(cost) = candidate_cost(
+                let Some(base_cost) = candidate_cost(
                     table,
                     index,
                     candidate.access_path.cost_hints.as_ref(),
@@ -2419,6 +2674,11 @@ fn choose_index_access(
                 ) else {
                     continue;
                 };
+                let class = match &candidate.lookup {
+                    IndexLookupCandidate::Point { .. } => PlannerCalibrationClass::IndexPoint,
+                    IndexLookupCandidate::Range { .. } => PlannerCalibrationClass::IndexRange,
+                };
+                let cost = effective_planning_cost(base_cost, calibration.ratio(class));
                 if best.is_none_or(|(_, best_cost)| cost < best_cost) {
                     best = Some((candidate, cost));
                 }
@@ -2428,7 +2688,11 @@ fn choose_index_access(
                     build_index_scan(candidate, binding_id, table_id, table_name, columns)
                 });
             };
-            if cost >= seq_scan_cost(table) {
+            let seq_cost = effective_planning_cost(
+                seq_scan_cost(table),
+                calibration.ratio(PlannerCalibrationClass::SeqScan),
+            );
+            if cost >= seq_cost {
                 return None;
             }
             candidate
@@ -2874,13 +3138,33 @@ pub fn plan_statement_with_partition_snapshots(
     access_paths: &[AccessPath],
     range_tables: &[RangeTablePlanningSnapshot],
 ) -> PhysicalStatement {
+    plan_statement_with_partition_snapshots_and_calibration(
+        logical,
+        table_statistics,
+        access_paths,
+        range_tables,
+        &PlannerCalibrationProfile::IDENTITY,
+    )
+}
+
+#[must_use]
+pub fn plan_statement_with_partition_snapshots_and_calibration(
+    logical: &LogicalStatement,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+    calibration: &PlannerCalibrationProfile,
+) -> PhysicalStatement {
     match logical {
-        LogicalStatement::Query(query) => PhysicalStatement::Query(plan_with_partition_snapshots(
-            query,
-            table_statistics,
-            access_paths,
-            range_tables,
-        )),
+        LogicalStatement::Query(query) => {
+            PhysicalStatement::Query(plan_with_partition_snapshots_and_calibration(
+                query,
+                table_statistics,
+                access_paths,
+                range_tables,
+                calibration,
+            ))
+        }
         LogicalStatement::Insert {
             table_id,
             table_name,
@@ -2895,12 +3179,24 @@ pub fn plan_statement_with_partition_snapshots(
             table_id,
             assignments,
         } => PhysicalStatement::Update {
-            input: plan_raw_with_statistics(input, table_statistics, access_paths, range_tables),
+            input: plan_raw_with_statistics(
+                input,
+                table_statistics,
+                access_paths,
+                range_tables,
+                calibration,
+            ),
             table_id: *table_id,
             assignments: assignments.clone(),
         },
         LogicalStatement::Delete { input, table_id } => PhysicalStatement::Delete {
-            input: plan_raw_with_statistics(input, table_statistics, access_paths, range_tables),
+            input: plan_raw_with_statistics(
+                input,
+                table_statistics,
+                access_paths,
+                range_tables,
+                calibration,
+            ),
             table_id: *table_id,
         },
     }
@@ -2914,19 +3210,42 @@ pub fn plan_statement_with_columnar_snapshots(
     range_tables: &[RangeTablePlanningSnapshot],
     projections: &[ColumnarProjectionPlanningSnapshot],
 ) -> PhysicalStatement {
+    plan_statement_with_columnar_snapshots_and_calibration(
+        logical,
+        table_statistics,
+        access_paths,
+        range_tables,
+        projections,
+        &PlannerCalibrationProfile::IDENTITY,
+    )
+}
+
+#[must_use]
+pub fn plan_statement_with_columnar_snapshots_and_calibration(
+    logical: &LogicalStatement,
+    table_statistics: &[TableAccessStatistics],
+    access_paths: &[AccessPath],
+    range_tables: &[RangeTablePlanningSnapshot],
+    projections: &[ColumnarProjectionPlanningSnapshot],
+    calibration: &PlannerCalibrationProfile,
+) -> PhysicalStatement {
     match logical {
-        LogicalStatement::Query(query) => PhysicalStatement::Query(plan_with_columnar_snapshots(
-            query,
-            table_statistics,
-            access_paths,
-            range_tables,
-            projections,
-        )),
-        _ => plan_statement_with_partition_snapshots(
+        LogicalStatement::Query(query) => {
+            PhysicalStatement::Query(plan_with_columnar_snapshots_and_calibration(
+                query,
+                table_statistics,
+                access_paths,
+                range_tables,
+                projections,
+                calibration,
+            ))
+        }
+        _ => plan_statement_with_partition_snapshots_and_calibration(
             logical,
             table_statistics,
             access_paths,
             range_tables,
+            calibration,
         ),
     }
 }

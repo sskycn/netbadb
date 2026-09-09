@@ -21,6 +21,9 @@ mod maintenance;
 #[cfg(test)]
 mod maintenance_tests;
 mod partition_catalog;
+mod planner_calibration;
+#[cfg(test)]
+mod planner_calibration_tests;
 mod projection_catalog;
 mod registry;
 mod schema_catalog;
@@ -61,8 +64,9 @@ use netbadb_planner::{
     AccessCostHints, AccessPath, AccessPathCapabilities, ColumnarProjectionPlanningSnapshot,
     ColumnarRowGroupPlanningSnapshot, ColumnarZoneMapPlanningSnapshot, PartitionPlanningSnapshot,
     PhysicalStatement, RangeTablePlanningSnapshot, TableAccessStatistics,
-    estimate_execution_accesses, plan_statement_with_columnar_snapshots,
-    plan_statement_with_partition_snapshots,
+    estimate_execution_accesses_with_calibration,
+    plan_statement_with_columnar_snapshots_and_calibration,
+    plan_statement_with_partition_snapshots_and_calibration,
 };
 use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{
@@ -95,6 +99,7 @@ pub use adaptive_workload::{
     AdaptiveWorkloadLimits, AdaptiveWorkloadOutcome, AdaptiveWorkloadPolicy,
     AdaptiveWorkloadRecordError, AdaptiveWorkloadRecordOutcome, AdaptiveWorkloadStaleReason,
     AdaptiveWorkloadTarget, AdaptiveWorkloadWindow, AggregatedCalibrationEvidence,
+    CalibrationVisibilityEvidence,
 };
 pub use columnar::{
     ChangeStreamGcReport, ColumnarAdvanceBudget, ColumnarAdvanceReport, ColumnarCompactionReport,
@@ -118,8 +123,10 @@ pub use netbadb_executor::{
 };
 pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
 pub use netbadb_planner::{
-    PlanNodeOrdinal, PlanVariant, PlanVariantError, PlannerAccessEstimate, PlannerAccessKind,
-    PlannerCalibrationSample, PlannerEstimateDirection, PlannerWorkModel,
+    CalibrationRatio, CalibrationRatioError, PlanNodeOrdinal, PlanVariant, PlanVariantError,
+    PlannerAccessEstimate, PlannerAccessKind, PlannerCalibrationClass, PlannerCalibrationEpoch,
+    PlannerCalibrationProfile, PlannerCalibrationSample, PlannerEstimateDirection,
+    PlannerWorkModel, apply_calibration_ratio,
 };
 pub use netbadb_rel::{
     CanonicalBindingOrdinal, LiteralShape, LogicalQueryShape, QueryColumnShape,
@@ -140,6 +147,12 @@ pub use netbadb_types::{
 };
 pub use partition_catalog::{
     PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
+};
+pub use planner_calibration::{
+    PlannerCalibrationAdvisorError, PlannerCalibrationDecision, PlannerCalibrationEvidence,
+    PlannerCalibrationMutationError, PlannerCalibrationNoAction, PlannerCalibrationPolicy,
+    PlannerCalibrationProposal, PlannerCalibrationQueryShapeEvidence, PlannerCalibrationReceipt,
+    PlannerCalibrationShadowDecision, PlannerCalibrationShadowReport,
 };
 pub use projection_catalog::ProjectionCatalogError;
 pub use registry::StorageRegistryError;
@@ -1178,6 +1191,7 @@ pub struct Database {
     schema_writer: schema_mutation::SchemaWriter,
     maintenance_cursor: Option<maintenance::MaintenanceCursor>,
     adaptive_runtime: adaptive::AdaptiveRuntimeState,
+    planner_calibration: PlannerCalibrationProfile,
     group_barrier: Rc<Cell<Option<u64>>>,
     active_group: Option<ActiveGroupCommit>,
     next_group_id: u64,
@@ -2094,6 +2108,7 @@ impl Database {
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
             adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
+            planner_calibration: netbadb_planner::PlannerCalibrationProfile::IDENTITY,
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
@@ -2126,6 +2141,7 @@ impl Database {
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
             adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
+            planner_calibration: PlannerCalibrationProfile::IDENTITY,
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
@@ -2175,6 +2191,7 @@ impl Database {
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
             adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
+            planner_calibration: PlannerCalibrationProfile::IDENTITY,
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
@@ -2249,6 +2266,7 @@ impl Database {
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
             adaptive_runtime: adaptive::AdaptiveRuntimeState::default(),
+            planner_calibration: PlannerCalibrationProfile::IDENTITY,
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
@@ -3994,6 +4012,7 @@ impl Database {
                 result,
                 execution_feedback::correlate_execution_feedback(
                     anchor,
+                    self.planner_calibration.epoch,
                     query_shape,
                     plan_variant,
                     &estimates,
@@ -4024,6 +4043,7 @@ impl Database {
                     result,
                     execution_feedback::correlate_execution_feedback(
                         anchor,
+                        self.planner_calibration.epoch,
                         retry_query_shape,
                         retry_plan_variant,
                         &retry_estimates,
@@ -4985,20 +5005,23 @@ impl Database {
         let access_paths = self.planner_access_paths();
         let range_tables = self.planner_range_tables();
         let projections = self.planner_columnar_projections();
-        let physical = plan_statement_with_columnar_snapshots(
+        let calibration = self.planner_calibration;
+        let physical = plan_statement_with_columnar_snapshots_and_calibration(
             &compiled.logical_statement,
             &table_statistics,
             &access_paths,
             &range_tables,
             &projections,
+            &calibration,
         );
         let estimates = match &physical {
-            PhysicalStatement::Query(plan) => estimate_execution_accesses(
+            PhysicalStatement::Query(plan) => estimate_execution_accesses_with_calibration(
                 plan,
                 &table_statistics,
                 &access_paths,
                 &range_tables,
                 &projections,
+                &calibration,
             ),
             _ => Vec::new(),
         };
@@ -5006,12 +5029,14 @@ impl Database {
     }
 
     fn plan_logical_statement(&self, logical: &netbadb_rel::LogicalStatement) -> PhysicalStatement {
-        plan_statement_with_columnar_snapshots(
+        let calibration = self.planner_calibration;
+        plan_statement_with_columnar_snapshots_and_calibration(
             logical,
             &self.planner_table_statistics(),
             &self.planner_access_paths(),
             &self.planner_range_tables(),
             &self.planner_columnar_projections(),
+            &calibration,
         )
     }
 
@@ -5118,11 +5143,13 @@ impl Database {
                 }),
             }));
         }
-        plan_statement_with_partition_snapshots(
+        let calibration = self.planner_calibration;
+        plan_statement_with_partition_snapshots_and_calibration(
             logical,
             &statistics,
             &access_paths,
             &self.planner_range_tables(),
+            &calibration,
         )
     }
 
@@ -7834,6 +7861,7 @@ mod tests {
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
             adaptive_runtime: crate::adaptive::AdaptiveRuntimeState::default(),
+            planner_calibration: netbadb_planner::PlannerCalibrationProfile::IDENTITY,
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,

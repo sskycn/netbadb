@@ -147,6 +147,15 @@ expire it; schema or exact physical-target changes do. Deterministic integer
 hysteresis can validate, hold, or runtime-suppress only the existing Columnar
 generation and never persists history or calibrates planner coefficients.
 
+[Adaptive Operations Phase 4](adaptive-operations-phase4.md) adds an explicit
+runtime-only global access-class calibration overlay. Phase 3 aggregates are
+kept separate by calibration epoch and QueryShape; a bounded integer-ratio
+advisor must pass diversity, direction, deadband, clamp, and QueryShape-level
+shadow-error checks before explicit apply. Base estimates and actual execution
+evidence remain unchanged, every apply/revert advances the runtime epoch, and
+neither G, durable formats, Columnar suppression, nor Inspection JSON v7 is
+modified.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

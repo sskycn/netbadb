@@ -22,7 +22,7 @@ use crate::{
 
 const CLOCK_TABLE_ID: TableId = TableId(88_002);
 
-fn query_shape(schema: &Schema, sql: &str) -> LogicalQueryShape {
+pub(super) fn query_shape(schema: &Schema, sql: &str) -> LogicalQueryShape {
     let compiled = compile_statement(schema, sql).expect("compile shape query");
     let LogicalStatement::Query(plan) = compiled.logical_statement else {
         panic!("expected logical query")
@@ -30,7 +30,7 @@ fn query_shape(schema: &Schema, sql: &str) -> LogicalQueryShape {
     LogicalQueryShape::from_plan(&plan).expect("derive logical query shape")
 }
 
-fn workload_target(database: &Database) -> AdaptiveWorkloadTarget {
+pub(super) fn workload_target(database: &Database) -> AdaptiveWorkloadTarget {
     let projection = database.inspect_columnar_projections().remove(0);
     AdaptiveWorkloadTarget {
         table_id: projection.table_id,
@@ -41,7 +41,7 @@ fn workload_target(database: &Database) -> AdaptiveWorkloadTarget {
     }
 }
 
-fn set_target_work(
+pub(super) fn set_target_work(
     report: &mut ExecutionFeedbackReport,
     target: AdaptiveWorkloadTarget,
     estimated: u64,
@@ -60,23 +60,31 @@ fn set_target_work(
         .expect("target access");
     let planner = access.planner.as_mut().expect("target planner evidence");
     planner.estimated_work_units = Some(estimated);
+    planner.effective_work_units = Some(estimated);
     planner.source_alternative_work_units = Some(source);
-    access.calibration = Some(PlannerCalibrationSample::new(estimated, Some(actual)));
+    planner.effective_source_alternative_work_units = Some(source);
+    planner.calibration_epoch = report.calibration_epoch;
+    access.calibration = Some(PlannerCalibrationSample::with_effective(
+        estimated,
+        Some(estimated),
+        report.calibration_epoch,
+        Some(actual),
+    ));
     access.actual.work.overflowed = false;
     access.actual.work.incomplete = false;
     report.overflowed = false;
     report.incomplete = false;
 }
 
-struct TimelineFixture {
-    root: PathBuf,
-    event_path: PathBuf,
-    clock_path: PathBuf,
-    database: Database,
+pub(super) struct TimelineFixture {
+    pub(super) root: PathBuf,
+    pub(super) event_path: PathBuf,
+    pub(super) clock_path: PathBuf,
+    pub(super) database: Database,
 }
 
 impl TimelineFixture {
-    fn create(name: &str) -> Self {
+    pub(super) fn create(name: &str) -> Self {
         let suffix = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "netbadb-adaptive-workload-{name}-{}-{suffix}",
@@ -153,13 +161,13 @@ impl TimelineFixture {
         }
     }
 
-    fn close(self) {
+    pub(super) fn close(self) {
         self.database.close().expect("close timeline database");
         cleanup(&self.root, &[self.event_path, self.clock_path]);
     }
 }
 
-fn cleanup(root: &Path, storage_paths: &[PathBuf]) {
+pub(super) fn cleanup(root: &Path, storage_paths: &[PathBuf]) {
     cleanup_created_table_files(storage_paths);
     let _ = fs::remove_dir_all(root);
 }
@@ -735,16 +743,16 @@ fn one_shape_keeps_columnar_and_source_variants_with_calibration_diagnostics() {
     assert_eq!(window.total_samples, 1);
     assert_eq!(window.query_shapes.len(), 3);
     assert_eq!(window.query_shapes[0].plan_variants.len(), 2);
-    let kinds = window
+    let classes = window
         .query_shapes
         .iter()
         .flat_map(|shape| shape.plan_variants.iter())
         .flat_map(|variant| variant.calibration.iter())
-        .map(|calibration| calibration.access_kind)
+        .map(|calibration| calibration.calibration_class)
         .collect::<Vec<_>>();
-    assert!(kinds.contains(&netbadb_planner::PlannerAccessKind::Columnar));
-    assert!(kinds.contains(&netbadb_planner::PlannerAccessKind::SeqScan));
-    assert!(kinds.contains(&netbadb_planner::PlannerAccessKind::IndexPoint));
-    assert!(kinds.contains(&netbadb_planner::PlannerAccessKind::IndexRange));
+    assert!(classes.contains(&netbadb_planner::PlannerCalibrationClass::Columnar));
+    assert!(classes.contains(&netbadb_planner::PlannerCalibrationClass::SeqScan));
+    assert!(classes.contains(&netbadb_planner::PlannerCalibrationClass::IndexPoint));
+    assert!(classes.contains(&netbadb_planner::PlannerCalibrationClass::IndexRange));
     fixture.close();
 }
