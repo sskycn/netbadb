@@ -309,6 +309,36 @@ impl DatabaseTransaction {
             .map_err(CoordinatorError::from)
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_participant_change_prepare_sync_failure(
+        &mut self,
+        storage_id: StorageId,
+    ) -> Result<(), CoordinatorError> {
+        let participant = self
+            .participants
+            .get_mut(&storage_id)
+            .ok_or(CoordinatorError::UnknownStorageId { storage_id })?;
+        participant
+            .context
+            .inject_change_stream_group_prepare_sync_failure();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_participant_change_finalize_sync_failure(
+        &mut self,
+        storage_id: StorageId,
+    ) -> Result<(), CoordinatorError> {
+        let participant = self
+            .participants
+            .get_mut(&storage_id)
+            .ok_or(CoordinatorError::UnknownStorageId { storage_id })?;
+        participant
+            .context
+            .inject_change_stream_group_finalize_sync_failure();
+        Ok(())
+    }
+
     pub(crate) fn validate_owner(&self, owner: &Rc<()>) -> Result<(), CoordinatorError> {
         self.validate_commit_owner(owner)?;
         self.ensure_active()

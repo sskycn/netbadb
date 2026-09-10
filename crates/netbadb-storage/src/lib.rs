@@ -461,11 +461,16 @@ pub struct PreparedRuntimeInspection {
     pub single_commit_sync_count: u64,
     /// Post-decision barriers shared by explicit group members.
     pub group_commit_barrier_sync_count: u64,
-    /// All NBCL prepare and finalize sync calls issued by this live runtime.
+    /// All NBCL prepare and finalize sync calls successfully completed by this
+    /// live runtime. Failed or uncertain attempts are not counted.
     pub change_stream_sync_count: u64,
+    /// Successful per-member NBCL Prepare syncs in this live runtime.
     pub change_stream_member_prepare_sync_count: u64,
+    /// Successful grouped NBCL Prepare barriers in this live runtime.
     pub change_stream_group_prepare_barrier_sync_count: u64,
+    /// Successful per-member NBCL Finalize syncs in this live runtime.
     pub change_stream_member_finalize_sync_count: u64,
+    /// Successful grouped NBCL Finalize barriers in this live runtime.
     pub change_stream_group_finalize_barrier_sync_count: u64,
     /// Successful syncs that checkpointed previously promoted pipelined
     /// Finalizes. This overlaps the reason-specific counters below.

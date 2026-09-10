@@ -1478,6 +1478,20 @@ impl Transaction {
             .borrow_mut()
             .inject_partial_append_failure(after_bytes);
     }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn inject_change_stream_group_prepare_sync_failure(&mut self) {
+        if let Some(stream) = &self.change_stream {
+            stream.borrow_mut().inject_group_prepare_sync_failure();
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn inject_change_stream_group_finalize_sync_failure(&mut self) {
+        if let Some(stream) = &self.change_stream {
+            stream.borrow_mut().inject_group_finalize_sync_failure();
+        }
+    }
 }
 
 impl Drop for Transaction {

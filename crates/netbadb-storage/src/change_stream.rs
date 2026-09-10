@@ -646,6 +646,10 @@ pub(crate) struct ChangeStreamManager {
     state: State,
     sync_counts: ChangeStreamSyncCounts,
     retention_pins: Rc<RefCell<RetentionPinRegistry>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_next_group_prepare_sync: bool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_next_group_finalize_sync: bool,
     #[cfg(test)]
     fail_next_explicit_checkpoint_sync: bool,
 }
@@ -668,6 +672,10 @@ impl ChangeStreamManager {
             },
             sync_counts: ChangeStreamSyncCounts::default(),
             retention_pins: Rc::new(RefCell::new(RetentionPinRegistry::default())),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_next_group_prepare_sync: false,
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_next_group_finalize_sync: false,
             #[cfg(test)]
             fail_next_explicit_checkpoint_sync: false,
         })
@@ -705,6 +713,10 @@ impl ChangeStreamManager {
                 state,
                 sync_counts: ChangeStreamSyncCounts::default(),
                 retention_pins: Rc::new(RefCell::new(RetentionPinRegistry::default())),
+                #[cfg(any(test, feature = "test-hooks"))]
+                fail_next_group_prepare_sync: false,
+                #[cfg(any(test, feature = "test-hooks"))]
+                fail_next_group_finalize_sync: false,
                 #[cfg(test)]
                 fail_next_explicit_checkpoint_sync: false,
             });
@@ -759,6 +771,10 @@ impl ChangeStreamManager {
                                     retention_pins: Rc::new(RefCell::new(
                                         RetentionPinRegistry::default(),
                                     )),
+                                    #[cfg(any(test, feature = "test-hooks"))]
+                                    fail_next_group_prepare_sync: false,
+                                    #[cfg(any(test, feature = "test-hooks"))]
+                                    fail_next_group_finalize_sync: false,
                                     #[cfg(test)]
                                     fail_next_explicit_checkpoint_sync: false,
                                 });
@@ -789,6 +805,10 @@ impl ChangeStreamManager {
             state,
             sync_counts: ChangeStreamSyncCounts::default(),
             retention_pins: Rc::new(RefCell::new(RetentionPinRegistry::default())),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_next_group_prepare_sync: false,
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_next_group_finalize_sync: false,
             #[cfg(test)]
             fail_next_explicit_checkpoint_sync: false,
         })
@@ -922,6 +942,8 @@ impl ChangeStreamManager {
                     &[(txn_id, database_txn_id, prepared)],
                     false,
                     SyncReason::MemberPrepare,
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    false,
                 )?;
                 debug_assert!(report.syncs <= 1);
             }
@@ -952,6 +974,8 @@ impl ChangeStreamManager {
         &mut self,
         candidates: &[(TxnId, DatabaseTxnId, PreparedChange)],
     ) -> Result<ChangePrepareBatchReport, StorageError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        let fail_sync = std::mem::take(&mut self.fail_next_group_prepare_sync);
         let identities = candidates
             .iter()
             .map(|(txn_id, database_txn_id, prepared)| (*txn_id, Some(*database_txn_id), *prepared))
@@ -962,6 +986,8 @@ impl ChangeStreamManager {
             &identities,
             true,
             SyncReason::GroupPrepare,
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_sync,
         );
         match result {
             Ok(report) => Ok(report),
@@ -984,6 +1010,8 @@ impl ChangeStreamManager {
             &[(txn_id, prepared, lsm_commit)],
             true,
             SyncReason::MemberFinalize,
+            #[cfg(any(test, feature = "test-hooks"))]
+            false,
         );
         if let Err(error) = &result {
             self.poison_after_io_error(error);
@@ -995,12 +1023,16 @@ impl ChangeStreamManager {
         &mut self,
         candidates: &[(TxnId, PreparedChange, Option<LsmCommitSeq>)],
     ) -> Result<ChangeFinalizeBatchReport, StorageError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        let fail_sync = std::mem::take(&mut self.fail_next_group_finalize_sync);
         let result = finalize_batch(
             &mut self.state,
             &mut self.sync_counts,
             candidates,
             true,
             SyncReason::GroupFinalize,
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_sync,
         );
         match result {
             Ok(report) => Ok(report),
@@ -1021,6 +1053,8 @@ impl ChangeStreamManager {
             candidates,
             false,
             SyncReason::GroupFinalize,
+            #[cfg(any(test, feature = "test-hooks"))]
+            false,
         );
         if let Err(error) = &result {
             self.poison_after_io_error(error);
@@ -1074,6 +1108,16 @@ impl ChangeStreamManager {
     #[cfg(test)]
     pub(crate) fn inject_finalize_checkpoint_sync_failure(&mut self) {
         self.fail_next_explicit_checkpoint_sync = true;
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn inject_group_prepare_sync_failure(&mut self) {
+        self.fail_next_group_prepare_sync = true;
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn inject_group_finalize_sync_failure(&mut self) {
+        self.fail_next_group_finalize_sync = true;
     }
 
     fn poison_after_io_error(&mut self, error: &ChangeStreamError) {
@@ -1647,6 +1691,7 @@ fn durabilize_prepared_batch(
     candidates: &[(TxnId, Option<DatabaseTxnId>, PreparedChange)],
     require_exact_prefix: bool,
     sync_reason: SyncReason,
+    #[cfg(any(test, feature = "test-hooks"))] fail_sync: bool,
 ) -> Result<ChangePrepareBatchReport, ChangeStreamError> {
     let Some((_, _, first_prepared)) = candidates.first().copied() else {
         return Err(ChangeStreamError::InvalidRecord(
@@ -1710,6 +1755,12 @@ fn durabilize_prepared_batch(
         (record_bytes, needs_sync)
     };
     if needs_sync {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if fail_sync {
+            return Err(ChangeStreamError::Io(std::io::Error::other(
+                "injected group Prepare sync failure",
+            )));
+        }
         #[cfg(test)]
         crate::crash_test::maybe_crash_named("change-group-before-prepare-sync");
         let checkpoint = sync_log(state, sync_counts, sync_reason)?;
@@ -1829,6 +1880,7 @@ fn finalize_batch(
     candidates: &[(TxnId, PreparedChange, Option<LsmCommitSeq>)],
     sync_immediately: bool,
     sync_reason: SyncReason,
+    #[cfg(any(test, feature = "test-hooks"))] fail_sync: bool,
 ) -> Result<ChangeFinalizeBatchReport, ChangeStreamError> {
     let Some((_, first_prepared, _)) = candidates.first().copied() else {
         return Err(ChangeStreamError::InvalidRecord(
@@ -1980,6 +2032,12 @@ fn finalize_batch(
     }
 
     if sync_immediately {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if fail_sync {
+            return Err(ChangeStreamError::Io(std::io::Error::other(
+                "injected group Finalize sync failure",
+            )));
+        }
         #[cfg(test)]
         crate::crash_test::maybe_crash_named("change-group-before-finalize-sync");
         sync_log(state, sync_counts, sync_reason)?;

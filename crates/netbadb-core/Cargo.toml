@@ -19,6 +19,9 @@ netbadb-schema = { path = "../netbadb-schema" }
 netbadb-storage = { path = "../netbadb-storage" }
 netbadb-types = { path = "../netbadb-types" }
 
+[dev-dependencies]
+netbadb-storage = { path = "../netbadb-storage", features = ["test-hooks"] }
+
 [[bench]]
 name = "phase7_baseline"
 harness = false

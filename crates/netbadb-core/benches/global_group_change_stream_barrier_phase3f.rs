@@ -9,6 +9,8 @@ use netbadb_core::{
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
 
+const CSV_HEADER: &str = "engine,change_stream_mode,transactions,group_size,groups,authoritative_prepare_barrier_syncs,coordinator_group_syncs,authoritative_commit_barrier_syncs,nbcl_member_prepare_syncs,nbcl_group_prepare_barrier_syncs,nbcl_member_finalize_syncs,nbcl_group_finalize_barrier_syncs,nbcl_total_syncs,total_elapsed_ns,mean_transaction_ns,nbcl_bytes,heap_wal_bytes,lsm_wal_bytes,coordinator_bytes,published_g,heap_frontier,lsm_frontier";
+
 fn table(id: u64, name: &str) -> TableDef {
     TableDef::new(
         TableId(id),
@@ -193,34 +195,43 @@ fn run(
         file_bytes(&netbadb_storage::heap_change_log_path(&heap))
             + file_bytes(&netbadb_storage::lsm_change_log_path(&lsm))
     };
-    println!(
-        "{engine},{},{transactions},{group_size},{groups},{authoritative_prepare},{},{authoritative_commit},{member_prepare},{group_prepare},{member_finalize},{group_finalize},{nbcl_total},{},{},{nbcl_bytes},{},{},{},{},{heap_frontier},{lsm_frontier}",
-        mode_name(mode),
-        global.group_decision_sync_count,
-        elapsed.as_nanos(),
-        elapsed.as_nanos() / transactions as u128,
-        global.published_commit_seq.map_or(0, |sequence| sequence.0),
-        if engine == "lsm" {
-            0
-        } else {
-            file_bytes(&netbadb_storage::wal_path(&heap))
-        },
-        if engine == "heap" {
-            0
-        } else {
-            lsm_wal_bytes(&lsm)
-        },
-        global.coordinator_bytes,
+    let change_stream_mode = mode_name(mode);
+    let coordinator_group_syncs = global.group_decision_sync_count;
+    let total_elapsed_ns = elapsed.as_nanos();
+    let mean_transaction_ns = total_elapsed_ns / transactions as u128;
+    let heap_wal_bytes = if engine == "lsm" {
+        0
+    } else {
+        file_bytes(&netbadb_storage::wal_path(&heap))
+    };
+    let lsm_wal_bytes = if engine == "heap" {
+        0
+    } else {
+        lsm_wal_bytes(&lsm)
+    };
+    let coordinator_bytes = global.coordinator_bytes;
+    let published_g = global.published_commit_seq.map_or(0, |sequence| sequence.0);
+    assert_eq!(published_g, transactions as u64);
+    assert!(engine != "heap" || lsm_wal_bytes == 0);
+    assert!(engine != "lsm" || heap_wal_bytes == 0);
+
+    let row = format!(
+        "{engine},{change_stream_mode},{transactions},{group_size},{groups},{authoritative_prepare},{coordinator_group_syncs},{authoritative_commit},{member_prepare},{group_prepare},{member_finalize},{group_finalize},{nbcl_total},{total_elapsed_ns},{mean_transaction_ns},{nbcl_bytes},{heap_wal_bytes},{lsm_wal_bytes},{coordinator_bytes},{published_g},{heap_frontier},{lsm_frontier}"
     );
+    let columns = row.split(',').collect::<Vec<_>>();
+    assert_eq!(columns.len(), CSV_HEADER.split(',').count());
+    assert_eq!(columns[16], heap_wal_bytes.to_string());
+    assert_eq!(columns[17], lsm_wal_bytes.to_string());
+    assert_eq!(columns[18], coordinator_bytes.to_string());
+    assert_eq!(columns[19], published_g.to_string());
+    println!("{row}");
     database.close()?;
     let _ = std::fs::remove_dir_all(root);
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    println!(
-        "engine,change_stream_mode,transactions,group_size,groups,authoritative_prepare_barrier_syncs,coordinator_group_syncs,authoritative_commit_barrier_syncs,nbcl_member_prepare_syncs,nbcl_group_prepare_barrier_syncs,nbcl_member_finalize_syncs,nbcl_group_finalize_barrier_syncs,nbcl_total_syncs,total_elapsed_ns,mean_transaction_ns,nbcl_bytes,heap_wal_bytes,lsm_wal_bytes,coordinator_bytes,published_g,heap_frontier,lsm_frontier"
-    );
+    println!("{CSV_HEADER}");
     for engine in ["heap", "lsm", "heap+lsm"] {
         for transactions in [100, 1_000] {
             for group_size in [1, 4, 8, 10, 16, 32] {

@@ -719,6 +719,34 @@ impl StorageTransaction {
         }
     }
 
+    /// Installs a one-shot NBCL group-Prepare sync error for integration tests.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn inject_change_stream_group_prepare_sync_failure(&mut self) {
+        match &mut self.inner {
+            StorageTransactionKind::Heap(txn) => {
+                txn.inject_change_stream_group_prepare_sync_failure();
+            }
+            StorageTransactionKind::Lsm(txn) => {
+                txn.inject_change_stream_group_prepare_sync_failure();
+            }
+        }
+    }
+
+    /// Installs a one-shot NBCL group-Finalize sync error for integration tests.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn inject_change_stream_group_finalize_sync_failure(&mut self) {
+        match &mut self.inner {
+            StorageTransactionKind::Heap(txn) => {
+                txn.inject_change_stream_group_finalize_sync_failure();
+            }
+            StorageTransactionKind::Lsm(txn) => {
+                txn.inject_change_stream_group_finalize_sync_failure();
+            }
+        }
+    }
+
     pub fn park_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
         match &mut self.inner {
             StorageTransactionKind::Heap(txn) => txn.park_prepared(database_txn_id),

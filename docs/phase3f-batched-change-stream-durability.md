@@ -113,10 +113,15 @@ rewrite behavior; batched records require no special persistent case.
 ## Sync accounting
 
 `PreparedRuntimeInspection::change_stream_sync_count` remains the total number
-of NBCL sync calls made by the live runtime. Separate member Prepare, group
-Prepare, member Finalize, and group Finalize counters explain that total.
+of successfully completed NBCL sync calls in the live runtime; failed or
+uncertain attempts are not counted. Separate member Prepare, group Prepare,
+member Finalize, and group Finalize counters explain that total.
 `GroupCommitReport` reports the selected mode, per-storage Prepare/Finalize
-batches, bytes, frontiers, and actual sync calls.
+batches, bytes, frontiers, and successful sync calls attributable to that
+group. Its counts are group deltas, not lifetime runtime totals; `PerMember`
+therefore reports one successful Prepare and Finalize sync per changing member,
+while `BatchedBarriers` reports at most one of each per participating enabled
+StorageId.
 
 For 100 changing transactions in ten-member groups on one storage:
 

@@ -422,6 +422,12 @@ struct ActiveGroupCommit {
     inspection: GroupCommitInspection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct GroupChangeStreamSyncTotals {
+    prepare: u64,
+    finalize: u64,
+}
+
 #[derive(Debug)]
 pub struct GroupCommitBatch {
     owner: Weak<()>,
@@ -433,6 +439,7 @@ pub struct GroupCommitBatch {
     prepare_mode: Option<GroupPrepareMode>,
     change_stream_durability_mode: GroupChangeStreamDurabilityMode,
     change_stream_finalize_mode: GroupChangeStreamFinalizeMode,
+    change_stream_sync_baseline: GroupChangeStreamSyncTotals,
     prepare_barrier_started: bool,
     change_prepare_completed_storages: BTreeSet<StorageId>,
     change_stream_prepare_batches: BTreeMap<StorageId, StorageChangePrepareBatchReport>,
@@ -456,10 +463,12 @@ pub struct GroupCommitReport {
     pub storage_prepare_batches: Vec<StoragePrepareBatchReport>,
     pub storage_prepare_wal_syncs: u64,
     pub change_stream_prepare_batches: Vec<StorageChangePrepareBatchReport>,
+    /// Successful NBCL Prepare syncs attributable to this group.
     pub change_stream_prepare_syncs: u64,
     pub storage_commit_batches: Vec<StorageCommitBatchReport>,
     pub storage_commit_wal_syncs: u64,
     pub change_stream_finalize_batches: Vec<StorageChangeFinalizeBatchReport>,
+    /// Successful NBCL Finalize syncs attributable to this group.
     pub change_stream_finalize_syncs: u64,
     pub prior_finalize_checkpoints_checkpointed: usize,
     pub pending_finalize_checkpoints_after_group: usize,
@@ -1405,6 +1414,26 @@ fn current_visibility_boundaries(
                 .map_err(Into::into)
         })
         .collect()
+}
+
+fn group_change_stream_sync_totals(registry: &StorageRegistry) -> GroupChangeStreamSyncTotals {
+    registry.iter().fold(
+        GroupChangeStreamSyncTotals::default(),
+        |mut totals, entry| {
+            let runtime = entry.storage.prepared_runtime_inspection();
+            totals.prepare = totals.prepare.saturating_add(
+                runtime
+                    .change_stream_member_prepare_sync_count
+                    .saturating_add(runtime.change_stream_group_prepare_barrier_sync_count),
+            );
+            totals.finalize = totals.finalize.saturating_add(
+                runtime
+                    .change_stream_member_finalize_sync_count
+                    .saturating_add(runtime.change_stream_group_finalize_barrier_sync_count),
+            );
+            totals
+        },
+    )
 }
 
 fn initial_published_visibility(
@@ -2572,6 +2601,7 @@ impl Database {
         let base_snapshot = self
             .current_database_snapshot()?
             .ok_or(CoordinatorError::GlobalVisibilityNotEnabled)?;
+        let change_stream_sync_baseline = group_change_stream_sync_totals(&self.registry);
         let id = self.next_group_id;
         self.next_group_id = id
             .checked_add(1)
@@ -2600,6 +2630,7 @@ impl Database {
             prepare_mode: None,
             change_stream_durability_mode,
             change_stream_finalize_mode,
+            change_stream_sync_baseline,
             prepare_barrier_started: false,
             change_prepare_completed_storages: BTreeSet::new(),
             change_stream_prepare_batches: BTreeMap::new(),
@@ -3109,10 +3140,6 @@ impl Database {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let change_stream_prepare_syncs = change_stream_prepare_batches
-            .iter()
-            .map(|report| report.syncs)
-            .sum();
         let prior_finalize_checkpoints_checkpointed = change_stream_prepare_batches
             .iter()
             .map(|report| report.prior_finalize_checkpoints_checkpointed)
@@ -3131,14 +3158,19 @@ impl Database {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let change_stream_finalize_syncs = change_stream_finalize_batches
-            .iter()
-            .map(|report| report.syncs)
-            .sum();
         let pending_finalize_checkpoints_after_group = change_stream_finalize_batches
             .iter()
             .map(|report| report.pending_finalize_checkpoints_after)
             .sum();
+        let change_stream_sync_totals = group_change_stream_sync_totals(&self.registry);
+        let change_stream_prepare_syncs = change_stream_sync_totals
+            .prepare
+            .checked_sub(group.change_stream_sync_baseline.prepare)
+            .ok_or(CoordinatorError::InvalidGroupCommit)?;
+        let change_stream_finalize_syncs = change_stream_sync_totals
+            .finalize
+            .checked_sub(group.change_stream_sync_baseline.finalize)
+            .ok_or(CoordinatorError::InvalidGroupCommit)?;
         group.completed = true;
         group.members.clear();
         self.group_barrier.set(None);
@@ -11097,6 +11129,10 @@ mod tests {
         assert_eq!(report.prepare_mode, super::GroupPrepareMode::BatchedBarrier);
         assert_eq!(report.storage_prepare_wal_syncs, 2);
         assert_eq!(report.storage_prepare_batches.len(), 2);
+        assert_eq!(report.change_stream_prepare_syncs, 6);
+        assert_eq!(report.change_stream_finalize_syncs, 6);
+        assert!(report.change_stream_prepare_batches.is_empty());
+        assert!(report.change_stream_finalize_batches.is_empty());
         assert!(
             report
                 .storage_prepare_batches
@@ -11251,6 +11287,406 @@ mod tests {
         );
         drop(group);
         database.close().unwrap();
+        cleanup_mixed_crash_fixture(&root);
+    }
+
+    #[test]
+    fn phase3f_group_report_counts_successful_member_and_batched_stream_syncs() {
+        for (mode, expected_member, expected_group) in [
+            (
+                super::GroupChangeStreamDurabilityMode::PerMember,
+                3_u64,
+                0_u64,
+            ),
+            (
+                super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+                0_u64,
+                1_u64,
+            ),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "netbadb-phase3f-report-{mode:?}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            cleanup_coordinator_fixture(&root);
+            let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+            let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+            let mut database = Database::create_tables_with_coordinator(tables, config).unwrap();
+            database.enable_change_stream(TableId(1)).unwrap();
+            database
+                .execute("INSERT INTO users (id, name) VALUES (99, 'baseline')")
+                .unwrap();
+            let before = database.inspect_prepared_runtime(TableId(1)).unwrap();
+            let mut group = database
+                .begin_group_commit_with_options(super::GroupCommitOptions {
+                    prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                    change_stream_durability_mode: mode,
+                })
+                .unwrap();
+            for id in 1..=3_i64 {
+                let mut member = database.begin_group_member(&group).unwrap();
+                database
+                    .execute_in(
+                        &mut member,
+                        &format!("INSERT INTO users (id, name) VALUES ({id}, 'report')"),
+                    )
+                    .unwrap();
+                database.stage_group_member(&mut group, member).unwrap();
+            }
+            let report = database.commit_group(&mut group).unwrap();
+            let expected_syncs = expected_member + expected_group;
+            assert_eq!(report.change_stream_prepare_syncs, expected_syncs);
+            assert_eq!(report.change_stream_finalize_syncs, expected_syncs);
+
+            let after = database.inspect_prepared_runtime(TableId(1)).unwrap();
+            assert_eq!(
+                after.change_stream_member_prepare_sync_count
+                    - before.change_stream_member_prepare_sync_count,
+                expected_member
+            );
+            assert_eq!(
+                after.change_stream_member_finalize_sync_count
+                    - before.change_stream_member_finalize_sync_count,
+                expected_member
+            );
+            assert_eq!(
+                after.change_stream_group_prepare_barrier_sync_count
+                    - before.change_stream_group_prepare_barrier_sync_count,
+                expected_group
+            );
+            assert_eq!(
+                after.change_stream_group_finalize_barrier_sync_count
+                    - before.change_stream_group_finalize_barrier_sync_count,
+                expected_group
+            );
+            drop(group);
+            database.close().unwrap();
+            cleanup_coordinator_fixture(&root);
+        }
+    }
+
+    #[test]
+    fn phase3f_prepare_sync_error_precedes_decision_and_recovers_as_abort() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3f-prepare-sync-error-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database =
+            Database::create_tables_with_coordinator(tables.clone(), config.clone()).unwrap();
+        let cursor = database.enable_change_stream(TableId(1)).unwrap();
+        let mut group = database
+            .begin_group_commit_with_options(super::GroupCommitOptions {
+                prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                change_stream_durability_mode:
+                    super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+            })
+            .unwrap();
+        for id in 1..=3_i64 {
+            let mut member = database.begin_group_member(&group).unwrap();
+            database
+                .execute_in(
+                    &mut member,
+                    &format!("INSERT INTO users (id, name) VALUES ({id}, 'prepare-error')"),
+                )
+                .unwrap();
+            database.stage_group_member(&mut group, member).unwrap();
+        }
+        let storage_id = database.bindings.resolve_single(TableId(1)).unwrap();
+        group.members[0]
+            .inject_participant_change_prepare_sync_failure(storage_id)
+            .unwrap();
+        let error = database
+            .commit_group(&mut group)
+            .expect_err("NBCL Prepare sync must fail");
+        assert!(matches!(
+            error,
+            DatabaseError::Storage(netbadb_storage::StorageError::ChangeStream(
+                netbadb_storage::ChangeStreamError::Io(_)
+            ))
+        ));
+        assert!(group.commit_sequences.is_none());
+        assert_eq!(
+            database.inspect_group_commit().unwrap().decision_state,
+            super::GroupDecisionState::PrepareBarrierPending
+        );
+        let visibility = database.inspect_global_visibility().unwrap();
+        assert_eq!(visibility.group_decision_sync_count, 0);
+        assert_eq!(visibility.published_commit_seq, Some(DatabaseCommitSeq(0)));
+        let runtime = database.inspect_prepared_runtime(TableId(1)).unwrap();
+        assert_eq!(runtime.change_stream_group_prepare_barrier_sync_count, 0);
+        assert_eq!(runtime.change_stream_group_finalize_barrier_sync_count, 0);
+        drop(group);
+        drop(database);
+
+        let mut reopened =
+            Database::open_tables_with_coordinator(tables, config).expect("recover as abort");
+        assert!(
+            reopened
+                .query("SELECT id FROM users")
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .read_changes(TableId(1), cursor, 10, u64::MAX)
+                .unwrap()
+                .batches
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .current_database_snapshot()
+                .unwrap()
+                .unwrap()
+                .commit_seq(),
+            DatabaseCommitSeq(0)
+        );
+        reopened.close().unwrap();
+        cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn phase3f_finalize_sync_error_is_commit_only_and_recovery_is_idempotent() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3f-finalize-sync-error-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database =
+            Database::create_tables_with_coordinator(tables.clone(), config.clone()).unwrap();
+        let cursor = database.enable_change_stream(TableId(1)).unwrap();
+        let mut group = database
+            .begin_group_commit_with_options(super::GroupCommitOptions {
+                prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                change_stream_durability_mode:
+                    super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+            })
+            .unwrap();
+        for id in 1..=3_i64 {
+            let mut member = database.begin_group_member(&group).unwrap();
+            database
+                .execute_in(
+                    &mut member,
+                    &format!("INSERT INTO users (id, name) VALUES ({id}, 'finalize-error')"),
+                )
+                .unwrap();
+            database.stage_group_member(&mut group, member).unwrap();
+        }
+        let storage_id = database.bindings.resolve_single(TableId(1)).unwrap();
+        group.members[0]
+            .inject_participant_change_finalize_sync_failure(storage_id)
+            .unwrap();
+        let error = database
+            .commit_group(&mut group)
+            .expect_err("NBCL Finalize sync must fail");
+        assert!(matches!(
+            error,
+            DatabaseError::Storage(netbadb_storage::StorageError::ChangeStream(
+                netbadb_storage::ChangeStreamError::Io(_)
+            ))
+        ));
+        assert!(group.commit_sequences.is_some());
+        assert!(matches!(
+            database.abort_group(&mut group),
+            Err(DatabaseError::Transaction(
+                CoordinatorError::GroupCommitAlreadyDecided
+            ))
+        ));
+        let visibility = database.inspect_global_visibility().unwrap();
+        assert_eq!(visibility.group_decision_sync_count, 1);
+        assert_eq!(visibility.published_commit_seq, Some(DatabaseCommitSeq(0)));
+        let runtime = database.inspect_prepared_runtime(TableId(1)).unwrap();
+        assert_eq!(runtime.change_stream_group_prepare_barrier_sync_count, 1);
+        assert_eq!(runtime.change_stream_group_finalize_barrier_sync_count, 0);
+        assert!(
+            database
+                .query("SELECT id FROM users")
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        drop(group);
+        drop(database);
+
+        for pass in 0..2 {
+            let mut reopened =
+                Database::open_tables_with_coordinator(tables.clone(), config.clone())
+                    .unwrap_or_else(|error| panic!("recover Finalize error pass {pass}: {error}"));
+            assert_eq!(
+                reopened
+                    .query("SELECT id FROM users ORDER BY id")
+                    .unwrap()
+                    .rows,
+                vec![
+                    vec![ScalarValue::Int64(1)],
+                    vec![ScalarValue::Int64(2)],
+                    vec![ScalarValue::Int64(3)],
+                ]
+            );
+            let changes = reopened
+                .read_changes(TableId(1), cursor, 10, u64::MAX)
+                .unwrap();
+            assert_eq!(changes.batches.len(), 3);
+            assert!(
+                changes
+                    .batches
+                    .windows(2)
+                    .all(|pair| pair[0].after == pair[1].before)
+            );
+            assert_eq!(
+                reopened
+                    .current_database_snapshot()
+                    .unwrap()
+                    .unwrap()
+                    .commit_seq(),
+                DatabaseCommitSeq(3)
+            );
+            reopened.close().unwrap();
+        }
+        cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn phase3f_partial_multi_storage_finalize_error_delays_global_publication() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3f-partial-finalize-error-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_mixed_crash_fixture(&root);
+        let (_, _, coordinator_path) = mixed_crash_paths(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database =
+            Database::create_storages_with_coordinator(mixed_create_specs(&root), config.clone())
+                .unwrap();
+        let heap_cursor = database.enable_change_stream(TableId(1)).unwrap();
+        let lsm_cursor = database.enable_change_stream(TableId(2)).unwrap();
+        let mut group = database
+            .begin_group_commit_with_options(super::GroupCommitOptions {
+                prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                change_stream_durability_mode:
+                    super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+            })
+            .unwrap();
+        for id in 1..=3_i64 {
+            let mut member = database.begin_group_member(&group).unwrap();
+            database
+                .insert_into_in(
+                    TableId(1),
+                    &mut member,
+                    &[
+                        ScalarValue::Int64(id),
+                        ScalarValue::Text("partial-finalize".into()),
+                    ],
+                )
+                .unwrap();
+            database
+                .insert_into_in(TableId(2), &mut member, &[ScalarValue::Int64(id)])
+                .unwrap();
+            database.stage_group_member(&mut group, member).unwrap();
+        }
+        let heap_storage_id = database.bindings.resolve_single(TableId(1)).unwrap();
+        let lsm_storage_id = database.bindings.resolve_single(TableId(2)).unwrap();
+        assert!(heap_storage_id < lsm_storage_id);
+        group.members[0]
+            .inject_participant_change_finalize_sync_failure(lsm_storage_id)
+            .unwrap();
+        assert!(matches!(
+            database.commit_group(&mut group),
+            Err(DatabaseError::Storage(
+                netbadb_storage::StorageError::ChangeStream(
+                    netbadb_storage::ChangeStreamError::Io(_)
+                )
+            ))
+        ));
+        assert_eq!(
+            database
+                .inspect_change_stream(TableId(1))
+                .unwrap()
+                .current_data_version,
+            netbadb_types::StorageDataVersion(3)
+        );
+        assert_eq!(
+            database.inspect_change_stream(TableId(2)).unwrap().status,
+            netbadb_storage::ChangeStreamStatus::Unavailable
+        );
+        assert_eq!(
+            database
+                .current_database_snapshot()
+                .unwrap()
+                .unwrap()
+                .commit_seq(),
+            DatabaseCommitSeq(0)
+        );
+        assert!(
+            database
+                .query("SELECT id FROM users")
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert!(
+            database
+                .query("SELECT id FROM lsm_items")
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        drop(group);
+        drop(database);
+
+        let mut reopened =
+            Database::open_storages_with_coordinator(mixed_open_specs(&root), config)
+                .expect("recover partial multi-storage Finalize");
+        let expected = vec![
+            vec![ScalarValue::Int64(1)],
+            vec![ScalarValue::Int64(2)],
+            vec![ScalarValue::Int64(3)],
+        ];
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM users ORDER BY id")
+                .unwrap()
+                .rows,
+            expected
+        );
+        assert_eq!(
+            reopened
+                .query("SELECT id FROM lsm_items ORDER BY id")
+                .unwrap()
+                .rows,
+            expected
+        );
+        for (table_id, cursor) in [(TableId(1), heap_cursor), (TableId(2), lsm_cursor)] {
+            let changes = reopened
+                .read_changes(table_id, cursor, 10, u64::MAX)
+                .unwrap();
+            assert_eq!(changes.batches.len(), 3);
+            assert!(
+                changes
+                    .batches
+                    .windows(2)
+                    .all(|pair| pair[0].after == pair[1].before)
+            );
+        }
+        assert_eq!(
+            reopened
+                .current_database_snapshot()
+                .unwrap()
+                .unwrap()
+                .commit_seq(),
+            DatabaseCommitSeq(3)
+        );
+        reopened.close().unwrap();
         cleanup_mixed_crash_fixture(&root);
     }
 

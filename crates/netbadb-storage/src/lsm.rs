@@ -3115,6 +3115,22 @@ impl LsmTransaction {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn inject_change_stream_group_prepare_sync_failure(&mut self) {
+        self.shared
+            .borrow_mut()
+            .change_stream
+            .inject_group_prepare_sync_failure();
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn inject_change_stream_group_finalize_sync_failure(&mut self) {
+        self.shared
+            .borrow_mut()
+            .change_stream
+            .inject_group_finalize_sync_failure();
+    }
+
     fn finish_terminal(&mut self, state: TransactionState) {
         self.state = state;
         self.pending.clear();
