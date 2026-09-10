@@ -151,16 +151,20 @@ pub use adaptive_workload::{
     CalibrationVisibilityEvidence,
 };
 pub use automatic_safe_mode::{
-    AutomaticAdmissionScope, AutomaticCalibrationTrialEvaluationReport,
+    AutomaticAdmissionScope, AutomaticBoundedColumnarBurstServiceState,
+    AutomaticBoundedFourLaneServiceState, AutomaticCalibrationTrialEvaluationReport,
     AutomaticCalibrationTrialPolicy, AutomaticCalibrationTrialStaleReason,
     AutomaticCandidateInspection, AutomaticCandidateInspectionReport, AutomaticCandidateKey,
     AutomaticCandidateRankEvidence, AutomaticCandidateReadiness, AutomaticColumnarTrial,
-    AutomaticCrossLaneServicePolicy, AutomaticCrossLaneServiceState, AutomaticLaneSelectionReason,
+    AutomaticCrossLaneServicePolicy, AutomaticCrossLaneServicePolicyKind,
+    AutomaticCrossLaneServiceState, AutomaticEvidenceRenewalReason,
+    AutomaticEvidenceRenewalRecommendation, AutomaticLaneSelectionReason,
     AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy, AutomaticMultiSafeModeReport,
-    AutomaticPlannerCalibrationTrial, AutomaticSafeModeError, AutomaticSafeModeInput,
-    AutomaticSafeModeLane, AutomaticSafeModeMutation, AutomaticSafeModeNoAction,
-    AutomaticSafeModeOutcome, AutomaticSafeModePolicy, AutomaticSafeModeReport,
-    AutomaticSafeModeState, AutomaticSafeTrial, AutomaticTrialAwaitingReason,
+    AutomaticPlannerCalibrationTrial, AutomaticProactiveLane, AutomaticSafeModeError,
+    AutomaticSafeModeInput, AutomaticSafeModeLane, AutomaticSafeModeMutation,
+    AutomaticSafeModeNoAction, AutomaticSafeModeOutcome, AutomaticSafeModePolicy,
+    AutomaticSafeModeReport, AutomaticSafeModeState, AutomaticSafeTrial,
+    AutomaticTrialAwaitingReason,
 };
 pub use columnar::{
     ChangeStreamGcReport, ColumnarAdvanceBudget, ColumnarAdvanceReport, ColumnarCompactionReport,

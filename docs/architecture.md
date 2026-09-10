@@ -213,6 +213,17 @@ Change Stream state remain invariant. `compact_full` is excluded, LSM actions
 create no probation trial or adaptive rollback, and defaults, persistent
 formats, protocol, and Inspection JSON v7 remain unchanged.
 
+[Adaptive Operations Phase 11](adaptive-operations-phase11.md) adds an
+explicit bounded four-lane cycle across the existing Columnar, Change Stream
+reclamation, authoritative LSM, and planner-calibration lanes. Safety still
+determines readiness and each lane retains its own ranking and formal mutation
+authority; a fixed runtime cursor guarantees a continuously Ready lane an
+opportunity within four proactive admissions. Real Columnar layout/eligibility
+or LSM layout mutations can return a typed evidence-renewal recommendation,
+but only the caller may rotate its evidence pool. Defaults, active-trial
+exclusivity, one-mutation steps, durable formats, protocol, and Inspection JSON
+v7 remain unchanged.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

@@ -1,5 +1,5 @@
 use netbadb_planner::{PlannerCalibrationClass, PlannerCalibrationEpoch};
-use netbadb_types::DatabaseCommitSeq;
+use netbadb_types::{DatabaseCommitSeq, ScalarValue};
 
 use crate::adaptive_workload_tests::{TimelineFixture, set_target_work, workload_target};
 use crate::execution_feedback_tests::TABLE_ID;
@@ -7,7 +7,9 @@ use crate::planner_calibration_tests::permissive_policy;
 use crate::{
     AdaptiveColumnarCompactionPolicy, AdaptiveEvidencePool, AdaptiveEvidenceRecordError,
     AdaptivePolicy, AdaptiveWorkloadPolicy, AutomaticAdmissionScope,
-    AutomaticCalibrationTrialPolicy, AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy,
+    AutomaticCalibrationTrialPolicy, AutomaticCrossLaneServicePolicyKind,
+    AutomaticEvidenceRenewalReason, AutomaticEvidenceRenewalRecommendation,
+    AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy, AutomaticProactiveLane,
     AutomaticSafeModeLane, AutomaticSafeModeMutation, AutomaticSafeModeOutcome,
     AutomaticSafeModePolicy, AutomaticSafeTrial, AutomaticTrialAwaitingReason,
     ColumnarAdvanceBudget, ColumnarProjectionSpec, MaintenanceBudget,
@@ -99,6 +101,7 @@ fn inspection_is_pure_scope_is_deduplicated_and_active_trial_preempts_admission(
         .execute("UPDATE events SET category = 7 WHERE id = 7")
         .expect("create lag");
     let pool = AdaptiveEvidencePool::default();
+    let pool_before = pool.inspection();
     let tables = [TABLE_ID, TABLE_ID];
     let first = fixture
         .database
@@ -122,6 +125,12 @@ fn inspection_is_pure_scope_is_deduplicated_and_active_trial_preempts_admission(
         .database
         .automatic_safe_step_multi(&pool, input(&tables, &[]), policy())
         .expect("start one trial");
+    assert_eq!(
+        started.evidence_renewal_recommendation,
+        Some(AutomaticEvidenceRenewalRecommendation {
+            reason: AutomaticEvidenceRenewalReason::ColumnarPhysicalStateChanged,
+        })
+    );
     assert!(matches!(
         started.action.mutation,
         Some(AutomaticSafeModeMutation::ColumnarAdvance { .. })
@@ -130,6 +139,7 @@ fn inspection_is_pure_scope_is_deduplicated_and_active_trial_preempts_admission(
         started.action.trial_after,
         Some(AutomaticSafeTrial::Columnar(_))
     ));
+    assert_eq!(pool.inspection(), pool_before);
 
     let waiting = fixture
         .database
@@ -148,6 +158,172 @@ fn inspection_is_pure_scope_is_deduplicated_and_active_trial_preempts_admission(
         )
     );
     fixture.close();
+}
+
+#[test]
+fn four_lane_policy_switch_is_virtual_until_admission_and_trial_freezes_cursor() {
+    let mut fixture = TimelineFixture::create("phase11-four-lane-runtime");
+    let pool = AdaptiveEvidencePool::default();
+    let mut four_lane = AutomaticMultiSafeModePolicy {
+        cross_lane_service: crate::AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle,
+        ..AutomaticMultiSafeModePolicy::default()
+    };
+    let runtime_before = fixture.database.automatic_safe_mode_state();
+    let inspected = fixture
+        .database
+        .inspect_automatic_candidates(&pool, input(&[], &[]), four_lane)
+        .expect("inspect switched policy");
+    assert_eq!(
+        inspected.cross_lane_service_state.active_policy,
+        AutomaticCrossLaneServicePolicyKind::BoundedFourLaneCycle
+    );
+    assert_eq!(fixture.database.automatic_safe_mode_state(), runtime_before);
+    for _ in 0..100 {
+        assert_eq!(
+            fixture
+                .database
+                .inspect_automatic_candidates(&pool, input(&[], &[]), four_lane)
+                .expect("repeat pure switched-policy inspection"),
+            inspected
+        );
+    }
+    assert_eq!(fixture.database.automatic_safe_mode_state(), runtime_before);
+
+    let idle = fixture
+        .database
+        .automatic_safe_step_multi(&pool, input(&[], &[]), four_lane)
+        .expect("idle switched policy");
+    assert_eq!(
+        idle.cross_lane_service_before,
+        idle.cross_lane_service_after
+    );
+    assert_eq!(fixture.database.automatic_safe_mode_state(), runtime_before);
+
+    fixture
+        .database
+        .execute("UPDATE events SET category = 7 WHERE id = 7")
+        .expect("create ready Columnar work");
+    four_lane.safe_mode = policy().safe_mode;
+    let admitted = fixture
+        .database
+        .automatic_safe_step_multi(&pool, input(&[TABLE_ID], &[]), four_lane)
+        .expect("admit canonical first lane");
+    assert_eq!(
+        admitted.action.selected_lane,
+        AutomaticSafeModeLane::ColumnarMaintenance
+    );
+    assert_eq!(
+        admitted.cross_lane_service_after.active_policy,
+        AutomaticCrossLaneServicePolicyKind::BoundedFourLaneCycle
+    );
+    assert_eq!(
+        admitted
+            .cross_lane_service_after
+            .bounded_four_lane_cycle
+            .next_lane,
+        AutomaticProactiveLane::ChangeStreamReclamation
+    );
+    let service_during_trial = admitted.cross_lane_service_after;
+    let awaiting = fixture
+        .database
+        .automatic_safe_step_multi(&pool, input(&[TABLE_ID], &[]), four_lane)
+        .expect("trial owns step");
+    assert_eq!(awaiting.cross_lane_service_before, service_during_trial);
+    assert_eq!(awaiting.cross_lane_service_after, service_during_trial);
+    assert_eq!(
+        awaiting.lane_selection_reason,
+        crate::AutomaticLaneSelectionReason::ActiveTrial
+    );
+    fixture.close();
+}
+
+#[test]
+fn four_lane_service_cannot_bypass_phase3e_staged_columnar_blocker() {
+    let mut fixture = TimelineFixture::create("phase11-staged-columnar");
+    fixture
+        .database
+        .execute("UPDATE events SET category = 7 WHERE id = 7")
+        .expect("create Columnar lag");
+    let mut group = fixture.database.begin_group_commit().unwrap();
+    let mut member = fixture.database.begin_group_member(&group).unwrap();
+    fixture
+        .database
+        .insert_into_in(
+            TABLE_ID,
+            &mut member,
+            &[
+                ScalarValue::Int64(90_000),
+                ScalarValue::Int64(1),
+                ScalarValue::Text("staged".into()),
+            ],
+        )
+        .unwrap();
+    fixture
+        .database
+        .stage_group_member(&mut group, member)
+        .unwrap();
+
+    let mut four_lane = policy();
+    four_lane.cross_lane_service = crate::AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle;
+    let before = fixture.database.automatic_safe_mode_state();
+    let report = fixture
+        .database
+        .automatic_safe_step_multi(
+            &AdaptiveEvidencePool::default(),
+            input(&[TABLE_ID], &[]),
+            four_lane,
+        )
+        .expect("staged Columnar work is blocked");
+    assert_eq!(report.selected_candidate, None);
+    assert!(report.candidates.iter().any(|candidate| {
+        candidate.lane == AutomaticSafeModeLane::ColumnarMaintenance
+            && candidate.readiness
+                == crate::AutomaticCandidateReadiness::ColumnarBlocked(
+                    crate::AdaptiveNoActionReason::MaintenanceBusy,
+                )
+    }));
+    assert_eq!(fixture.database.automatic_safe_mode_state(), before);
+    fixture.database.abort_group(&mut group).unwrap();
+    drop(group);
+    fixture.close();
+}
+
+#[test]
+fn four_lane_cursor_is_runtime_only_and_reopens_at_canonical_defaults() {
+    let mut fixture = TimelineFixture::create("phase11-four-lane-reopen");
+    fixture
+        .database
+        .execute("UPDATE events SET category = 7 WHERE id = 7")
+        .expect("create ready Columnar work");
+    let mut four_lane = policy();
+    four_lane.cross_lane_service = crate::AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle;
+    let admitted = fixture
+        .database
+        .automatic_safe_step_multi(
+            &AdaptiveEvidencePool::default(),
+            input(&[TABLE_ID], &[]),
+            four_lane,
+        )
+        .expect("advance four-lane cursor");
+    assert_eq!(
+        admitted
+            .cross_lane_service_after
+            .bounded_four_lane_cycle
+            .next_lane,
+        AutomaticProactiveLane::ChangeStreamReclamation
+    );
+
+    let root = fixture.root.clone();
+    let event_path = fixture.event_path.clone();
+    let clock_path = fixture.clock_path.clone();
+    fixture.database.close().expect("close database");
+    let reopened = crate::Database::open_catalog(root.join("catalog")).expect("reopen database");
+    assert_eq!(
+        reopened.automatic_safe_mode_state().cross_lane_service(),
+        crate::AutomaticCrossLaneServiceState::default()
+    );
+    reopened.close().expect("close reopened database");
+    crate::adaptive_workload_tests::cleanup(&root, &[event_path, clock_path]);
 }
 
 #[test]
@@ -306,6 +482,7 @@ fn calibration_candidate_uses_global_pool_and_starts_one_epoch_trial() {
             ..
         })
     ));
+    assert_eq!(applied.evidence_renewal_recommendation, None);
     assert!(matches!(
         applied.action.trial_after,
         Some(AutomaticSafeTrial::PlannerCalibration(_))
@@ -654,6 +831,12 @@ fn automatic_compaction_is_opt_in_enters_existing_trial_and_rotates_evidence_nat
         admitted.action.outcome,
         AutomaticSafeModeOutcome::ColumnarCompactionCompleted
     );
+    assert_eq!(
+        admitted.evidence_renewal_recommendation,
+        Some(AutomaticEvidenceRenewalRecommendation {
+            reason: AutomaticEvidenceRenewalReason::ColumnarPhysicalStateChanged,
+        })
+    );
     let Some(AutomaticSafeModeMutation::ColumnarCompaction {
         old_generation,
         new_generation,
@@ -743,6 +926,12 @@ fn automatic_compaction_is_opt_in_enters_existing_trial_and_rotates_evidence_nat
     assert_eq!(
         reverted.action.outcome,
         AutomaticSafeModeOutcome::ColumnarTrialReverted
+    );
+    assert_eq!(
+        reverted.evidence_renewal_recommendation,
+        Some(AutomaticEvidenceRenewalRecommendation {
+            reason: AutomaticEvidenceRenewalReason::ColumnarEligibilityChanged,
+        })
     );
     assert_eq!(reverted.action.trial_after, None);
     assert_eq!(

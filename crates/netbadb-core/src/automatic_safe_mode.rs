@@ -169,6 +169,35 @@ pub enum AutomaticSafeModeLane {
     PlannerCalibration,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutomaticProactiveLane {
+    #[default]
+    ColumnarMaintenance,
+    ChangeStreamReclamation,
+    AuthoritativeMaintenance,
+    PlannerCalibration,
+}
+
+impl AutomaticProactiveLane {
+    const fn next(self) -> Self {
+        match self {
+            Self::ColumnarMaintenance => Self::ChangeStreamReclamation,
+            Self::ChangeStreamReclamation => Self::AuthoritativeMaintenance,
+            Self::AuthoritativeMaintenance => Self::PlannerCalibration,
+            Self::PlannerCalibration => Self::ColumnarMaintenance,
+        }
+    }
+
+    const fn safe_mode_lane(self) -> AutomaticSafeModeLane {
+        match self {
+            Self::ColumnarMaintenance => AutomaticSafeModeLane::ColumnarMaintenance,
+            Self::ChangeStreamReclamation => AutomaticSafeModeLane::ChangeStreamReclamation,
+            Self::AuthoritativeMaintenance => AutomaticSafeModeLane::AuthoritativeMaintenance,
+            Self::PlannerCalibration => AutomaticSafeModeLane::PlannerCalibration,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutomaticSafeModeMutation {
     ColumnarAdvance {
@@ -345,11 +374,74 @@ pub enum AutomaticCrossLaneServicePolicy {
     BoundedColumnarBurst {
         max_consecutive_columnar_admissions: u64,
     },
+    BoundedFourLaneCycle,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutomaticCrossLaneServicePolicyKind {
+    #[default]
+    StrictPhysicalPriority,
+    BoundedColumnarBurst,
+    BoundedFourLaneCycle,
+}
+
+impl AutomaticCrossLaneServicePolicy {
+    const fn kind(self) -> AutomaticCrossLaneServicePolicyKind {
+        match self {
+            Self::StrictPhysicalPriority => {
+                AutomaticCrossLaneServicePolicyKind::StrictPhysicalPriority
+            }
+            Self::BoundedColumnarBurst { .. } => {
+                AutomaticCrossLaneServicePolicyKind::BoundedColumnarBurst
+            }
+            Self::BoundedFourLaneCycle => AutomaticCrossLaneServicePolicyKind::BoundedFourLaneCycle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutomaticBoundedColumnarBurstServiceState {
+    pub consecutive_columnar_admissions: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutomaticBoundedFourLaneServiceState {
+    pub next_lane: AutomaticProactiveLane,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AutomaticCrossLaneServiceState {
+    pub active_policy: AutomaticCrossLaneServicePolicyKind,
+    /// Legacy Phase 7 counter retained as a direct field for API compatibility.
     pub consecutive_columnar_admissions: u64,
+    pub bounded_four_lane_cycle: AutomaticBoundedFourLaneServiceState,
+}
+
+impl AutomaticCrossLaneServiceState {
+    const fn canonical(policy: AutomaticCrossLaneServicePolicy) -> Self {
+        Self {
+            active_policy: policy.kind(),
+            consecutive_columnar_admissions: 0,
+            bounded_four_lane_cycle: AutomaticBoundedFourLaneServiceState {
+                next_lane: AutomaticProactiveLane::ColumnarMaintenance,
+            },
+        }
+    }
+
+    fn effective_for(self, policy: AutomaticCrossLaneServicePolicy) -> Self {
+        if self.active_policy == policy.kind() {
+            self
+        } else {
+            Self::canonical(policy)
+        }
+    }
+
+    #[must_use]
+    pub const fn bounded_columnar_burst(self) -> AutomaticBoundedColumnarBurstServiceState {
+        AutomaticBoundedColumnarBurstServiceState {
+            consecutive_columnar_admissions: self.consecutive_columnar_admissions,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,7 +456,20 @@ pub enum AutomaticLaneSelectionReason {
     OnlyAuthoritativeMaintenanceReady,
     ReclamationPriority,
     AuthoritativeMaintenancePriority,
+    BoundedFourLaneCycle,
     NoReadyCandidates,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomaticEvidenceRenewalReason {
+    ColumnarPhysicalStateChanged,
+    ColumnarEligibilityChanged,
+    AuthoritativeLsmLayoutChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutomaticEvidenceRenewalRecommendation {
+    pub reason: AutomaticEvidenceRenewalReason,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -456,6 +561,7 @@ pub struct AutomaticMultiSafeModeReport {
     pub cross_lane_service_before: AutomaticCrossLaneServiceState,
     pub cross_lane_service_after: AutomaticCrossLaneServiceState,
     pub lane_selection_reason: AutomaticLaneSelectionReason,
+    pub evidence_renewal_recommendation: Option<AutomaticEvidenceRenewalRecommendation>,
     pub action: AutomaticSafeModeReport,
 }
 
@@ -723,13 +829,14 @@ impl Database {
             calibration.len(),
             policy,
         )?;
+        let effective_service_state = service_state.effective_for(policy.cross_lane_service);
         let (preferred_lane, lane_selection_reason) = select_ready_lane(
             &columnar,
             &reclamation,
             &authoritative,
             &calibration,
             policy.cross_lane_service,
-            service_state,
+            effective_service_state,
         );
         Ok(AutomaticCandidateInspectionReport {
             candidates: columnar
@@ -740,7 +847,7 @@ impl Database {
                 .map(|candidate| candidate.inspection)
                 .collect(),
             blocked_by_active_trial: None,
-            cross_lane_service_state: service_state,
+            cross_lane_service_state: effective_service_state,
             preferred_lane,
             lane_selection_reason,
         })
@@ -826,6 +933,7 @@ impl Database {
                 cross_lane_service_before: service_before,
                 cross_lane_service_after: self.automatic_safe_mode.cross_lane_service,
                 lane_selection_reason: AutomaticLaneSelectionReason::ActiveTrial,
+                evidence_renewal_recommendation: evidence_renewal_for_action(&action),
                 action,
             });
         }
@@ -877,7 +985,7 @@ impl Database {
             &authoritative,
             &calibration,
             policy.cross_lane_service,
-            service_before,
+            service_before.effective_for(policy.cross_lane_service),
         );
         let selected = match selected_lane {
             AutomaticSafeModeLane::ColumnarMaintenance => {
@@ -897,7 +1005,7 @@ impl Database {
         if let Some(selected) = selected {
             let key = selected.inspection.key;
             self.advance_fairness(&inspections, key, policy.max_fairness_entries);
-            self.record_cross_lane_admission(selected_lane);
+            self.record_cross_lane_admission(policy.cross_lane_service, selected_lane);
             let action =
                 self.execute_multi_candidate(selected, input.maintenance_budget, trial_before)?;
             return Ok(AutomaticMultiSafeModeReport {
@@ -907,6 +1015,7 @@ impl Database {
                 cross_lane_service_before: service_before,
                 cross_lane_service_after: self.automatic_safe_mode.cross_lane_service,
                 lane_selection_reason,
+                evidence_renewal_recommendation: evidence_renewal_for_action(&action),
                 action,
             });
         }
@@ -930,6 +1039,7 @@ impl Database {
             cross_lane_service_before: service_before,
             cross_lane_service_after: self.automatic_safe_mode.cross_lane_service,
             lane_selection_reason,
+            evidence_renewal_recommendation: None,
             action: self.finish_automatic_report(
                 trial_before,
                 AutomaticSafeModeLane::None,
@@ -1539,26 +1649,16 @@ impl Database {
         }
     }
 
-    fn record_cross_lane_admission(&mut self, lane: AutomaticSafeModeLane) {
-        match lane {
-            AutomaticSafeModeLane::ColumnarMaintenance => {
-                let consecutive = &mut self
-                    .automatic_safe_mode
-                    .cross_lane_service
-                    .consecutive_columnar_admissions;
-                *consecutive = consecutive.saturating_add(1);
-            }
-            AutomaticSafeModeLane::PlannerCalibration => {
-                self.automatic_safe_mode
-                    .cross_lane_service
-                    .consecutive_columnar_admissions = 0;
-            }
-            AutomaticSafeModeLane::ChangeStreamReclamation => {}
-            AutomaticSafeModeLane::AuthoritativeMaintenance => {}
-            AutomaticSafeModeLane::None
-            | AutomaticSafeModeLane::ActiveColumnarTrial
-            | AutomaticSafeModeLane::ActivePlannerCalibrationTrial => {}
-        }
+    fn record_cross_lane_admission(
+        &mut self,
+        policy: AutomaticCrossLaneServicePolicy,
+        lane: AutomaticSafeModeLane,
+    ) {
+        self.automatic_safe_mode.cross_lane_service = cross_lane_state_after_admission(
+            self.automatic_safe_mode.cross_lane_service,
+            policy,
+            lane,
+        );
     }
 
     fn execute_multi_candidate(
@@ -2107,6 +2207,78 @@ fn validate_multi_scope(
     Ok(())
 }
 
+fn evidence_renewal_for_action(
+    action: &AutomaticSafeModeReport,
+) -> Option<AutomaticEvidenceRenewalRecommendation> {
+    let reason = match action.mutation? {
+        AutomaticSafeModeMutation::ColumnarAdvance { .. }
+        | AutomaticSafeModeMutation::ColumnarCompaction { .. } => {
+            AutomaticEvidenceRenewalReason::ColumnarPhysicalStateChanged
+        }
+        AutomaticSafeModeMutation::ColumnarSuppression { .. } => {
+            AutomaticEvidenceRenewalReason::ColumnarEligibilityChanged
+        }
+        AutomaticSafeModeMutation::LsmMaintenance { .. } => {
+            AutomaticEvidenceRenewalReason::AuthoritativeLsmLayoutChanged
+        }
+        AutomaticSafeModeMutation::ChangeStreamReclamation { .. }
+        | AutomaticSafeModeMutation::PlannerCalibrationApply { .. }
+        | AutomaticSafeModeMutation::PlannerCalibrationRevert { .. } => return None,
+    };
+    Some(AutomaticEvidenceRenewalRecommendation { reason })
+}
+
+const fn proactive_lane(lane: AutomaticSafeModeLane) -> Option<AutomaticProactiveLane> {
+    match lane {
+        AutomaticSafeModeLane::ColumnarMaintenance => {
+            Some(AutomaticProactiveLane::ColumnarMaintenance)
+        }
+        AutomaticSafeModeLane::ChangeStreamReclamation => {
+            Some(AutomaticProactiveLane::ChangeStreamReclamation)
+        }
+        AutomaticSafeModeLane::AuthoritativeMaintenance => {
+            Some(AutomaticProactiveLane::AuthoritativeMaintenance)
+        }
+        AutomaticSafeModeLane::PlannerCalibration => {
+            Some(AutomaticProactiveLane::PlannerCalibration)
+        }
+        AutomaticSafeModeLane::None
+        | AutomaticSafeModeLane::ActiveColumnarTrial
+        | AutomaticSafeModeLane::ActivePlannerCalibrationTrial => None,
+    }
+}
+
+fn cross_lane_state_after_admission(
+    current: AutomaticCrossLaneServiceState,
+    policy: AutomaticCrossLaneServicePolicy,
+    lane: AutomaticSafeModeLane,
+) -> AutomaticCrossLaneServiceState {
+    let mut state = current.effective_for(policy);
+    match policy {
+        AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle => {
+            if let Some(selected) = proactive_lane(lane) {
+                state.bounded_four_lane_cycle.next_lane = selected.next();
+            }
+        }
+        AutomaticCrossLaneServicePolicy::StrictPhysicalPriority
+        | AutomaticCrossLaneServicePolicy::BoundedColumnarBurst { .. } => match lane {
+            AutomaticSafeModeLane::ColumnarMaintenance => {
+                state.consecutive_columnar_admissions =
+                    state.consecutive_columnar_admissions.saturating_add(1);
+            }
+            AutomaticSafeModeLane::PlannerCalibration => {
+                state.consecutive_columnar_admissions = 0;
+            }
+            AutomaticSafeModeLane::ChangeStreamReclamation
+            | AutomaticSafeModeLane::AuthoritativeMaintenance
+            | AutomaticSafeModeLane::None
+            | AutomaticSafeModeLane::ActiveColumnarTrial
+            | AutomaticSafeModeLane::ActivePlannerCalibrationTrial => {}
+        },
+    }
+    state
+}
+
 fn validate_candidate_count(
     columnar: usize,
     reclamation: usize,
@@ -2178,6 +2350,28 @@ fn select_ready_lane(
     let authoritative_ready = authoritative
         .iter()
         .any(|candidate| candidate.inspection.readiness == AutomaticCandidateReadiness::Ready);
+    if policy == AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle {
+        let ready = |lane| match lane {
+            AutomaticProactiveLane::ColumnarMaintenance => columnar_ready,
+            AutomaticProactiveLane::ChangeStreamReclamation => reclamation_ready,
+            AutomaticProactiveLane::AuthoritativeMaintenance => authoritative_ready,
+            AutomaticProactiveLane::PlannerCalibration => calibration_ready,
+        };
+        let mut lane = state.bounded_four_lane_cycle.next_lane;
+        for _ in 0..4 {
+            if ready(lane) {
+                return (
+                    lane.safe_mode_lane(),
+                    AutomaticLaneSelectionReason::BoundedFourLaneCycle,
+                );
+            }
+            lane = lane.next();
+        }
+        return (
+            AutomaticSafeModeLane::None,
+            AutomaticLaneSelectionReason::NoReadyCandidates,
+        );
+    }
     if columnar_ready && calibration_ready {
         return match policy {
             AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
@@ -2193,6 +2387,10 @@ fn select_ready_lane(
             AutomaticCrossLaneServicePolicy::StrictPhysicalPriority => (
                 AutomaticSafeModeLane::ColumnarMaintenance,
                 AutomaticLaneSelectionReason::StrictPhysicalPriority,
+            ),
+            AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle => (
+                state.bounded_four_lane_cycle.next_lane.safe_mode_lane(),
+                AutomaticLaneSelectionReason::BoundedFourLaneCycle,
             ),
         };
     }
@@ -2741,6 +2939,7 @@ mod admission_tests {
         let calibration = vec![calibration(PlannerCalibrationClass::Columnar, 0, 1)];
         let state = AutomaticCrossLaneServiceState {
             consecutive_columnar_admissions: 2,
+            ..AutomaticCrossLaneServiceState::default()
         };
         assert_eq!(
             select_ready_lane(
@@ -2799,6 +2998,7 @@ mod admission_tests {
         let calibration = vec![calibration(PlannerCalibrationClass::Columnar, 0, 1)];
         let state = AutomaticCrossLaneServiceState {
             consecutive_columnar_admissions: 2,
+            ..AutomaticCrossLaneServiceState::default()
         };
         assert_eq!(
             select_ready_lane(
@@ -2843,6 +3043,273 @@ mod admission_tests {
                 AutomaticSafeModeLane::PlannerCalibration,
                 AutomaticLaneSelectionReason::CalibrationServiceDue,
             )
+        );
+    }
+
+    #[test]
+    fn four_lane_cycle_services_every_continuously_ready_lane_within_four_admissions() {
+        let columnar = vec![columnar(1, 1, 0, 1, 1)];
+        let reclamation = vec![reclamation(2, 2, 0, 100)];
+        let authoritative = vec![lsm(3, 3, true, 0, 100)];
+        let calibration = vec![calibration(PlannerCalibrationClass::Columnar, 0, 1)];
+        let policy = AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle;
+        let expected = [
+            AutomaticSafeModeLane::ColumnarMaintenance,
+            AutomaticSafeModeLane::ChangeStreamReclamation,
+            AutomaticSafeModeLane::AuthoritativeMaintenance,
+            AutomaticSafeModeLane::PlannerCalibration,
+        ];
+        let mut state = AutomaticCrossLaneServiceState::default();
+        for lane in expected.into_iter().cycle().take(8) {
+            let selected = select_ready_lane(
+                &columnar,
+                &reclamation,
+                &authoritative,
+                &calibration,
+                policy,
+                state.effective_for(policy),
+            );
+            assert_eq!(
+                selected,
+                (lane, AutomaticLaneSelectionReason::BoundedFourLaneCycle)
+            );
+            state = cross_lane_state_after_admission(state, policy, lane);
+        }
+    }
+
+    #[test]
+    fn four_lane_cycle_skips_blocked_lanes_without_idling_or_cross_lane_age() {
+        let columnar = vec![columnar(1, 1, 0, 1, 1)];
+        let mut reclamation = reclamation(2, 2, u64::MAX, u64::MAX);
+        reclamation.inspection.readiness = AutomaticCandidateReadiness::ChangeStreamGcBlocked(
+            AdaptiveChangeStreamGcNoActionReason::Safety(
+                crate::AdaptiveChangeStreamGcSafetyBlocker::NoRetentionConsumer,
+            ),
+        );
+        let mut authoritative = lsm(3, 3, true, u64::MAX, u64::MAX);
+        authoritative.inspection.readiness = AutomaticCandidateReadiness::LsmMaintenanceBlocked(
+            AdaptiveLsmMaintenanceNoActionReason::MaintenanceBlocked(
+                crate::MaintenanceBlocker::Busy,
+            ),
+        );
+        let calibration = vec![calibration(PlannerCalibrationClass::Columnar, 0, 1)];
+        let policy = AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle;
+        let state = AutomaticCrossLaneServiceState {
+            active_policy: AutomaticCrossLaneServicePolicyKind::BoundedFourLaneCycle,
+            bounded_four_lane_cycle: AutomaticBoundedFourLaneServiceState {
+                next_lane: AutomaticProactiveLane::ChangeStreamReclamation,
+            },
+            ..AutomaticCrossLaneServiceState::default()
+        };
+        let selected = select_ready_lane(
+            &columnar,
+            &[reclamation],
+            &[authoritative],
+            &calibration,
+            policy,
+            state,
+        );
+        assert_eq!(
+            selected,
+            (
+                AutomaticSafeModeLane::PlannerCalibration,
+                AutomaticLaneSelectionReason::BoundedFourLaneCycle,
+            )
+        );
+        let after = cross_lane_state_after_admission(state, policy, selected.0);
+        assert_eq!(
+            after.bounded_four_lane_cycle.next_lane,
+            AutomaticProactiveLane::ColumnarMaintenance
+        );
+    }
+
+    #[test]
+    fn four_lane_cycle_reselects_the_only_ready_lane_and_selected_abort_advances() {
+        let authoritative = vec![lsm(3, 3, true, 0, 100)];
+        let policy = AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle;
+        let mut state = AutomaticCrossLaneServiceState::canonical(policy);
+        state.bounded_four_lane_cycle.next_lane = AutomaticProactiveLane::ChangeStreamReclamation;
+        for _ in 0..3 {
+            let selected = select_ready_lane(&[], &[], &authoritative, &[], policy, state);
+            assert_eq!(selected.0, AutomaticSafeModeLane::AuthoritativeMaintenance);
+            // Admission is committed before authority revalidation, so an abort
+            // takes this same transition and cannot retry the lane in-place.
+            state = cross_lane_state_after_admission(state, policy, selected.0);
+            assert_eq!(
+                state.bounded_four_lane_cycle.next_lane,
+                AutomaticProactiveLane::PlannerCalibration
+            );
+        }
+    }
+
+    #[test]
+    fn four_lane_service_precedes_lane_local_age_and_new_readiness_is_bounded() {
+        let columnar = vec![columnar(1, 1, 0, 1, 1)];
+        let reclamation = vec![reclamation(2, 2, u64::MAX, u64::MAX)];
+        let calibration = vec![calibration(PlannerCalibrationClass::Columnar, u64::MAX, 1)];
+        let policy = AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle;
+        let mut state = AutomaticCrossLaneServiceState::canonical(policy);
+        assert_eq!(
+            select_ready_lane(&columnar, &reclamation, &[], &[], policy, state).0,
+            AutomaticSafeModeLane::ColumnarMaintenance
+        );
+        state = cross_lane_state_after_admission(
+            state,
+            policy,
+            AutomaticSafeModeLane::ColumnarMaintenance,
+        );
+        assert_eq!(
+            select_ready_lane(&columnar, &reclamation, &[], &[], policy, state).0,
+            AutomaticSafeModeLane::ChangeStreamReclamation
+        );
+
+        // Calibration becomes Ready after the cursor has passed it. Even with
+        // continuously Ready work in other lanes it remains bounded.
+        state.bounded_four_lane_cycle.next_lane = AutomaticProactiveLane::PlannerCalibration;
+        let before_ready = select_ready_lane(&columnar, &reclamation, &[], &[], policy, state).0;
+        assert_eq!(before_ready, AutomaticSafeModeLane::ColumnarMaintenance);
+        state = cross_lane_state_after_admission(state, policy, before_ready);
+        let mut serviced_at = None;
+        for admissions in 1..=4 {
+            let selected =
+                select_ready_lane(&columnar, &reclamation, &[], &calibration, policy, state).0;
+            state = cross_lane_state_after_admission(state, policy, selected);
+            if selected == AutomaticSafeModeLane::PlannerCalibration {
+                serviced_at = Some(admissions);
+                break;
+            }
+        }
+        assert!(serviced_at.is_some_and(|admissions| admissions <= 4));
+    }
+
+    #[test]
+    fn four_lane_safety_and_recovery_blockers_beat_the_cursor() {
+        let columnar = vec![columnar(1, 1, 0, 1, 1)];
+        let mut reclamation = reclamation(2, 2, u64::MAX, u64::MAX);
+        reclamation.inspection.readiness = AutomaticCandidateReadiness::ChangeStreamGcBlocked(
+            AdaptiveChangeStreamGcNoActionReason::Safety(
+                crate::AdaptiveChangeStreamGcSafetyBlocker::NoRetentionConsumer,
+            ),
+        );
+        let mut authoritative = lsm(3, 3, true, u64::MAX, u64::MAX);
+        authoritative.inspection.readiness = AutomaticCandidateReadiness::LsmMaintenanceBlocked(
+            AdaptiveLsmMaintenanceNoActionReason::MaintenanceBlocked(
+                crate::MaintenanceBlocker::RecoveryRequired,
+            ),
+        );
+        let policy = AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle;
+        for next_lane in [
+            AutomaticProactiveLane::ChangeStreamReclamation,
+            AutomaticProactiveLane::AuthoritativeMaintenance,
+        ] {
+            let state = AutomaticCrossLaneServiceState {
+                active_policy: AutomaticCrossLaneServicePolicyKind::BoundedFourLaneCycle,
+                bounded_four_lane_cycle: AutomaticBoundedFourLaneServiceState { next_lane },
+                ..AutomaticCrossLaneServiceState::default()
+            };
+            assert_eq!(
+                select_ready_lane(
+                    &columnar,
+                    &[reclamation.clone()],
+                    &[authoritative.clone()],
+                    &[],
+                    policy,
+                    state,
+                )
+                .0,
+                AutomaticSafeModeLane::ColumnarMaintenance
+            );
+        }
+    }
+
+    #[test]
+    fn policy_switches_use_canonical_policy_specific_state() {
+        let strict = AutomaticCrossLaneServiceState {
+            consecutive_columnar_admissions: 9,
+            ..AutomaticCrossLaneServiceState::default()
+        };
+        let four = AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle;
+        let virtual_four = strict.effective_for(four);
+        assert_eq!(
+            virtual_four.active_policy,
+            AutomaticCrossLaneServicePolicyKind::BoundedFourLaneCycle
+        );
+        assert_eq!(
+            virtual_four.bounded_four_lane_cycle.next_lane,
+            AutomaticProactiveLane::ColumnarMaintenance
+        );
+        assert_eq!(strict.consecutive_columnar_admissions, 9);
+
+        let after_four = cross_lane_state_after_admission(
+            strict,
+            four,
+            AutomaticSafeModeLane::ColumnarMaintenance,
+        );
+        let burst = AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
+            max_consecutive_columnar_admissions: 2,
+        };
+        let after_burst = cross_lane_state_after_admission(
+            after_four,
+            burst,
+            AutomaticSafeModeLane::ColumnarMaintenance,
+        );
+        assert_eq!(
+            after_burst.active_policy,
+            AutomaticCrossLaneServicePolicyKind::BoundedColumnarBurst
+        );
+        assert_eq!(after_burst.consecutive_columnar_admissions, 1);
+    }
+
+    #[test]
+    fn evidence_renewal_is_derived_only_from_real_shape_mutations() {
+        let target = AdaptiveWorkloadTarget {
+            table_id: TableId(1),
+            storage_id: StorageId(2),
+            projection_id: ColumnarProjectionId(3),
+            generation: ColumnarGeneration(4),
+            schema_generation: SchemaGeneration(5),
+        };
+        let recommendation = |mutation| {
+            evidence_renewal_for_action(&AutomaticSafeModeReport {
+                trial_before: None,
+                selected_lane: AutomaticSafeModeLane::None,
+                mutation,
+                columnar_cycle: None,
+                columnar_compaction: None,
+                change_stream_gc: None,
+                lsm_maintenance: None,
+                workload_evaluation: None,
+                calibration_decision: None,
+                calibration_shadow: None,
+                calibration_trial_evaluation: None,
+                outcome: AutomaticSafeModeOutcome::NoAction(
+                    AutomaticSafeModeNoAction::ColumnarNoAction,
+                ),
+                trial_after: None,
+            })
+        };
+        assert_eq!(recommendation(None), None);
+        assert_eq!(
+            recommendation(Some(AutomaticSafeModeMutation::ColumnarSuppression {
+                target
+            })),
+            Some(AutomaticEvidenceRenewalRecommendation {
+                reason: AutomaticEvidenceRenewalReason::ColumnarEligibilityChanged,
+            })
+        );
+        assert_eq!(
+            recommendation(Some(AutomaticSafeModeMutation::ChangeStreamReclamation {
+                storage_id: StorageId(2),
+                new_earliest_frontier: StorageDataVersion(3),
+            })),
+            None
+        );
+        assert_eq!(
+            recommendation(Some(AutomaticSafeModeMutation::PlannerCalibrationApply {
+                calibration_class: PlannerCalibrationClass::Columnar,
+                applied_epoch: PlannerCalibrationEpoch(2),
+            })),
+            None
         );
     }
 
