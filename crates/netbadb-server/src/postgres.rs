@@ -23,10 +23,13 @@ use netbadb_protocol::WireTransactionState;
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, SemanticType, TableId};
 use sha2::{Digest, Sha256};
 
+use crate::adaptive_feedback::{
+    ServerAdaptiveFeedbackRuntime, execute_prepared_with_optional_server_feedback,
+};
 use crate::authorization::{AuthorizationPolicy, PrincipalAuthorization};
 use crate::{
-    ClientIdentity, DatabaseSession, ServerConfig, ServerLimits, SessionPolicy, TableBootstrap,
-    TransportKind,
+    ClientIdentity, DatabaseSession, ServerAdaptiveFeedbackConfig, ServerConfig, ServerLimits,
+    SessionPolicy, TableBootstrap, TransportKind,
 };
 
 const MAX_PREPARED_STATEMENTS: usize = 1_024;
@@ -39,12 +42,24 @@ const MAX_CATALOG_PATTERN_ATOMS: usize = 1_024;
 
 pub struct PostgresTcpServer {
     config: ServerConfig,
+    adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
 }
 
 impl PostgresTcpServer {
     #[must_use]
     pub fn new(config: ServerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            adaptive_feedback: None,
+        }
+    }
+
+    /// Enables bounded autocommit Core-query feedback capture in this
+    /// PostgreSQL server's database worker. The wire contract is unchanged.
+    #[must_use]
+    pub fn with_adaptive_feedback(mut self, config: ServerAdaptiveFeedbackConfig) -> Self {
+        self.adaptive_feedback = Some(config);
+        self
     }
 
     pub fn start(self) -> Result<PostgresServerHandle, PostgresTcpServerError> {
@@ -52,7 +67,12 @@ impl PostgresTcpServer {
         if security.kind() != TransportKind::PlaintextLoopback {
             return Err(PostgresTcpServerError::TlsManifestUnsupported);
         }
-        let worker = PgDatabaseWorker::start(tables, limits.session_policy(), authorization)?;
+        let worker = PgDatabaseWorker::start(
+            tables,
+            limits.session_policy(),
+            authorization,
+            self.adaptive_feedback,
+        )?;
         let listener = match TcpListener::bind(listen) {
             Ok(listener) => listener,
             Err(source) => {
@@ -410,6 +430,7 @@ impl PgDatabaseWorker {
         tables: Vec<TableBootstrap>,
         policy: SessionPolicy,
         authorization: AuthorizationPolicy,
+        adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
     ) -> Result<Self, PostgresTcpServerError> {
         let (commands, receiver) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -430,7 +451,7 @@ impl PgDatabaseWorker {
                 if ready_tx.send(Ok(())).is_err() {
                     return database.close().map_err(|error| error.to_string());
                 }
-                run_pg_worker(database, policy, authorization, receiver)
+                run_pg_worker(database, policy, authorization, adaptive_feedback, receiver)
             })
             .map_err(PostgresTcpServerError::ThreadSpawn)?;
         match ready_rx
@@ -490,9 +511,11 @@ fn run_pg_worker(
     mut database: Database,
     policy: SessionPolicy,
     authorization: AuthorizationPolicy,
+    adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
     commands: Receiver<PgWorkerCommand>,
 ) -> Result<(), String> {
     let mut sessions: HashMap<u64, PgWorkerSession> = HashMap::new();
+    let mut adaptive_feedback = adaptive_feedback.map(ServerAdaptiveFeedbackRuntime::new);
     while let Ok(command) = commands.recv() {
         match command {
             PgWorkerCommand::Open {
@@ -536,7 +559,11 @@ fn run_pg_worker(
                     let _ = reply.send(Err(PgConnectionError::WorkerStopped));
                     continue;
                 };
-                let messages = session.handle(&mut database, message);
+                let messages = session.handle_with_adaptive_feedback(
+                    &mut database,
+                    adaptive_feedback.as_mut(),
+                    message,
+                );
                 let _ = reply.send(Ok(messages));
             }
             PgWorkerCommand::Close { session_id, reply } => {
@@ -1006,7 +1033,17 @@ impl PgWorkerSession {
         ))
     }
 
+    #[cfg(test)]
     fn handle(&mut self, database: &mut Database, message: FrontendMessage) -> Vec<BackendMessage> {
+        self.handle_with_adaptive_feedback(database, None, message)
+    }
+
+    fn handle_with_adaptive_feedback(
+        &mut self,
+        database: &mut Database,
+        adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
+        message: FrontendMessage,
+    ) -> Vec<BackendMessage> {
         self.trace_frontend(&message);
         let messages = if self.awaiting_sync {
             match message {
@@ -1018,7 +1055,7 @@ impl PgWorkerSession {
             }
         } else {
             match message {
-                FrontendMessage::Query(sql) => self.simple_query(database, &sql),
+                FrontendMessage::Query(sql) => self.simple_query(database, adaptive_feedback, &sql),
                 FrontendMessage::Parse {
                     statement,
                     query,
@@ -1039,7 +1076,7 @@ impl PgWorkerSession {
                 ),
                 FrontendMessage::Describe { target, name } => self.describe(target, &name),
                 FrontendMessage::Execute { portal, max_rows } => {
-                    self.execute_portal(database, &portal, max_rows)
+                    self.execute_portal(database, adaptive_feedback, &portal, max_rows)
                 }
                 FrontendMessage::Close { target, name } => self.close_object(target, &name),
                 FrontendMessage::Sync => {
@@ -1118,7 +1155,12 @@ impl PgWorkerSession {
         }
     }
 
-    fn simple_query(&mut self, database: &mut Database, sql: &str) -> Vec<BackendMessage> {
+    fn simple_query(
+        &mut self,
+        database: &mut Database,
+        mut adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
+        sql: &str,
+    ) -> Vec<BackendMessage> {
         self.prepared.remove("");
         self.portals.remove("");
         let statements = split_statements(sql);
@@ -1130,7 +1172,7 @@ impl PgWorkerSession {
         }
         let mut messages = Vec::new();
         for statement in statements {
-            match self.execute_statement(database, statement) {
+            match self.execute_statement(database, adaptive_feedback.as_deref_mut(), statement) {
                 Ok(mut statement_messages) => messages.append(&mut statement_messages),
                 Err(error) => {
                     messages.push(BackendMessage::ErrorResponse(error));
@@ -1500,6 +1542,7 @@ impl PgWorkerSession {
     fn execute_portal(
         &mut self,
         database: &mut Database,
+        adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
         name: &str,
         max_rows: u32,
     ) -> Vec<BackendMessage> {
@@ -1515,6 +1558,7 @@ impl PgWorkerSession {
         if portal.result.is_none() {
             let result = match self.execute_to_portal(
                 database,
+                adaptive_feedback,
                 &portal.sql,
                 &portal.execution,
                 &portal.values,
@@ -1540,6 +1584,7 @@ impl PgWorkerSession {
     fn execute_to_portal(
         &mut self,
         database: &mut Database,
+        adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
         sql: &str,
         execution: &PreparedExecution,
         values: &[ScalarValue],
@@ -1547,7 +1592,7 @@ impl PgWorkerSession {
     ) -> Result<PortalResult, ErrorResponse> {
         let result = match execution {
             PreparedExecution::Core(prepared) => {
-                self.execute_prepared_core(database, prepared, values)?
+                self.execute_prepared_core(database, adaptive_feedback, prepared, values)?
             }
             PreparedExecution::Ddl(prepared) => {
                 if !values.is_empty() {
@@ -1666,6 +1711,7 @@ impl PgWorkerSession {
     fn execute_statement(
         &mut self,
         database: &mut Database,
+        adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
         sql: &str,
     ) -> Result<Vec<BackendMessage>, ErrorResponse> {
         let normalized = normalize_sql(sql);
@@ -1788,7 +1834,7 @@ impl PgWorkerSession {
             .map_err(|error| self.record_error(&error))?;
         let result = match prepared {
             PreparedSqlStatement::Relational(prepared) => {
-                self.execute_prepared_core(database, &prepared, &[])?
+                self.execute_prepared_core(database, adaptive_feedback, &prepared, &[])?
             }
             PreparedSqlStatement::Ddl(prepared) => {
                 preflight_ddl_types(&prepared).map_err(|e| self.record_protocol_error(e))?;
@@ -1820,6 +1866,7 @@ impl PgWorkerSession {
     fn execute_prepared_core(
         &mut self,
         database: &mut Database,
+        adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
         prepared: &CorePrepared,
         values: &[ScalarValue],
     ) -> Result<ExecutionResult, ErrorResponse> {
@@ -1830,9 +1877,14 @@ impl PgWorkerSession {
             ));
         }
         self.authorize_access(&prepared.access())?;
-        self.execution
-            .execute_prepared(database, prepared, values)
-            .map_err(|error| self.record_error(&error))
+        execute_prepared_with_optional_server_feedback(
+            adaptive_feedback,
+            &mut self.execution,
+            database,
+            prepared,
+            values,
+        )
+        .map_err(|error| self.record_error(&error))
     }
 
     fn authorize_access(&mut self, access: &StatementAccess) -> Result<(), ErrorResponse> {
@@ -6160,6 +6212,9 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[path = "postgres_adaptive_feedback_tests.rs"]
+mod adaptive_feedback_tests;
 #[cfg(test)]
 #[path = "postgres_alter_table_tests.rs"]
 mod alter_table_tests;

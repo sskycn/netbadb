@@ -58,5 +58,13 @@
 - Result-row policy belongs in transport-neutral `SessionState`, but is checked
   only after core execution materializes the complete `QueryResult`. Do not
   describe it as an executor memory limit or statement timeout.
+- Explicit adaptive feedback capture runs only inside the current Database
+  execution owner, after authorization, and only for eligible autocommit Core
+  queries. Its bounded `AdaptiveEvidencePool` belongs to that worker, never a
+  connection thread, `SessionState`, protocol message, or `Database`.
+- Adaptive evidence admission failure is telemetry-only. It MUST NOT change an
+  otherwise successful client result, protocol transaction state, or worker
+  lifetime, and the Server MUST NOT retry, clear, rotate, schedule, or run
+  maintenance in response.
 - Wire responses MUST expose stable protocol domain values and errors, never
   internal Rust layouts, discriminants, debug strings, pages, or row locators.

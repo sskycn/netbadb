@@ -13,14 +13,16 @@ use netbadb_protocol::{
     write_server_frame,
 };
 
+use crate::adaptive_feedback::ServerAdaptiveFeedbackRuntime;
 use crate::authorization::{
     AuthorizationAction, AuthorizationDenied, AuthorizationPolicy, PrincipalAuthorization,
 };
 use crate::manifest::validate_listener_security;
 use crate::tls::{ConnectionStream, TlsHandshakeError, TransportSecurity};
 use crate::{
-    ClientIdentity, ManifestError, ResponseBatch, ServerConfig, ServerLimits, ServerMetricsHandle,
-    SessionPolicy, SessionResponse, SessionState, TableBootstrap, TransportKind,
+    ClientIdentity, ManifestError, ResponseBatch, ServerAdaptiveFeedbackConfig, ServerConfig,
+    ServerLimits, ServerMetricsHandle, SessionPolicy, SessionResponse, SessionState,
+    TableBootstrap, TransportKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -142,12 +144,24 @@ impl From<ManifestError> for TcpServerError {
 
 pub struct TcpServer {
     config: ServerConfig,
+    adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
 }
 
 impl TcpServer {
     #[must_use]
     pub fn new(config: ServerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            adaptive_feedback: None,
+        }
+    }
+
+    /// Enables bounded autocommit Core-query feedback capture in this
+    /// server's database worker. Deployment manifest v4 remains unchanged.
+    #[must_use]
+    pub fn with_adaptive_feedback(mut self, config: ServerAdaptiveFeedbackConfig) -> Self {
+        self.adaptive_feedback = Some(config);
+        self
     }
 
     pub fn start(self) -> Result<ServerHandle, TcpServerError> {
@@ -155,7 +169,12 @@ impl TcpServer {
         validate_listener_security(listen, security.kind() == TransportKind::MutualTls)?;
         let table_count = tables.len();
         let transport_kind = security.kind();
-        let worker = DatabaseWorker::start(tables, limits.session_policy(), authorization)?;
+        let worker = DatabaseWorker::start(
+            tables,
+            limits.session_policy(),
+            authorization,
+            self.adaptive_feedback,
+        )?;
         let metrics = ServerMetricsHandle::new();
         let listener = match TcpListener::bind(listen) {
             Ok(listener) => listener,
@@ -347,6 +366,7 @@ impl DatabaseWorker {
         tables: Vec<TableBootstrap>,
         session_policy: SessionPolicy,
         authorization: AuthorizationPolicy,
+        adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
     ) -> Result<Self, TcpServerError> {
         let (commands, command_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
@@ -376,6 +396,7 @@ impl DatabaseWorker {
                     database,
                     session_policy,
                     authorization,
+                    adaptive_feedback,
                     command_rx,
                     events_tx,
                 )
@@ -517,6 +538,7 @@ impl fmt::Display for WorkerRequestError {
 
 struct DatabaseWorkerState {
     database: Option<Database>,
+    adaptive_feedback: Option<ServerAdaptiveFeedbackRuntime>,
     sessions: HashMap<SessionId, WorkerSession>,
     session_policy: SessionPolicy,
     authorization: AuthorizationPolicy,
@@ -545,9 +567,20 @@ impl WorkerSession {
         self.identity.is_authenticated()
     }
 
+    #[cfg(test)]
     fn handle(
         &mut self,
         database: &mut Database,
+        request_id: u64,
+        request: ClientMessage,
+    ) -> SessionResponse {
+        self.handle_with_adaptive_feedback(database, None, request_id, request)
+    }
+
+    fn handle_with_adaptive_feedback(
+        &mut self,
+        database: &mut Database,
+        adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
         request_id: u64,
         request: ClientMessage,
     ) -> SessionResponse {
@@ -582,7 +615,9 @@ impl WorkerSession {
             {
                 return authorization_denied_response(&self.state, request_id, denial);
             }
-            return self.state.handle_prepared(database, request_id, &prepared);
+            return self
+                .state
+                .handle_prepared(database, adaptive_feedback, request_id, &prepared);
         }
 
         let denial = match &request {
@@ -655,9 +690,11 @@ impl DatabaseWorkerState {
         database: Database,
         session_policy: SessionPolicy,
         authorization: AuthorizationPolicy,
+        adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
     ) -> Self {
         Self {
             database: Some(database),
+            adaptive_feedback: adaptive_feedback.map(ServerAdaptiveFeedbackRuntime::new),
             sessions: HashMap::new(),
             session_policy,
             authorization,
@@ -705,10 +742,12 @@ fn run_database_worker(
     database: Database,
     session_policy: SessionPolicy,
     authorization: AuthorizationPolicy,
+    adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
     commands: Receiver<WorkerCommand>,
     events: Sender<WorkerFatalError>,
 ) -> Result<(), WorkerFatalError> {
-    let mut state = DatabaseWorkerState::new(database, session_policy, authorization);
+    let mut state =
+        DatabaseWorkerState::new(database, session_policy, authorization, adaptive_feedback);
     while let Ok(command) = commands.recv() {
         match command {
             WorkerCommand::OpenSession {
@@ -754,7 +793,12 @@ fn run_database_worker(
                     let _ = events.send(error.clone());
                     return Err(error);
                 };
-                let response = session.handle(database, frame.request_id, frame.message);
+                let response = session.handle_with_adaptive_feedback(
+                    database,
+                    state.adaptive_feedback.as_mut(),
+                    frame.request_id,
+                    frame.message,
+                );
                 let _ = reply.send(Ok(response));
             }
             WorkerCommand::CloseSession { session_id, reply } => {
@@ -1148,6 +1192,10 @@ mod tests {
         drop(client);
     }
 }
+
+#[cfg(test)]
+#[path = "native_adaptive_feedback_tests.rs"]
+mod adaptive_feedback_tests;
 
 #[cfg(test)]
 #[path = "native_alter_table_tests.rs"]

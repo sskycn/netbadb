@@ -253,6 +253,16 @@ feedback remains excluded pending a separate authority theorem, and there is no
 background collection, Server capture, protocol, manifest, or Inspection JSON
 change.
 
+[Adaptive Operations Phase 15](adaptive-operations-phase15.md) adds an explicit
+Server workload-evidence bridge for successful autocommit Core queries. Each
+current Native or PostgreSQL Database worker owns one optional bounded evidence
+pool and synchronously admits the exact Phase 14 report after authorization;
+connections, sessions, `Database`, and protocols own no pool. DML, DDL,
+explicit-transaction queries, and PostgreSQL compatibility queries remain on
+ordinary non-instrumented paths. Admission failure is telemetry-only, and the
+bridge performs no retry, automatic rotation, scheduler tick, orchestration,
+maintenance, visibility-mode change, manifest update, or wire change.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

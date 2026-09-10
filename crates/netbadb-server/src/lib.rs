@@ -1,5 +1,6 @@
 //! Transport-neutral synchronous NetbaDB protocol sessions.
 
+mod adaptive_feedback;
 mod authorization;
 mod limits;
 mod manifest;
@@ -21,6 +22,7 @@ use netbadb_protocol::{
     WireTransactionState, validate_server_message,
 };
 
+pub use adaptive_feedback::ServerAdaptiveFeedbackConfig;
 pub use authorization::AuthorizationConfigError;
 pub use limits::{
     DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_RESULT_ROWS, DEFAULT_WRITE_TIMEOUT,
@@ -185,6 +187,28 @@ impl DatabaseSession {
         }
     }
 
+    fn execute_sql_prepared_with_optional_server_feedback(
+        &mut self,
+        runtime: Option<&mut adaptive_feedback::ServerAdaptiveFeedbackRuntime>,
+        database: &mut Database,
+        prepared: &PreparedSqlStatement,
+    ) -> Result<ExecutionResult, DatabaseError> {
+        match prepared {
+            PreparedSqlStatement::Relational(statement) => {
+                adaptive_feedback::execute_prepared_with_optional_server_feedback(
+                    runtime,
+                    self,
+                    database,
+                    statement,
+                    &[],
+                )
+            }
+            PreparedSqlStatement::Ddl(statement) => self
+                .execute_ddl(database, statement)
+                .map(|_| ExecutionResult::AffectedRows(0)),
+        }
+    }
+
     fn execute(
         &mut self,
         database: &mut Database,
@@ -213,6 +237,10 @@ impl DatabaseSession {
             self.transaction = None;
         }
         result
+    }
+
+    fn has_explicit_transaction(&self) -> bool {
+        self.transaction.is_some()
     }
 
     fn execute_ddl(
@@ -443,10 +471,17 @@ impl SessionState {
     fn handle_prepared(
         &mut self,
         database: &mut Database,
+        adaptive_feedback: Option<&mut adaptive_feedback::ServerAdaptiveFeedbackRuntime>,
         request_id: u64,
         prepared: &PreparedSqlStatement,
     ) -> SessionResponse {
-        match self.execution.execute_sql_prepared(database, prepared) {
+        match self
+            .execution
+            .execute_sql_prepared_with_optional_server_feedback(
+                adaptive_feedback,
+                database,
+                prepared,
+            ) {
             Ok(ExecutionResult::AffectedRows(count)) => SessionResponse::standard(
                 self.success_batch(request_id, vec![ServerMessage::AffectedRows { count }]),
             ),
