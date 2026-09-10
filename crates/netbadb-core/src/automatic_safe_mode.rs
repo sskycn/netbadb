@@ -13,7 +13,10 @@ use crate::{
     AdaptiveColumnarCompactionExecutionReport, AdaptiveColumnarCompactionNoActionReason,
     AdaptiveColumnarCompactionObservation, AdaptiveColumnarCompactionOutcome,
     AdaptiveColumnarCompactionPolicy, AdaptiveColumnarCompactionProposal, AdaptiveCycleReport,
-    AdaptiveDecision, AdaptiveError, AdaptiveEvidencePool, AdaptiveMaintenanceOutcome,
+    AdaptiveDecision, AdaptiveError, AdaptiveEvidencePool, AdaptiveLsmCompactionPolicy,
+    AdaptiveLsmFlushPolicy, AdaptiveLsmMaintenanceDecision, AdaptiveLsmMaintenanceError,
+    AdaptiveLsmMaintenanceExecutionReport, AdaptiveLsmMaintenanceNoActionReason,
+    AdaptiveLsmMaintenanceOutcome, AdaptiveLsmMaintenanceProposal, AdaptiveMaintenanceOutcome,
     AdaptiveNoActionReason, AdaptivePolicy, AdaptiveWorkloadEvaluationReport,
     AdaptiveWorkloadLimits, AdaptiveWorkloadOutcome, AdaptiveWorkloadPolicy,
     AdaptiveWorkloadStaleReason, AdaptiveWorkloadTarget, AdaptiveWorkloadWindow, Database,
@@ -162,6 +165,7 @@ pub enum AutomaticSafeModeLane {
     ActivePlannerCalibrationTrial,
     ColumnarMaintenance,
     ChangeStreamReclamation,
+    AuthoritativeMaintenance,
     PlannerCalibration,
 }
 
@@ -181,6 +185,10 @@ pub enum AutomaticSafeModeMutation {
     ChangeStreamReclamation {
         storage_id: StorageId,
         new_earliest_frontier: StorageDataVersion,
+    },
+    LsmMaintenance {
+        storage_id: StorageId,
+        action: crate::AdaptiveLsmMaintenanceAction,
     },
     PlannerCalibrationApply {
         calibration_class: PlannerCalibrationClass,
@@ -218,6 +226,7 @@ pub enum AutomaticSafeModeNoAction {
     CalibrationAdvisorNoAction(PlannerCalibrationNoAction),
     CalibrationShadowRejected(PlannerCalibrationNoAction),
     ChangeStreamGcNoAction(AdaptiveChangeStreamGcNoActionReason),
+    LsmMaintenanceNoAction(AdaptiveLsmMaintenanceNoActionReason),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +252,9 @@ pub enum AutomaticSafeModeOutcome {
     ChangeStreamGcCompleted,
     ChangeStreamGcAborted,
     ChangeStreamGcInconclusive,
+    LsmMaintenanceCompleted,
+    LsmMaintenanceAborted,
+    LsmMaintenanceInconclusive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +280,7 @@ pub struct AutomaticSafeModeReport {
     pub columnar_cycle: Option<Box<AdaptiveCycleReport>>,
     pub columnar_compaction: Option<Box<AdaptiveColumnarCompactionExecutionReport>>,
     pub change_stream_gc: Option<Box<AdaptiveChangeStreamGcExecutionReport>>,
+    pub lsm_maintenance: Option<Box<AdaptiveLsmMaintenanceExecutionReport>>,
     pub workload_evaluation: Option<AdaptiveWorkloadEvaluationReport>,
     pub calibration_decision: Option<PlannerCalibrationDecision>,
     pub calibration_shadow: Option<PlannerCalibrationShadowDecision>,
@@ -293,7 +306,11 @@ pub struct AutomaticMultiSafeModePolicy {
     pub safe_mode: AutomaticSafeModePolicy,
     pub allow_columnar_compaction: bool,
     pub allow_change_stream_gc: bool,
+    pub allow_lsm_flush: bool,
+    pub allow_lsm_compaction: bool,
     pub change_stream_gc_policy: AdaptiveChangeStreamGcPolicy,
+    pub lsm_flush_policy: AdaptiveLsmFlushPolicy,
+    pub lsm_compaction_policy: AdaptiveLsmCompactionPolicy,
     pub columnar_compaction_policy: AdaptiveColumnarCompactionPolicy,
     pub cross_lane_service: AutomaticCrossLaneServicePolicy,
     pub max_candidate_tables: u64,
@@ -307,7 +324,11 @@ impl Default for AutomaticMultiSafeModePolicy {
             safe_mode: AutomaticSafeModePolicy::default(),
             allow_columnar_compaction: false,
             allow_change_stream_gc: false,
+            allow_lsm_flush: false,
+            allow_lsm_compaction: false,
             change_stream_gc_policy: AdaptiveChangeStreamGcPolicy::default(),
+            lsm_flush_policy: AdaptiveLsmFlushPolicy::default(),
+            lsm_compaction_policy: AdaptiveLsmCompactionPolicy::default(),
             columnar_compaction_policy: AdaptiveColumnarCompactionPolicy::default(),
             cross_lane_service: AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
             max_candidate_tables: 16,
@@ -340,7 +361,9 @@ pub enum AutomaticLaneSelectionReason {
     OnlyColumnarReady,
     OnlyCalibrationReady,
     OnlyReclamationReady,
+    OnlyAuthoritativeMaintenanceReady,
     ReclamationPriority,
+    AuthoritativeMaintenancePriority,
     NoReadyCandidates,
 }
 
@@ -361,6 +384,14 @@ pub enum AutomaticCandidateKey {
         table_id: TableId,
         storage_id: StorageId,
     },
+    LsmFlush {
+        table_id: TableId,
+        storage_id: StorageId,
+    },
+    LsmCompaction {
+        table_id: TableId,
+        storage_id: StorageId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +402,7 @@ pub enum AutomaticCandidateReadiness {
     CalibrationBlocked(PlannerCalibrationNoAction),
     CalibrationEvidenceUnavailable,
     ChangeStreamGcBlocked(AdaptiveChangeStreamGcNoActionReason),
+    LsmMaintenanceBlocked(AdaptiveLsmMaintenanceNoActionReason),
     StaleEvidence,
 }
 
@@ -390,6 +422,11 @@ pub struct AutomaticCandidateRankEvidence {
     pub reclaimable_mutations: Option<u64>,
     pub reclaimable_bytes: Option<u64>,
     pub safe_reclaim_frontier: Option<StorageDataVersion>,
+    pub lsm_memtable_entries: Option<u64>,
+    pub lsm_memtable_bytes: Option<u64>,
+    pub lsm_flush_threshold_bytes: Option<u64>,
+    pub lsm_compaction_input_bytes: Option<u64>,
+    pub lsm_compaction_work_units: Option<u64>,
     pub distinct_query_shapes: Option<u64>,
     pub sample_count: Option<u64>,
 }
@@ -426,6 +463,7 @@ pub struct AutomaticMultiSafeModeReport {
 pub enum AutomaticSafeModeError {
     Adaptive(AdaptiveError),
     ColumnarCompaction(AdaptiveColumnarCompactionError),
+    LsmMaintenance(AdaptiveLsmMaintenanceError),
     CalibrationAdvisor(PlannerCalibrationAdvisorError),
     CalibrationMutation(PlannerCalibrationMutationError),
     MissingColumnarMeasurement,
@@ -441,6 +479,7 @@ impl fmt::Display for AutomaticSafeModeError {
         match self {
             Self::Adaptive(error) => error.fmt(formatter),
             Self::ColumnarCompaction(error) => error.fmt(formatter),
+            Self::LsmMaintenance(error) => error.fmt(formatter),
             Self::CalibrationAdvisor(error) => error.fmt(formatter),
             Self::CalibrationMutation(error) => error.fmt(formatter),
             Self::MissingColumnarMeasurement => formatter.write_str(
@@ -467,6 +506,7 @@ impl Error for AutomaticSafeModeError {
         match self {
             Self::Adaptive(error) => Some(error),
             Self::ColumnarCompaction(error) => Some(error),
+            Self::LsmMaintenance(error) => Some(error),
             Self::CalibrationAdvisor(error) => Some(error),
             Self::CalibrationMutation(error) => Some(error),
             Self::Database(error) => Some(error),
@@ -488,6 +528,12 @@ impl From<AdaptiveError> for AutomaticSafeModeError {
 impl From<AdaptiveColumnarCompactionError> for AutomaticSafeModeError {
     fn from(error: AdaptiveColumnarCompactionError) -> Self {
         Self::ColumnarCompaction(error)
+    }
+}
+
+impl From<AdaptiveLsmMaintenanceError> for AutomaticSafeModeError {
+    fn from(error: AdaptiveLsmMaintenanceError) -> Self {
+        Self::LsmMaintenance(error)
     }
 }
 
@@ -560,6 +606,7 @@ enum AutomaticCandidateAuthority {
     ColumnarCompaction(Box<ColumnarCompactionCandidateAuthority>),
     PlannerCalibration(Box<CalibrationCandidateAuthority>),
     ChangeStreamGc(Box<ChangeStreamGcCandidateAuthority>),
+    LsmMaintenance(Box<LsmMaintenanceCandidateAuthority>),
 }
 
 #[derive(Debug, Clone)]
@@ -584,6 +631,11 @@ struct CalibrationCandidateAuthority {
 #[derive(Debug, Clone)]
 struct ChangeStreamGcCandidateAuthority {
     proposal: AdaptiveChangeStreamGcProposal,
+}
+
+#[derive(Debug, Clone)]
+struct LsmMaintenanceCandidateAuthority {
+    proposal: AdaptiveLsmMaintenanceProposal,
 }
 
 #[derive(Debug, Clone)]
@@ -647,16 +699,34 @@ impl Database {
             input.maintenance_budget,
             policy,
         )?;
-        validate_candidate_count(columnar.len(), reclamation.len(), 0, policy)?;
+        let authoritative = self.discover_lsm_maintenance_candidates(
+            input.scope.table_ids,
+            input.maintenance_budget,
+            policy,
+        )?;
+        validate_candidate_count(
+            columnar.len(),
+            reclamation.len(),
+            authoritative.len(),
+            0,
+            policy,
+        )?;
         let calibration = self.discover_calibration_candidates(
             pool,
             input.scope.calibration_classes,
             policy.safe_mode,
         )?;
-        validate_candidate_count(columnar.len(), reclamation.len(), calibration.len(), policy)?;
+        validate_candidate_count(
+            columnar.len(),
+            reclamation.len(),
+            authoritative.len(),
+            calibration.len(),
+            policy,
+        )?;
         let (preferred_lane, lane_selection_reason) = select_ready_lane(
             &columnar,
             &reclamation,
+            &authoritative,
             &calibration,
             policy.cross_lane_service,
             service_state,
@@ -665,6 +735,7 @@ impl Database {
             candidates: columnar
                 .into_iter()
                 .chain(reclamation)
+                .chain(authoritative)
                 .chain(calibration)
                 .map(|candidate| candidate.inspection)
                 .collect(),
@@ -769,22 +840,41 @@ impl Database {
             input.maintenance_budget,
             policy,
         )?;
-        validate_candidate_count(columnar.len(), reclamation.len(), 0, policy)?;
+        let mut authoritative = self.discover_lsm_maintenance_candidates(
+            input.scope.table_ids,
+            input.maintenance_budget,
+            policy,
+        )?;
+        validate_candidate_count(
+            columnar.len(),
+            reclamation.len(),
+            authoritative.len(),
+            0,
+            policy,
+        )?;
         let mut calibration = self.discover_calibration_candidates(
             pool,
             input.scope.calibration_classes,
             policy.safe_mode,
         )?;
-        validate_candidate_count(columnar.len(), reclamation.len(), calibration.len(), policy)?;
+        validate_candidate_count(
+            columnar.len(),
+            reclamation.len(),
+            authoritative.len(),
+            calibration.len(),
+            policy,
+        )?;
         let mut inspections = columnar
             .iter()
             .map(|candidate| candidate.inspection)
             .collect::<Vec<_>>();
         inspections.extend(reclamation.iter().map(|candidate| candidate.inspection));
+        inspections.extend(authoritative.iter().map(|candidate| candidate.inspection));
         inspections.extend(calibration.iter().map(|candidate| candidate.inspection));
         let (selected_lane, lane_selection_reason) = select_ready_lane(
             &columnar,
             &reclamation,
+            &authoritative,
             &calibration,
             policy.cross_lane_service,
             service_before,
@@ -795,6 +885,9 @@ impl Database {
             }
             AutomaticSafeModeLane::ChangeStreamReclamation => {
                 select_reclamation_candidate(&reclamation).map(|index| reclamation.remove(index))
+            }
+            AutomaticSafeModeLane::AuthoritativeMaintenance => {
+                select_lsm_candidate(&authoritative).map(|index| authoritative.remove(index))
             }
             AutomaticSafeModeLane::PlannerCalibration => {
                 select_calibration_candidate(&calibration).map(|index| calibration.remove(index))
@@ -822,6 +915,8 @@ impl Database {
         let no_action = if !policy.safe_mode.allow_columnar_maintenance
             && !policy.allow_columnar_compaction
             && !policy.allow_change_stream_gc
+            && !policy.allow_lsm_flush
+            && !policy.allow_lsm_compaction
             && !policy.safe_mode.allow_planner_calibration
         {
             AutomaticSafeModeNoAction::AutomaticActionsDisabled
@@ -1322,6 +1417,81 @@ impl Database {
         Ok(output)
     }
 
+    fn discover_lsm_maintenance_candidates(
+        &self,
+        table_ids: &[TableId],
+        budget: MaintenanceBudget,
+        policy: AutomaticMultiSafeModePolicy,
+    ) -> Result<Vec<DiscoveredAutomaticCandidate>, AutomaticSafeModeError> {
+        if !policy.allow_lsm_flush && !policy.allow_lsm_compaction {
+            return Ok(Vec::new());
+        }
+        let mut output = Vec::new();
+        for table_id in stable_unique_tables(table_ids) {
+            for observation in self.observe_adaptive_lsm_maintenance(table_id, budget)? {
+                if policy.allow_lsm_flush {
+                    let key = AutomaticCandidateKey::LsmFlush {
+                        table_id,
+                        storage_id: observation.storage_id,
+                    };
+                    let rank = AutomaticCandidateRankEvidence {
+                        ready_age: self.ready_age(key),
+                        maintenance_work_units: observation
+                            .maintenance
+                            .flush_conservative_bound
+                            .map(|bound| bound.work_units),
+                        read_bytes: observation
+                            .maintenance
+                            .flush_conservative_bound
+                            .map(|bound| bound.read_bytes),
+                        write_bytes: observation
+                            .maintenance
+                            .flush_conservative_bound
+                            .map(|bound| bound.write_bytes),
+                        lsm_memtable_entries: Some(observation.maintenance.memtable_entry_count),
+                        lsm_memtable_bytes: Some(observation.maintenance.memtable_bytes),
+                        lsm_flush_threshold_bytes: Some(
+                            observation.maintenance.memtable_flush_threshold_bytes,
+                        ),
+                        ..AutomaticCandidateRankEvidence::default()
+                    };
+                    output.push(lsm_discovered_candidate(
+                        key,
+                        rank,
+                        observation.decide_flush(policy.lsm_flush_policy, budget),
+                    ));
+                }
+                if policy.allow_lsm_compaction {
+                    let key = AutomaticCandidateKey::LsmCompaction {
+                        table_id,
+                        storage_id: observation.storage_id,
+                    };
+                    let plan = observation.maintenance.next_compaction.as_ref();
+                    let rank = AutomaticCandidateRankEvidence {
+                        ready_age: self.ready_age(key),
+                        maintenance_work_units: plan.map(|plan| plan.conservative_bound.work_units),
+                        read_bytes: plan.map(|plan| plan.conservative_bound.read_bytes),
+                        write_bytes: plan.map(|plan| plan.conservative_bound.write_bytes),
+                        lsm_memtable_entries: Some(observation.maintenance.memtable_entry_count),
+                        lsm_memtable_bytes: Some(observation.maintenance.memtable_bytes),
+                        lsm_flush_threshold_bytes: Some(
+                            observation.maintenance.memtable_flush_threshold_bytes,
+                        ),
+                        lsm_compaction_input_bytes: plan.map(|plan| plan.input_bytes),
+                        lsm_compaction_work_units: plan.map(|plan| plan.input_entries),
+                        ..AutomaticCandidateRankEvidence::default()
+                    };
+                    output.push(lsm_discovered_candidate(
+                        key,
+                        rank,
+                        observation.decide_compaction(policy.lsm_compaction_policy, budget),
+                    ));
+                }
+            }
+        }
+        Ok(output)
+    }
+
     fn ready_age(&self, key: AutomaticCandidateKey) -> u64 {
         self.automatic_safe_mode
             .admission
@@ -1384,6 +1554,7 @@ impl Database {
                     .consecutive_columnar_admissions = 0;
             }
             AutomaticSafeModeLane::ChangeStreamReclamation => {}
+            AutomaticSafeModeLane::AuthoritativeMaintenance => {}
             AutomaticSafeModeLane::None
             | AutomaticSafeModeLane::ActiveColumnarTrial
             | AutomaticSafeModeLane::ActivePlannerCalibrationTrial => {}
@@ -1540,6 +1711,44 @@ impl Database {
                 report.change_stream_gc = Some(Box::new(execution));
                 Ok(report)
             }
+            Some(AutomaticCandidateAuthority::LsmMaintenance(authority)) => {
+                let LsmMaintenanceCandidateAuthority { proposal } = *authority;
+                let execution = self.execute_adaptive_lsm_maintenance(&proposal, budget)?;
+                let mutation = (execution.outcome == AdaptiveLsmMaintenanceOutcome::Completed)
+                    .then_some(AutomaticSafeModeMutation::LsmMaintenance {
+                        storage_id: match &proposal {
+                            AdaptiveLsmMaintenanceProposal::Flush(proposal) => proposal.storage_id,
+                            AdaptiveLsmMaintenanceProposal::CompactOne(proposal) => {
+                                proposal.storage_id
+                            }
+                        },
+                        action: proposal.action(),
+                    });
+                let outcome = match execution.outcome {
+                    AdaptiveLsmMaintenanceOutcome::Completed => {
+                        AutomaticSafeModeOutcome::LsmMaintenanceCompleted
+                    }
+                    AdaptiveLsmMaintenanceOutcome::Aborted(_) => {
+                        AutomaticSafeModeOutcome::LsmMaintenanceAborted
+                    }
+                    AdaptiveLsmMaintenanceOutcome::InconclusiveNoWork => {
+                        AutomaticSafeModeOutcome::LsmMaintenanceInconclusive
+                    }
+                };
+                let mut report = self.finish_automatic_report(
+                    trial_before,
+                    AutomaticSafeModeLane::AuthoritativeMaintenance,
+                    mutation,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    outcome,
+                );
+                report.lsm_maintenance = Some(Box::new(execution));
+                Ok(report)
+            }
             Some(AutomaticCandidateAuthority::PlannerCalibration(authority)) => {
                 let CalibrationCandidateAuthority {
                     decision,
@@ -1603,6 +1812,7 @@ impl Database {
             columnar_cycle,
             columnar_compaction: None,
             change_stream_gc: None,
+            lsm_maintenance: None,
             workload_evaluation,
             calibration_decision,
             calibration_shadow,
@@ -1900,12 +2110,14 @@ fn validate_multi_scope(
 fn validate_candidate_count(
     columnar: usize,
     reclamation: usize,
+    authoritative: usize,
     calibration: usize,
     policy: AutomaticMultiSafeModePolicy,
 ) -> Result<(), AutomaticSafeModeError> {
     if u64::try_from(
         columnar
             .saturating_add(reclamation)
+            .saturating_add(authoritative)
             .saturating_add(calibration),
     )
     .map_or(true, |count| count > policy.max_fairness_entries)
@@ -1915,9 +2127,41 @@ fn validate_candidate_count(
     Ok(())
 }
 
+fn lsm_discovered_candidate(
+    key: AutomaticCandidateKey,
+    rank: AutomaticCandidateRankEvidence,
+    decision: AdaptiveLsmMaintenanceDecision,
+) -> DiscoveredAutomaticCandidate {
+    match decision {
+        AdaptiveLsmMaintenanceDecision::Proposal(proposal) => DiscoveredAutomaticCandidate {
+            inspection: AutomaticCandidateInspection {
+                key,
+                lane: AutomaticSafeModeLane::AuthoritativeMaintenance,
+                readiness: AutomaticCandidateReadiness::Ready,
+                rank,
+            },
+            authority: Some(AutomaticCandidateAuthority::LsmMaintenance(Box::new(
+                LsmMaintenanceCandidateAuthority {
+                    proposal: *proposal,
+                },
+            ))),
+        },
+        AdaptiveLsmMaintenanceDecision::NoAction(reason) => DiscoveredAutomaticCandidate {
+            inspection: AutomaticCandidateInspection {
+                key,
+                lane: AutomaticSafeModeLane::AuthoritativeMaintenance,
+                readiness: AutomaticCandidateReadiness::LsmMaintenanceBlocked(reason),
+                rank,
+            },
+            authority: None,
+        },
+    }
+}
+
 fn select_ready_lane(
     columnar: &[DiscoveredAutomaticCandidate],
     reclamation: &[DiscoveredAutomaticCandidate],
+    authoritative: &[DiscoveredAutomaticCandidate],
     calibration: &[DiscoveredAutomaticCandidate],
     policy: AutomaticCrossLaneServicePolicy,
     state: AutomaticCrossLaneServiceState,
@@ -1931,36 +2175,11 @@ fn select_ready_lane(
     let reclamation_ready = reclamation
         .iter()
         .any(|candidate| candidate.inspection.readiness == AutomaticCandidateReadiness::Ready);
-    match (columnar_ready, reclamation_ready, calibration_ready) {
-        (true, false, false) => (
-            AutomaticSafeModeLane::ColumnarMaintenance,
-            AutomaticLaneSelectionReason::OnlyColumnarReady,
-        ),
-        (false, false, true) => (
-            AutomaticSafeModeLane::PlannerCalibration,
-            AutomaticLaneSelectionReason::OnlyCalibrationReady,
-        ),
-        (false, true, false) => (
-            AutomaticSafeModeLane::ChangeStreamReclamation,
-            AutomaticLaneSelectionReason::OnlyReclamationReady,
-        ),
-        (false, true, true) => (
-            AutomaticSafeModeLane::ChangeStreamReclamation,
-            AutomaticLaneSelectionReason::ReclamationPriority,
-        ),
-        (false, false, false) => (
-            AutomaticSafeModeLane::None,
-            AutomaticLaneSelectionReason::NoReadyCandidates,
-        ),
-        (true, _, false) => (
-            AutomaticSafeModeLane::ColumnarMaintenance,
-            AutomaticLaneSelectionReason::StrictPhysicalPriority,
-        ),
-        (true, _, true) => match policy {
-            AutomaticCrossLaneServicePolicy::StrictPhysicalPriority => (
-                AutomaticSafeModeLane::ColumnarMaintenance,
-                AutomaticLaneSelectionReason::StrictPhysicalPriority,
-            ),
+    let authoritative_ready = authoritative
+        .iter()
+        .any(|candidate| candidate.inspection.readiness == AutomaticCandidateReadiness::Ready);
+    if columnar_ready && calibration_ready {
+        return match policy {
             AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
                 max_consecutive_columnar_admissions,
             } if state.consecutive_columnar_admissions >= max_consecutive_columnar_admissions => (
@@ -1971,8 +2190,48 @@ fn select_ready_lane(
                 AutomaticSafeModeLane::ColumnarMaintenance,
                 AutomaticLaneSelectionReason::ColumnarBurstAvailable,
             ),
-        },
+            AutomaticCrossLaneServicePolicy::StrictPhysicalPriority => (
+                AutomaticSafeModeLane::ColumnarMaintenance,
+                AutomaticLaneSelectionReason::StrictPhysicalPriority,
+            ),
+        };
     }
+    if columnar_ready {
+        return (
+            AutomaticSafeModeLane::ColumnarMaintenance,
+            AutomaticLaneSelectionReason::OnlyColumnarReady,
+        );
+    }
+    if reclamation_ready {
+        return (
+            AutomaticSafeModeLane::ChangeStreamReclamation,
+            if calibration_ready || authoritative_ready {
+                AutomaticLaneSelectionReason::ReclamationPriority
+            } else {
+                AutomaticLaneSelectionReason::OnlyReclamationReady
+            },
+        );
+    }
+    if authoritative_ready {
+        return (
+            AutomaticSafeModeLane::AuthoritativeMaintenance,
+            if calibration_ready {
+                AutomaticLaneSelectionReason::AuthoritativeMaintenancePriority
+            } else {
+                AutomaticLaneSelectionReason::OnlyAuthoritativeMaintenanceReady
+            },
+        );
+    }
+    if calibration_ready {
+        return (
+            AutomaticSafeModeLane::PlannerCalibration,
+            AutomaticLaneSelectionReason::OnlyCalibrationReady,
+        );
+    }
+    (
+        AutomaticSafeModeLane::None,
+        AutomaticLaneSelectionReason::NoReadyCandidates,
+    )
 }
 
 fn compaction_rank_evidence(
@@ -2087,7 +2346,72 @@ const fn columnar_class_priority(key: AutomaticCandidateKey) -> u8 {
         AutomaticCandidateKey::Columnar { .. } => 1,
         AutomaticCandidateKey::ColumnarCompaction { .. } => 0,
         AutomaticCandidateKey::PlannerCalibration { .. }
-        | AutomaticCandidateKey::ChangeStreamGc { .. } => 0,
+        | AutomaticCandidateKey::ChangeStreamGc { .. }
+        | AutomaticCandidateKey::LsmFlush { .. }
+        | AutomaticCandidateKey::LsmCompaction { .. } => 0,
+    }
+}
+
+fn select_lsm_candidate(candidates: &[DiscoveredAutomaticCandidate]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.inspection.readiness == AutomaticCandidateReadiness::Ready
+        })
+        .max_by(|(_, left), (_, right)| compare_lsm_rank(&left.inspection, &right.inspection))
+        .map(|(index, _)| index)
+}
+
+fn compare_lsm_rank(
+    left: &AutomaticCandidateInspection,
+    right: &AutomaticCandidateInspection,
+) -> std::cmp::Ordering {
+    left.rank
+        .ready_age
+        .cmp(&right.rank.ready_age)
+        .then_with(|| lsm_class_priority(left.key).cmp(&lsm_class_priority(right.key)))
+        .then_with(|| match (left.key, right.key) {
+            (AutomaticCandidateKey::LsmFlush { .. }, AutomaticCandidateKey::LsmFlush { .. }) => {
+                left.rank
+                    .lsm_memtable_bytes
+                    .cmp(&right.rank.lsm_memtable_bytes)
+                    .then_with(|| {
+                        left.rank
+                            .lsm_memtable_entries
+                            .cmp(&right.rank.lsm_memtable_entries)
+                    })
+                    .then_with(|| {
+                        right
+                            .rank
+                            .maintenance_work_units
+                            .cmp(&left.rank.maintenance_work_units)
+                    })
+                    .then_with(|| right.rank.write_bytes.cmp(&left.rank.write_bytes))
+            }
+            (
+                AutomaticCandidateKey::LsmCompaction { .. },
+                AutomaticCandidateKey::LsmCompaction { .. },
+            ) => left
+                .rank
+                .lsm_compaction_input_bytes
+                .cmp(&right.rank.lsm_compaction_input_bytes)
+                .then_with(|| {
+                    left.rank
+                        .lsm_compaction_work_units
+                        .cmp(&right.rank.lsm_compaction_work_units)
+                })
+                .then_with(|| right.rank.write_bytes.cmp(&left.rank.write_bytes)),
+            _ => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| right.key.cmp(&left.key))
+}
+
+const fn lsm_class_priority(key: AutomaticCandidateKey) -> u8 {
+    match key {
+        AutomaticCandidateKey::LsmFlush { .. } => 1,
+        AutomaticCandidateKey::LsmCompaction { .. } => 0,
+        _ => 0,
     }
 }
 
@@ -2270,6 +2594,42 @@ mod admission_tests {
         }
     }
 
+    fn lsm(
+        table: u64,
+        storage: u64,
+        flush: bool,
+        age: u64,
+        bytes: u64,
+    ) -> DiscoveredAutomaticCandidate {
+        DiscoveredAutomaticCandidate {
+            inspection: AutomaticCandidateInspection {
+                key: if flush {
+                    AutomaticCandidateKey::LsmFlush {
+                        table_id: TableId(table),
+                        storage_id: StorageId(storage),
+                    }
+                } else {
+                    AutomaticCandidateKey::LsmCompaction {
+                        table_id: TableId(table),
+                        storage_id: StorageId(storage),
+                    }
+                },
+                lane: AutomaticSafeModeLane::AuthoritativeMaintenance,
+                readiness: AutomaticCandidateReadiness::Ready,
+                rank: AutomaticCandidateRankEvidence {
+                    ready_age: age,
+                    write_bytes: Some(bytes),
+                    lsm_memtable_entries: flush.then_some(2),
+                    lsm_memtable_bytes: flush.then_some(bytes),
+                    lsm_compaction_input_bytes: (!flush).then_some(bytes),
+                    lsm_compaction_work_units: (!flush).then_some(2),
+                    ..AutomaticCandidateRankEvidence::default()
+                },
+            },
+            authority: None,
+        }
+    }
+
     #[test]
     fn ready_age_precedes_merit_and_never_makes_blocked_ready() {
         let high = columnar(1, 1, 0, 10_000, 1);
@@ -2324,6 +2684,54 @@ mod admission_tests {
     }
 
     #[test]
+    fn lsm_rank_uses_age_then_flush_priority_then_real_pressure() {
+        let flush = lsm(1, 1, true, 0, 10);
+        let compact = lsm(2, 2, false, 0, 10_000);
+        assert_eq!(select_lsm_candidate(&[flush, compact]), Some(0));
+
+        let flush = lsm(1, 1, true, 0, 10_000);
+        let aged_compact = lsm(2, 2, false, 1, 1);
+        assert_eq!(select_lsm_candidate(&[flush, aged_compact]), Some(1));
+
+        let small = lsm(1, 1, false, 0, 10);
+        let large = lsm(2, 2, false, 0, 100);
+        assert_eq!(select_lsm_candidate(&[small, large]), Some(1));
+    }
+
+    #[test]
+    fn authoritative_lane_follows_reclamation_and_precedes_calibration() {
+        let authoritative = vec![lsm(1, 1, true, 0, 10)];
+        let calibration = vec![calibration(PlannerCalibrationClass::Columnar, 0, 1)];
+        assert_eq!(
+            select_ready_lane(
+                &[],
+                &[],
+                &authoritative,
+                &calibration,
+                AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
+                AutomaticCrossLaneServiceState::default(),
+            ),
+            (
+                AutomaticSafeModeLane::AuthoritativeMaintenance,
+                AutomaticLaneSelectionReason::AuthoritativeMaintenancePriority,
+            )
+        );
+        let reclamation = vec![reclamation(2, 2, 0, 20)];
+        assert_eq!(
+            select_ready_lane(
+                &[],
+                &reclamation,
+                &authoritative,
+                &calibration,
+                AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
+                AutomaticCrossLaneServiceState::default(),
+            )
+            .0,
+            AutomaticSafeModeLane::ChangeStreamReclamation
+        );
+    }
+
+    #[test]
     fn cross_lane_service_is_opt_in_and_cannot_override_readiness() {
         assert_eq!(
             AutomaticMultiSafeModePolicy::default().cross_lane_service,
@@ -2338,6 +2746,7 @@ mod admission_tests {
             select_ready_lane(
                 &columnar,
                 &[],
+                &[],
                 &calibration,
                 AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
                 state,
@@ -2350,6 +2759,7 @@ mod admission_tests {
         assert_eq!(
             select_ready_lane(
                 &columnar,
+                &[],
                 &[],
                 &calibration,
                 AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
@@ -2367,6 +2777,7 @@ mod admission_tests {
         assert_eq!(
             select_ready_lane(
                 &columnar,
+                &[],
                 &[],
                 &[blocked],
                 AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
@@ -2393,6 +2804,7 @@ mod admission_tests {
             select_ready_lane(
                 &columnar,
                 &reclamation,
+                &[],
                 &calibration,
                 AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
                 state,
@@ -2406,6 +2818,7 @@ mod admission_tests {
             select_ready_lane(
                 &[],
                 &reclamation,
+                &[],
                 &calibration,
                 AutomaticCrossLaneServicePolicy::StrictPhysicalPriority,
                 state,
@@ -2419,6 +2832,7 @@ mod admission_tests {
             select_ready_lane(
                 &columnar,
                 &reclamation,
+                &[],
                 &calibration,
                 AutomaticCrossLaneServicePolicy::BoundedColumnarBurst {
                     max_consecutive_columnar_admissions: 2,

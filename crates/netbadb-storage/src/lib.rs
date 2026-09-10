@@ -45,10 +45,12 @@ pub(crate) use lsm::LsmRowHandle;
 pub use lsm::{
     DEFAULT_LSM_MEMTABLE_FLUSH_BYTES, LSM_MANIFEST_FORMAT_VERSION, LSM_MAX_LEVELS,
     LSM_MAX_PENDING_MUTATIONS, LSM_MAX_PENDING_TRANSACTION_BYTES, LSM_SSTABLE_FORMAT_VERSION,
-    LSM_WAL_FORMAT_VERSION, LsmError, LsmIdentityInspection, LsmInspection, LsmLevelInspection,
-    LsmMaintenanceCostInspection, LsmMaintenanceInspection, LsmReadAmplification, LsmReadView,
-    LsmRecoveryInspection, LsmStorage, LsmTransaction, LsmWriteAmplification,
-    fuzz_lsm_manifest_bytes, fuzz_lsm_sstable_block_bytes, fuzz_lsm_wal_bytes,
+    LSM_WAL_FORMAT_VERSION, LsmCompactionPlanInspection, LsmError, LsmIdentityInspection,
+    LsmInspection, LsmLevelInspection, LsmMaintenanceAnchor, LsmMaintenanceBoundInspection,
+    LsmMaintenanceCostInspection, LsmMaintenanceInspection, LsmMaintenanceSafetyBlocker,
+    LsmReadAmplification, LsmReadView, LsmRecoveryInspection, LsmStorage, LsmTransaction,
+    LsmWriteAmplification, fuzz_lsm_manifest_bytes, fuzz_lsm_sstable_block_bytes,
+    fuzz_lsm_wal_bytes,
 };
 pub use mvcc::{IsolationLevel, ReadView, Snapshot};
 pub use netbadb_index::{IndexDefinition, IndexStatistics, TableStatistics};
