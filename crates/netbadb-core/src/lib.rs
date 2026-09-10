@@ -4967,6 +4967,13 @@ impl Database {
         self.validate_transaction(transaction)?;
         self.validate_prepared_dependencies(prepared, Some(transaction))?;
         let logical = bind_statement(&prepared.compiled, values)?;
+        #[cfg(test)]
+        if matches!(
+            transaction.schema_composition,
+            schema_composition::SchemaCompositionState::TypeConversionReady(_)
+        ) {
+            return Err(SchemaMutationError::MigrationDataAccessAfterRefinement.into());
+        }
         if let Some(affected_rows) =
             deferred_backfill::try_execute_adopted_update(self, transaction, &logical)?
         {
@@ -11400,6 +11407,8 @@ mod tests {
 
 #[cfg(test)]
 mod adopted_source_refinement_expansion_audit_tests;
+#[cfg(test)]
+mod alter_type_using_audit_tests;
 #[cfg(test)]
 mod change_stream_schema_replacement_audit_tests;
 #[cfg(test)]

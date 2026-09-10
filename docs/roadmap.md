@@ -31,6 +31,27 @@ See [`phase3d-batched-participant-commit.md`](phase3d-batched-participant-commit
 
 See [`phase3c-explicit-group-commit.md`](phase3c-explicit-group-commit.md).
 
+## Synthetic `ALTER COLUMN TYPE ... USING` lowering audit (Round 61 complete)
+
+- selected a fresh-ColumnId synthetic shadow plan over fake writers, internal
+  SQL choreography, same-ID rewrites, early S2, a second evaluator, and
+  multi-transaction migration;
+- executable-proved one shared deferred action/materializer for pristine
+  committed S1 and same-table post-DML transaction-visible S1/P1 authority,
+  with no fake participant;
+- preserved public name, declaration ordinal, nullability, unrelated index
+  identity, and replaced one supported old index with a fresh IndexId;
+- added a test-only sealed logical state, pre-reservation validation, exact
+  tag-25/tag-35 asymmetry, one validation scan, one S2 copy pass, and
+  pre/post-Decision recovery across three reopens;
+- proved Phase 9 reclamation does not weaken the Round 52 Enabled-stream guard,
+  and retained group, Columnar, maintenance, CAST, format, and production
+  parser/HIR/PostgreSQL boundaries.
+
+Production still rejects `ALTER COLUMN TYPE`; Round 62 may open only the
+bounded USING-required surface described in
+[`alter-type-using-round61.md`](alter-type-using-round61.md).
+
 ## Production cross-physical CAST and atomic shadow migration (Round 60 complete)
 
 - productionized one typed CAST semantics across HIR, relational binding,

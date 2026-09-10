@@ -116,7 +116,8 @@ IndexCatalog/BTree, NBCL, NBCM/NBCS/NBCD/NBPC, Partition/LSM, native Protocol
 v2, PostgreSQL framing, manifests, SDK schema and Inspection JSON version are
 unchanged. Inspection content is more truthful for Cast but retains JSON v7.
 
-Round 61 may evaluate `ALTER COLUMN TYPE ... USING` as syntax that synthesizes
-the proven shadow workflow. Float conversion, Bytes conversion, imported/LSM/
-partitioned migration, general constraint rewriting and automatic type
-migration remain outside Round 60.
+Round 61 has now selected and executable-proved a fresh-ColumnId synthetic
+lowering for `ALTER COLUMN TYPE ... USING` without opening production syntax;
+see [`alter-type-using-round61.md`](alter-type-using-round61.md). Float
+conversion, Bytes conversion, imported/LSM/partitioned migration, general
+constraint rewriting and automatic type migration remain outside Round 60.

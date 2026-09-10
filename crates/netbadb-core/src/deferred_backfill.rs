@@ -260,6 +260,34 @@ struct DeferredBackfillAction {
     semantic_digest: [u8; 32],
 }
 
+/// Narrow source authority used while observing one deferred action. The
+/// distinction is about which existing read view is authoritative; it does not
+/// change row evaluation or deferred-program semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferredSourceAuthority {
+    #[cfg(test)]
+    CommittedStorageView {
+        storage: StorageId,
+    },
+    TransactionStorageView {
+        storage: StorageId,
+    },
+}
+
+/// An observed action that is not installed in a transaction-local program
+/// until all statement validation and durable identity reservations succeed.
+#[cfg(test)]
+pub(crate) struct PendingDeferredAction {
+    action: DeferredBackfillAction,
+}
+
+#[cfg(test)]
+impl PendingDeferredAction {
+    pub(crate) fn semantic_digest(&self) -> [u8; 32] {
+        self.action.semantic_digest
+    }
+}
+
 impl DeferredBackfillAction {
     fn evaluate(
         &self,
@@ -324,6 +352,16 @@ impl DeferredBackfillProgram {
             self.evaluation_schema = Some(FrozenEvaluationSchema::capture(target, target_version));
         }
         self.actions.push(action);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accept_pending_action(
+        &mut self,
+        pending: PendingDeferredAction,
+        target: &TableDef,
+        target_version: TableSchemaVersion,
+    ) {
+        self.accept_action(pending.action, target, target_version);
     }
 
     pub(crate) fn begin_finalization(&self) -> Vec<ActionAccumulator> {
@@ -738,31 +776,20 @@ fn scan_and_predicate(
     }
 }
 
-fn build_action(
-    statement: &LogicalStatement,
+fn build_action_parts(
+    table_id: TableId,
+    scan_columns: &[netbadb_rel::ColumnRef],
+    predicate: Option<&Expr>,
+    assignments: &[Assignment],
     base: &TableDef,
     target: &TableDef,
     reserved: &BTreeSet<ColumnId>,
 ) -> Result<Option<DeferredBackfillAction>, DatabaseError> {
-    let LogicalStatement::Update {
-        input,
-        table_id,
-        assignments,
-    } = statement
-    else {
-        return Ok(None);
-    };
-    if *table_id != base.id || target.id != base.id || assignments.is_empty() {
+    if table_id != base.id || target.id != base.id || assignments.is_empty() {
         return Ok(None);
     }
     if assignments.len() > MAX_ASSIGNMENTS_PER_ACTION {
         return Err(SchemaMutationError::CompositionLimitExceeded("deferred assignments").into());
-    }
-    let Some((scan_table, scan_columns, predicate)) = scan_and_predicate(input) else {
-        return Ok(None);
-    };
-    if scan_table != *table_id {
-        return Ok(None);
     }
     let surviving = target
         .columns
@@ -787,7 +814,7 @@ fn build_action(
         .collect::<BTreeSet<_>>();
     let target_positions = scan_columns
         .iter()
-        .filter(|column| column.table_id == *table_id && readable.contains(&column.column_id))
+        .filter(|column| column.table_id == table_id && readable.contains(&column.column_id))
         .map(|column| {
             target
                 .columns
@@ -811,7 +838,7 @@ fn build_action(
     };
     let mut node_count = 0;
     if let Some(expression) = predicate {
-        if !expression_is_eligible(expression, *table_id, &readable, 1, &mut node_count)? {
+        if !expression_is_eligible(expression, table_id, &readable, 1, &mut node_count)? {
             return Ok(None);
         }
     }
@@ -822,11 +849,11 @@ fn build_action(
         };
         if base.column_by_id(column.column_id).is_some()
             || !reserved.contains(&column.column_id)
-            || column.table_id != *table_id
+            || column.table_id != table_id
         {
             return Ok(None);
         }
-        if !expression_is_eligible(value, *table_id, &readable, 1, &mut node_count)? {
+        if !expression_is_eligible(value, table_id, &readable, 1, &mut node_count)? {
             return Ok(None);
         }
         let target_position = target
@@ -869,6 +896,103 @@ fn build_action(
         },
         semantic_digest: semantic.finalize().into(),
     }))
+}
+
+fn build_action(
+    statement: &LogicalStatement,
+    base: &TableDef,
+    target: &TableDef,
+    reserved: &BTreeSet<ColumnId>,
+) -> Result<Option<DeferredBackfillAction>, DatabaseError> {
+    let LogicalStatement::Update {
+        input,
+        table_id,
+        assignments,
+    } = statement
+    else {
+        return Ok(None);
+    };
+    let Some((scan_table, scan_columns, predicate)) = scan_and_predicate(input) else {
+        return Ok(None);
+    };
+    if scan_table != *table_id {
+        return Ok(None);
+    }
+    build_action_parts(
+        *table_id,
+        scan_columns,
+        predicate,
+        assignments,
+        base,
+        target,
+        reserved,
+    )
+}
+
+#[cfg(test)]
+fn collect_expression_columns(expression: &Expr, columns: &mut Vec<netbadb_rel::ColumnRef>) {
+    match &expression.kind {
+        ExprKind::Column(column) => {
+            if !columns.iter().any(|candidate| {
+                candidate.binding_id == column.binding_id && candidate.column_id == column.column_id
+            }) {
+                columns.push(column.clone());
+            }
+        }
+        ExprKind::Literal(_) | ExprKind::Parameter(_) => {}
+        ExprKind::Cast { expression }
+        | ExprKind::Unary { expression, .. }
+        | ExprKind::IsNull { expression, .. } => collect_expression_columns(expression, columns),
+        ExprKind::Binary { left, right, .. } => {
+            collect_expression_columns(left, columns);
+            collect_expression_columns(right, columns);
+        }
+    }
+}
+
+/// Builds the one assignment synthesized by the Round 61 test carrier. The
+/// input expression is already typed and bound against the pre-change schema;
+/// this function neither parses source text nor selects a conversion.
+#[cfg(test)]
+pub(crate) fn build_synthetic_assignment(
+    using: Expr,
+    base: &TableDef,
+    evaluation: &TableDef,
+    target_column: ColumnId,
+) -> Result<PendingDeferredAction, DatabaseError> {
+    let target = evaluation
+        .column_by_id(target_column)
+        .ok_or(SchemaMutationError::Corrupt(
+            "synthetic deferred target column absent",
+        ))?;
+    let mut scan_columns = Vec::new();
+    collect_expression_columns(&using, &mut scan_columns);
+    let assignment = Assignment {
+        column: netbadb_rel::ColumnRef {
+            binding_id: netbadb_types::RelationBindingId(0),
+            table_id: base.id,
+            column_id: target_column,
+            relation_name: evaluation.name.clone(),
+            name: target.name.clone(),
+            data_type: target.semantic_type(),
+            nullable: target.nullable,
+        },
+        value: using,
+    };
+    let reserved = BTreeSet::from([target_column]);
+    let action = build_action_parts(
+        base.id,
+        &scan_columns,
+        None,
+        &[assignment],
+        base,
+        evaluation,
+        &reserved,
+    )?
+    .ok_or(SchemaMutationError::InvalidSchemaEvolution(
+        "USING expression is not a same-table scalar expression",
+    ))?;
+    Ok(PendingDeferredAction { action })
 }
 
 struct AdoptedParts {
@@ -927,6 +1051,241 @@ fn adopted_parts(transaction: &Transaction) -> Result<AdoptedParts, DatabaseErro
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn observe_action(
+    database: &mut Database,
+    transaction: &mut Transaction,
+    authority: DeferredSourceAuthority,
+    base: &TableDef,
+    projection: &RowProjection,
+    prefix: &DeferredBackfillProgram,
+    action: &DeferredBackfillAction,
+    final_table: Option<&TableDef>,
+    evaluation: &TableDef,
+) -> Result<ActionObservation, DatabaseError> {
+    let storage = match authority {
+        #[cfg(test)]
+        DeferredSourceAuthority::CommittedStorageView { storage }
+        | DeferredSourceAuthority::TransactionStorageView { storage } => storage,
+        #[cfg(not(test))]
+        DeferredSourceAuthority::TransactionStorageView { storage } => storage,
+    };
+    let transaction_view = match authority {
+        #[cfg(test)]
+        DeferredSourceAuthority::CommittedStorageView { .. } => None,
+        DeferredSourceAuthority::TransactionStorageView { .. } => {
+            Some(transaction.begin_read_view(&[storage], &mut database.registry)?)
+        }
+    };
+    let committed_view = match authority {
+        #[cfg(test)]
+        DeferredSourceAuthority::CommittedStorageView { .. } => Some(
+            database
+                .registry
+                .get(storage)
+                .ok_or(SchemaMutationError::Corrupt("deferred source Heap absent"))?
+                .read_view()?,
+        ),
+        DeferredSourceAuthority::TransactionStorageView { .. } => None,
+    };
+    let source_view = match (&transaction_view, &committed_view) {
+        (Some(view), None) => view
+            .iter()
+            .find_map(|(candidate, view)| (candidate == storage).then_some(view))
+            .ok_or(SchemaMutationError::Corrupt(
+                "deferred transaction source read view absent",
+            ))?,
+        (None, Some(view)) => view,
+        _ => {
+            return Err(SchemaMutationError::Corrupt("deferred source view state invalid").into());
+        }
+    };
+    let columns = base
+        .columns
+        .iter()
+        .map(|column| column.id)
+        .collect::<Vec<_>>();
+    let final_projection = final_table
+        .map(|final_table| FinalOutputProjection::build(evaluation, final_table))
+        .transpose()?;
+    let mut observation = ActionAccumulator::new();
+    let mut prefix_observations = prefix.begin_finalization();
+    let flow = database
+        .registry
+        .get_mut(storage)
+        .ok_or(SchemaMutationError::Corrupt("deferred source Heap absent"))?
+        .visit_rows_with_view_control::<DatabaseError, _>(
+            &columns,
+            source_view,
+            |_row, source_values| {
+                let mut virtual_values =
+                    projection.project_without_target_constraints(&source_values)?;
+                prefix.apply_row(
+                    &source_values,
+                    &mut virtual_values,
+                    &mut prefix_observations,
+                )?;
+                if final_projection.is_none() {
+                    projection.validate_target_constraints(&virtual_values)?;
+                }
+                if let Some(assignments) = action.evaluate(&virtual_values)? {
+                    let digest_values = assignments
+                        .iter()
+                        .map(|(column, _, value)| (*column, value.clone()))
+                        .collect::<Vec<_>>();
+                    observation.observe(&source_values, &digest_values)?;
+                    if let Some(final_projection) = &final_projection {
+                        for (_, position, value) in assignments {
+                            *virtual_values.get_mut(position).ok_or(
+                                SchemaMutationError::Corrupt(
+                                    "synthetic deferred target ordinal out of bounds",
+                                ),
+                            )? = value;
+                        }
+                        final_projection.project(virtual_values)?;
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+    if flow.is_break() {
+        return Err(SchemaMutationError::Corrupt(
+            "deferred source row visitor stopped unexpectedly",
+        )
+        .into());
+    }
+    prefix.verify_finalization(prefix_observations)?;
+    Ok(observation.finish())
+}
+
+/// Executes the complete Round 61 acceptance scan without retaining converted
+/// rows. The same pending action and frozen evaluation schema are installed
+/// only after this function succeeds.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observe_synthetic_assignment(
+    database: &mut Database,
+    transaction: &mut Transaction,
+    authority: DeferredSourceAuthority,
+    pending: &mut PendingDeferredAction,
+    base: &TableDef,
+    base_version: TableSchemaVersion,
+    evaluation: &TableDef,
+    evaluation_version: TableSchemaVersion,
+    final_table: &TableDef,
+    target_column: ColumnId,
+) -> Result<u64, DatabaseError> {
+    let projection = RowProjection::build(
+        base,
+        base_version,
+        evaluation,
+        evaluation_version,
+        &BTreeSet::from([target_column]),
+    )?;
+    let prefix = DeferredBackfillProgram::default();
+    let expected = observe_action(
+        database,
+        transaction,
+        authority,
+        base,
+        &projection,
+        &prefix,
+        &pending.action,
+        Some(final_table),
+        evaluation,
+    )?;
+    let affected_rows = expected.affected_rows;
+    pending.action.expected = expected;
+    Ok(affected_rows)
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SyntheticDeferredCost {
+    pub(crate) validation: std::time::Duration,
+    pub(crate) finalization: std::time::Duration,
+    pub(crate) transient_vector_allocations: usize,
+    pub(crate) resident_metadata_bytes: usize,
+}
+
+/// In-memory cost observation for the exact synthetic action and E-to-F row
+/// path. Heap I/O and fixture construction are deliberately excluded.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn audit_synthetic_deferred_cost<F>(
+    using: Expr,
+    base: &TableDef,
+    base_version: TableSchemaVersion,
+    evaluation: &TableDef,
+    evaluation_version: TableSchemaVersion,
+    final_table: &TableDef,
+    target_column: ColumnId,
+    rows: usize,
+    mut source_row: F,
+) -> Result<SyntheticDeferredCost, DatabaseError>
+where
+    F: FnMut(usize) -> Vec<ScalarValue>,
+{
+    let mut pending = build_synthetic_assignment(using, base, evaluation, target_column)?;
+    let reserved = BTreeSet::from([target_column]);
+    let base_to_evaluation = RowProjection::build(
+        base,
+        base_version,
+        evaluation,
+        evaluation_version,
+        &reserved,
+    )?;
+    let evaluation_to_final = FinalOutputProjection::build(evaluation, final_table)?;
+    let validation_started = std::time::Instant::now();
+    let mut observed = ActionAccumulator::new();
+    for row in 0..rows {
+        let source_values = source_row(row);
+        let mut values = base_to_evaluation.project_without_target_constraints(&source_values)?;
+        let assignments = pending
+            .action
+            .evaluate(&values)?
+            .ok_or(SchemaMutationError::Corrupt(
+                "synthetic cost action unexpectedly skipped a row",
+            ))?;
+        let digest_values = assignments
+            .iter()
+            .map(|(column, _, value)| (*column, value.clone()))
+            .collect::<Vec<_>>();
+        observed.observe(&source_values, &digest_values)?;
+        for (_, position, value) in assignments {
+            values[position] = value;
+        }
+        std::hint::black_box(evaluation_to_final.project(values)?);
+    }
+    let validation = validation_started.elapsed();
+    pending.action.expected = observed.finish();
+
+    let mut program = DeferredBackfillProgram::default();
+    program.accept_pending_action(pending, evaluation, evaluation_version);
+    let projection =
+        program.build_finalization_projection(base, base_version, final_table, &reserved)?;
+    let finalization_started = std::time::Instant::now();
+    let mut observations = program.begin_finalization();
+    for row in 0..rows {
+        let source_values = source_row(row);
+        std::hint::black_box(program.project_final_row(
+            &projection,
+            &source_values,
+            &mut observations,
+        )?);
+    }
+    program.verify_finalization(observations)?;
+    let finalization = finalization_started.elapsed();
+    Ok(SyntheticDeferredCost {
+        validation,
+        finalization,
+        transient_vector_allocations: rows.checked_mul(4).ok_or(SchemaMutationError::Corrupt(
+            "synthetic cost allocation count overflow",
+        ))?,
+        resident_metadata_bytes: program.resident_metadata_bytes_estimate(),
+    })
+}
+
 pub(crate) fn try_execute_adopted_update(
     database: &mut Database,
     transaction: &mut Transaction,
@@ -974,58 +1333,19 @@ fn try_execute_adopted_update_inner(
     }
 
     let prefix = plan.deferred_backfill.clone();
-    let view = transaction.begin_read_view(&[parts.storage], &mut database.registry)?;
-    let source_view = view
-        .iter()
-        .find_map(|(storage, view)| (storage == parts.storage).then_some(view))
-        .ok_or(SchemaMutationError::Corrupt(
-            "deferred source read view absent",
-        ))?;
-    let columns = parts
-        .base
-        .columns
-        .iter()
-        .map(|column| column.id)
-        .collect::<Vec<_>>();
-    let mut observation = ActionAccumulator::new();
-    let mut prefix_observations = prefix.begin_finalization();
-    let flow = database
-        .registry
-        .get_mut(parts.storage)
-        .ok_or(SchemaMutationError::Corrupt("deferred source Heap absent"))?
-        .visit_rows_with_view_control::<DatabaseError, _>(
-            &columns,
-            source_view,
-            |_row, source_values| {
-                let mut virtual_values = parts
-                    .projection
-                    .project_without_target_constraints(&source_values)?;
-                prefix.apply_row(
-                    &source_values,
-                    &mut virtual_values,
-                    &mut prefix_observations,
-                )?;
-                parts
-                    .projection
-                    .validate_target_constraints(&virtual_values)?;
-                if let Some(assignments) = action.evaluate(&virtual_values)? {
-                    let digest_values = assignments
-                        .into_iter()
-                        .map(|(column, _, value)| (column, value))
-                        .collect::<Vec<_>>();
-                    observation.observe(&source_values, &digest_values)?;
-                }
-                Ok(ControlFlow::Continue(()))
-            },
-        )?;
-    if flow.is_break() {
-        return Err(SchemaMutationError::Corrupt(
-            "deferred source row visitor stopped unexpectedly",
-        )
-        .into());
-    }
-    prefix.verify_finalization(prefix_observations)?;
-    action.expected = observation.finish();
+    action.expected = observe_action(
+        database,
+        transaction,
+        DeferredSourceAuthority::TransactionStorageView {
+            storage: parts.storage,
+        },
+        &parts.base,
+        &parts.projection,
+        &prefix,
+        &action,
+        None,
+        &parts.target,
+    )?;
     let affected_rows = action.expected.affected_rows;
     let semantic_digest = action.semantic_digest;
     let adopted =
