@@ -2,7 +2,8 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 
 use netbadb_storage::{
-    ChangeBatchMaintenanceInspection, ChangeStreamStatus, LsmMaintenanceCostInspection, StorageKind,
+    ChangeBatchMaintenanceInspection, ChangeStreamStatus, LsmMaintenanceCostInspection,
+    LsmMaintenanceInspection, LsmMaintenanceSafetyBlocker, StorageKind,
 };
 use netbadb_types::{ColumnarProjectionId, StorageId, TableId};
 
@@ -151,6 +152,8 @@ pub enum MaintenanceBlocker {
     NoReclaimableHistory,
     RetentionUnsafe,
     HistoryUnavailable,
+    RecoveryRequired,
+    MemtableNotEmpty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,7 +315,9 @@ impl Database {
         &self,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceState, DatabaseError> {
-        let busy = Rc::strong_count(&self.transaction_owner) != 1;
+        let busy = Rc::strong_count(&self.transaction_owner) != 1
+            || self.inspect_group_commit().is_some()
+            || self.schema_writer.get().is_some();
         let projection_inspections = self.inspect_columnar_projections();
         let stream_inspections = self
             .registry
@@ -435,34 +440,13 @@ impl Database {
                     storage_id: *storage_id,
                 },
             )?;
-            if let Some(cost) = lsm.flush_cost {
-                candidates.push(candidate(
-                    MaintenanceAction::FlushLsm {
-                        table_id: *table_id,
-                        storage_id: *storage_id,
-                    },
-                    MaintenanceReason::LsmMemtableFlush,
-                    MaintenanceBound::EstimateGatedAtomic,
-                    MaintenanceEstimate::from_lsm(cost),
-                    None,
-                    busy,
-                    budget,
-                ));
-            }
-            if let Some(cost) = lsm.next_compaction_cost {
-                candidates.push(candidate(
-                    MaintenanceAction::CompactLsm {
-                        table_id: *table_id,
-                        storage_id: *storage_id,
-                    },
-                    MaintenanceReason::LsmCompactionPressure,
-                    MaintenanceBound::EstimateGatedAtomic,
-                    MaintenanceEstimate::from_lsm(cost),
-                    None,
-                    busy,
-                    budget,
-                ));
-            }
+            candidates.extend(lsm_maintenance_candidates(
+                *table_id,
+                *storage_id,
+                &lsm,
+                busy,
+                budget,
+            ));
         }
         Ok(MaintenanceState { candidates })
     }
@@ -611,6 +595,54 @@ impl Database {
         };
         Ok((report, consumed))
     }
+}
+
+pub(crate) fn lsm_maintenance_candidates(
+    table_id: TableId,
+    storage_id: StorageId,
+    inspection: &LsmMaintenanceInspection,
+    core_busy: bool,
+    budget: MaintenanceBudget,
+) -> Vec<MaintenanceCandidate> {
+    let safety_blocker = inspection.safety_blocker.map(|blocker| match blocker {
+        LsmMaintenanceSafetyBlocker::RecoveryRequired => MaintenanceBlocker::RecoveryRequired,
+        LsmMaintenanceSafetyBlocker::WriterActive { .. }
+        | LsmMaintenanceSafetyBlocker::OutstandingTransactions { .. }
+        | LsmMaintenanceSafetyBlocker::OutstandingReadViews { .. } => MaintenanceBlocker::Busy,
+    });
+    let mut candidates = Vec::new();
+    if let Some(cost) = inspection.flush_cost {
+        candidates.push(candidate(
+            MaintenanceAction::FlushLsm {
+                table_id,
+                storage_id,
+            },
+            MaintenanceReason::LsmMemtableFlush,
+            MaintenanceBound::EstimateGatedAtomic,
+            MaintenanceEstimate::from_lsm(cost),
+            safety_blocker,
+            core_busy,
+            budget,
+        ));
+    }
+    if let Some(cost) = inspection.next_compaction_cost {
+        let blocker = safety_blocker.or_else(|| {
+            (inspection.memtable_entry_count != 0).then_some(MaintenanceBlocker::MemtableNotEmpty)
+        });
+        candidates.push(candidate(
+            MaintenanceAction::CompactLsm {
+                table_id,
+                storage_id,
+            },
+            MaintenanceReason::LsmCompactionPressure,
+            MaintenanceBound::EstimateGatedAtomic,
+            MaintenanceEstimate::from_lsm(cost),
+            blocker,
+            core_busy,
+            budget,
+        ));
+    }
+    candidates
 }
 
 fn columnar_compaction_candidate(

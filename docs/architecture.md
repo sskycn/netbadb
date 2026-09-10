@@ -202,6 +202,17 @@ existing production GC writer can run. Ordinary cursors remain unpinned,
 active trials still preempt admission, GC creates no trial or G publication,
 and no persistent format, protocol, or Inspection JSON contract changes.
 
+[Adaptive Operations Phase 10](adaptive-operations-phase10.md) adds opt-in
+authoritative LSM MemTable flush and single-step compaction in a distinct
+automatic lane. Storage exposes a complete layout anchor, exact production
+compaction identity, shared quiescence/eligibility, and checked conservative
+rewrite bounds; Core binds these into separate proposals and exactly
+revalidates them before calling the existing `flush` or `compact_one` writer.
+Logical rows, all retained MVCC horizons, G, schema, logical data version, and
+Change Stream state remain invariant. `compact_full` is excluded, LSM actions
+create no probation trial or adaptive rollback, and defaults, persistent
+formats, protocol, and Inspection JSON v7 remain unchanged.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

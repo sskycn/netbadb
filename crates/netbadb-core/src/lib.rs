@@ -10,6 +10,9 @@ mod adaptive_columnar_compaction_tests;
 mod adaptive_evidence_pool;
 #[cfg(test)]
 mod adaptive_evidence_pool_tests;
+mod adaptive_lsm_maintenance;
+#[cfg(test)]
+mod adaptive_lsm_maintenance_tests;
 #[cfg(test)]
 mod adaptive_tests;
 mod adaptive_workload;
@@ -131,6 +134,14 @@ pub use adaptive_evidence_pool::{
     AdaptiveEvidenceRecordError, AdaptiveEvidenceRecordOutcome, AdaptiveEvidenceRecordReport,
     AdaptiveEvidenceRotationError, AdaptiveEvidenceRotationReport, AdaptiveEvidenceWindowEpoch,
     AdaptiveTargetLineage, AdaptiveTargetWindowInspection,
+};
+pub use adaptive_lsm_maintenance::{
+    AdaptiveLsmCompactionPolicy, AdaptiveLsmCompactionProposal, AdaptiveLsmFlushPolicy,
+    AdaptiveLsmFlushProposal, AdaptiveLsmMaintenanceAbortReason, AdaptiveLsmMaintenanceAction,
+    AdaptiveLsmMaintenanceDecision, AdaptiveLsmMaintenanceError,
+    AdaptiveLsmMaintenanceExecutionReport, AdaptiveLsmMaintenanceMeasurement,
+    AdaptiveLsmMaintenanceNoActionReason, AdaptiveLsmMaintenanceObservation,
+    AdaptiveLsmMaintenanceOutcome, AdaptiveLsmMaintenanceProposal,
 };
 pub use adaptive_workload::{
     AdaptivePlanVariantAggregate, AdaptiveQueryShapeAggregate, AdaptiveWorkloadEvaluationReport,

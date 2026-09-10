@@ -503,6 +503,7 @@ struct AmplificationCounters {
     compaction_input_bytes: Cell<u64>,
     compaction_output_bytes: Cell<u64>,
     obsolete_bytes: Cell<u64>,
+    write_overflowed: Cell<bool>,
 }
 
 impl AmplificationCounters {
@@ -524,12 +525,24 @@ impl AmplificationCounters {
             compaction_input_bytes: self.compaction_input_bytes.get(),
             compaction_output_bytes: self.compaction_output_bytes.get(),
             obsolete_bytes: self.obsolete_bytes.get(),
+            overflowed: self.write_overflowed.get(),
         }
     }
 }
 
 fn increment(counter: &Cell<u64>, value: u64) {
     counter.set(counter.get().saturating_add(value));
+}
+
+fn increment_write_counter(counters: &AmplificationCounters, counter: &Cell<u64>, value: u64) {
+    let current = counter.get();
+    match current.checked_add(value) {
+        Some(next) => counter.set(next),
+        None => {
+            counter.set(u64::MAX);
+            counters.write_overflowed.set(true);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -549,6 +562,9 @@ pub struct LsmWriteAmplification {
     pub compaction_input_bytes: u64,
     pub compaction_output_bytes: u64,
     pub obsolete_bytes: u64,
+    /// At least one write-amplification counter saturated, so deltas are no
+    /// longer authoritative execution measurements.
+    pub overflowed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,14 +738,59 @@ pub struct LsmMaintenanceCostInspection {
     pub write_bytes: u64,
 }
 
-/// Immutable structural state used by higher-level maintenance policy.
+/// Conservative structural resource bound for one authoritative LSM rewrite.
+///
+/// `read_bytes` and `write_bytes` describe the production format and are not
+/// claims about device I/O. Successful production accounting is guaranteed to
+/// remain at or below these values while amplification counters are complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LsmMaintenanceBoundInspection {
+    pub work_units: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+}
+
+/// Equality authority for the exact current authoritative LSM layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LsmMaintenanceAnchor {
+    pub storage_id: StorageId,
+    pub manifest_generation: u64,
+    pub wal_generation: u64,
+    pub visible_commit_sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LsmMaintenanceSafetyBlocker {
+    RecoveryRequired,
+    WriterActive { txn_id: TxnId },
+    OutstandingTransactions { count: u64 },
+    OutstandingReadViews { count: u64 },
+}
+
+/// Exact identity and storage-owned resource evidence for the next production
+/// `compact_one` selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsmCompactionPlanInspection {
+    pub input_sstable_ids: Vec<u64>,
+    pub output_level: u8,
+    pub input_entries: u64,
+    pub input_bytes: u64,
+    pub estimated_cost: LsmMaintenanceCostInspection,
+    pub conservative_bound: LsmMaintenanceBoundInspection,
+}
+
+/// Immutable structural state used by higher-level maintenance policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LsmMaintenanceInspection {
+    pub anchor: LsmMaintenanceAnchor,
+    pub safety_blocker: Option<LsmMaintenanceSafetyBlocker>,
     pub memtable_entry_count: u64,
     pub memtable_bytes: u64,
     pub memtable_flush_threshold_bytes: u64,
     pub flush_cost: Option<LsmMaintenanceCostInspection>,
+    pub flush_conservative_bound: Option<LsmMaintenanceBoundInspection>,
     pub next_compaction_cost: Option<LsmMaintenanceCostInspection>,
+    pub next_compaction: Option<LsmCompactionPlanInspection>,
 }
 
 #[derive(Debug)]
@@ -1174,15 +1235,30 @@ impl LsmStorage {
             read_bytes: shared.memtable_bytes,
             write_bytes: shared.memtable_bytes,
         });
-        let next_compaction_cost = pick_compaction(&shared)?
-            .map(|plan| compaction_cost_inspection(&shared, &plan))
+        let flush_conservative_bound = if memtable_entry_count == 0 {
+            None
+        } else {
+            Some(flush_conservative_bound(&shared)?)
+        };
+        let next_compaction = pick_compaction(&shared)?
+            .map(|plan| compaction_plan_inspection(&shared, &plan))
             .transpose()?;
+        let next_compaction_cost = next_compaction.as_ref().map(|plan| plan.estimated_cost);
         Ok(LsmMaintenanceInspection {
+            anchor: LsmMaintenanceAnchor {
+                storage_id: shared.manifest.storage_id,
+                manifest_generation: shared.manifest.generation,
+                wal_generation: shared.manifest.wal_generation,
+                visible_commit_sequence: shared.visible_commit_seq.0,
+            },
+            safety_blocker: maintenance_safety_blocker(&shared),
             memtable_entry_count,
             memtable_bytes: shared.memtable_bytes,
             memtable_flush_threshold_bytes: shared.flush_threshold,
             flush_cost,
+            flush_conservative_bound,
             next_compaction_cost,
+            next_compaction,
         })
     }
 
@@ -3464,22 +3540,39 @@ fn value_size(value: &EntryValue) -> u64 {
 }
 
 fn ensure_maintenance_safe(shared: &LsmShared) -> Result<(), StorageError> {
-    if shared.runtime.recovery_required.get() {
-        return Err(CheckpointError::RecoveryRequired.into());
-    }
-    if let Some(txn_id) = shared.runtime.writer.get() {
-        return Err(CheckpointError::WriterActive { txn_id }.into());
-    }
-    if shared.runtime.outstanding_transactions.get() != 0 {
-        return Err(CheckpointError::OutstandingTransactions {
-            count: shared.runtime.outstanding_transactions.get(),
+    match maintenance_safety_blocker(shared) {
+        Some(LsmMaintenanceSafetyBlocker::RecoveryRequired) => {
+            Err(CheckpointError::RecoveryRequired.into())
         }
-        .into());
+        Some(LsmMaintenanceSafetyBlocker::WriterActive { txn_id }) => {
+            Err(CheckpointError::WriterActive { txn_id }.into())
+        }
+        Some(LsmMaintenanceSafetyBlocker::OutstandingTransactions { count }) => {
+            Err(CheckpointError::OutstandingTransactions { count }.into())
+        }
+        Some(LsmMaintenanceSafetyBlocker::OutstandingReadViews { .. }) => {
+            Err(LsmError::Busy("outstanding read views").into())
+        }
+        None => Ok(()),
     }
-    if shared.runtime.outstanding_read_views.get() != 0 {
-        return Err(LsmError::Busy("outstanding read views").into());
+}
+
+fn maintenance_safety_blocker(shared: &LsmShared) -> Option<LsmMaintenanceSafetyBlocker> {
+    if shared.runtime.recovery_required.get() {
+        Some(LsmMaintenanceSafetyBlocker::RecoveryRequired)
+    } else if let Some(txn_id) = shared.runtime.writer.get() {
+        Some(LsmMaintenanceSafetyBlocker::WriterActive { txn_id })
+    } else if shared.runtime.outstanding_transactions.get() != 0 {
+        Some(LsmMaintenanceSafetyBlocker::OutstandingTransactions {
+            count: shared.runtime.outstanding_transactions.get(),
+        })
+    } else if shared.runtime.outstanding_read_views.get() != 0 {
+        Some(LsmMaintenanceSafetyBlocker::OutstandingReadViews {
+            count: shared.runtime.outstanding_read_views.get(),
+        })
+    } else {
+        None
     }
-    Ok(())
 }
 
 fn manifest_path(root: &Path) -> PathBuf {
@@ -4691,11 +4784,13 @@ fn flush_memtable(shared: &mut LsmShared) -> Result<(), StorageError> {
     canonicalize_sstables(&mut shared.sstables);
     shared.memtable.clear();
     shared.memtable_bytes = 0;
-    increment(
+    increment_write_counter(
+        &shared.runtime.amplification,
         &shared.runtime.amplification.flush_input_bytes,
         entries.iter().map(estimated_entry_bytes).sum(),
     );
-    increment(
+    increment_write_counter(
+        &shared.runtime.amplification,
         &shared.runtime.amplification.flush_output_bytes,
         shared
             .sstables
@@ -4743,6 +4838,105 @@ fn compact_full_sstables(shared: &mut LsmShared) -> Result<(), StorageError> {
 struct CompactionPlan {
     output_level: u8,
     input_ids: BTreeSet<u64>,
+}
+
+fn conservative_sstable_output_bound(
+    entry_count: u64,
+    distinct_clustering_keys: u64,
+    encoded_entry_bytes: u64,
+) -> Result<u64, StorageError> {
+    if entry_count == 0 || distinct_clustering_keys == 0 {
+        return Err(LsmError::InvalidSstable {
+            sstable_id: 0,
+            reason: "maintenance output bound has no entries or clustering keys",
+        }
+        .into());
+    }
+    let bloom_bytes = u64::try_from(
+        BloomFilter::for_distinct_keys(distinct_clustering_keys)?
+            .bits
+            .len(),
+    )
+    .map_err(|_| StorageError::CountOverflow)?;
+    // Every real block contains at least one entry. Charging one block header,
+    // checksum and index record per entry is therefore a conservative bound
+    // independent of the production chunking decisions.
+    let per_block_overhead = u64::try_from(
+        SST_BLOCK_HEADER_SIZE
+            .checked_add(4)
+            .and_then(|bytes| bytes.checked_add(SST_INDEX_ENTRY_SIZE))
+            .ok_or(StorageError::CountOverflow)?,
+    )
+    .map_err(|_| StorageError::CountOverflow)?;
+    (SST_HEADER_SIZE as u64)
+        .checked_add(bloom_bytes)
+        .and_then(|bytes| bytes.checked_add(encoded_entry_bytes))
+        .and_then(|bytes| {
+            entry_count
+                .checked_mul(per_block_overhead)
+                .and_then(|overhead| bytes.checked_add(overhead))
+        })
+        .and_then(|bytes| bytes.checked_add(SST_FOOTER_SIZE as u64))
+        .ok_or(StorageError::CountOverflow)
+}
+
+fn flush_conservative_bound(
+    shared: &LsmShared,
+) -> Result<LsmMaintenanceBoundInspection, StorageError> {
+    let mut entry_count = 0_u64;
+    let mut encoded_entry_bytes = 0_u64;
+    let mut distinct = BTreeSet::new();
+    for (key, versions) in &shared.memtable {
+        distinct.insert(key.clustering);
+        for value in versions.values() {
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or(StorageError::CountOverflow)?;
+            encoded_entry_bytes = encoded_entry_bytes
+                .checked_add(32)
+                .and_then(|bytes| bytes.checked_add(value_size(value)))
+                .ok_or(StorageError::CountOverflow)?;
+        }
+    }
+    let distinct = u64::try_from(distinct.len()).map_err(|_| StorageError::CountOverflow)?;
+    Ok(LsmMaintenanceBoundInspection {
+        work_units: entry_count,
+        read_bytes: shared.memtable_bytes,
+        write_bytes: conservative_sstable_output_bound(entry_count, distinct, encoded_entry_bytes)?,
+    })
+}
+
+fn compaction_plan_inspection(
+    shared: &LsmShared,
+    plan: &CompactionPlan,
+) -> Result<LsmCompactionPlanInspection, StorageError> {
+    let estimated_cost = compaction_cost_inspection(shared, plan)?;
+    let inputs = shared
+        .sstables
+        .iter()
+        .filter(|sstable| plan.input_ids.contains(&sstable.reference.id))
+        .collect::<Vec<_>>();
+    let output_plans = plan_compaction_outputs(shared, &inputs, false)?;
+    let write_bytes = output_plans.iter().try_fold(0_u64, |total, output| {
+        conservative_sstable_output_bound(
+            output.entry_count,
+            output.distinct_clustering_keys,
+            output.approximate_bytes,
+        )
+        .and_then(|bound| total.checked_add(bound).ok_or(StorageError::CountOverflow))
+    })?;
+    Ok(LsmCompactionPlanInspection {
+        input_sstable_ids: plan.input_ids.iter().copied().collect(),
+        output_level: plan.output_level,
+        input_entries: estimated_cost.work_units,
+        input_bytes: estimated_cost.read_bytes,
+        estimated_cost,
+        conservative_bound: LsmMaintenanceBoundInspection {
+            work_units: estimated_cost.work_units,
+            read_bytes: estimated_cost.read_bytes,
+            write_bytes,
+        },
+    })
 }
 
 fn compaction_cost_inspection(
@@ -4954,15 +5148,21 @@ fn execute_compaction(
             return Err(source);
         }
     }
-    increment(
+    increment_write_counter(
+        &shared.runtime.amplification,
         &shared.runtime.amplification.compaction_input_bytes,
         input_bytes,
     );
-    increment(
+    increment_write_counter(
+        &shared.runtime.amplification,
         &shared.runtime.amplification.compaction_output_bytes,
         output_bytes,
     );
-    increment(&shared.runtime.amplification.obsolete_bytes, input_bytes);
+    increment_write_counter(
+        &shared.runtime.amplification,
+        &shared.runtime.amplification.obsolete_bytes,
+        input_bytes,
+    );
     for old in old_sstables {
         if plan.input_ids.contains(&old.reference.id) {
             #[cfg(test)]
@@ -4982,53 +5182,7 @@ fn write_compaction_outputs(
     garbage_collect: bool,
     next_id: &mut u64,
 ) -> Result<Vec<Sstable>, StorageError> {
-    let mut plans = Vec::<CompactionOutputPlan>::new();
-    let mut current: Option<CompactionOutputPlan> = None;
-    for_each_compaction_entry(shared, inputs, garbage_collect, |entry| {
-        if current.as_ref().is_some_and(|plan| {
-            plan.approximate_bytes >= SST_TARGET_FILE_BYTES
-                && plan.max_clustering != entry.key.clustering
-        }) {
-            plans.push(current.take().ok_or(LsmError::InvalidSstable {
-                sstable_id: 0,
-                reason: "compaction output plan disappeared",
-            })?);
-        }
-        let plan = current.get_or_insert(CompactionOutputPlan {
-            max_clustering: entry.key.clustering,
-            entry_count: 0,
-            distinct_clustering_keys: 0,
-            approximate_bytes: 0,
-        });
-        if plan.entry_count == 0 || plan.max_clustering != entry.key.clustering {
-            plan.distinct_clustering_keys =
-                plan.distinct_clustering_keys
-                    .checked_add(1)
-                    .ok_or(LsmError::InvalidSstable {
-                        sstable_id: 0,
-                        reason: "distinct clustering-key count overflows",
-                    })?;
-        }
-        plan.max_clustering = entry.key.clustering;
-        plan.entry_count = plan
-            .entry_count
-            .checked_add(1)
-            .ok_or(LsmError::InvalidSstable {
-                sstable_id: 0,
-                reason: "compaction output entry count overflows",
-            })?;
-        plan.approximate_bytes = plan
-            .approximate_bytes
-            .checked_add(estimated_entry_bytes(entry))
-            .ok_or(LsmError::InvalidSstable {
-                sstable_id: 0,
-                reason: "compaction output byte estimate overflows",
-            })?;
-        Ok(())
-    })?;
-    if let Some(plan) = current {
-        plans.push(plan);
-    }
+    let plans = plan_compaction_outputs(shared, inputs, garbage_collect)?;
 
     let mut outputs = Vec::new();
     let mut plan_index = 0_usize;
@@ -5101,6 +5255,61 @@ fn write_compaction_outputs(
         .into());
     }
     Ok(outputs)
+}
+
+fn plan_compaction_outputs(
+    shared: &LsmShared,
+    inputs: &[&Sstable],
+    garbage_collect: bool,
+) -> Result<Vec<CompactionOutputPlan>, StorageError> {
+    let mut plans = Vec::<CompactionOutputPlan>::new();
+    let mut current: Option<CompactionOutputPlan> = None;
+    for_each_compaction_entry(shared, inputs, garbage_collect, |entry| {
+        if current.as_ref().is_some_and(|plan| {
+            plan.approximate_bytes >= SST_TARGET_FILE_BYTES
+                && plan.max_clustering != entry.key.clustering
+        }) {
+            plans.push(current.take().ok_or(LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "compaction output plan disappeared",
+            })?);
+        }
+        let plan = current.get_or_insert(CompactionOutputPlan {
+            max_clustering: entry.key.clustering,
+            entry_count: 0,
+            distinct_clustering_keys: 0,
+            approximate_bytes: 0,
+        });
+        if plan.entry_count == 0 || plan.max_clustering != entry.key.clustering {
+            plan.distinct_clustering_keys =
+                plan.distinct_clustering_keys
+                    .checked_add(1)
+                    .ok_or(LsmError::InvalidSstable {
+                        sstable_id: 0,
+                        reason: "distinct clustering-key count overflows",
+                    })?;
+        }
+        plan.max_clustering = entry.key.clustering;
+        plan.entry_count = plan
+            .entry_count
+            .checked_add(1)
+            .ok_or(LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "compaction output entry count overflows",
+            })?;
+        plan.approximate_bytes = plan
+            .approximate_bytes
+            .checked_add(estimated_entry_bytes(entry))
+            .ok_or(LsmError::InvalidSstable {
+                sstable_id: 0,
+                reason: "compaction output byte estimate overflows",
+            })?;
+        Ok(())
+    })?;
+    if let Some(plan) = current {
+        plans.push(plan);
+    }
+    Ok(plans)
 }
 
 #[derive(Debug)]
@@ -8200,6 +8409,113 @@ mod tests {
         );
         drop(view);
         storage.close().expect("close");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn flush_and_compact_one_bounds_preserve_every_historical_horizon_after_reopen() {
+        fn rows_at(
+            storage: &mut LsmStorage,
+            horizon: netbadb_types::LsmCommitSeq,
+        ) -> Vec<Vec<ScalarValue>> {
+            let view = storage.read_view_at(horizon).expect("historical view");
+            storage
+                .scan_columns_with_view(&[ColumnId(1), ColumnId(2)], &view)
+                .expect("historical scan")
+                .into_iter()
+                .map(|(_, values)| values)
+                .collect()
+        }
+
+        fn flush_with_bound(storage: &LsmStorage) {
+            let plan = storage.maintenance_inspection().expect("flush plan");
+            let bound = plan.flush_conservative_bound.expect("flush hard bound");
+            let before = storage.inspection().write_amplification;
+            storage.flush().expect("bounded flush");
+            let after = storage.inspection().write_amplification;
+            assert!(after.flush_input_bytes - before.flush_input_bytes <= bound.read_bytes);
+            assert!(after.flush_output_bytes - before.flush_output_bytes <= bound.write_bytes);
+        }
+
+        let root = root("maintenance-history-bound");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+
+        let first = storage.insert(&row(1, "v1")).expect("insert v1");
+        let c1 = storage.current_commit_seq();
+        flush_with_bound(&storage);
+
+        let current = storage
+            .read_view()
+            .and_then(|view| storage.refresh_handle(first.row_id, &view))
+            .expect("current v1");
+        let updated = storage.update(current, &row(1, "v2")).expect("update v2");
+        let c2 = storage.current_commit_seq();
+        flush_with_bound(&storage);
+        let current = storage
+            .read_view()
+            .and_then(|view| storage.refresh_handle(updated.row_id, &view))
+            .expect("current v2");
+        storage.delete(current).expect("delete v2");
+        let c3 = storage.current_commit_seq();
+        flush_with_bound(&storage);
+
+        let expected = [
+            rows_at(&mut storage, c1),
+            rows_at(&mut storage, c2),
+            rows_at(&mut storage, c3),
+        ];
+        assert_eq!(expected[0], vec![row(1, "v1")]);
+        assert_eq!(expected[1], vec![row(1, "v2")]);
+        assert!(expected[2].is_empty());
+
+        let compaction = storage.maintenance_inspection().expect("compaction plan");
+        let plan = compaction.next_compaction.expect("exact compact_one plan");
+        assert_eq!(compaction.memtable_entry_count, 0);
+        let before_compaction = storage.inspection().write_amplification;
+        assert!(storage.compact_one().expect("compact one"));
+        let after_compaction = storage.inspection().write_amplification;
+        assert!(
+            after_compaction.compaction_input_bytes - before_compaction.compaction_input_bytes
+                <= plan.conservative_bound.read_bytes
+        );
+        assert!(
+            after_compaction.compaction_output_bytes - before_compaction.compaction_output_bytes
+                <= plan.conservative_bound.write_bytes
+        );
+        assert_eq!(rows_at(&mut storage, c1), expected[0]);
+        assert_eq!(rows_at(&mut storage, c2), expected[1]);
+        assert_eq!(rows_at(&mut storage, c3), expected[2]);
+
+        storage.close().expect("close");
+        let mut reopened = LsmStorage::open(&root, table()).expect("reopen");
+        assert_eq!(rows_at(&mut reopened, c1), expected[0]);
+        assert_eq!(rows_at(&mut reopened, c2), expected[1]);
+        assert_eq!(rows_at(&mut reopened, c3), expected[2]);
+        reopened.close().expect("close reopened");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn maintenance_inspection_exposes_the_same_recovery_required_guard_as_the_writer() {
+        let root = root("maintenance-recovery-blocker");
+        cleanup(&root);
+        let storage = LsmStorage::create(&root, table(), ColumnId(1)).expect("create");
+        storage.shared.borrow().runtime.recovery_required.set(true);
+        assert_eq!(
+            storage
+                .maintenance_inspection()
+                .expect("inspect blocker")
+                .safety_blocker,
+            Some(super::LsmMaintenanceSafetyBlocker::RecoveryRequired)
+        );
+        assert!(matches!(
+            storage.flush(),
+            Err(StorageError::Checkpoint(
+                super::CheckpointError::RecoveryRequired
+            ))
+        ));
+        drop(storage);
         cleanup(&root);
     }
 
