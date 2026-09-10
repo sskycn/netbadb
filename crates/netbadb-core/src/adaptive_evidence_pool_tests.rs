@@ -98,6 +98,38 @@ fn ingestion_is_explicit_and_cross_g_is_one_timeline() {
 }
 
 #[test]
+fn progress_token_is_read_only_and_tracks_recording_and_window_rotation() {
+    let mut fixture = TimelineFixture::create("phase13-progress-token");
+    let mut pool = AdaptiveEvidencePool::default();
+    let initial = pool.progress_token();
+    assert_eq!(initial.window_epoch, AdaptiveEvidenceWindowEpoch(0));
+    assert_eq!(initial.recorded_reports, 0);
+    assert_eq!(pool.progress_token(), initial);
+    assert_eq!(pool.progress_token(), initial);
+
+    let mut report = feedback(&mut fixture);
+    report.anchor.global_commit_seq = Some(DatabaseCommitSeq(100));
+    pool.record_execution_feedback(&report)
+        .expect("record one report");
+    let recorded = pool.progress_token();
+    assert_eq!(recorded.window_epoch, initial.window_epoch);
+    assert_eq!(
+        recorded.schema_generation,
+        Some(report.anchor.schema_generation)
+    );
+    assert_eq!(recorded.recorded_reports, 1);
+    assert_ne!(recorded, initial);
+
+    pool.rotate_window().expect("rotate evidence window");
+    let rotated = pool.progress_token();
+    assert_eq!(rotated.window_epoch, AdaptiveEvidenceWindowEpoch(1));
+    assert_eq!(rotated.schema_generation, recorded.schema_generation);
+    assert_eq!(rotated.recorded_reports, 0);
+    assert_ne!(rotated, recorded);
+    fixture.close();
+}
+
+#[test]
 fn one_report_fans_out_targets_but_calibration_report_counts_once() {
     let mut fixture = TimelineFixture::create("phase6-multi-target-report");
     let mut report = feedback(&mut fixture);

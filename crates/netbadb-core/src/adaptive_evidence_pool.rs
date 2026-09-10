@@ -48,6 +48,17 @@ pub struct AdaptiveTargetLineage {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AdaptiveEvidenceWindowEpoch(pub u64);
 
+/// Allocation-free progress coordinate for cooperative adaptive scheduling.
+///
+/// This token only indicates that the caller-owned aggregation state may have
+/// changed. It is not evidence quality, freshness, or mutation authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AdaptiveEvidenceProgressToken {
+    pub window_epoch: AdaptiveEvidenceWindowEpoch,
+    pub schema_generation: Option<SchemaGeneration>,
+    pub recorded_reports: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdaptiveEvidencePoolHealth {
     Healthy,
@@ -317,6 +328,17 @@ impl AdaptiveEvidencePool {
     #[must_use]
     pub const fn window_epoch(&self) -> AdaptiveEvidenceWindowEpoch {
         self.window_epoch
+    }
+
+    /// Returns an O(1), read-only scheduling hint without materializing the
+    /// target and calibration vectors returned by `inspection`.
+    #[must_use]
+    pub const fn progress_token(&self) -> AdaptiveEvidenceProgressToken {
+        AdaptiveEvidenceProgressToken {
+            window_epoch: self.window_epoch,
+            schema_generation: self.schema_generation,
+            recorded_reports: self.recorded_reports,
+        }
     }
 
     pub fn clear(&mut self) {
