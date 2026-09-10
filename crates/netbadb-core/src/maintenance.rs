@@ -40,6 +40,46 @@ impl MaintenanceBudget {
         }
     }
 
+    /// Returns the component-wise minimum of two independent maintenance
+    /// envelopes.
+    #[must_use]
+    pub const fn capped_by(self, other: Self) -> Self {
+        Self {
+            max_work_units: if self.max_work_units < other.max_work_units {
+                self.max_work_units
+            } else {
+                other.max_work_units
+            },
+            max_read_bytes: if self.max_read_bytes < other.max_read_bytes {
+                self.max_read_bytes
+            } else {
+                other.max_read_bytes
+            },
+            max_write_bytes: if self.max_write_bytes < other.max_write_bytes {
+                self.max_write_bytes
+            } else {
+                other.max_write_bytes
+            },
+            max_actions: if self.max_actions < other.max_actions {
+                self.max_actions
+            } else {
+                other.max_actions
+            },
+        }
+    }
+
+    pub(crate) const fn checked_remaining(self, consumed: MaintenanceConsumption) -> Option<Self> {
+        if !self.contains(consumed) {
+            return None;
+        }
+        Some(Self {
+            max_work_units: self.max_work_units - consumed.work_units,
+            max_read_bytes: self.max_read_bytes - consumed.read_bytes,
+            max_write_bytes: self.max_write_bytes - consumed.write_bytes,
+            max_actions: self.max_actions - consumed.actions,
+        })
+    }
+
     pub(crate) fn remaining(self, consumed: MaintenanceConsumption) -> Self {
         Self {
             max_work_units: self.max_work_units.saturating_sub(consumed.work_units),
@@ -70,6 +110,32 @@ pub struct MaintenanceConsumption {
     pub read_bytes: u64,
     pub write_bytes: u64,
     pub actions: u32,
+}
+
+impl MaintenanceConsumption {
+    /// Adds independently measured maintenance consumption without hiding an
+    /// overflow as a trustworthy total.
+    #[must_use]
+    pub const fn checked_add(self, other: Self) -> Option<Self> {
+        let Some(work_units) = self.work_units.checked_add(other.work_units) else {
+            return None;
+        };
+        let Some(read_bytes) = self.read_bytes.checked_add(other.read_bytes) else {
+            return None;
+        };
+        let Some(write_bytes) = self.write_bytes.checked_add(other.write_bytes) else {
+            return None;
+        };
+        let Some(actions) = self.actions.checked_add(other.actions) else {
+            return None;
+        };
+        Some(Self {
+            work_units,
+            read_bytes,
+            write_bytes,
+            actions,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
