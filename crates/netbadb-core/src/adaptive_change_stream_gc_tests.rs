@@ -12,8 +12,8 @@ use crate::{
     AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy, AutomaticSafeModeLane,
     AutomaticSafeModeMutation, AutomaticSafeModeOutcome, ChangeStreamCursor,
     ChangeStreamRetentionConsumer, ColumnarAdvanceBudget, ColumnarProjectionSpec, Database,
-    DatabaseCoordinatorConfig, MaintenanceBudget, TableStorageCreateSpec,
-    cleanup_created_table_files,
+    DatabaseCoordinatorConfig, GroupChangeStreamDurabilityMode, GroupCommitOptions,
+    GroupPrepareMode, MaintenanceBudget, TableStorageCreateSpec, cleanup_created_table_files,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -162,6 +162,59 @@ fn staged_group_prepare_blocks_reclamation_and_invalidates_stale_proposal() {
         .stage_group_member(&mut group, member)
         .unwrap();
 
+    let observation = fixture
+        .database
+        .observe_change_stream_reclamation(TABLE_ID)
+        .unwrap();
+    assert_eq!(observation.prepared_unresolved_count, 1);
+    assert_eq!(
+        observation.blocker,
+        Some(AdaptiveChangeStreamGcSafetyBlocker::PreparedChangesUnresolved)
+    );
+    let execution = fixture
+        .database
+        .execute_change_stream_reclamation(&proposal, generous_budget())
+        .unwrap();
+    assert_eq!(
+        execution.outcome,
+        AdaptiveChangeStreamGcOutcome::Aborted(
+            AdaptiveChangeStreamGcAbortReason::PreconditionsChanged
+        )
+    );
+    assert!(execution.actual.is_none());
+    fixture.database.abort_group(&mut group).unwrap();
+    drop(group);
+    fixture.cleanup();
+}
+
+#[test]
+fn phase3f_unsynced_change_prepare_blocks_reclamation_and_stale_proposal() {
+    let mut fixture = Fixture::global("phase3f-unsynced-change-prepare");
+    let proposal = fixture.proposal();
+    let mut group = fixture
+        .database
+        .begin_group_commit_with_options(GroupCommitOptions {
+            prepare_mode: GroupPrepareMode::BatchedBarrier,
+            change_stream_durability_mode: GroupChangeStreamDurabilityMode::BatchedBarriers,
+        })
+        .unwrap();
+    let mut member = fixture.database.begin_group_member(&group).unwrap();
+    fixture
+        .database
+        .insert_into_in(
+            TABLE_ID,
+            &mut member,
+            &[ScalarValue::Int64(99), ScalarValue::Int64(990)],
+        )
+        .unwrap();
+    fixture
+        .database
+        .stage_group_member(&mut group, member)
+        .unwrap();
+
+    let runtime = fixture.database.inspect_prepared_runtime(TABLE_ID).unwrap();
+    assert_eq!(runtime.change_stream_sync_count, 6);
+    assert_eq!(runtime.change_stream_group_prepare_barrier_sync_count, 0);
     let observation = fixture
         .database
         .observe_change_stream_reclamation(TABLE_ID)
