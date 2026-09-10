@@ -138,15 +138,15 @@ fn invalid_envelopes_are_typed_and_idle_run_retains_the_terminal_step() {
     fixture.close();
 }
 
-struct MultiGcFixture {
+pub(super) struct MultiGcFixture {
     root: PathBuf,
     heap_paths: Vec<PathBuf>,
-    table_ids: Vec<TableId>,
-    database: Database,
+    pub(super) table_ids: Vec<TableId>,
+    pub(super) database: Database,
 }
 
 impl MultiGcFixture {
-    fn create(name: &str, table_count: u64) -> Self {
+    pub(super) fn create(name: &str, table_count: u64) -> Self {
         let suffix = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "netbadb-automatic-orchestration-{name}-{}-{suffix}",
@@ -223,14 +223,14 @@ impl MultiGcFixture {
         }
     }
 
-    fn close(self) {
+    pub(super) fn close(self) {
         self.database.close().expect("close orchestration database");
         cleanup_created_table_files(&self.heap_paths);
         let _ = fs::remove_dir_all(self.root);
     }
 }
 
-fn gc_policy() -> AutomaticMultiSafeModePolicy {
+pub(super) fn gc_policy() -> AutomaticMultiSafeModePolicy {
     AutomaticMultiSafeModePolicy {
         allow_change_stream_gc: true,
         change_stream_gc_policy: AdaptiveChangeStreamGcPolicy::new(1, 0),

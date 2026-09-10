@@ -234,6 +234,15 @@ one rollbackable transaction. Candidate discovery, four-lane service,
 ready-age, mutation authority, evidence ownership, durable formats, protocol,
 and Inspection JSON v7 remain unchanged.
 
+[Adaptive Operations Phase 13](adaptive-operations-phase13.md) adds a
+caller-owned cooperative invocation policy around the Phase 12 bounded runner.
+Typed logical ticks drive minimum cadence, idle/no-progress backoff,
+evidence-aware trial wakeups, periodic stale-trial evaluation, evidence-window
+renewal gates, and hard fault gates; one tick invokes Phase 12 at most once.
+The scheduler owns no Database, evidence pool, candidate safety, lane service,
+or mutation authority, and adds no thread, wall clock, async runtime, server
+worker, persistent format, protocol, manifest, or Inspection JSON change.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

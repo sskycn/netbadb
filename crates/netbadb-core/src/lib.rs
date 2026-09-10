@@ -26,6 +26,7 @@ mod automatic_orchestration_tests;
 mod automatic_safe_mode;
 #[cfg(test)]
 mod automatic_safe_mode_tests;
+mod automatic_scheduler;
 mod columnar;
 #[cfg(test)]
 mod columnar_tests;
@@ -134,9 +135,9 @@ pub use adaptive_columnar_compaction::{
 pub use adaptive_evidence_pool::{
     AdaptiveCalibrationEpochInspection, AdaptiveCalibrationGroupInspection, AdaptiveEvidencePool,
     AdaptiveEvidencePoolHealth, AdaptiveEvidencePoolInspection, AdaptiveEvidencePoolLimits,
-    AdaptiveEvidenceRecordError, AdaptiveEvidenceRecordOutcome, AdaptiveEvidenceRecordReport,
-    AdaptiveEvidenceRotationError, AdaptiveEvidenceRotationReport, AdaptiveEvidenceWindowEpoch,
-    AdaptiveTargetLineage, AdaptiveTargetWindowInspection,
+    AdaptiveEvidenceProgressToken, AdaptiveEvidenceRecordError, AdaptiveEvidenceRecordOutcome,
+    AdaptiveEvidenceRecordReport, AdaptiveEvidenceRotationError, AdaptiveEvidenceRotationReport,
+    AdaptiveEvidenceWindowEpoch, AdaptiveTargetLineage, AdaptiveTargetWindowInspection,
 };
 pub use adaptive_lsm_maintenance::{
     AdaptiveLsmCompactionPolicy, AdaptiveLsmCompactionProposal, AdaptiveLsmFlushPolicy,
@@ -175,6 +176,13 @@ pub use automatic_safe_mode::{
     AutomaticSafeModeNoAction, AutomaticSafeModeOutcome, AutomaticSafeModePolicy,
     AutomaticSafeModeReport, AutomaticSafeModeState, AutomaticSafeTrial,
     AutomaticTrialAwaitingReason,
+};
+pub use automatic_scheduler::{
+    AutomaticScheduler, AutomaticSchedulerDelayClass, AutomaticSchedulerError,
+    AutomaticSchedulerFault, AutomaticSchedulerGate, AutomaticSchedulerHoldReason,
+    AutomaticSchedulerInspection, AutomaticSchedulerOrchestrationFailure, AutomaticSchedulerPolicy,
+    AutomaticSchedulerPolicyError, AutomaticSchedulerState, AutomaticSchedulerTick,
+    AutomaticSchedulerTickOutcome, AutomaticSchedulerTickReport,
 };
 pub use columnar::{
     ChangeStreamGcReport, ColumnarAdvanceBudget, ColumnarAdvanceReport, ColumnarCompactionReport,
