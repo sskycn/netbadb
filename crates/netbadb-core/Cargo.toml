@@ -83,5 +83,9 @@ harness = false
 name = "global_group_change_stream_barrier_phase3f"
 harness = false
 
+[[bench]]
+name = "global_group_change_stream_pipeline_phase3g"
+harness = false
+
 [lints]
 workspace = true

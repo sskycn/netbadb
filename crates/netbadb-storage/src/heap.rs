@@ -3122,6 +3122,7 @@ impl HeapStorage {
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
+        self.flush_change_stream_checkpoints()?;
         let written = self
             .transactions
             .wal()
@@ -3142,6 +3143,7 @@ impl HeapStorage {
     /// generation. The method never waits for transaction handles to finish.
     pub fn checkpoint(&mut self) -> Result<(), StorageError> {
         self.transactions.ensure_checkpoint_safe()?;
+        self.flush_change_stream_checkpoints()?;
         let written = self
             .transactions
             .wal()
@@ -3170,6 +3172,12 @@ impl HeapStorage {
     pub fn close(self) -> Result<(), StorageError> {
         self.transactions.ensure_clean_close()?;
         self.flush()
+    }
+
+    pub(crate) fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
+        self.change_stream
+            .borrow_mut()
+            .checkpoint_pending_finalizes()
     }
 
     #[must_use]
@@ -3691,10 +3699,10 @@ mod tests {
     };
     use crate::crash_test::{self, TestCrashPoint};
     use crate::{
-        BufferError, CheckpointError, PageError, PageManager, PageType, PreparedDecision,
-        PreparedTxnResolution, RecoveryError, SlotId, StorageError, TransactionError,
-        TransactionState, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager,
-        WalRecordKind, txn_status_path, wal_alternate_path, wal_path,
+        BufferError, ChangeStreamError, CheckpointError, PageError, PageManager, PageType,
+        PreparedDecision, PreparedTxnResolution, RecoveryError, SlotId, StorageError,
+        TransactionError, TransactionState, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError,
+        WalManager, WalRecordKind, txn_status_path, wal_alternate_path, wal_path,
     };
     use netbadb_index::{
         BTreeHandle, IndexCatalogNode, IndexError, IndexSpec, IndexStatistics, TableStatistics,
@@ -3703,7 +3711,7 @@ mod tests {
     use netbadb_schema::{ColumnDef, SchemaError, TableDef, TypeSpec};
     use netbadb_types::{
         ColumnId, DatabaseTxnId, Float32Value, Float64Value, IndexId, IndexName, Lsn, PageId,
-        PhysicalType, ScalarRef, ScalarValue, SemanticType, StorageId, TableId,
+        PhysicalType, ScalarRef, ScalarValue, SemanticType, StorageDataVersion, StorageId, TableId,
     };
 
     const FIRST_HEAP_PAGE: PageId = PageId(2);
@@ -5426,6 +5434,70 @@ mod tests {
             rows[0].1,
             vec![ScalarValue::Int64(7), ScalarValue::Text("Ada".into())]
         );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn clean_close_reports_finalize_checkpoint_failure_and_reopen_keeps_commit() {
+        let path = test_path("phase3g-close-checkpoint-failure");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).expect("create heap");
+        let cursor = storage.enable_change_stream().expect("enable stream");
+        let database_txn_id = DatabaseTxnId(1_303);
+        let mut transaction = storage.begin_transaction().expect("begin group member");
+        storage
+            .insert_in(
+                &mut transaction,
+                &[
+                    ScalarValue::Int64(1),
+                    ScalarValue::Text("close-failure".into()),
+                ],
+            )
+            .expect("insert group row");
+        transaction
+            .stage_group_prepare(database_txn_id)
+            .expect("stage group Prepare");
+        {
+            let mut participants = [(&mut transaction, database_txn_id)];
+            crate::Transaction::durabilize_group_change_prepare_batch(&mut participants)
+                .expect("durabilize NBCL Prepare");
+            crate::Transaction::durabilize_group_prepare_batch(&mut participants)
+                .expect("durabilize authoritative Prepare");
+            crate::Transaction::commit_prepared_batch_authoritative(&mut participants)
+                .expect("durabilize authoritative Commit");
+            crate::Transaction::finalize_group_changes_batch_pipelined(&mut participants)
+                .expect("append and promote Finalize");
+        }
+        drop(transaction);
+        assert_eq!(
+            storage
+                .change_stream_inspection()
+                .pending_finalize_checkpoint_count,
+            1
+        );
+        storage
+            .change_stream
+            .borrow_mut()
+            .inject_finalize_checkpoint_sync_failure();
+        assert!(matches!(
+            storage.close(),
+            Err(StorageError::ChangeStream(ChangeStreamError::Io(_)))
+        ));
+
+        let mut reopened = HeapStorage::open(&path, table()).expect("recover committed heap");
+        assert_eq!(
+            reopened.scan().expect("scan recovered heap")[0].1,
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Text("close-failure".into())
+            ]
+        );
+        let changes = reopened
+            .read_changes(cursor, 10, u64::MAX)
+            .expect("read recovered changes");
+        assert_eq!(changes.batches.len(), 1);
+        assert_eq!(changes.current_frontier, StorageDataVersion(1));
+        reopened.close().expect("close recovered heap");
         cleanup(&path);
     }
 

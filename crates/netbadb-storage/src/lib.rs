@@ -467,6 +467,12 @@ pub struct PreparedRuntimeInspection {
     pub change_stream_group_prepare_barrier_sync_count: u64,
     pub change_stream_member_finalize_sync_count: u64,
     pub change_stream_group_finalize_barrier_sync_count: u64,
+    /// Successful syncs that checkpointed previously promoted pipelined
+    /// Finalizes. This overlaps the reason-specific counters below.
+    pub change_stream_pipelined_finalize_checkpoint_sync_count: u64,
+    pub change_stream_combined_finalize_prepare_sync_count: u64,
+    pub change_stream_explicit_finalize_checkpoint_sync_count: u64,
+    pub change_stream_recovery_finalize_sync_count: u64,
 }
 
 impl fmt::Display for TransactionError {

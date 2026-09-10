@@ -837,6 +837,13 @@ impl LsmStorage {
             change_stream_group_prepare_barrier_sync_count: change_syncs.group_prepare,
             change_stream_member_finalize_sync_count: change_syncs.member_finalize,
             change_stream_group_finalize_barrier_sync_count: change_syncs.group_finalize,
+            change_stream_pipelined_finalize_checkpoint_sync_count: change_syncs
+                .pipelined_finalize_checkpoint,
+            change_stream_combined_finalize_prepare_sync_count: change_syncs
+                .combined_finalize_prepare,
+            change_stream_explicit_finalize_checkpoint_sync_count: change_syncs
+                .explicit_finalize_checkpoint,
+            change_stream_recovery_finalize_sync_count: change_syncs.recovery_finalize,
         }
     }
 
@@ -1835,6 +1842,7 @@ impl LsmStorage {
     pub fn flush(&self) -> Result<(), StorageError> {
         let mut shared = self.shared.borrow_mut();
         ensure_maintenance_safe(&shared)?;
+        shared.change_stream.checkpoint_pending_finalizes()?;
         flush_memtable(&mut shared)
     }
 
@@ -1881,12 +1889,20 @@ impl LsmStorage {
         {
             let mut shared = self.shared.borrow_mut();
             ensure_maintenance_safe(&shared)?;
+            shared.change_stream.checkpoint_pending_finalizes()?;
             if !shared.memtable.is_empty() {
                 flush_memtable(&mut shared)?;
             }
             shared.wal.sync()?;
         }
         Ok(())
+    }
+
+    pub(crate) fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
+        self.shared
+            .borrow_mut()
+            .change_stream
+            .checkpoint_pending_finalizes()
     }
 }
 
@@ -2561,6 +2577,19 @@ impl LsmTransaction {
     pub(crate) fn finalize_group_changes_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
+        Self::finalize_group_changes_batch_with_mode(participants, false)
+    }
+
+    pub(crate) fn finalize_group_changes_batch_pipelined(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
+        Self::finalize_group_changes_batch_with_mode(participants, true)
+    }
+
+    fn finalize_group_changes_batch_with_mode(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+        pipelined: bool,
+    ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
         let Some((first, _)) = participants.first() else {
             return Err(TransactionError::EmptyPreparedCommitBatch.into());
         };
@@ -2586,6 +2615,13 @@ impl LsmTransaction {
         }
         let report = if candidates.is_empty() {
             None
+        } else if pipelined {
+            Some(
+                shared_handle
+                    .borrow_mut()
+                    .change_stream
+                    .finalize_group_batch_pipelined(&candidates)?,
+            )
         } else {
             Some(
                 shared_handle

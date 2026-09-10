@@ -350,8 +350,18 @@ pub enum GroupPrepareMode {
 pub enum GroupChangeStreamDurabilityMode {
     /// Every changing member durabilizes NBCL Prepare and Finalize separately.
     PerMember,
-    /// One NBCL Prepare and Finalize barrier is used per participating storage.
+    /// One NBCL Prepare and Finalize batch is used per participating storage.
+    /// The default Finalize policy synchronizes that batch before publication.
     BatchedBarriers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupChangeStreamFinalizeMode {
+    /// Phase 3F: Finalize markers are synchronized before group publication.
+    ImmediateBarrier,
+    /// Phase 3G: markers are appended and promoted before publication, while
+    /// their checkpoint sync is combined with the next stream sync or flush.
+    PipelinedCheckpoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +379,23 @@ impl Default for GroupCommitOptions {
     }
 }
 
+/// Source-compatible extension point for opt-in group durability policies.
+/// Existing [`GroupCommitOptions`] literals remain unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedGroupCommitOptions {
+    pub group: GroupCommitOptions,
+    pub change_stream_finalize_mode: GroupChangeStreamFinalizeMode,
+}
+
+impl Default for ExtendedGroupCommitOptions {
+    fn default() -> Self {
+        Self {
+            group: GroupCommitOptions::default(),
+            change_stream_finalize_mode: GroupChangeStreamFinalizeMode::ImmediateBarrier,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupCommitInspection {
     pub group_id: u64,
@@ -378,6 +405,7 @@ pub struct GroupCommitInspection {
     pub participating_storage_count: usize,
     pub prepare_mode: Option<GroupPrepareMode>,
     pub change_stream_durability_mode: GroupChangeStreamDurabilityMode,
+    pub change_stream_finalize_mode: GroupChangeStreamFinalizeMode,
     pub decision_state: GroupDecisionState,
 }
 
@@ -396,6 +424,7 @@ pub struct GroupCommitBatch {
     configured_prepare_mode: Option<GroupPrepareMode>,
     prepare_mode: Option<GroupPrepareMode>,
     change_stream_durability_mode: GroupChangeStreamDurabilityMode,
+    change_stream_finalize_mode: GroupChangeStreamFinalizeMode,
     prepare_barrier_started: bool,
     change_prepare_completed_storages: BTreeSet<StorageId>,
     change_stream_prepare_batches: BTreeMap<StorageId, StorageChangePrepareBatchReport>,
@@ -411,6 +440,7 @@ pub struct GroupCommitBatch {
 pub struct GroupCommitReport {
     pub prepare_mode: GroupPrepareMode,
     pub change_stream_durability_mode: GroupChangeStreamDurabilityMode,
+    pub change_stream_finalize_mode: GroupChangeStreamFinalizeMode,
     pub member_count: usize,
     pub first_commit_seq: DatabaseCommitSeq,
     pub last_commit_seq: DatabaseCommitSeq,
@@ -423,6 +453,8 @@ pub struct GroupCommitReport {
     pub storage_commit_wal_syncs: u64,
     pub change_stream_finalize_batches: Vec<StorageChangeFinalizeBatchReport>,
     pub change_stream_finalize_syncs: u64,
+    pub prior_finalize_checkpoints_checkpointed: usize,
+    pub pending_finalize_checkpoints_after_group: usize,
 }
 
 /// Result of one explicit, synchronous coordinator-history compaction.
@@ -2463,7 +2495,11 @@ impl Database {
     /// Opens one explicit synchronous group-commit builder at the current
     /// published database snapshot.
     pub fn begin_group_commit(&mut self) -> Result<GroupCommitBatch, DatabaseError> {
-        self.begin_group_commit_internal(None, GroupChangeStreamDurabilityMode::PerMember)
+        self.begin_group_commit_internal(
+            None,
+            GroupChangeStreamDurabilityMode::PerMember,
+            GroupChangeStreamFinalizeMode::ImmediateBarrier,
+        )
     }
 
     /// Opens an explicit group with its durability modes fixed before the
@@ -2481,6 +2517,31 @@ impl Database {
         self.begin_group_commit_internal(
             Some(options.prepare_mode),
             options.change_stream_durability_mode,
+            GroupChangeStreamFinalizeMode::ImmediateBarrier,
+        )
+    }
+
+    /// Opens an explicit group with the Phase 3G Finalize checkpoint policy.
+    /// This separate options type preserves existing Phase 3F struct literals.
+    pub fn begin_group_commit_with_extended_options(
+        &mut self,
+        options: ExtendedGroupCommitOptions,
+    ) -> Result<GroupCommitBatch, DatabaseError> {
+        if (options.group.prepare_mode == GroupPrepareMode::DurablePerMember
+            && options.group.change_stream_durability_mode
+                == GroupChangeStreamDurabilityMode::BatchedBarriers)
+            || (options.change_stream_finalize_mode
+                == GroupChangeStreamFinalizeMode::PipelinedCheckpoint
+                && (options.group.prepare_mode != GroupPrepareMode::BatchedBarrier
+                    || options.group.change_stream_durability_mode
+                        != GroupChangeStreamDurabilityMode::BatchedBarriers))
+        {
+            return Err(CoordinatorError::UnsupportedGroupDurabilityCombination.into());
+        }
+        self.begin_group_commit_internal(
+            Some(options.group.prepare_mode),
+            options.group.change_stream_durability_mode,
+            options.change_stream_finalize_mode,
         )
     }
 
@@ -2488,6 +2549,7 @@ impl Database {
         &mut self,
         configured_prepare_mode: Option<GroupPrepareMode>,
         change_stream_durability_mode: GroupChangeStreamDurabilityMode,
+        change_stream_finalize_mode: GroupChangeStreamFinalizeMode,
     ) -> Result<GroupCommitBatch, DatabaseError> {
         if self.visibility_mode() != DatabaseVisibilityMode::Global {
             return Err(CoordinatorError::GroupCommitRequiresGlobalVisibility.into());
@@ -2516,6 +2578,7 @@ impl Database {
                 participating_storage_count: 0,
                 prepare_mode: None,
                 change_stream_durability_mode,
+                change_stream_finalize_mode,
                 decision_state: GroupDecisionState::Building,
             },
         });
@@ -2528,6 +2591,7 @@ impl Database {
             configured_prepare_mode,
             prepare_mode: None,
             change_stream_durability_mode,
+            change_stream_finalize_mode,
             prepare_barrier_started: false,
             change_prepare_completed_storages: BTreeSet::new(),
             change_stream_prepare_batches: BTreeMap::new(),
@@ -2939,11 +3003,18 @@ impl Database {
                     "group-before-change-finalize-barrier",
                     position + 1,
                 );
-                if let Some(report) =
+                let finalize = if group.change_stream_finalize_mode
+                    == GroupChangeStreamFinalizeMode::PipelinedCheckpoint
+                {
+                    netbadb_storage::StorageTransaction::finalize_group_changes_batch_pipelined(
+                        &mut participants,
+                    )?
+                } else {
                     netbadb_storage::StorageTransaction::finalize_group_changes_batch(
                         &mut participants,
                     )?
-                {
+                };
+                if let Some(report) = finalize {
                     group
                         .change_stream_finalize_batches
                         .insert(storage_id, report);
@@ -3034,6 +3105,10 @@ impl Database {
             .iter()
             .map(|report| report.syncs)
             .sum();
+        let prior_finalize_checkpoints_checkpointed = change_stream_prepare_batches
+            .iter()
+            .map(|report| report.prior_finalize_checkpoints_checkpointed)
+            .sum();
         let storage_commit_batches = group
             .storage_commit_batches
             .values()
@@ -3052,6 +3127,10 @@ impl Database {
             .iter()
             .map(|report| report.syncs)
             .sum();
+        let pending_finalize_checkpoints_after_group = change_stream_finalize_batches
+            .iter()
+            .map(|report| report.pending_finalize_checkpoints_after)
+            .sum();
         group.completed = true;
         group.members.clear();
         self.group_barrier.set(None);
@@ -3059,6 +3138,7 @@ impl Database {
         Ok(GroupCommitReport {
             prepare_mode,
             change_stream_durability_mode: group.change_stream_durability_mode,
+            change_stream_finalize_mode: group.change_stream_finalize_mode,
             member_count,
             first_commit_seq,
             last_commit_seq,
@@ -3071,6 +3151,8 @@ impl Database {
             storage_commit_wal_syncs,
             change_stream_finalize_batches,
             change_stream_finalize_syncs,
+            prior_finalize_checkpoints_checkpointed,
+            pending_finalize_checkpoints_after_group,
         })
     }
 
@@ -3246,6 +3328,22 @@ impl Database {
                 .flush_complete_checkpoints()?;
         }
         Ok(())
+    }
+
+    /// Synchronizes only committed Change Stream Finalize checkpoints left by
+    /// explicit Phase 3G groups. Reads never invoke this operation.
+    pub fn flush_change_stream_checkpoints(&self) -> Result<u64, DatabaseError> {
+        if self.active_group.is_some() {
+            return Err(CoordinatorError::GroupCommitActive.into());
+        }
+        self.ensure_schema_available(None)?;
+        let mut syncs = 0_u64;
+        for entry in self.registry.iter() {
+            syncs = syncs
+                .checked_add(entry.storage.flush_change_stream_checkpoints()?)
+                .ok_or(ExecutionError::AffectedRowsOverflow)?;
+        }
+        Ok(syncs)
     }
 
     /// Creates a quiescent checkpoint and recycles the previous WAL history.
@@ -4218,6 +4316,11 @@ impl Database {
             if blocker == AdaptiveChangeStreamGcSafetyBlocker::PreparedChangesUnresolved {
                 return Err(StorageError::from(ChangeStreamError::Busy).into());
             }
+            if blocker == AdaptiveChangeStreamGcSafetyBlocker::FinalizeCheckpointPending {
+                return Err(
+                    StorageError::from(ChangeStreamError::FinalizeCheckpointPending).into(),
+                );
+            }
             if blocker != AdaptiveChangeStreamGcSafetyBlocker::NoReclaimableHistory {
                 return Err(DatabaseError::ChangeStreamGcUnsafe {
                     storage_id,
@@ -4402,7 +4505,11 @@ impl Database {
 
     /// Explicitly closes the embedded database after flushing dirty pages.
     pub fn close(self) -> Result<(), DatabaseError> {
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("database-before-close-flush");
         self.flush()?;
+        #[cfg(test)]
+        crate::coordinator_crash::maybe_crash("database-after-close-flush");
         for entry in self.registry.into_entries() {
             entry.storage.close()?;
         }
@@ -7140,11 +7247,15 @@ mod tests {
         if case.starts_with("group:")
             || case.starts_with("group3e:")
             || case.starts_with("group3f:")
+            || case.starts_with("group3g:")
         {
             group_crash_child(
                 &root,
-                case.starts_with("group3e:") || case.starts_with("group3f:"),
-                case.starts_with("group3f:"),
+                case.starts_with("group3e:")
+                    || case.starts_with("group3f:")
+                    || case.starts_with("group3g:"),
+                case.starts_with("group3f:") || case.starts_with("group3g:"),
+                case.starts_with("group3g:"),
             );
             panic!("group crash child returned without reaching its crash point");
         }
@@ -7288,6 +7399,7 @@ mod tests {
         root: &std::path::Path,
         batched_prepare: bool,
         batched_change_stream: bool,
+        pipelined_finalize: bool,
     ) {
         let (_, _, coordinator) = mixed_crash_paths(root);
         let mut database = Database::open_storages_with_coordinator(
@@ -7295,7 +7407,19 @@ mod tests {
             DatabaseCoordinatorConfig::new(coordinator),
         )
         .expect("open group crash child database");
-        let mut group = if batched_change_stream {
+        let mut group = if pipelined_finalize {
+            database
+                .begin_group_commit_with_extended_options(super::ExtendedGroupCommitOptions {
+                    group: super::GroupCommitOptions {
+                        prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                        change_stream_durability_mode:
+                            super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+                    },
+                    change_stream_finalize_mode:
+                        super::GroupChangeStreamFinalizeMode::PipelinedCheckpoint,
+                })
+                .expect("begin Phase 3G crash group")
+        } else if batched_change_stream {
             database
                 .begin_group_commit_with_options(super::GroupCommitOptions {
                     prepare_mode: super::GroupPrepareMode::BatchedBarrier,
@@ -7334,6 +7458,12 @@ mod tests {
         database
             .commit_group(&mut group)
             .expect("commit until group crash point");
+        if pipelined_finalize {
+            drop(group);
+            database
+                .close()
+                .expect("close until Phase 3G checkpoint crash point");
+        }
     }
 
     fn global_single_crash_child(root: &std::path::Path, table_id: TableId) {
@@ -11117,6 +11247,448 @@ mod tests {
     }
 
     #[test]
+    fn phase3g_pipeline_promotes_before_publication_and_flushes_explicitly() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3g-pipeline-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_mixed_crash_fixture(&root);
+        let (_, _, coordinator_path) = mixed_crash_paths(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database =
+            Database::create_storages_with_coordinator(mixed_create_specs(&root), config).unwrap();
+        let heap_cursor = database.enable_change_stream(TableId(1)).unwrap();
+        let lsm_cursor = database.enable_change_stream(TableId(2)).unwrap();
+        let mut group = database
+            .begin_group_commit_with_extended_options(super::ExtendedGroupCommitOptions {
+                group: super::GroupCommitOptions {
+                    prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                    change_stream_durability_mode:
+                        super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+                },
+                change_stream_finalize_mode:
+                    super::GroupChangeStreamFinalizeMode::PipelinedCheckpoint,
+            })
+            .unwrap();
+        for id in 1..=3_i64 {
+            let mut member = database.begin_group_member(&group).unwrap();
+            database
+                .insert_into_in(
+                    TableId(1),
+                    &mut member,
+                    &[
+                        ScalarValue::Int64(id),
+                        ScalarValue::Text(format!("phase3g-{id}")),
+                    ],
+                )
+                .unwrap();
+            database
+                .insert_into_in(TableId(2), &mut member, &[ScalarValue::Int64(id)])
+                .unwrap();
+            database.stage_group_member(&mut group, member).unwrap();
+        }
+        let report = database.commit_group(&mut group).unwrap();
+        assert_eq!(
+            report.change_stream_finalize_mode,
+            super::GroupChangeStreamFinalizeMode::PipelinedCheckpoint
+        );
+        assert_eq!(report.change_stream_prepare_syncs, 2);
+        assert_eq!(report.change_stream_finalize_syncs, 0);
+        assert_eq!(report.pending_finalize_checkpoints_after_group, 6);
+        assert_eq!(report.prior_finalize_checkpoints_checkpointed, 0);
+        assert_eq!(
+            database
+                .current_database_snapshot()
+                .unwrap()
+                .unwrap()
+                .commit_seq(),
+            DatabaseCommitSeq(3)
+        );
+        for (table_id, cursor) in [(TableId(1), heap_cursor), (TableId(2), lsm_cursor)] {
+            let stream = database.inspect_change_stream(table_id).unwrap();
+            assert_eq!(
+                stream.current_data_version,
+                netbadb_types::StorageDataVersion(3)
+            );
+            assert_eq!(
+                stream.finalize_checkpointed_through,
+                Some(netbadb_types::StorageDataVersion(0))
+            );
+            assert_eq!(stream.pending_finalize_checkpoint_count, 3);
+            assert_eq!(
+                database
+                    .read_changes(table_id, cursor, 10, 1_000_000)
+                    .unwrap()
+                    .batches
+                    .len(),
+                3
+            );
+            let runtime = database.inspect_prepared_runtime(table_id).unwrap();
+            assert_eq!(runtime.change_stream_sync_count, 1);
+            assert_eq!(runtime.change_stream_group_prepare_barrier_sync_count, 1);
+            assert_eq!(runtime.change_stream_group_finalize_barrier_sync_count, 0);
+        }
+        let heap_syncs_before_select = database
+            .inspect_prepared_runtime(TableId(1))
+            .unwrap()
+            .change_stream_sync_count;
+        let lsm_syncs_before_select = database
+            .inspect_prepared_runtime(TableId(2))
+            .unwrap()
+            .change_stream_sync_count;
+        assert_eq!(
+            database
+                .query("SELECT id FROM users ORDER BY id")
+                .unwrap()
+                .rows
+                .len(),
+            3
+        );
+        assert_eq!(
+            database
+                .query("SELECT id FROM lsm_items ORDER BY id")
+                .unwrap()
+                .rows
+                .len(),
+            3
+        );
+        assert_eq!(
+            database
+                .inspect_prepared_runtime(TableId(1))
+                .unwrap()
+                .change_stream_sync_count,
+            heap_syncs_before_select
+        );
+        assert_eq!(
+            database
+                .inspect_prepared_runtime(TableId(2))
+                .unwrap()
+                .change_stream_sync_count,
+            lsm_syncs_before_select
+        );
+        drop(group);
+
+        let mut next = database
+            .begin_group_commit_with_extended_options(super::ExtendedGroupCommitOptions {
+                group: super::GroupCommitOptions {
+                    prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                    change_stream_durability_mode:
+                        super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+                },
+                change_stream_finalize_mode:
+                    super::GroupChangeStreamFinalizeMode::PipelinedCheckpoint,
+            })
+            .unwrap();
+        let mut member = database.begin_group_member(&next).unwrap();
+        database
+            .insert_into_in(
+                TableId(1),
+                &mut member,
+                &[
+                    ScalarValue::Int64(4),
+                    ScalarValue::Text("phase3g-next".into()),
+                ],
+            )
+            .unwrap();
+        database
+            .insert_into_in(TableId(2), &mut member, &[ScalarValue::Int64(4)])
+            .unwrap();
+        database.stage_group_member(&mut next, member).unwrap();
+        let next_report = database.commit_group(&mut next).unwrap();
+        assert_eq!(next_report.prior_finalize_checkpoints_checkpointed, 6);
+        assert_eq!(next_report.change_stream_finalize_syncs, 0);
+        assert_eq!(next_report.pending_finalize_checkpoints_after_group, 2);
+        drop(next);
+        for table_id in [TableId(1), TableId(2)] {
+            let stream = database.inspect_change_stream(table_id).unwrap();
+            assert_eq!(
+                stream.current_data_version,
+                netbadb_types::StorageDataVersion(4)
+            );
+            assert_eq!(
+                stream.finalize_checkpointed_through,
+                Some(netbadb_types::StorageDataVersion(3))
+            );
+            assert_eq!(stream.pending_finalize_checkpoint_count, 1);
+            let runtime = database.inspect_prepared_runtime(table_id).unwrap();
+            assert_eq!(runtime.change_stream_sync_count, 2);
+            assert_eq!(
+                runtime.change_stream_combined_finalize_prepare_sync_count,
+                1
+            );
+        }
+        assert_eq!(database.flush_change_stream_checkpoints().unwrap(), 2);
+        for table_id in [TableId(1), TableId(2)] {
+            let stream = database.inspect_change_stream(table_id).unwrap();
+            assert_eq!(
+                stream.finalize_checkpointed_through,
+                Some(netbadb_types::StorageDataVersion(4))
+            );
+            assert_eq!(stream.pending_finalize_checkpoint_count, 0);
+            let runtime = database.inspect_prepared_runtime(table_id).unwrap();
+            assert_eq!(runtime.change_stream_sync_count, 3);
+            assert_eq!(
+                runtime.change_stream_pipelined_finalize_checkpoint_sync_count,
+                2
+            );
+            assert_eq!(
+                runtime.change_stream_explicit_finalize_checkpoint_sync_count,
+                1
+            );
+        }
+        database.close().unwrap();
+
+        let reopened = Database::open_storages_with_coordinator(
+            mixed_open_specs(&root),
+            DatabaseCoordinatorConfig::new(coordinator_path),
+        )
+        .unwrap();
+        for table_id in [TableId(1), TableId(2)] {
+            let stream = reopened.inspect_change_stream(table_id).unwrap();
+            assert_eq!(
+                stream.current_data_version,
+                netbadb_types::StorageDataVersion(4)
+            );
+            assert_eq!(
+                stream.finalize_checkpointed_through,
+                Some(netbadb_types::StorageDataVersion(4))
+            );
+            assert_eq!(stream.pending_finalize_checkpoint_count, 0);
+        }
+        reopened.close().unwrap();
+        cleanup_mixed_crash_fixture(&root);
+    }
+
+    #[test]
+    fn phase3g_pending_finalize_is_checkpointed_by_the_next_write() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3g-cross-mode-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let mut database = Database::create_tables_with_coordinator(
+            tables,
+            DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility(),
+        )
+        .unwrap();
+        database.enable_change_stream(TableId(1)).unwrap();
+        let pipeline = super::ExtendedGroupCommitOptions {
+            group: super::GroupCommitOptions {
+                prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                change_stream_durability_mode:
+                    super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+            },
+            change_stream_finalize_mode: super::GroupChangeStreamFinalizeMode::PipelinedCheckpoint,
+        };
+        let mut first = database
+            .begin_group_commit_with_extended_options(pipeline)
+            .unwrap();
+        let mut member = database.begin_group_member(&first).unwrap();
+        database
+            .execute_in(
+                &mut member,
+                "INSERT INTO users (id, name) VALUES (1, 'pipeline')",
+            )
+            .unwrap();
+        database.stage_group_member(&mut first, member).unwrap();
+        database.commit_group(&mut first).unwrap();
+        drop(first);
+        assert_eq!(
+            database
+                .inspect_change_stream(TableId(1))
+                .unwrap()
+                .pending_finalize_checkpoint_count,
+            1
+        );
+
+        let mut immediate = database
+            .begin_group_commit_with_options(super::GroupCommitOptions {
+                prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                change_stream_durability_mode:
+                    super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+            })
+            .unwrap();
+        let mut member = database.begin_group_member(&immediate).unwrap();
+        database
+            .execute_in(
+                &mut member,
+                "INSERT INTO users (id, name) VALUES (2, 'immediate')",
+            )
+            .unwrap();
+        database.stage_group_member(&mut immediate, member).unwrap();
+        let report = database.commit_group(&mut immediate).unwrap();
+        assert_eq!(report.prior_finalize_checkpoints_checkpointed, 1);
+        assert_eq!(report.change_stream_finalize_syncs, 1);
+        assert_eq!(report.pending_finalize_checkpoints_after_group, 0);
+        drop(immediate);
+        let stream = database.inspect_change_stream(TableId(1)).unwrap();
+        assert_eq!(stream.pending_finalize_checkpoint_count, 0);
+        assert_eq!(
+            stream.current_data_version,
+            netbadb_types::StorageDataVersion(2)
+        );
+        assert_eq!(
+            stream.finalize_checkpointed_through,
+            Some(stream.current_data_version)
+        );
+        let runtime = database.inspect_prepared_runtime(TableId(1)).unwrap();
+        assert_eq!(runtime.change_stream_sync_count, 3);
+        assert_eq!(
+            runtime.change_stream_combined_finalize_prepare_sync_count,
+            1
+        );
+
+        let mut second_pipeline = database
+            .begin_group_commit_with_extended_options(pipeline)
+            .unwrap();
+        let mut member = database.begin_group_member(&second_pipeline).unwrap();
+        database
+            .execute_in(
+                &mut member,
+                "INSERT INTO users (id, name) VALUES (3, 'pipeline-again')",
+            )
+            .unwrap();
+        database
+            .stage_group_member(&mut second_pipeline, member)
+            .unwrap();
+        database.commit_group(&mut second_pipeline).unwrap();
+        drop(second_pipeline);
+        assert_eq!(
+            database
+                .inspect_change_stream(TableId(1))
+                .unwrap()
+                .pending_finalize_checkpoint_count,
+            1
+        );
+        let before_ordinary = database.inspect_prepared_runtime(TableId(1)).unwrap();
+        database
+            .execute("INSERT INTO users (id, name) VALUES (4, 'ordinary')")
+            .unwrap();
+        let after_ordinary = database.inspect_prepared_runtime(TableId(1)).unwrap();
+        assert_eq!(
+            after_ordinary.change_stream_sync_count,
+            before_ordinary.change_stream_sync_count + 2,
+            "the ordinary transaction retains its own Prepare and Finalize syncs"
+        );
+        assert_eq!(
+            after_ordinary.change_stream_combined_finalize_prepare_sync_count,
+            runtime.change_stream_combined_finalize_prepare_sync_count + 1
+        );
+        let stream = database.inspect_change_stream(TableId(1)).unwrap();
+        assert_eq!(stream.pending_finalize_checkpoint_count, 0);
+        assert_eq!(
+            stream.finalize_checkpointed_through,
+            Some(netbadb_types::StorageDataVersion(4))
+        );
+        assert_eq!(stream.committed_batch_count, 4);
+        database.close().unwrap();
+        cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
+    fn phase3g_flush_checkpoint_and_clean_close_flush_pending_finalizes() {
+        fn commit_pipeline_member(database: &mut Database, id: i64, label: &str) {
+            let mut group = database
+                .begin_group_commit_with_extended_options(super::ExtendedGroupCommitOptions {
+                    group: super::GroupCommitOptions {
+                        prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                        change_stream_durability_mode:
+                            super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+                    },
+                    change_stream_finalize_mode:
+                        super::GroupChangeStreamFinalizeMode::PipelinedCheckpoint,
+                })
+                .unwrap();
+            let mut member = database.begin_group_member(&group).unwrap();
+            database
+                .insert_into_in(
+                    TableId(1),
+                    &mut member,
+                    &[ScalarValue::Int64(id), ScalarValue::Text(label.into())],
+                )
+                .unwrap();
+            database.stage_group_member(&mut group, member).unwrap();
+            database.commit_group(&mut group).unwrap();
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3g-clean-close-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database =
+            Database::create_tables_with_coordinator(tables.clone(), config.clone()).unwrap();
+        let cursor = database.enable_change_stream(TableId(1)).unwrap();
+        commit_pipeline_member(&mut database, 1, "flush");
+        assert_eq!(
+            database
+                .inspect_change_stream(TableId(1))
+                .unwrap()
+                .pending_finalize_checkpoint_count,
+            1
+        );
+        database.flush().unwrap();
+        assert_eq!(
+            database
+                .inspect_change_stream(TableId(1))
+                .unwrap()
+                .pending_finalize_checkpoint_count,
+            0
+        );
+
+        commit_pipeline_member(&mut database, 2, "checkpoint");
+        assert_eq!(
+            database
+                .inspect_change_stream(TableId(1))
+                .unwrap()
+                .pending_finalize_checkpoint_count,
+            1
+        );
+        database.checkpoint().unwrap();
+        assert_eq!(
+            database
+                .inspect_change_stream(TableId(1))
+                .unwrap()
+                .pending_finalize_checkpoint_count,
+            0
+        );
+
+        commit_pipeline_member(&mut database, 3, "close");
+        assert_eq!(
+            database
+                .inspect_change_stream(TableId(1))
+                .unwrap()
+                .pending_finalize_checkpoint_count,
+            1
+        );
+        database.close().unwrap();
+
+        let reopened = Database::open_tables_with_coordinator(tables, config).unwrap();
+        let stream = reopened.inspect_change_stream(TableId(1)).unwrap();
+        assert_eq!(stream.pending_finalize_checkpoint_count, 0);
+        assert_eq!(
+            stream.finalize_checkpointed_through,
+            Some(stream.current_data_version)
+        );
+        assert_eq!(
+            reopened
+                .read_changes(TableId(1), cursor, 10, 1_000_000)
+                .unwrap()
+                .batches
+                .len(),
+            3
+        );
+        reopened.close().unwrap();
+        cleanup_coordinator_fixture(&root);
+    }
+
+    #[test]
     fn phase3f_mode_is_explicit_rejects_unsupported_pair_and_skips_disabled_streams() {
         let root = std::env::temp_dir().join(format!(
             "netbadb-phase3f-mode-disabled-{}-{:?}",
@@ -11132,6 +11704,21 @@ mod tests {
                 prepare_mode: super::GroupPrepareMode::DurablePerMember,
                 change_stream_durability_mode:
                     super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+            }),
+            Err(DatabaseError::Transaction(
+                CoordinatorError::UnsupportedGroupDurabilityCombination
+            ))
+        ));
+        assert!(database.inspect_group_commit().is_none());
+        assert!(matches!(
+            database.begin_group_commit_with_extended_options(super::ExtendedGroupCommitOptions {
+                group: super::GroupCommitOptions {
+                    prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                    change_stream_durability_mode:
+                        super::GroupChangeStreamDurabilityMode::PerMember,
+                },
+                change_stream_finalize_mode:
+                    super::GroupChangeStreamFinalizeMode::PipelinedCheckpoint,
             }),
             Err(DatabaseError::Transaction(
                 CoordinatorError::UnsupportedGroupDurabilityCombination
@@ -12124,6 +12711,120 @@ mod tests {
                             .rows,
                         expected,
                         "LSM pass {pass}, point {point}"
+                    );
+                    for (table_id, cursor) in [(TableId(1), heap_cursor), (TableId(2), lsm_cursor)]
+                    {
+                        let changes = recovered
+                            .read_changes(table_id, cursor, 10, 1_000_000)
+                            .unwrap();
+                        assert_eq!(changes.batches.len(), if committed { 3 } else { 0 });
+                        assert!(
+                            changes
+                                .batches
+                                .windows(2)
+                                .all(|pair| pair[0].after == pair[1].before)
+                        );
+                    }
+                    assert_eq!(
+                        recovered
+                            .current_database_snapshot()
+                            .unwrap()
+                            .unwrap()
+                            .commit_seq(),
+                        DatabaseCommitSeq(if committed { 3 } else { 0 })
+                    );
+                    recovered.close().unwrap();
+                }
+                cleanup_mixed_crash_fixture(&root);
+            }
+        }
+    }
+
+    #[test]
+    fn subprocess_phase3g_pipeline_recovers_by_authoritative_group_decision() {
+        let cases = [
+            ("group-after-member-park-1", false),
+            ("group-after-member-park-3", false),
+            ("group-before-change-prepare-barrier-1", false),
+            ("group-after-change-prepare-barrier-1", false),
+            ("group-after-all-prepare-barriers", false),
+            ("group-after-durable-decision", true),
+            ("group-after-authoritative-commit-barrier-1", true),
+            ("group-before-change-finalize-barrier-1", true),
+            ("group-after-change-finalize-barrier-1", true),
+            ("group-after-participant-commit-1", true),
+            ("group-after-all-participant-commits", true),
+            ("group-after-all-completes-before-publication", true),
+            ("group-after-publication-before-complete-sync", true),
+            ("database-before-close-flush", true),
+            ("database-after-close-flush", true),
+        ];
+        for reverse_storage_order in [false, true] {
+            for (point, committed) in cases {
+                let root = std::env::temp_dir().join(format!(
+                    "netbadb-phase3g-crash-{reverse_storage_order}-{point}-{}",
+                    std::process::id()
+                ));
+                cleanup_mixed_crash_fixture(&root);
+                let (_, _, coordinator) = mixed_crash_paths(&root);
+                let mut initial = Database::create_storages_with_coordinator(
+                    mixed_create_specs(&root),
+                    DatabaseCoordinatorConfig::new(&coordinator).with_global_visibility(),
+                )
+                .unwrap();
+                let heap_cursor = initial.enable_change_stream(TableId(1)).unwrap();
+                let lsm_cursor = initial.enable_change_stream(TableId(2)).unwrap();
+                initial.close().unwrap();
+
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .arg("--exact")
+                    .arg("tests::coordinator_crash_child_entrypoint")
+                    .arg("--nocapture");
+                if reverse_storage_order {
+                    command
+                        .env("NETBADB_REVERSE_GROUP_STORAGE_PREPARE", "1")
+                        .env("NETBADB_REVERSE_GROUP_STORAGE_COMMIT", "1");
+                }
+                crate::coordinator_crash::configure_child(
+                    &mut command,
+                    &format!("group3g:{point}"),
+                    &root,
+                    point,
+                );
+                let status = command.status().expect("start Phase 3G crash child");
+                assert_eq!(status.code(), Some(crate::coordinator_crash::EXIT_CODE));
+
+                for pass in 0..2 {
+                    let mut recovered = Database::open_storages_with_coordinator(
+                        mixed_open_specs(&root),
+                        DatabaseCoordinatorConfig::new(&coordinator),
+                    )
+                    .unwrap_or_else(|error| panic!("recover {point} pass {pass}: {error}"));
+                    let expected = if committed {
+                        vec![
+                            vec![ScalarValue::Int64(1)],
+                            vec![ScalarValue::Int64(2)],
+                            vec![ScalarValue::Int64(3)],
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(
+                        recovered
+                            .query("SELECT id FROM users ORDER BY id")
+                            .unwrap()
+                            .rows,
+                        expected,
+                        "Heap {point} pass {pass}"
+                    );
+                    assert_eq!(
+                        recovered
+                            .query("SELECT id FROM lsm_items ORDER BY id")
+                            .unwrap()
+                            .rows,
+                        expected,
+                        "LSM {point} pass {pass}"
                     );
                     for (table_id, cursor) in [(TableId(1), heap_cursor), (TableId(2), lsm_cursor)]
                     {

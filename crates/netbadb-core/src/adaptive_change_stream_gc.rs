@@ -76,6 +76,7 @@ pub struct ChangeStreamReclaimPrefix {
 pub enum AdaptiveChangeStreamGcSafetyBlocker {
     StreamUnavailable,
     PreparedChangesUnresolved,
+    FinalizeCheckpointPending,
     ProjectionCatalogUnavailable,
     ManagedProjectionUnavailable,
     UnmanagedIncrementalProjection,
@@ -97,6 +98,7 @@ pub struct AdaptiveChangeStreamGcObservation {
     pub earliest_available_frontier: Option<StorageDataVersion>,
     pub current_frontier: StorageDataVersion,
     pub prepared_unresolved_count: u64,
+    pub pending_finalize_checkpoint_count: u64,
     pub batch_count: u64,
     pub file_bytes: u64,
     pub consumers: Vec<ChangeStreamRetentionConsumer>,
@@ -458,6 +460,7 @@ impl Database {
             earliest_available_frontier: maintenance.stream.earliest_available_frontier,
             current_frontier: maintenance.stream.current_data_version,
             prepared_unresolved_count: maintenance.stream.prepared_unresolved_count,
+            pending_finalize_checkpoint_count: maintenance.stream.pending_finalize_checkpoint_count,
             batch_count: maintenance.stream.committed_batch_count,
             file_bytes: maintenance.stream.file_bytes,
             consumers: Vec::new(),
@@ -483,6 +486,14 @@ impl Database {
         if maintenance.stream.prepared_unresolved_count != 0 {
             observation.blocker =
                 Some(AdaptiveChangeStreamGcSafetyBlocker::PreparedChangesUnresolved);
+            return Ok(ChangeStreamRetentionAssessment {
+                observation,
+                maintenance,
+            });
+        }
+        if maintenance.stream.pending_finalize_checkpoint_count != 0 {
+            observation.blocker =
+                Some(AdaptiveChangeStreamGcSafetyBlocker::FinalizeCheckpointPending);
             return Ok(ChangeStreamRetentionAssessment {
                 observation,
                 maintenance,

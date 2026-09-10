@@ -138,6 +138,13 @@ and ordinary transaction paths retain per-member NBCL durability. Existing
 NBCL v2 records, independent ChangeBatches, local frontiers, and CORD v5 remain
 unchanged; this is not asynchronous CDC or globally ordered CDC.
 
+[Phase 3G](docs/phase3g-pipelined-change-stream-finalize.md) lets that explicit
+batched group opt into pipelining Change Stream Finalize checkpoints into the
+next durability barrier per `StorageId`. Finalize markers are still appended,
+and independent ChangeBatches are promoted, before publication; clean close
+flushes the last pending checkpoint. PreparedChange durability and ordinary
+transaction behavior are unchanged.
+
 NetbaDB's selected write-concurrency architecture is
 [partitioned single-writer](docs/disjoint-write-domains.md): each authoritative
 `StorageId` has at most one active mutation owner, while transactions whose

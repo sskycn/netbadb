@@ -467,6 +467,8 @@ pub struct StorageChangePrepareBatchReport {
     pub before_frontier: StorageDataVersion,
     /// Reserved by staged records; this is not the committed stream frontier.
     pub after_reserved_frontier: StorageDataVersion,
+    /// Previously promoted pipelined Finalizes checkpointed by this same sync.
+    pub prior_finalize_checkpoints_checkpointed: usize,
 }
 
 /// Result of one storage-local NBCL Finalize durability barrier and promotion.
@@ -479,6 +481,8 @@ pub struct StorageChangeFinalizeBatchReport {
     pub syncs: u64,
     pub before_committed_frontier: StorageDataVersion,
     pub after_committed_frontier: StorageDataVersion,
+    /// Committed markers still awaiting an explicit NBCL sync after promotion.
+    pub pending_finalize_checkpoints_after: usize,
 }
 
 #[derive(Debug)]
@@ -908,6 +912,64 @@ impl StorageTransaction {
             syncs: report.syncs,
             before_committed_frontier: report.before_committed_frontier,
             after_committed_frontier: report.after_committed_frontier,
+            pending_finalize_checkpoints_after: report.pending_finalize_checkpoints_after,
+        }))
+    }
+
+    /// Appends and promotes an exact group Finalize subsequence while leaving
+    /// its checkpoint sync for the next NBCL durability boundary.
+    #[doc(hidden)]
+    pub fn finalize_group_changes_batch_pipelined(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<Option<StorageChangeFinalizeBatchReport>, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedCommitBatch.into());
+        };
+        let storage_id = first.storage_id;
+        let table_id = first.table_id;
+        let heap = matches!(first.inner, StorageTransactionKind::Heap(_));
+        let report = if heap {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Heap(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Lsm(_) => {
+                        return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                    }
+                }
+            }
+            Transaction::finalize_group_changes_batch_pipelined(&mut batch)?
+        } else {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Lsm(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Heap(_) => {
+                        return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                    }
+                }
+            }
+            LsmTransaction::finalize_group_changes_batch_pipelined(&mut batch)?
+        };
+        Ok(report.map(|report| StorageChangeFinalizeBatchReport {
+            storage_id,
+            finalized_member_count: report.finalized_member_count,
+            markers_staged: report.markers_staged,
+            marker_bytes: report.marker_bytes,
+            syncs: report.syncs,
+            before_committed_frontier: report.before_committed_frontier,
+            after_committed_frontier: report.after_committed_frontier,
+            pending_finalize_checkpoints_after: report.pending_finalize_checkpoints_after,
         }))
     }
 
@@ -1027,6 +1089,7 @@ impl StorageTransaction {
             last_sequence: report.last_sequence,
             before_frontier: report.before_frontier,
             after_reserved_frontier: report.after_reserved_frontier,
+            prior_finalize_checkpoints_checkpointed: report.prior_finalize_checkpoints_checkpointed,
         }))
     }
 
@@ -2205,6 +2268,14 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => storage.flush(),
             Self::Lsm(storage) => storage.flush(),
+        }
+    }
+
+    /// Synchronizes only pending pipelined NBCL Finalize checkpoints.
+    pub fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.flush_change_stream_checkpoints(),
+            Self::Lsm(storage) => storage.flush_change_stream_checkpoints(),
         }
     }
 

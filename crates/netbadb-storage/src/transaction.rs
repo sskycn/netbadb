@@ -520,6 +520,19 @@ impl Transaction {
     pub(crate) fn finalize_group_changes_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
+        Self::finalize_group_changes_batch_with_mode(participants, false)
+    }
+
+    pub(crate) fn finalize_group_changes_batch_pipelined(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
+        Self::finalize_group_changes_batch_with_mode(participants, true)
+    }
+
+    fn finalize_group_changes_batch_with_mode(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+        pipelined: bool,
+    ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
         let mut stream = None::<SharedChangeStream>;
         let mut candidates = Vec::new();
         for (participant, _) in participants.iter() {
@@ -546,7 +559,14 @@ impl Transaction {
             }
         }
         let report = if let Some(stream) = stream {
-            Some(stream.borrow_mut().finalize_group_batch(&candidates)?)
+            let report = if pipelined {
+                stream
+                    .borrow_mut()
+                    .finalize_group_batch_pipelined(&candidates)?
+            } else {
+                stream.borrow_mut().finalize_group_batch(&candidates)?
+            };
+            Some(report)
         } else {
             None
         };
@@ -1530,6 +1550,13 @@ impl TransactionManager {
             change_stream_group_prepare_barrier_sync_count: change_syncs.group_prepare,
             change_stream_member_finalize_sync_count: change_syncs.member_finalize,
             change_stream_group_finalize_barrier_sync_count: change_syncs.group_finalize,
+            change_stream_pipelined_finalize_checkpoint_sync_count: change_syncs
+                .pipelined_finalize_checkpoint,
+            change_stream_combined_finalize_prepare_sync_count: change_syncs
+                .combined_finalize_prepare,
+            change_stream_explicit_finalize_checkpoint_sync_count: change_syncs
+                .explicit_finalize_checkpoint,
+            change_stream_recovery_finalize_sync_count: change_syncs.recovery_finalize,
         }
     }
 

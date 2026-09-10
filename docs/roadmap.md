@@ -1,5 +1,21 @@
 # NetbaDB roadmap
 
+## Pipelined Change Stream Finalize checkpoints (Phase 3G complete)
+
+- added an explicit source-compatible Finalize policy while retaining all
+  Phase 3F defaults;
+- moved only the Finalize sync checkpoint after runtime promotion and database
+  publication, while keeping PreparedChange durability and Finalize append in
+  the foreground;
+- combined prior Finalize checkpoints with the next NBCL sync and flushed the
+  final checkpoint through explicit flush/checkpoint/clean-close boundaries;
+- separated runtime current and checkpointed frontiers, added a distinct GC
+  blocker, and batched reopen repair behind one sync per NBCL file;
+- retained independent ChangeBatches, exact LSM versions, NBCL v1/v2 and CORD
+  v5 formats, ordinary transaction durability, and single-writer execution.
+
+See [`phase3g-pipelined-change-stream-finalize.md`](phase3g-pipelined-change-stream-finalize.md).
+
 ## Bounded production `ALTER COLUMN TYPE ... USING` (Round 62 complete)
 
 - opened only the exact USING-required grammar for runtime-created Single Heap

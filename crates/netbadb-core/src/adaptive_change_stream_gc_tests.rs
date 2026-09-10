@@ -12,8 +12,9 @@ use crate::{
     AutomaticCandidateReadiness, AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy,
     AutomaticSafeModeLane, AutomaticSafeModeMutation, AutomaticSafeModeOutcome, ChangeStreamCursor,
     ChangeStreamRetentionConsumer, ColumnarAdvanceBudget, ColumnarProjectionSpec, Database,
-    DatabaseCoordinatorConfig, GroupChangeStreamDurabilityMode, GroupCommitOptions,
-    GroupPrepareMode, MaintenanceBudget, TableStorageCreateSpec, cleanup_created_table_files,
+    DatabaseCoordinatorConfig, ExtendedGroupCommitOptions, GroupChangeStreamDurabilityMode,
+    GroupChangeStreamFinalizeMode, GroupCommitOptions, GroupPrepareMode, MaintenanceBudget,
+    TableStorageCreateSpec, cleanup_created_table_files,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -266,6 +267,203 @@ fn phase3f_unsynced_change_prepare_blocks_reclamation_and_stale_proposal() {
     fixture.database.abort_group(&mut group).unwrap();
     drop(group);
     fixture.cleanup();
+}
+
+#[test]
+fn phase3g_pending_finalize_blocks_gc_but_not_columnar_advance() {
+    let mut fixture = Fixture::global("phase3g-finalize-checkpoint");
+    let proposal = fixture.proposal();
+    let mut group = fixture
+        .database
+        .begin_group_commit_with_extended_options(ExtendedGroupCommitOptions {
+            group: GroupCommitOptions {
+                prepare_mode: GroupPrepareMode::BatchedBarrier,
+                change_stream_durability_mode: GroupChangeStreamDurabilityMode::BatchedBarriers,
+            },
+            change_stream_finalize_mode: GroupChangeStreamFinalizeMode::PipelinedCheckpoint,
+        })
+        .unwrap();
+    let mut member = fixture.database.begin_group_member(&group).unwrap();
+    fixture
+        .database
+        .insert_into_in(
+            TABLE_ID,
+            &mut member,
+            &[ScalarValue::Int64(99), ScalarValue::Int64(990)],
+        )
+        .unwrap();
+    fixture
+        .database
+        .stage_group_member(&mut group, member)
+        .unwrap();
+    fixture.database.commit_group(&mut group).unwrap();
+    drop(group);
+
+    let before_columnar = fixture
+        .database
+        .inspect_prepared_runtime(TABLE_ID)
+        .unwrap()
+        .change_stream_sync_count;
+    let observation = fixture
+        .database
+        .observe_change_stream_reclamation(TABLE_ID)
+        .unwrap();
+    assert_eq!(observation.prepared_unresolved_count, 0);
+    assert_eq!(observation.pending_finalize_checkpoint_count, 1);
+    assert_eq!(
+        observation.blocker,
+        Some(AdaptiveChangeStreamGcSafetyBlocker::FinalizeCheckpointPending)
+    );
+    assert!(
+        fixture
+            .database
+            .registry
+            .get_mut(fixture.origin.storage_id)
+            .unwrap()
+            .gc_change_stream(StorageDataVersion(2))
+            .is_err()
+    );
+    let execution = fixture
+        .database
+        .execute_change_stream_reclamation(&proposal, generous_budget())
+        .unwrap();
+    assert_eq!(
+        execution.outcome,
+        AdaptiveChangeStreamGcOutcome::Aborted(
+            AdaptiveChangeStreamGcAbortReason::PreconditionsChanged
+        )
+    );
+    assert!(execution.actual.is_none());
+
+    fixture
+        .database
+        .advance_columnar_projection(
+            fixture.projection_id,
+            ColumnarAdvanceBudget::new(10, 1 << 30),
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .database
+            .inspect_prepared_runtime(TABLE_ID)
+            .unwrap()
+            .change_stream_sync_count,
+        before_columnar,
+        "derived Columnar maintenance must not checkpoint NBCL"
+    );
+    assert_eq!(
+        fixture.database.inspect_columnar_projections()[0].health,
+        crate::ColumnarProjectionHealth::Fresh
+    );
+    assert_eq!(
+        fixture.database.flush_change_stream_checkpoints().unwrap(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .database
+            .inspect_change_stream(TABLE_ID)
+            .unwrap()
+            .pending_finalize_checkpoint_count,
+        0
+    );
+    let reclaimed = fixture.database.gc_change_stream(TABLE_ID).unwrap();
+    assert_eq!(reclaimed.new_earliest_frontier, StorageDataVersion(4));
+    fixture.cleanup();
+}
+
+#[test]
+fn phase3g_columnar_catch_up_and_source_frontier_survive_unclean_reopen() {
+    let mut fixture = Fixture::global("phase3g-columnar-reopen");
+    let mut group = fixture
+        .database
+        .begin_group_commit_with_extended_options(ExtendedGroupCommitOptions {
+            group: GroupCommitOptions {
+                prepare_mode: GroupPrepareMode::BatchedBarrier,
+                change_stream_durability_mode: GroupChangeStreamDurabilityMode::BatchedBarriers,
+            },
+            change_stream_finalize_mode: GroupChangeStreamFinalizeMode::PipelinedCheckpoint,
+        })
+        .unwrap();
+    let mut member = fixture.database.begin_group_member(&group).unwrap();
+    fixture
+        .database
+        .insert_into_in(
+            TABLE_ID,
+            &mut member,
+            &[ScalarValue::Int64(99), ScalarValue::Int64(990)],
+        )
+        .unwrap();
+    fixture
+        .database
+        .stage_group_member(&mut group, member)
+        .unwrap();
+    fixture.database.commit_group(&mut group).unwrap();
+    drop(group);
+    assert_eq!(
+        fixture
+            .database
+            .inspect_change_stream(TABLE_ID)
+            .unwrap()
+            .pending_finalize_checkpoint_count,
+        1
+    );
+    let syncs_before_advance = fixture
+        .database
+        .inspect_prepared_runtime(TABLE_ID)
+        .unwrap()
+        .change_stream_sync_count;
+    fixture
+        .database
+        .advance_columnar_projection(
+            fixture.projection_id,
+            ColumnarAdvanceBudget::new(10, 1 << 30),
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .database
+            .inspect_prepared_runtime(TABLE_ID)
+            .unwrap()
+            .change_stream_sync_count,
+        syncs_before_advance
+    );
+    assert_eq!(
+        fixture.database.inspect_columnar_projections()[0].health,
+        crate::ColumnarProjectionHealth::Fresh
+    );
+
+    let Fixture {
+        root,
+        heap,
+        database,
+        origin,
+        projection_id,
+        second_projection_id: _,
+    } = fixture;
+    drop(database);
+    let reopened = Database::open_catalog(root.join("catalog")).unwrap();
+    assert_eq!(
+        reopened
+            .inspect_change_stream(TABLE_ID)
+            .unwrap()
+            .current_data_version,
+        StorageDataVersion(4)
+    );
+    let changes = reopened
+        .read_changes(TABLE_ID, origin, 10, 1 << 30)
+        .unwrap();
+    assert_eq!(changes.current_frontier, StorageDataVersion(4));
+    assert_eq!(changes.batches.len(), 4);
+    let projection = reopened
+        .inspect_columnar_projections()
+        .into_iter()
+        .find(|projection| projection.projection_id == Some(projection_id))
+        .expect("reopened projection");
+    assert_eq!(projection.health, crate::ColumnarProjectionHealth::Fresh);
+    reopened.close().unwrap();
+    cleanup_created_table_files(&[heap]);
+    let _ = fs::remove_dir_all(root);
 }
 
 fn generous_budget() -> MaintenanceBudget {

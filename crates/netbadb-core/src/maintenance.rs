@@ -848,6 +848,9 @@ fn change_stream_gc_candidate(
         crate::AdaptiveChangeStreamGcSafetyBlocker::PreparedChangesUnresolved => {
             MaintenanceBlocker::Busy
         }
+        crate::AdaptiveChangeStreamGcSafetyBlocker::FinalizeCheckpointPending => {
+            MaintenanceBlocker::Busy
+        }
         crate::AdaptiveChangeStreamGcSafetyBlocker::NoRetentionConsumer => {
             MaintenanceBlocker::NoRetentionConsumer
         }
