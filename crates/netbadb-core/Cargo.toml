@@ -79,5 +79,9 @@ harness = false
 name = "global_group_prepare_barrier_phase3e"
 harness = false
 
+[[bench]]
+name = "global_group_change_stream_barrier_phase3f"
+harness = false
+
 [lints]
 workspace = true

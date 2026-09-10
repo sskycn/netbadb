@@ -23,7 +23,8 @@ use netbadb_types::{
 
 use crate::StorageVersionKey;
 use crate::change_stream::{
-    AuthoritativeOutcome, ChangeStreamManager, PendingChangeSet, PreparedChange,
+    AuthoritativeOutcome, ChangeFinalizeBatchReport, ChangePrepareBatchReport, ChangeStreamManager,
+    PendingChangeSet, PreparedChange,
 };
 use crate::row_codec::{
     decode_row, decode_row_columns, decode_row_positions, encode_row, resolve_columns, validate_row,
@@ -821,6 +822,7 @@ impl LsmStorage {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        let change_syncs = shared.change_stream.sync_counts();
         crate::PreparedRuntimeInspection {
             parked_prepared_count: chain.len(),
             parked_prepare_pending_count: shared.runtime.parked_prepare_pending.borrow().len(),
@@ -831,6 +833,10 @@ impl LsmStorage {
             single_commit_sync_count: shared.runtime.single_commit_sync_count.get(),
             group_commit_barrier_sync_count: shared.runtime.group_commit_barrier_sync_count.get(),
             change_stream_sync_count: shared.change_stream.sync_count(),
+            change_stream_member_prepare_sync_count: change_syncs.member_prepare,
+            change_stream_group_prepare_barrier_sync_count: change_syncs.group_prepare,
+            change_stream_member_finalize_sync_count: change_syncs.member_finalize,
+            change_stream_group_finalize_barrier_sync_count: change_syncs.group_finalize,
         }
     }
 
@@ -2174,6 +2180,21 @@ impl LsmTransaction {
         &mut self,
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
+        self.stage_group_prepare_inner(database_txn_id, false)
+    }
+
+    pub(crate) fn stage_group_prepare_with_batched_change_stream(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+    ) -> Result<(), StorageError> {
+        self.stage_group_prepare_inner(database_txn_id, true)
+    }
+
+    fn stage_group_prepare_inner(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+        batch_change_stream: bool,
+    ) -> Result<(), StorageError> {
         self.ensure_recovery_not_required()?;
         if database_txn_id.0 == 0 {
             return Err(TransactionError::InvalidDatabaseTxnId.into());
@@ -2195,11 +2216,19 @@ impl LsmTransaction {
                         &shared.table,
                         LsmCommitSeq(0),
                     )?;
-                    self.prepared_change = shared.change_stream.prepare(
-                        self.id,
-                        Some(database_txn_id),
-                        changes.as_slice(),
-                    )?;
+                    self.prepared_change = if batch_change_stream {
+                        shared.change_stream.stage_group_prepare(
+                            self.id,
+                            database_txn_id,
+                            changes.as_slice(),
+                        )?
+                    } else {
+                        shared.change_stream.prepare(
+                            self.id,
+                            Some(database_txn_id),
+                            changes.as_slice(),
+                        )?
+                    };
                 }
                 self.last_lsn = shared.wal.append(&WalRecord::MutationBatch {
                     txn_id: self.id,
@@ -2385,6 +2414,31 @@ impl LsmTransaction {
     pub(crate) fn commit_prepared_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<PreparedCommitBatchReport, StorageError> {
+        let report = Self::commit_prepared_batch_authoritative(participants)?;
+        for (position, (participant, _)) in participants.iter_mut().enumerate() {
+            let commit_seq = participant.pending_commit_seq.ok_or(LsmError::InvalidWal(
+                "prepared pending commit sequence is missing",
+            ))?;
+            if let Some(prepared) = participant.prepared_change {
+                participant.shared.borrow_mut().change_stream.publish(
+                    participant.id,
+                    prepared,
+                    Some(commit_seq),
+                )?;
+            }
+            participant.prepared_change = None;
+            participant.finish_terminal(TransactionState::Committed);
+            #[cfg(test)]
+            maybe_lsm_crash(&format!("group-after-runtime-finalize-{}", position + 1));
+            #[cfg(not(test))]
+            let _ = position;
+        }
+        Ok(report)
+    }
+
+    pub(crate) fn commit_prepared_batch_authoritative(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<PreparedCommitBatchReport, StorageError> {
         let Some((first, _)) = participants.first() else {
             return Err(TransactionError::EmptyPreparedCommitBatch.into());
         };
@@ -2477,7 +2531,7 @@ impl LsmTransaction {
             maybe_lsm_crash("group-after-commit-sync");
         }
 
-        for (position, (participant, _)) in participants.iter_mut().enumerate() {
+        for (participant, _) in participants.iter_mut() {
             let commit_seq = participant.pending_commit_seq.ok_or(LsmError::InvalidWal(
                 "prepared pending commit sequence is missing",
             ))?;
@@ -2490,17 +2544,8 @@ impl LsmTransaction {
                 apply_mutations(&mut shared.memtable, batch, commit_seq)?;
                 shared.memtable_bytes = estimate_memtable_bytes(&shared.memtable)?;
                 shared.visible_commit_seq = shared.visible_commit_seq.max(commit_seq);
-                if let Some(prepared) = participant.prepared_change {
-                    shared
-                        .change_stream
-                        .publish(participant.id, prepared, Some(commit_seq))?;
-                }
             }
-            participant.finish_terminal(TransactionState::Committed);
-            #[cfg(test)]
-            maybe_lsm_crash(&format!("group-after-runtime-finalize-{}", position + 1));
-            #[cfg(not(test))]
-            let _ = position;
+            participant.state = TransactionState::ChangeFinalizePending;
         }
         let first_seq = first_seq.ok_or(TransactionError::EmptyPreparedCommitBatch)?;
         let last_seq = last_seq.ok_or(TransactionError::EmptyPreparedCommitBatch)?;
@@ -2511,6 +2556,49 @@ impl LsmTransaction {
             first_local_boundary: first_seq.0,
             last_local_boundary: last_seq.0,
         })
+    }
+
+    pub(crate) fn finalize_group_changes_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedCommitBatch.into());
+        };
+        let shared_handle = first.shared.clone();
+        let mut candidates = Vec::new();
+        for (participant, _) in participants.iter() {
+            if !Rc::ptr_eq(&participant.shared, &shared_handle) {
+                return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+            }
+            if participant.state != TransactionState::ChangeFinalizePending {
+                return Err(TransactionError::NotPrepared {
+                    txn_id: participant.id,
+                    state: participant.state,
+                }
+                .into());
+            }
+            if let Some(prepared) = participant.prepared_change {
+                let commit_seq = participant.pending_commit_seq.ok_or(LsmError::InvalidWal(
+                    "prepared pending commit sequence is missing",
+                ))?;
+                candidates.push((participant.id, prepared, Some(commit_seq)));
+            }
+        }
+        let report = if candidates.is_empty() {
+            None
+        } else {
+            Some(
+                shared_handle
+                    .borrow_mut()
+                    .change_stream
+                    .finalize_group_batch(&candidates)?,
+            )
+        };
+        for (participant, _) in participants.iter_mut() {
+            participant.prepared_change = None;
+            participant.finish_terminal(TransactionState::Committed);
+        }
+        Ok(report)
     }
 
     pub(crate) fn durabilize_group_prepare_batch(
@@ -2593,6 +2681,43 @@ impl LsmTransaction {
             first_local_boundary: first_lsn.0,
             last_local_boundary: last_lsn.0,
         })
+    }
+
+    pub(crate) fn durabilize_group_change_prepare_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<Option<ChangePrepareBatchReport>, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedPrepareBatch.into());
+        };
+        let shared_handle = first.shared.clone();
+        let mut candidates = Vec::new();
+        for (participant, database_txn_id) in participants {
+            if !Rc::ptr_eq(&participant.shared, &shared_handle) {
+                return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+            }
+            participant.validate_database_txn(*database_txn_id)?;
+            if !matches!(
+                participant.state,
+                TransactionState::ParkedPreparePending | TransactionState::ParkedPrepared
+            ) {
+                return Err(TransactionError::NotPrepared {
+                    txn_id: participant.id,
+                    state: participant.state,
+                }
+                .into());
+            }
+            if let Some(prepared) = participant.prepared_change {
+                candidates.push((participant.id, *database_txn_id, prepared));
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let report = shared_handle
+            .borrow_mut()
+            .change_stream
+            .durabilize_group_prepared_batch(&candidates)?;
+        Ok(Some(report))
     }
 
     pub fn rollback_prepared(

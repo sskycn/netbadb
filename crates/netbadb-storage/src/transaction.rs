@@ -7,7 +7,10 @@ use netbadb_types::{
 };
 
 use crate::StorageVersionKey;
-use crate::change_stream::{PendingChangeSet, PreparedChange, SharedChangeStream};
+use crate::change_stream::{
+    ChangeFinalizeBatchReport, ChangePrepareBatchReport, PendingChangeSet, PreparedChange,
+    SharedChangeStream,
+};
 use crate::mvcc::{IsolationLevel, ReadView, Snapshot};
 use crate::txn_status::SharedTxnStatus;
 use crate::wal::page_update_kind;
@@ -70,6 +73,9 @@ pub enum TransactionState {
     ParkedPreparePending,
     ParkedPrepared,
     CommitPending,
+    /// Authoritative commit is durable, while a grouped Change Stream
+    /// Finalize barrier has not yet promoted the prepared batch.
+    ChangeFinalizePending,
     RollbackPending,
     Committed,
     RolledBack,
@@ -252,12 +258,31 @@ impl Transaction {
         &mut self,
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
+        self.stage_group_prepare_inner(database_txn_id, false)
+    }
+
+    pub(crate) fn stage_group_prepare_with_batched_change_stream(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+    ) -> Result<(), StorageError> {
+        self.stage_group_prepare_inner(database_txn_id, true)
+    }
+
+    fn stage_group_prepare_inner(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+        batch_change_stream: bool,
+    ) -> Result<(), StorageError> {
         if database_txn_id.0 == 0 {
             return Err(TransactionError::InvalidDatabaseTxnId.into());
         }
         match self.state {
             TransactionState::Active => {
-                self.prepare_changes(Some(database_txn_id))?;
+                if batch_change_stream {
+                    self.stage_group_changes(database_txn_id)?;
+                } else {
+                    self.prepare_changes(Some(database_txn_id))?;
+                }
                 let lsn = self
                     .wal
                     .try_borrow_mut()
@@ -359,6 +384,25 @@ impl Transaction {
     pub(crate) fn commit_prepared_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<PreparedCommitBatchReport, StorageError> {
+        let report = Self::commit_prepared_batch_authoritative(participants)?;
+        for (position, (participant, _)) in participants.iter_mut().enumerate() {
+            participant.publish_changes(None)?;
+            participant.prepared_change = None;
+            participant.state = TransactionState::Committed;
+            #[cfg(test)]
+            crate::crash_test::maybe_crash_indexed(
+                "heap-group-after-runtime-finalize",
+                position + 1,
+            );
+            #[cfg(not(test))]
+            let _ = position;
+        }
+        Ok(report)
+    }
+
+    pub(crate) fn commit_prepared_batch_authoritative(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<PreparedCommitBatchReport, StorageError> {
         let Some((first, _)) = participants.first() else {
             return Err(TransactionError::EmptyPreparedCommitBatch.into());
         };
@@ -450,27 +494,19 @@ impl Transaction {
         #[cfg(test)]
         crate::crash_test::maybe_crash_named("heap-group-after-commit-sync");
 
-        for (position, (participant, _)) in participants.iter_mut().enumerate() {
+        for (participant, _) in participants.iter_mut() {
             let commit_lsn = participant.last_lsn;
             statuses
                 .try_borrow_mut()
                 .map_err(|_| TransactionError::StatusBusy)?
                 .record_committed(participant.id, CommitSeq(commit_lsn.0))?;
-            participant.state = TransactionState::Committed;
             if !participant.retired_btree_pages.is_empty() {
                 participant.buffer.invalidate_reuse_inventory();
             }
             participant.release_writer();
             participant.remove_parked_resolution(false)?;
             participant.unregister();
-            participant.publish_changes(None)?;
-            #[cfg(test)]
-            crate::crash_test::maybe_crash_indexed(
-                "heap-group-after-runtime-finalize",
-                position + 1,
-            );
-            #[cfg(not(test))]
-            let _ = position;
+            participant.state = TransactionState::ChangeFinalizePending;
         }
         Ok(PreparedCommitBatchReport {
             member_count: participants.len(),
@@ -479,6 +515,47 @@ impl Transaction {
             first_local_boundary: first_lsn.0,
             last_local_boundary: last_lsn.0,
         })
+    }
+
+    pub(crate) fn finalize_group_changes_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
+        let mut stream = None::<SharedChangeStream>;
+        let mut candidates = Vec::new();
+        for (participant, _) in participants.iter() {
+            if participant.state != TransactionState::ChangeFinalizePending {
+                return Err(TransactionError::NotPrepared {
+                    txn_id: participant.id,
+                    state: participant.state,
+                }
+                .into());
+            }
+            if let Some(prepared) = participant.prepared_change {
+                let participant_stream = participant
+                    .change_stream
+                    .as_ref()
+                    .ok_or(TransactionError::PreparedCommitBatchStorageMismatch)?;
+                if stream
+                    .as_ref()
+                    .is_some_and(|current| !Rc::ptr_eq(current, participant_stream))
+                {
+                    return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                }
+                stream.get_or_insert_with(|| participant_stream.clone());
+                candidates.push((participant.id, prepared, None));
+            }
+        }
+        let report = if let Some(stream) = stream {
+            Some(stream.borrow_mut().finalize_group_batch(&candidates)?)
+        } else {
+            None
+        };
+        for (participant, _) in participants.iter_mut() {
+            participant.changes.clear();
+            participant.prepared_change = None;
+            participant.state = TransactionState::Committed;
+        }
+        Ok(report)
     }
 
     pub(crate) fn durabilize_group_prepare_batch(
@@ -565,6 +642,47 @@ impl Transaction {
             first_local_boundary: first_lsn.0,
             last_local_boundary: last_lsn.0,
         })
+    }
+
+    pub(crate) fn durabilize_group_change_prepare_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<Option<ChangePrepareBatchReport>, StorageError> {
+        let mut stream = None::<SharedChangeStream>;
+        let mut candidates = Vec::new();
+        for (participant, database_txn_id) in participants {
+            participant.validate_prepared_database_txn(*database_txn_id)?;
+            if !matches!(
+                participant.state,
+                TransactionState::ParkedPreparePending | TransactionState::ParkedPrepared
+            ) {
+                return Err(TransactionError::NotPrepared {
+                    txn_id: participant.id,
+                    state: participant.state,
+                }
+                .into());
+            }
+            if let Some(prepared) = participant.prepared_change {
+                let participant_stream = participant
+                    .change_stream
+                    .as_ref()
+                    .ok_or(TransactionError::PreparedPrepareBatchStorageMismatch)?;
+                if stream
+                    .as_ref()
+                    .is_some_and(|current| !Rc::ptr_eq(current, participant_stream))
+                {
+                    return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+                }
+                stream.get_or_insert_with(|| participant_stream.clone());
+                candidates.push((participant.id, *database_txn_id, prepared));
+            }
+        }
+        let Some(stream) = stream else {
+            return Ok(None);
+        };
+        let report = stream
+            .borrow_mut()
+            .durabilize_group_prepared_batch(&candidates)?;
+        Ok(Some(report))
     }
 
     /// Rolls back a prepared participant only while no durable global commit
@@ -832,6 +950,19 @@ impl Transaction {
         if self.prepared_change.is_none() {
             if let Some(stream) = &self.change_stream {
                 self.prepared_change = stream.borrow_mut().prepare(
+                    self.id,
+                    database_txn_id,
+                    self.changes.as_slice(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn stage_group_changes(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
+        if self.prepared_change.is_none() {
+            if let Some(stream) = &self.change_stream {
+                self.prepared_change = stream.borrow_mut().stage_group_prepare(
                     self.id,
                     database_txn_id,
                     self.changes.as_slice(),
@@ -1377,6 +1508,11 @@ impl TransactionManager {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        let change_syncs = self
+            .change_stream
+            .as_ref()
+            .map(|stream| stream.borrow().sync_counts())
+            .unwrap_or_default();
         crate::PreparedRuntimeInspection {
             parked_prepared_count: chain.len(),
             parked_prepare_pending_count: self.runtime.parked_prepare_pending.borrow().len(),
@@ -1390,6 +1526,10 @@ impl TransactionManager {
                 .change_stream
                 .as_ref()
                 .map_or(0, |stream| stream.borrow().sync_count()),
+            change_stream_member_prepare_sync_count: change_syncs.member_prepare,
+            change_stream_group_prepare_barrier_sync_count: change_syncs.group_prepare,
+            change_stream_member_finalize_sync_count: change_syncs.member_finalize,
+            change_stream_group_finalize_barrier_sync_count: change_syncs.group_finalize,
         }
     }
 
