@@ -34,6 +34,32 @@ fn session(db: &Database, schema_admin: bool) -> PgWorkerSession {
     .0
 }
 
+fn session_with_table_permissions(db: &Database, read: bool, write: bool) -> PgWorkerSession {
+    let authorization = AuthorizationPolicy::new(
+        TransportKind::PlaintextLoopback,
+        Some(PrincipalGrants {
+            schema_admin: true,
+            tables: vec![TablePermissions::new(TableId(2), read, write, true, false)],
+        }),
+        vec![],
+        &[TableId(1), TableId(2)],
+    )
+    .unwrap()
+    .admit(&ClientIdentity::LocalPlaintext)
+    .unwrap();
+    PgWorkerSession::new(
+        db,
+        SessionPolicy::default(),
+        authorization,
+        StartupMessage {
+            parameters: Default::default(),
+        },
+        1,
+    )
+    .unwrap()
+    .0
+}
+
 fn sql(session: &mut PgWorkerSession, db: &mut Database, source: &str) -> Vec<BackendMessage> {
     session.handle(db, FrontendMessage::Query(source.into()))
 }
@@ -62,6 +88,50 @@ fn project(name: &str) -> (std::path::PathBuf, Database) {
         .unwrap();
     db.execute("INSERT INTO projects VALUES (1, 'one')")
         .unwrap();
+    (root, db)
+}
+
+fn primary_key_project(name: &str) -> (std::path::PathBuf, Database) {
+    let root = std::env::temp_dir().join(format!(
+        "netbadb-round62-server-{name}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let mut db = Database::create_catalog(
+        root.join("catalog"),
+        vec![
+            netbadb_core::TableStorageCreateSpec::heap(
+                root.join("seed"),
+                netbadb_schema::TableDef::new(
+                    TableId(1),
+                    "seed",
+                    vec![netbadb_schema::ColumnDef::new(
+                        ColumnId(1),
+                        "id",
+                        netbadb_schema::TypeSpec::Physical(netbadb_types::PhysicalType::Int64),
+                    )],
+                ),
+            ),
+            netbadb_core::TableStorageCreateSpec::heap(
+                root.join("projects"),
+                netbadb_schema::TableDef::new(
+                    TableId(2),
+                    "projects",
+                    vec![
+                        netbadb_schema::ColumnDef::new(
+                            ColumnId(1),
+                            "id",
+                            netbadb_schema::TypeSpec::Physical(netbadb_types::PhysicalType::Text),
+                        )
+                        .primary_key(true),
+                    ],
+                ),
+            ),
+        ],
+        None,
+    )
+    .unwrap();
+    db.execute("INSERT INTO projects VALUES ('43')").unwrap();
     (root, db)
 }
 
@@ -1934,6 +2004,289 @@ fn pg_round60_production_casts_and_sqlstates_keep_alter_type_closed() {
 
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round62_alter_type_using_simple_and_explicit_transactions() {
+    let (root, mut db) = project("pg-round62-success");
+    let mut admin = session(&db, true);
+    ok(&sql(
+        &mut admin,
+        &mut db,
+        "UPDATE projects SET name = '43' WHERE id = 1",
+    ));
+    assert_eq!(
+        sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT",
+        ),
+        [
+            BackendMessage::CommandComplete("ALTER TABLE".into()),
+            BackendMessage::ReadyForQuery(b'I'),
+        ]
+    );
+    assert_eq!(
+        db.query("SELECT id, name FROM projects").unwrap().rows,
+        vec![vec![
+            netbadb_types::ScalarValue::Int64(1),
+            netbadb_types::ScalarValue::Int64(43),
+        ]]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+
+    let (root, mut db) = project("pg-round62-adopted");
+    db.execute("INSERT INTO projects VALUES (2, NULL)").unwrap();
+    let mut admin = session(&db, true);
+    for (source, tag, ready) in [
+        ("BEGIN", "BEGIN", b'T'),
+        (
+            "UPDATE projects SET name = '99' WHERE id = 1",
+            "UPDATE 1",
+            b'T',
+        ),
+        (
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT",
+            "ALTER TABLE",
+            b'T',
+        ),
+        ("COMMIT", "COMMIT", b'I'),
+    ] {
+        assert_eq!(
+            sql(&mut admin, &mut db, source),
+            [
+                BackendMessage::CommandComplete(tag.into()),
+                BackendMessage::ReadyForQuery(ready),
+            ],
+            "{source}"
+        );
+    }
+    assert_eq!(
+        db.query("SELECT name FROM projects ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![netbadb_types::ScalarValue::Int64(99)],
+            vec![netbadb_types::ScalarValue::Null],
+        ]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round62_alter_type_using_sqlstates_and_failed_transaction_state() {
+    for (name, statement, expected) in [
+        (
+            "invalid-text",
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT",
+            "22P02",
+        ),
+        (
+            "range",
+            "ALTER TABLE projects ALTER COLUMN name TYPE UINT8 USING name::UINT8",
+            "22003",
+        ),
+        (
+            "unsupported-cast",
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING true::BIGINT",
+            "42846",
+        ),
+        (
+            "mismatch",
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name",
+            "42804",
+        ),
+        (
+            "missing-using",
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT",
+            "0A000",
+        ),
+        (
+            "set-data-type",
+            "ALTER TABLE projects ALTER COLUMN name SET DATA TYPE BIGINT USING name::BIGINT",
+            "0A000",
+        ),
+        (
+            "same-physical",
+            "ALTER TABLE projects ALTER COLUMN name TYPE TEXT USING name",
+            "0A000",
+        ),
+    ] {
+        let (root, mut db) = project(&format!("pg-round62-{name}"));
+        if name == "range" {
+            db.execute("UPDATE projects SET name = '256'").unwrap();
+        }
+        let mut admin = session(&db, true);
+        ok(&sql(&mut admin, &mut db, "BEGIN"));
+        state(&sql(&mut admin, &mut db, statement), expected);
+        state(
+            &sql(&mut admin, &mut db, "SELECT id FROM projects"),
+            "25P02",
+        );
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    let (root, mut db) = project("pg-round62-stream");
+    db.execute("UPDATE projects SET name = '43'").unwrap();
+    db.enable_change_stream(TableId(2)).unwrap();
+    let mut admin = session(&db, true);
+    ok(&sql(&mut admin, &mut db, "BEGIN"));
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT",
+        ),
+        "0A000",
+    );
+    state(
+        &sql(&mut admin, &mut db, "SELECT id FROM projects"),
+        "25P02",
+    );
+    ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round62_alter_type_using_extended_success_and_parameter_rejection() {
+    let (root, mut db) = project("pg-round62-extended");
+    db.execute("UPDATE projects SET name = '43'").unwrap();
+    let mut admin = session(&db, true);
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "alter-type".into(),
+                query: "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT"
+                    .into(),
+                parameter_types: vec![],
+            },
+        ),
+        [BackendMessage::ParseComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Bind {
+                portal: "alter-type".into(),
+                statement: "alter-type".into(),
+                parameter_formats: vec![],
+                parameters: vec![],
+                result_formats: vec![],
+            },
+        ),
+        [BackendMessage::BindComplete]
+    );
+    assert_eq!(
+        admin.handle(
+            &mut db,
+            FrontendMessage::Execute {
+                portal: "alter-type".into(),
+                max_rows: 0,
+            },
+        ),
+        [BackendMessage::CommandComplete("ALTER TABLE".into())]
+    );
+
+    state(
+        &admin.handle(
+            &mut db,
+            FrontendMessage::Parse {
+                statement: "parameterized-alter".into(),
+                query: "ALTER TABLE projects ALTER COLUMN name TYPE TEXT USING $1".into(),
+                parameter_types: vec![PostgresType::Text.oid()],
+            },
+        ),
+        "0A000",
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pg_round62_alter_type_using_requires_read_write_and_schema_authority() {
+    for (name, read, write) in [("no-read", false, true), ("no-write", true, false)] {
+        let (root, mut db) = project(&format!("pg-round62-auth-{name}"));
+        db.execute("UPDATE projects SET name = '43'").unwrap();
+        let old_column = db
+            .schema()
+            .table("projects")
+            .unwrap()
+            .column("name")
+            .unwrap()
+            .id;
+        let storage_floor = db.next_storage_id();
+        let mut denied = session_with_table_permissions(&db, read, write);
+        state(
+            &sql(
+                &mut denied,
+                &mut db,
+                "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT",
+            ),
+            "42501",
+        );
+        assert_eq!(
+            db.schema()
+                .table("projects")
+                .unwrap()
+                .column("name")
+                .unwrap()
+                .id,
+            old_column
+        );
+        assert_eq!(db.next_storage_id(), storage_floor);
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn pg_round62_alter_type_using_pk_and_post_success_seal_sqlstates() {
+    let (root, mut db) = primary_key_project("pg-round62-pk");
+    let mut admin = session(&db, true);
+    state(
+        &sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE projects ALTER COLUMN id TYPE BIGINT USING id::BIGINT",
+        ),
+        "2BP01",
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+
+    for (name, after) in [
+        ("read", "SELECT id FROM projects"),
+        ("ddl", "ALTER TABLE projects ADD COLUMN later BIGINT"),
+    ] {
+        let (root, mut db) = project(&format!("pg-round62-seal-{name}"));
+        db.execute("UPDATE projects SET name = '43'").unwrap();
+        let mut admin = session(&db, true);
+        ok(&sql(&mut admin, &mut db, "BEGIN"));
+        ok(&sql(
+            &mut admin,
+            &mut db,
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT",
+        ));
+        state(&sql(&mut admin, &mut db, after), "25000");
+        ok(&sql(&mut admin, &mut db, "ROLLBACK"));
+        assert_eq!(
+            db.schema()
+                .table("projects")
+                .unwrap()
+                .column("name")
+                .unwrap()
+                .id,
+            ColumnId(2)
+        );
+        db.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

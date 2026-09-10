@@ -581,6 +581,15 @@ evacuation, DROP/RENAME and fresh index creation still produce one final S2 and
 one structural publication. No migration interpreter, durable opcode, wire
 change or `ALTER COLUMN TYPE` syntax is introduced.
 
+[Round 62](alter-type-using-round62.md) adds the bounded production
+`ALTER COLUMN TYPE ... USING` adapter over that same machinery. HIR binds USING
+against the old schema and the compiler lowers it to relational IR. Core builds
+fresh-ID evaluation/final schemas, validates either committed S1 or adopted
+S1/P1 before durable identity reservation, then seals the transaction. Commit
+performs one ordinary deferred S1-to-S2 materialization and one structural
+publication; no alternate evaluator, fake participant, persistent expression,
+protocol change, or format version is introduced.
+
 [Phase 3B](phase3b-global-commit-pipeline.md) preserves that one-G publication
 model while moving only a pure data transaction's Complete sync out of its
 foreground path. Decision sync remains the irreversible commit point;

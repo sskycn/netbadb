@@ -353,6 +353,17 @@ fingerprint and existing-column actions bind ColumnId. Parse/Bind/Describe are
 side-effect-free; Execute calls the existing Round 24 rewrite and returns
 `ALTER TABLE`.
 
+Round 62 additionally supports the exact bounded form `ALTER TABLE t ALTER
+COLUMN c TYPE T USING expr` for runtime-created Single Heaps. USING is bound
+against the old same-table schema and must return exactly T. Physical
+replacement uses a fresh ColumnId and, for one supported named single-column
+secondary index, a fresh same-name IndexId. Public name, declaration ordinal
+and nullability are preserved. Simple and Extended success return `ALTER
+TABLE`; invalid text/range/cast/type-mismatch use `22P02`/`22003`/`42846`/
+`42804`. Missing USING, same-physical conversion and active Change Stream use
+`0A000`; primary-key conversion uses `2BP01`. See
+[the Round 62 contract](alter-type-using-round62.md).
+
 Every committed operation keeps TableId and surviving ColumnIds/IndexIds, advances
 the table version and SchemaGeneration once, and installs a new StorageId. Current
 indexes are validated and rebuilt at Execute. Prepared ALTER fails after a table

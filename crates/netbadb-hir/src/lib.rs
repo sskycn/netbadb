@@ -83,6 +83,11 @@ pub enum TypedAlterTableOperation {
     DropNotNull {
         column_id: ColumnId,
     },
+    AlterColumnTypeUsing {
+        column_id: ColumnId,
+        target_type: SemanticType,
+        using: Box<TypedExpr>,
+    },
 }
 
 pub fn lower_drop_table(
@@ -187,6 +192,35 @@ pub fn lower_alter_table(
         AstAlterTableAction::DropNotNull { column_name } => TypedAlterTableOperation::DropNotNull {
             column_id: resolve_column(column_name)?,
         },
+        AstAlterTableAction::AlterColumnTypeUsing {
+            column_name,
+            data_type,
+            using,
+            ..
+        } => {
+            if let Some(span) = first_parameter_span(using) {
+                return Err(HirError::InvalidTableDefinition {
+                    message: "ALTER COLUMN TYPE USING does not accept parameters",
+                    span,
+                });
+            }
+            let column_id = resolve_column(column_name)?;
+            let target_type = resolve_declared_type(data_type)?;
+            let mut parameters = ParameterContext::new(&[]);
+            let using = lower_expr(table, using, Some(&target_type), &mut parameters)?;
+            if using.expr_type.data_type != target_type {
+                return Err(HirError::TypeMismatch {
+                    expected: target_type,
+                    actual: using.expr_type.data_type,
+                    span: using.span,
+                });
+            }
+            TypedAlterTableOperation::AlterColumnTypeUsing {
+                column_id,
+                target_type,
+                using: Box::new(using),
+            }
+        }
     };
     Ok(TypedAlterTable {
         table_name: table.name.clone(),
@@ -194,6 +228,19 @@ pub fn lower_alter_table(
         operation,
         span: statement.span,
     })
+}
+
+fn first_parameter_span(expression: &AstExpr) -> Option<Span> {
+    match expression {
+        AstExpr::Parameter { span, .. } => Some(*span),
+        AstExpr::Cast { expression, .. }
+        | AstExpr::Unary { expression, .. }
+        | AstExpr::IsNull { expression, .. } => first_parameter_span(expression),
+        AstExpr::Binary { left, right, .. } => {
+            first_parameter_span(left).or_else(|| first_parameter_span(right))
+        }
+        AstExpr::Column(_) | AstExpr::Literal { .. } => None,
+    }
 }
 
 /// Resolve a declaration, without an existing-table lookup or nominal inference.

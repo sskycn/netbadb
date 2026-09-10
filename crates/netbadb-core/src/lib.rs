@@ -594,6 +594,12 @@ impl PreparedDdlStatement {
                 schema_tables: vec![statement.target.table_id],
                 schema_write: true,
             },
+            CompiledDdlStatement::AlterTypeUsing(statement) => StatementAccess {
+                read_tables: vec![statement.target.table_id],
+                write_tables: vec![statement.target.table_id],
+                schema_tables: vec![statement.target.table_id],
+                schema_write: true,
+            },
             CompiledDdlStatement::DropIndex(statement) => StatementAccess {
                 schema_write: true,
                 read_tables: Vec::new(),
@@ -654,7 +660,10 @@ impl PreparedDdlStatement {
     /// Whether this statement is a generic SQL ALTER TABLE.
     #[must_use]
     pub fn is_table_alter(&self) -> bool {
-        matches!(self.compiled, CompiledDdlStatement::AlterTable(_))
+        matches!(
+            self.compiled,
+            CompiledDdlStatement::AlterTable(_) | CompiledDdlStatement::AlterTypeUsing(_)
+        )
     }
 
     /// Exact prepared ALTER target, when applicable.
@@ -662,6 +671,7 @@ impl PreparedDdlStatement {
     pub fn alter_table_target(&self) -> Option<DropTableTarget> {
         match &self.compiled {
             CompiledDdlStatement::AlterTable(statement) => Some(statement.target),
+            CompiledDdlStatement::AlterTypeUsing(statement) => Some(statement.target),
             _ => None,
         }
     }
@@ -4534,6 +4544,18 @@ impl Database {
         source: &str,
         hints: &[Option<ParameterTypeHint>],
     ) -> Result<PreparedSqlStatement, DatabaseError> {
+        if let Some(transaction) = transaction {
+            if transaction.schema_composition.is_type_conversion_ready() {
+                return match netbadb_compiler::classify_sql_statement(source)? {
+                    netbadb_compiler::SqlStatementKind::Relational => {
+                        Err(SchemaMutationError::MigrationDataAccessAfterRefinement.into())
+                    }
+                    netbadb_compiler::SqlStatementKind::Ddl => {
+                        Err(SchemaMutationError::SchemaMutationAfterMaterialization.into())
+                    }
+                };
+            }
+        }
         let schema = transaction.map_or(&self.committed.schema, |t| {
             t.visible_schema(&self.committed.schema)
         });
@@ -4558,6 +4580,7 @@ impl Database {
                             CompiledDdlStatement::CreateTable(_)
                                 | CompiledDdlStatement::DropTable(_)
                                 | CompiledDdlStatement::AlterTable(_)
+                                | CompiledDdlStatement::AlterTypeUsing(_)
                                 | CompiledDdlStatement::CreateIndex(_)
                                 | CompiledDdlStatement::DropIndex(_)
                         )
@@ -4678,9 +4701,29 @@ impl Database {
             }
             CompiledDdlStatement::AlterTable(statement) => {
                 let mut transaction = self.begin_transaction()?;
-                if let Err(error) = self
-                    .compose_heap_table_schema_in(&mut transaction, AlterTableSpec::from(statement))
-                {
+                if let Err(error) = self.compose_heap_table_schema_in(
+                    &mut transaction,
+                    AlterTableSpec::try_from(statement)?,
+                ) {
+                    transaction.rollback()?;
+                    return Err(error);
+                }
+                self.commit_transaction(&mut transaction)?;
+                Ok(DdlOutcome::Altered)
+            }
+            CompiledDdlStatement::AlterTypeUsing(statement) => {
+                let mut transaction = self.begin_transaction()?;
+                let spec = schema_composition::AlterTypeUsingSpec {
+                    target: SchemaDependency {
+                        table_id: statement.target.table_id,
+                        table_version: statement.target.table_version,
+                        fingerprint: statement.target.fingerprint,
+                    },
+                    column_id: statement.column_id,
+                    target_type: statement.target_type.clone(),
+                    using: statement.using.clone(),
+                };
+                if let Err(error) = self.compose_alter_type_using(&mut transaction, spec) {
                     transaction.rollback()?;
                     return Err(error);
                 }
@@ -4724,6 +4767,9 @@ impl Database {
         prepared: &PreparedDdlStatement,
     ) -> Result<DdlOutcome, DatabaseError> {
         transaction.reject_group_structural_mutation()?;
+        if transaction.schema_composition.is_type_conversion_ready() {
+            return Err(SchemaMutationError::SchemaMutationAfterMaterialization.into());
+        }
         if transaction.schema_mutation.is_some() && !prepared.is_table_create() {
             return Err(DatabaseError::UnsupportedDdlCombination);
         }
@@ -4733,6 +4779,7 @@ impl Database {
                 CompiledDdlStatement::CreateTable(_)
                     | CompiledDdlStatement::DropTable(_)
                     | CompiledDdlStatement::AlterTable(_)
+                    | CompiledDdlStatement::AlterTypeUsing(_)
                     | CompiledDdlStatement::CreateIndex(_)
                     | CompiledDdlStatement::DropIndex(_)
             )
@@ -4768,7 +4815,26 @@ impl Database {
                 Ok(DdlOutcome::Dropped)
             }
             CompiledDdlStatement::AlterTable(statement) => {
-                self.compose_heap_table_schema_in(transaction, AlterTableSpec::from(statement))?;
+                self.compose_heap_table_schema_in(
+                    transaction,
+                    AlterTableSpec::try_from(statement)?,
+                )?;
+                Ok(DdlOutcome::Altered)
+            }
+            CompiledDdlStatement::AlterTypeUsing(statement) => {
+                self.compose_alter_type_using(
+                    transaction,
+                    schema_composition::AlterTypeUsingSpec {
+                        target: SchemaDependency {
+                            table_id: statement.target.table_id,
+                            table_version: statement.target.table_version,
+                            fingerprint: statement.target.fingerprint,
+                        },
+                        column_id: statement.column_id,
+                        target_type: statement.target_type.clone(),
+                        using: statement.using.clone(),
+                    },
+                )?;
                 Ok(DdlOutcome::Altered)
             }
             CompiledDdlStatement::DropIndex(statement) => {
@@ -5130,7 +5196,6 @@ impl Database {
         self.validate_transaction(transaction)?;
         self.validate_prepared_dependencies(prepared, Some(transaction))?;
         let logical = bind_statement(&prepared.compiled, values)?;
-        #[cfg(test)]
         if matches!(
             transaction.schema_composition,
             schema_composition::SchemaCompositionState::TypeConversionReady(_)
@@ -12207,7 +12272,7 @@ mod tests {
 #[cfg(test)]
 mod adopted_source_refinement_expansion_audit_tests;
 #[cfg(test)]
-mod alter_type_using_audit_tests;
+mod alter_type_using_tests;
 #[cfg(test)]
 mod change_stream_schema_replacement_audit_tests;
 #[cfg(test)]

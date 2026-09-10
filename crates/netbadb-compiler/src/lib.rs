@@ -55,8 +55,44 @@ pub enum CompiledDdlStatement {
     CreateTable(TypedCreateTable),
     DropTable(TypedDropTable),
     AlterTable(TypedAlterTable),
+    AlterTypeUsing(Box<CompiledAlterTypeUsing>),
     CreateIndex(TypedCreateIndex),
     DropIndex(TypedDropIndex),
+}
+
+/// Compiler-owned ALTER TYPE payload. HIR expressions never cross into Core;
+/// the USING expression is lowered to canonical relational IR here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledAlterTypeUsing {
+    pub table_name: String,
+    pub target: netbadb_schema::DropTableTarget,
+    pub column_id: netbadb_types::ColumnId,
+    pub target_type: SemanticType,
+    pub using: Expr,
+    pub span: netbadb_parser::Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlStatementKind {
+    Relational,
+    Ddl,
+}
+
+/// Parse-only classification used to reject preparation while a sealed schema
+/// conversion owns the transaction, before binding against its private schema.
+pub fn classify_sql_statement(source: &str) -> Result<SqlStatementKind, CompileError> {
+    let statement = parse_statement(source)?;
+    Ok(match statement {
+        netbadb_parser::Statement::CreateTable(_)
+        | netbadb_parser::Statement::DropTable(_)
+        | netbadb_parser::Statement::AlterTable(_)
+        | netbadb_parser::Statement::CreateIndex(_)
+        | netbadb_parser::Statement::DropIndex(_) => SqlStatementKind::Ddl,
+        netbadb_parser::Statement::Select(_)
+        | netbadb_parser::Statement::Insert(_)
+        | netbadb_parser::Statement::Update(_)
+        | netbadb_parser::Statement::Delete(_) => SqlStatementKind::Relational,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,9 +364,33 @@ fn compile_ddl_ast(
                 .map_err(CompileError::from)
         }
         netbadb_parser::Statement::AlterTable(statement) => {
-            netbadb_hir::lower_alter_table(schema, &statement, tables)
-                .map(CompiledDdlStatement::AlterTable)
-                .map_err(CompileError::from)
+            let typed = netbadb_hir::lower_alter_table(schema, &statement, tables)?;
+            let TypedAlterTable {
+                table_name,
+                target,
+                operation,
+                span,
+            } = typed;
+            Ok(match operation {
+                TypedAlterTableOperation::AlterColumnTypeUsing {
+                    column_id,
+                    target_type,
+                    using,
+                } => CompiledDdlStatement::AlterTypeUsing(Box::new(CompiledAlterTypeUsing {
+                    table_name,
+                    target,
+                    column_id,
+                    target_type,
+                    using: lower_expr(&using),
+                    span,
+                })),
+                operation => CompiledDdlStatement::AlterTable(TypedAlterTable {
+                    table_name,
+                    target,
+                    operation,
+                    span,
+                }),
+            })
         }
         netbadb_parser::Statement::DropIndex(statement) => {
             netbadb_hir::lower_drop_index(&statement, indexes)

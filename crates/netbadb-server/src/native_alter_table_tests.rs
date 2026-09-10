@@ -4,6 +4,9 @@ use crate::sql_create_table_test_support::{files, seed};
 use netbadb_protocol::ClientMessage;
 use netbadb_types::TableId;
 
+const ALTER_TYPE_SQL: &str =
+    "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT";
+
 fn authorization(schema_admin: bool) -> crate::authorization::PrincipalAuthorization {
     AuthorizationPolicy::new(
         TransportKind::PlaintextLoopback,
@@ -192,6 +195,73 @@ fn native_protocol_v1_routes_staged_drop_without_changing_ddl_results() {
             .column("name")
             .unwrap()
             .nullable
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn native_protocol_v2_executes_alter_type_using_in_autocommit_and_transaction() {
+    let (root, mut db) = seed("native-round62-alter-type");
+    db.execute("CREATE TABLE projects (id BIGINT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO projects VALUES (1, '43')").unwrap();
+    db.execute("CREATE INDEX projects_name_idx ON projects(name)")
+        .unwrap();
+    let mut admin = session(&mut db, true);
+    assert_eq!(
+        execute(&mut admin, &mut db, 2, ALTER_TYPE_SQL),
+        [ServerMessage::AffectedRows { count: 0 }]
+    );
+    assert_eq!(
+        db.query("SELECT name FROM projects").unwrap().rows,
+        vec![vec![netbadb_types::ScalarValue::Int64(43)]]
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+
+    let (root, mut db) = seed("native-round62-alter-type-adopted");
+    db.execute("CREATE TABLE projects (id BIGINT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO projects VALUES (1, 'bad')")
+        .unwrap();
+    let mut admin = session(&mut db, true);
+    assert_eq!(
+        admin
+            .handle(
+                &mut db,
+                2,
+                ClientMessage::Begin {
+                    table_id: TableId(2),
+                },
+            )
+            .batch
+            .messages,
+        [ServerMessage::TransactionStarted]
+    );
+    assert_eq!(
+        execute(
+            &mut admin,
+            &mut db,
+            3,
+            "UPDATE projects SET name = '99' WHERE id = 1",
+        ),
+        [ServerMessage::AffectedRows { count: 1 }]
+    );
+    assert_eq!(
+        execute(&mut admin, &mut db, 4, ALTER_TYPE_SQL),
+        [ServerMessage::AffectedRows { count: 0 }]
+    );
+    assert_eq!(
+        admin
+            .handle(&mut db, 5, ClientMessage::Commit)
+            .batch
+            .messages,
+        [ServerMessage::TransactionCommitted]
+    );
+    assert_eq!(
+        db.query("SELECT name FROM projects").unwrap().rows,
+        vec![vec![netbadb_types::ScalarValue::Int64(99)]]
     );
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();

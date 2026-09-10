@@ -258,14 +258,12 @@ pub(crate) struct AdoptedSourceTransaction {
     pub(crate) source_index_digest: [u8; 32],
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) enum TypeConversionSource {
     Committed(SchemaTransactionPlan),
     Adopted(AdoptedSourceTransaction),
 }
 
-#[cfg(test)]
 impl TypeConversionSource {
     fn logical(&self) -> &SchemaTransactionPlan {
         match self {
@@ -282,39 +280,21 @@ impl TypeConversionSource {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct TypeConversionTransaction {
     pub(crate) source: TypeConversionSource,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
-pub(crate) struct AlterTypeUsingAuditSpec {
+pub(crate) struct AlterTypeUsingSpec {
     pub(crate) target: SchemaDependency,
     pub(crate) column_id: ColumnId,
     pub(crate) target_type: netbadb_types::SemanticType,
     pub(crate) using: netbadb_rel::Expr,
-    pub(crate) hidden_name_seed: Option<String>,
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AlterTypeUsingAuditOutcome {
-    pub(crate) new_column_id: ColumnId,
-    pub(crate) new_index_id: Option<IndexId>,
-    pub(crate) affected_rows: u64,
-    pub(crate) semantic_digest: [u8; 32],
-    pub(crate) hidden_evaluation_name: String,
-    pub(crate) adopted_source: bool,
-    pub(crate) validation_scans: u64,
-}
-
-#[cfg(test)]
-fn evaluation_only_column_name(table: &TableDef, column: ColumnId, seed: Option<&str>) -> String {
-    let base = seed
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("__netbadb_alter_type_{}", column.0));
+fn evaluation_only_column_name(table: &TableDef, column: ColumnId) -> String {
+    let base = format!("__netbadb_alter_type_{}", column.0);
     let mut candidate = base.clone();
     let mut suffix = 0_u64;
     while table.column(&candidate).is_some() {
@@ -324,8 +304,7 @@ fn evaluation_only_column_name(table: &TableDef, column: ColumnId, seed: Option<
     candidate
 }
 
-#[cfg(test)]
-fn audit_type_spec(data_type: &netbadb_types::SemanticType) -> TypeSpec {
+fn conversion_type_spec(data_type: &netbadb_types::SemanticType) -> TypeSpec {
     match &data_type.name {
         Some(name) => TypeSpec::Semantic {
             name: name.clone(),
@@ -352,7 +331,6 @@ enum AlterValidationContext {
 pub(crate) enum SchemaCompositionState {
     None,
     Composing(Box<SchemaTransactionPlan>),
-    #[cfg(test)]
     TypeConversionReady(Box<TypeConversionTransaction>),
     AdoptedSourceRefining(Box<AdoptedSourceTransaction>),
     // S1 remains the only physical table; ordered deferred UPDATE actions are
@@ -444,14 +422,21 @@ impl SchemaCompositionState {
         matches!(self, Self::Composing(_))
     }
 
-    pub(crate) fn is_sealed(&self) -> bool {
-        #[cfg(test)]
-        if matches!(self, Self::TypeConversionReady(_)) {
-            return true;
+    pub(crate) fn is_type_conversion_ready(&self) -> bool {
+        matches!(self, Self::TypeConversionReady(_))
+    }
+
+    pub(crate) fn release_type_conversion_writer_on_rollback(&self) {
+        if let Self::TypeConversionReady(conversion) = self {
+            conversion.source.logical().writer.set(None);
         }
+    }
+
+    pub(crate) fn is_sealed(&self) -> bool {
         matches!(
             self,
-            Self::AdoptedSourceIndexFinalizing(_)
+            Self::TypeConversionReady(_)
+                | Self::AdoptedSourceIndexFinalizing(_)
                 | Self::SealingAndMaterializing(_)
                 | Self::Materialized(_)
                 | Self::BackfillMaterializing(_)
@@ -480,7 +465,6 @@ impl SchemaCompositionState {
             Self::Composing(plan)
             | Self::SealedNoEffectiveChange(plan)
             | Self::RollbackRequiredLogical(plan) => Some(plan),
-            #[cfg(test)]
             Self::TypeConversionReady(conversion) => Some(conversion.source.logical()),
             Self::AdoptedSourceRefining(adopted)
             | Self::AdoptedSourceBackfilling(adopted)
@@ -2758,17 +2742,14 @@ impl Database {
         })
     }
 
-    /// Round 61 executable architecture carrier. This is intentionally absent
-    /// from production builds: parser, HIR, native SQL and PostgreSQL continue
-    /// to reject ALTER COLUMN TYPE. The carrier accepts an already typed USING
-    /// expression and proves that the existing deferred program/materializer
-    /// can own both committed and adopted source authority.
-    #[cfg(test)]
-    pub(crate) fn audit_alter_type_using(
+    /// Installs one validated synthetic type conversion without materializing
+    /// its replacement Heap. The compiler has already bound and lowered USING
+    /// against the old schema; Core owns fresh identities and source authority.
+    pub(crate) fn compose_alter_type_using(
         &mut self,
         transaction: &mut Transaction,
-        spec: AlterTypeUsingAuditSpec,
-    ) -> Result<AlterTypeUsingAuditOutcome, DatabaseError> {
+        spec: AlterTypeUsingSpec,
+    ) -> Result<(), DatabaseError> {
         transaction.reject_group_structural_mutation()?;
         self.validate_transaction(transaction)?;
         if transaction.schema_mutation.is_some()
@@ -2871,17 +2852,13 @@ impl Database {
                     .checked_add(1)
                     .map(TableSchemaVersion)
                     .ok_or(SchemaMutationError::IdentityExhausted("TableSchemaVersion"))?;
-                let hidden_name = evaluation_only_column_name(
-                    &base_table,
-                    new_column_id,
-                    spec.hidden_name_seed.as_deref(),
-                );
+                let hidden_name = evaluation_only_column_name(&base_table, new_column_id);
                 let mut evaluation = base_table.clone();
                 evaluation.columns.push(
                     ColumnDef::new(
                         new_column_id,
-                        hidden_name.clone(),
-                        audit_type_spec(&spec.target_type),
+                        hidden_name,
+                        conversion_type_spec(&spec.target_type),
                     )
                     // This is an evaluation slot. Final nullability is checked only
                     // after USING assigns it and E is projected to F.
@@ -2897,7 +2874,7 @@ impl Database {
                 final_table.columns[old_position] = ColumnDef::new(
                     new_column_id,
                     old_column.name.clone(),
-                    audit_type_spec(&spec.target_type),
+                    conversion_type_spec(&spec.target_type),
                 )
                 .nullable(old_column.nullable);
                 final_table.validate()?;
@@ -2983,7 +2960,7 @@ impl Database {
                         storage: source_storage,
                     }
                 };
-                let affected_rows = crate::deferred_backfill::observe_synthetic_assignment(
+                let _affected_rows = crate::deferred_backfill::observe_synthetic_assignment(
                     self,
                     transaction,
                     authority,
@@ -3000,12 +2977,10 @@ impl Database {
                     next_column_id,
                     new_index,
                     target_version,
-                    hidden_name,
                     evaluation,
                     final_schema,
                     final_indexes,
                     pending,
-                    affected_rows,
                 ))
             })();
         let (
@@ -3013,12 +2988,10 @@ impl Database {
             next_column_id,
             new_index,
             target_version,
-            hidden_name,
             evaluation,
             final_schema,
             final_indexes,
             pending,
-            affected_rows,
         ) = match validation {
             Ok(accepted) => accepted,
             Err(error) => {
@@ -3047,7 +3020,7 @@ impl Database {
                 Err(error.into())
             };
         }
-        crash("round61-column-reservation-durable");
+        crash("alter-type-column-reservation-durable");
         if let Some((index, next_index_id)) = new_index {
             if let Err(error) =
                 journal
@@ -3071,7 +3044,7 @@ impl Database {
                     Err(error.into())
                 };
             }
-            crash("round61-index-reservation-durable");
+            crash("alter-type-index-reservation-durable");
         }
 
         let semantic_digest = pending.semantic_digest();
@@ -3107,16 +3080,8 @@ impl Database {
             SchemaCompositionState::TypeConversionReady(Box::new(TypeConversionTransaction {
                 source,
             }));
-        crash("round61-logical-plan-sealed");
-        Ok(AlterTypeUsingAuditOutcome {
-            new_column_id,
-            new_index_id: new_index.map(|entry| entry.0),
-            affected_rows,
-            semantic_digest,
-            hidden_evaluation_name: hidden_name,
-            adopted_source,
-            validation_scans: 1,
-        })
+        crash("alter-type-logical-plan-sealed");
+        Ok(())
     }
 
     fn validate_source_view_not_null(
@@ -5334,7 +5299,6 @@ impl Database {
         transaction: &mut Transaction,
         activate_backfill: bool,
     ) -> Result<(), DatabaseError> {
-        #[cfg(test)]
         if matches!(
             transaction.schema_composition,
             SchemaCompositionState::TypeConversionReady(_)
@@ -7640,7 +7604,6 @@ pub(crate) fn cleanup_composition_loser(
 ) -> Result<(), SchemaMutationError> {
     let previous = std::mem::replace(state, SchemaCompositionState::None);
     let (plan, intent) = match previous {
-        #[cfg(test)]
         SchemaCompositionState::TypeConversionReady(conversion) => match conversion.source {
             TypeConversionSource::Committed(logical) => (logical, None),
             TypeConversionSource::Adopted(adopted) => (adopted.logical, None),

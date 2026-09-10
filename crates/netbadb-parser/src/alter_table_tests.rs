@@ -1,7 +1,7 @@
 use super::{AlterTableAction, ParseErrorKind, Statement, parse_statement};
 
 #[test]
-fn parses_six_alter_table_actions_with_exact_spans() {
+fn parses_bounded_alter_table_actions_with_exact_spans() {
     let cases = [
         "ALTER TABLE projects RENAME TO work;",
         "ALTER TABLE projects RENAME COLUMN name TO title",
@@ -11,6 +11,7 @@ fn parses_six_alter_table_actions_with_exact_spans() {
         "ALTER TABLE projects DROP COLUMN active",
         "ALTER TABLE projects ALTER COLUMN name SET NOT NULL",
         "ALTER TABLE projects ALTER COLUMN name DROP NOT NULL",
+        "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT",
     ];
     for sql in cases {
         let Statement::AlterTable(statement) = parse_statement(sql).unwrap() else {
@@ -37,6 +38,24 @@ fn parses_six_alter_table_actions_with_exact_spans() {
             AlterTableAction::DropColumn { name } => assert_eq!(name.name, "active"),
             AlterTableAction::SetNotNull { column_name }
             | AlterTableAction::DropNotNull { column_name } => assert_eq!(column_name.name, "name"),
+            AlterTableAction::AlterColumnTypeUsing {
+                column_name,
+                data_type,
+                using,
+                span,
+            } => {
+                assert_eq!(column_name.name, "name");
+                assert_eq!(data_type.name, "BIGINT");
+                assert_eq!(&sql[data_type.span.start..data_type.span.end], "BIGINT");
+                assert_eq!(
+                    &sql[super::expr_span(&using).start..super::expr_span(&using).end],
+                    "name::BIGINT"
+                );
+                assert_eq!(
+                    &sql[span.start..span.end],
+                    "ALTER COLUMN name TYPE BIGINT USING name::BIGINT"
+                );
+            }
         }
     }
 }
@@ -56,6 +75,9 @@ fn rejects_unsupported_alter_table_grammar_without_ignoring_clauses() {
         "ALTER TABLE t DROP COLUMN c RESTRICT",
         "ALTER TABLE t ALTER COLUMN c TYPE TEXT",
         "ALTER TABLE t ALTER COLUMN c SET DATA TYPE TEXT",
+        "ALTER TABLE t ALTER COLUMN c TYPE VARCHAR(32) USING c::TEXT",
+        "ALTER TABLE t ALTER COLUMN c TYPE NUMERIC(10,2) USING c",
+        "ALTER TABLE t ALTER COLUMN c USING c::TEXT",
         "ALTER TABLE t ALTER COLUMN c SET DEFAULT 1",
         "ALTER TABLE t ALTER COLUMN c DROP DEFAULT",
         "ALTER TABLE t ADD CONSTRAINT c CHECK (true)",
@@ -100,6 +122,7 @@ fn deterministic_alter_mutations_never_escape_the_bounded_parser() {
         "ALTER TABLE projects ADD COLUMN active BOOLEAN;",
         "ALTER TABLE projects ALTER COLUMN name SET NOT NULL;",
         "ALTER TABLE projects ALTER COLUMN name DROP NOT NULL;",
+        "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT;",
     ];
     let replacements = *b" ,.();$'0A";
     let mut cases = 0_usize;

@@ -1,5 +1,24 @@
 # NetbaDB roadmap
 
+## Bounded production `ALTER COLUMN TYPE ... USING` (Round 62 complete)
+
+- opened only the exact USING-required grammar for runtime-created Single Heap
+  tables and kept aliases, modifiers, parameters and same-physical rewrites
+  closed;
+- bound USING against the old schema in HIR, lowered it to relational IR in the
+  compiler, and required exact target semantic type;
+- productionized pristine committed-source and post-DML adopted-source
+  authority without a fake writer, early S2, or retained converted rows;
+- validated before fresh ColumnId/IndexId reservation, preserved public
+  name/ordinal/nullability, and rebuilt one supported same-name secondary index
+  with a fresh identity;
+- sealed successful transactions until commit/rollback and reused one deferred
+  materializer, one S2, one G, existing journal tags, and existing recovery;
+- added native Protocol v2, PostgreSQL Simple/Extended, SQLSTATE,
+  authorization, rollback/reopen, crash-matrix and cost coverage.
+
+See [`alter-type-using-round62.md`](alter-type-using-round62.md).
+
 ## Batched participant Prepare barriers (Phase 3E complete)
 
 - preserved `park_group_member` as durable-per-member Prepare and added the
@@ -64,9 +83,10 @@ See [`phase3c-explicit-group-commit.md`](phase3c-explicit-group-commit.md).
   and retained group, Columnar, maintenance, CAST, format, and production
   parser/HIR/PostgreSQL boundaries.
 
-Production still rejects `ALTER COLUMN TYPE`; Round 62 may open only the
-bounded USING-required surface described in
-[`alter-type-using-round61.md`](alter-type-using-round61.md).
+Round 62 has now productionized exactly this bounded USING-required surface;
+the Round 61 document remains the design audit and
+[`alter-type-using-round62.md`](alter-type-using-round62.md) is authoritative
+for production behavior.
 
 ## Production cross-physical CAST and atomic shadow migration (Round 60 complete)
 
@@ -78,7 +98,8 @@ bounded USING-required surface described in
   extraction conservative;
 - proved the real repair/shadow conversion/NOT NULL/index evacuation/DROP/
   RENAME/fresh-index workflow, one S2/one G and pre/post-Decision recovery;
-- changed no durable or wire format and kept `ALTER COLUMN TYPE` absent.
+- changed no durable or wire format; Round 62 subsequently added only the
+  bounded USING-required high-level operation.
 
 See [`deferred-type-conversion-round60.md`](deferred-type-conversion-round60.md).
 

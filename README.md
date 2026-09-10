@@ -196,12 +196,15 @@ append-only so the original Bool/Int64/UInt64/Text/NULL bytes remain stable.
 See [Physical Types v2](docs/physical-types-v2.md) for the SQL, storage,
 protocol, pgwire and SDK contract.
 NetbaDB supports explicit deterministic cross-physical casts for checked integer
-families, Text/integer conversion and Bool/Text conversion. These casts can
-populate a late shadow column inside the bounded adopted-source migration
-pipeline, enabling an atomic physical-type replacement through the existing
-DROP/RENAME/index lifecycle. Float conversion, general PostgreSQL cast
-compatibility and `ALTER COLUMN TYPE` are not implied. See the
-[Round 60 production contract](docs/deferred-type-conversion-round60.md).
+families, Text/integer conversion and Bool/Text conversion. NetbaDB also supports
+a bounded `ALTER COLUMN TYPE ... USING` operation for runtime-created Single Heap
+tables. Physical replacement uses a fresh ColumnId, evaluates one typed
+same-table USING expression through the normal CAST/executor semantics, preserves
+the public name, ordinal and nullability, and publishes one atomic Heap
+replacement. This is not PostgreSQL-complete, implicit, online, same-ColumnId,
+LSM or constraint-rewriting ALTER TYPE. See the
+[Round 62 production contract](docs/alter-type-using-round62.md) and the
+[Round 60 explicit shadow workflow](docs/deferred-type-conversion-round60.md).
 Heap/LSM metadata validates that fingerprint against the persisted logical schema.
 The [Round 17 runtime schema catalog](docs/runtime-schema-catalog-round17.md)
 installs a full database schema snapshot once at create or explicit legacy import.
@@ -506,6 +509,15 @@ then replace C2 with C4 and a same-name CREATE reserves a fresh I2 before one
 atomic S2 materialization. Table-noop/index-effective composition reuses the
 same-S1 index-delta path. ADD, type conversion, post-terminal nullability and
 general post-refinement DML remain unsupported.
+
+[Round 62](docs/alter-type-using-round62.md) productionizes the exact
+USING-required high-level type conversion. Parser, HIR and compiler bind one
+same-table expression against the old schema and lower it to relational IR.
+Core validates one authoritative source scan before fresh ColumnId/IndexId
+reservation, seals the transaction, and reuses the deferred materializer for one
+atomic S2. Pristine committed-source and same-table post-DML adopted-source
+authority are both supported; an enabled Change Stream and broader ALTER TYPE
+shapes remain closed.
 
 
 Offline catalog and statement inspection is documented in

@@ -1,15 +1,11 @@
-//! Round 61 test-only synthetic ALTER COLUMN TYPE ... USING architecture audit.
+//! Round 62 production ALTER COLUMN TYPE ... USING coverage.
 
 use super::*;
-use crate::schema_composition::{
-    AlterTypeUsingAuditSpec, SchemaCompositionState, TypeConversionSource,
-};
+use crate::schema_composition::{SchemaCompositionState, TypeConversionSource};
 use crate::schema_mutation_journal::SchemaIndexTablePlan;
 use netbadb_rel::{Expr, ExprKind, LogicalPlan, LogicalStatement};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-use netbadb_types::{
-    ColumnId, ExprType, IndexId, PhysicalType, ScalarValue, SemanticType, StorageId, TableId,
-};
+use netbadb_types::{ColumnId, ExprType, IndexId, PhysicalType, ScalarValue, StorageId, TableId};
 use std::path::{Path, PathBuf};
 
 const USERS: TableId = TableId(2);
@@ -17,10 +13,12 @@ const ID: ColumnId = ColumnId(1);
 const LEGACY: ColumnId = ColumnId(2);
 const FLAG: ColumnId = ColumnId(3);
 const REPLACEMENT: ColumnId = ColumnId(4);
+const ALTER_TYPE_SQL: &str =
+    "ALTER TABLE users ALTER COLUMN legacy TYPE BIGINT USING legacy::BIGINT";
 
 fn root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "netbadb-round61-{name}-{}-{:?}",
+        "netbadb-round62-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -114,14 +112,19 @@ fn query_expression(database: &Database, transaction: Option<&Transaction>, sour
     }
 }
 
-fn spec(database: &Database, using: Expr) -> AlterTypeUsingAuditSpec {
-    AlterTypeUsingAuditSpec {
-        target: dependency(database),
-        column_id: LEGACY,
-        target_type: SemanticType::physical(PhysicalType::Int64),
-        using,
-        hidden_name_seed: None,
-    }
+fn prepare_ddl(database: &Database, source: &str) -> PreparedDdlStatement {
+    let PreparedSqlStatement::Ddl(prepared) = database.prepare_sql_statement(source, &[]).unwrap()
+    else {
+        panic!("expected DDL")
+    };
+    prepared
+}
+
+fn digest_hex(digest: [u8; 32]) -> String {
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 fn assert_int64_lookup(
@@ -175,20 +178,16 @@ fn pristine_synthetic_plan_preserves_order_and_replaces_one_index_in_one_s2() {
         PreparedSqlStatement::Relational(prepared) => prepared,
         PreparedSqlStatement::Ddl(_) => panic!("expected old query"),
     };
-    let using = query_expression(&database, None, "SELECT legacy::BIGINT FROM users");
+    let ddl = prepare_ddl(&database, ALTER_TYPE_SQL);
+    let access = ddl.access();
+    assert_eq!(access.read_tables(), &[USERS]);
+    assert_eq!(access.write_tables(), &[USERS]);
+    assert_eq!(access.schema_tables(), &[USERS]);
+    assert!(access.schema_write());
     let mut transaction = database.begin_transaction().unwrap();
-    let outcome = database
-        .audit_alter_type_using(&mut transaction, spec(&database, using))
-        .unwrap();
     assert_eq!(
-        (
-            outcome.new_column_id,
-            outcome.new_index_id,
-            outcome.affected_rows,
-            outcome.adopted_source,
-            outcome.validation_scans,
-        ),
-        (REPLACEMENT, Some(IndexId(3)), 3, false, 1)
+        database.execute_ddl_in(&mut transaction, &ddl).unwrap(),
+        DdlOutcome::Altered
     );
     assert_eq!(transaction.write_participant_count(), 0);
     assert_eq!(database.next_storage_id(), Some(target_storage));
@@ -212,7 +211,12 @@ fn pristine_synthetic_plan_preserves_order_and_replaces_one_index_in_one_s2() {
         vec![ID, REPLACEMENT, FLAG]
     );
     assert!(!private.column("legacy").unwrap().nullable);
-    assert!(private.column(&outcome.hidden_evaluation_name).is_none());
+    assert!(
+        private
+            .columns
+            .iter()
+            .all(|column| !column.name.starts_with("__netbadb_alter_type_"))
+    );
     let private_indexes = &plan.touched[&USERS].indexes.active;
     assert_eq!(
         private_indexes
@@ -254,6 +258,22 @@ fn pristine_synthetic_plan_preserves_order_and_replaces_one_index_in_one_s2() {
         LEGACY
     );
     assert!(matches!(
+        database.prepare_sql_statement_in(&transaction, "SELECT * FROM users", &[]),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::MigrationDataAccessAfterRefinement
+        ))
+    ));
+    assert!(matches!(
+        database.prepare_sql_statement_in(
+            &transaction,
+            "ALTER TABLE users ADD COLUMN later BIGINT",
+            &[]
+        ),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::SchemaMutationAfterMaterialization
+        ))
+    ));
+    assert!(matches!(
         database.execute_in(&mut transaction, "SELECT * FROM users"),
         Err(DatabaseError::SchemaMutation(
             SchemaMutationError::MigrationDataAccessAfterRefinement
@@ -286,9 +306,14 @@ fn pristine_synthetic_plan_preserves_order_and_replaces_one_index_in_one_s2() {
     let materialized = transaction.schema_composition.materialized_index().unwrap();
     assert_eq!(materialized.intent.action_count, 1);
     assert_eq!(materialized.intent.action_digest, whole_action_digest);
+    let semantic_digest = materialized
+        .logical
+        .deferred_backfill
+        .semantic_digest(0)
+        .unwrap();
     assert_eq!(
-        materialized.logical.deferred_backfill.semantic_digest(0),
-        Some(outcome.semantic_digest)
+        digest_hex(semantic_digest),
+        "0b5b8ee84bbdc8370cfc6d9a55707e8ce31cc5e33f3ae4a19e8a70f0f66a50a0"
     );
     assert!(
         !database
@@ -373,15 +398,12 @@ fn post_dml_source_reads_transaction_visible_repair_and_emits_tag35() {
             .unwrap(),
         ExecutionResult::AffectedRows(1)
     );
-    let using = query_expression(
-        &database,
-        Some(&transaction),
-        "SELECT legacy::BIGINT FROM users",
+    assert_eq!(
+        database
+            .execute_in(&mut transaction, ALTER_TYPE_SQL)
+            .unwrap(),
+        ExecutionResult::AffectedRows(0)
     );
-    let outcome = database
-        .audit_alter_type_using(&mut transaction, spec(&database, using))
-        .unwrap();
-    assert!(outcome.adopted_source);
     let SchemaCompositionState::TypeConversionReady(conversion) = &transaction.schema_composition
     else {
         panic!("expected sealed type conversion")
@@ -433,10 +455,9 @@ fn post_dml_source_reads_transaction_visible_repair_and_emits_tag35() {
 fn failed_validation_does_not_burn_column_or_index_identity() {
     let path = root("invalid");
     let mut database = seed(&path, true, false);
-    let using = query_expression(&database, None, "SELECT legacy::BIGINT FROM users");
     let mut failed = database.begin_transaction().unwrap();
     assert!(matches!(
-        database.audit_alter_type_using(&mut failed, spec(&database, using)),
+        database.execute_in(&mut failed, ALTER_TYPE_SQL),
         Err(DatabaseError::Execution(
             netbadb_executor::ExecutionError::InvalidCastText {
                 target: PhysicalType::Int64
@@ -448,13 +469,54 @@ fn failed_validation_does_not_burn_column_or_index_identity() {
     failed.rollback().unwrap();
     drop(failed);
 
-    let using = query_expression(&database, None, "SELECT 0::BIGINT");
-    let mut accepted = database.begin_transaction().unwrap();
-    let outcome = database
-        .audit_alter_type_using(&mut accepted, spec(&database, using))
+    database
+        .execute("UPDATE users SET legacy = '128' WHERE id = 3")
         .unwrap();
-    assert_eq!(outcome.new_column_id, REPLACEMENT);
-    assert_eq!(outcome.new_index_id, Some(IndexId(3)));
+    let mut ranged = database.begin_transaction().unwrap();
+    assert!(matches!(
+        database.execute_in(
+            &mut ranged,
+            "ALTER TABLE users ALTER COLUMN legacy TYPE TINYINT USING legacy::TINYINT",
+        ),
+        Err(DatabaseError::Execution(
+            netbadb_executor::ExecutionError::CastOutOfRange {
+                target: PhysicalType::Int8,
+                ..
+            }
+        ))
+    ));
+    assert!(ranged.schema_composition.is_none());
+    ranged.rollback().unwrap();
+    drop(ranged);
+
+    let mut accepted = database.begin_transaction().unwrap();
+    assert_eq!(
+        database
+            .execute_in(
+                &mut accepted,
+                "ALTER TABLE users ALTER COLUMN legacy TYPE BIGINT USING 0::BIGINT",
+            )
+            .unwrap(),
+        ExecutionResult::AffectedRows(0)
+    );
+    let plan = accepted.schema_composition.plan().unwrap();
+    assert_eq!(
+        plan.overlay
+            .schema
+            .table("users")
+            .unwrap()
+            .column("legacy")
+            .unwrap()
+            .id,
+        REPLACEMENT
+    );
+    assert!(
+        plan.touched[&USERS]
+            .indexes
+            .active
+            .iter()
+            .any(|index| index.id == IndexId(3) && index.column_id == REPLACEMENT)
+    );
     accepted.rollback().unwrap();
     assert_eq!(
         database
@@ -472,18 +534,23 @@ fn failed_validation_does_not_burn_column_or_index_identity() {
 
 #[test]
 fn using_other_column_and_constant_do_not_require_old_to_target_cast() {
-    for (name, sql, expected) in [
-        ("other", "SELECT id FROM users", vec![1_i64, 2, 3]),
-        ("constant", "SELECT 7::BIGINT", vec![7_i64, 7, 7]),
+    for (name, using, expected) in [
+        ("other", "id", vec![1_i64, 2, 3]),
+        ("constant", "7::BIGINT", vec![7_i64, 7, 7]),
+        ("qualified", "users.id", vec![1_i64, 2, 3]),
+        (
+            "chained",
+            "legacy::BIGINT::TEXT::BIGINT",
+            vec![43_i64, 0, 99],
+        ),
     ] {
         let path = root(name);
         let mut database = seed(&path, false, false);
-        let using = query_expression(&database, None, sql);
-        let mut transaction = database.begin_transaction().unwrap();
         database
-            .audit_alter_type_using(&mut transaction, spec(&database, using))
+            .execute(&format!(
+                "ALTER TABLE users ALTER COLUMN legacy TYPE BIGINT USING {using}"
+            ))
             .unwrap();
-        database.commit_transaction(&mut transaction).unwrap();
         assert_eq!(
             database
                 .query("SELECT legacy FROM users ORDER BY id")
@@ -497,41 +564,66 @@ fn using_other_column_and_constant_do_not_require_old_to_target_cast() {
         database.close().unwrap();
         std::fs::remove_dir_all(path).unwrap();
     }
+
+    let path = root("multiple");
+    let mut database = seed(&path, false, false);
+    database
+        .execute(
+            "ALTER TABLE users ALTER COLUMN legacy TYPE BOOLEAN \
+             USING flag AND legacy IS NOT NULL",
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .query("SELECT legacy FROM users ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![ScalarValue::Bool(true)],
+            vec![ScalarValue::Bool(false)],
+            vec![ScalarValue::Bool(true)],
+        ]
+    );
+    database.close().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
 }
 
 #[test]
 fn hidden_name_is_not_semantic_and_nullable_result_obeys_final_contract() {
+    let path = root("hidden-digest");
+    let database = seed(&path, false, false);
+    let base = database.schema().table("users").unwrap().clone();
+    let using = query_expression(&database, None, "SELECT legacy::BIGINT FROM users");
     let mut digests = Vec::new();
-    for hidden in ["__first", "legacy"] {
-        let path = root(hidden);
-        let mut database = seed(&path, false, false);
-        let using = query_expression(&database, None, "SELECT legacy::BIGINT FROM users");
-        let mut request = spec(&database, using);
-        request.hidden_name_seed = Some(hidden.to_owned());
-        let mut transaction = database.begin_transaction().unwrap();
-        let outcome = database
-            .audit_alter_type_using(&mut transaction, request)
-            .unwrap();
-        assert_ne!(outcome.hidden_evaluation_name, "legacy");
-        digests.push(outcome.semantic_digest);
-        transaction.rollback().unwrap();
-        database.close().unwrap();
-        std::fs::remove_dir_all(path).unwrap();
+    for hidden in ["__first", "__second"] {
+        let mut evaluation = base.clone();
+        evaluation.columns.push(
+            ColumnDef::new(REPLACEMENT, hidden, TypeSpec::Physical(PhysicalType::Int64))
+                .nullable(true),
+        );
+        digests.push(
+            crate::deferred_backfill::build_synthetic_assignment(
+                using.clone(),
+                &base,
+                &evaluation,
+                REPLACEMENT,
+            )
+            .unwrap()
+            .semantic_digest(),
+        );
     }
     assert_eq!(digests[0], digests[1]);
+    database.close().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
 
     let path = root("not-null");
     let mut database = seed(&path, false, false);
-    let using = Expr {
-        kind: ExprKind::Literal(ScalarValue::Null),
-        expr_type: ExprType {
-            data_type: SemanticType::physical(PhysicalType::Int64),
-            nullable: true,
-        },
-    };
     let mut transaction = database.begin_transaction().unwrap();
     assert!(matches!(
-        database.audit_alter_type_using(&mut transaction, spec(&database, using)),
+        database.execute_in(
+            &mut transaction,
+            "ALTER TABLE users ALTER COLUMN legacy TYPE BIGINT USING NULL::BIGINT",
+        ),
         Err(DatabaseError::SchemaMutation(
             SchemaMutationError::NotNullViolation(REPLACEMENT)
         ))
@@ -546,24 +638,41 @@ fn hidden_name_is_not_semantic_and_nullable_result_obeys_final_contract() {
 fn closed_language_and_structural_admission_boundaries_remain_exact() {
     let path = root("boundaries");
     let mut database = seed(&path, false, false);
-    let error = database
-        .prepare_sql_statement(
-            "ALTER TABLE users ALTER COLUMN legacy TYPE BIGINT USING legacy::BIGINT",
-            &[],
-        )
-        .unwrap_err();
-    assert_eq!(error.kind(), DatabaseErrorKind::FeatureNotSupported);
-
-    let text_using = query_expression(&database, None, "SELECT legacy FROM users");
-    let mut mismatch = database.begin_transaction().unwrap();
-    assert!(matches!(
-        database.audit_alter_type_using(&mut mismatch, spec(&database, text_using)),
-        Err(DatabaseError::Execution(
-            netbadb_executor::ExecutionError::TypeMismatch
-        ))
-    ));
-    mismatch.rollback().unwrap();
-    drop(mismatch);
+    assert!(prepare_ddl(&database, ALTER_TYPE_SQL).is_table_alter());
+    for unsupported in [
+        "ALTER TABLE users ALTER COLUMN legacy TYPE BIGINT",
+        "ALTER TABLE users ALTER COLUMN legacy SET DATA TYPE BIGINT USING legacy::BIGINT",
+        "ALTER TABLE users ALTER COLUMN legacy TYPE BIGINT(8) USING legacy::BIGINT",
+    ] {
+        assert_eq!(
+            database
+                .prepare_sql_statement(unsupported, &[])
+                .unwrap_err()
+                .kind(),
+            DatabaseErrorKind::FeatureNotSupported,
+            "{unsupported}"
+        );
+    }
+    assert_eq!(
+        database
+            .prepare_sql_statement(
+                "ALTER TABLE users ALTER COLUMN legacy TYPE BIGINT USING $1",
+                &[Some(PhysicalType::Int64)],
+            )
+            .unwrap_err()
+            .kind(),
+        DatabaseErrorKind::FeatureNotSupported
+    );
+    assert_eq!(
+        database
+            .prepare_sql_statement(
+                "ALTER TABLE users ALTER COLUMN legacy TYPE BIGINT USING legacy",
+                &[],
+            )
+            .unwrap_err()
+            .kind(),
+        DatabaseErrorKind::DatatypeMismatch
+    );
 
     assert_eq!(
         database
@@ -575,9 +684,8 @@ fn closed_language_and_structural_admission_boundaries_remain_exact() {
 
     let mut group = database.begin_group_commit().unwrap();
     let mut member = database.begin_group_member(&group).unwrap();
-    let using = query_expression(&database, None, "SELECT legacy::BIGINT FROM users");
     assert!(matches!(
-        database.audit_alter_type_using(&mut member, spec(&database, using)),
+        database.execute_in(&mut member, ALTER_TYPE_SQL),
         Err(DatabaseError::Transaction(
             CoordinatorError::GroupCommitStructuralMutation
         ))
@@ -613,10 +721,9 @@ fn enabled_change_stream_blocks_before_scan_or_identity_reservation() {
     let reclaimed = database.gc_change_stream(USERS).unwrap();
     assert!(reclaimed.batches_removed > 0);
     let stream_before = database.inspect_change_stream(USERS).unwrap();
-    let using = query_expression(&database, None, "SELECT legacy::BIGINT FROM users");
     let mut transaction = database.begin_transaction().unwrap();
     assert!(matches!(
-        database.audit_alter_type_using(&mut transaction, spec(&database, using)),
+        database.execute_in(&mut transaction, ALTER_TYPE_SQL),
         Err(DatabaseError::SchemaMutation(
             SchemaMutationError::ActiveChangeStreamBlocksReplacement { .. }
         ))
@@ -629,12 +736,22 @@ fn enabled_change_stream_blocks_before_scan_or_identity_reservation() {
     transaction.rollback().unwrap();
     drop(transaction);
     database.disable_change_stream(USERS).unwrap();
-    let using = query_expression(&database, None, "SELECT legacy::BIGINT FROM users");
     let mut accepted = database.begin_transaction().unwrap();
-    let outcome = database
-        .audit_alter_type_using(&mut accepted, spec(&database, using))
-        .unwrap();
-    assert_eq!(outcome.new_column_id, REPLACEMENT);
+    database.execute_in(&mut accepted, ALTER_TYPE_SQL).unwrap();
+    assert_eq!(
+        accepted
+            .schema_composition
+            .plan()
+            .unwrap()
+            .overlay
+            .schema
+            .table("users")
+            .unwrap()
+            .column("legacy")
+            .unwrap()
+            .id,
+        REPLACEMENT
+    );
     accepted.rollback().unwrap();
     database.close().unwrap();
     std::fs::remove_dir_all(path).unwrap();
@@ -647,12 +764,18 @@ fn nullable_values_survive_and_zero_row_dml_is_real_adopted_authority() {
     database
         .execute("UPDATE users SET legacy = NULL WHERE id = 2")
         .unwrap();
-    let using = query_expression(&database, None, "SELECT legacy::BIGINT FROM users");
     let mut transaction = database.begin_transaction().unwrap();
-    let outcome = database
-        .audit_alter_type_using(&mut transaction, spec(&database, using))
+    database
+        .execute_in(&mut transaction, ALTER_TYPE_SQL)
         .unwrap();
-    assert!(!outcome.adopted_source);
+    let SchemaCompositionState::TypeConversionReady(conversion) = &transaction.schema_composition
+    else {
+        panic!("expected sealed type conversion")
+    };
+    assert!(matches!(
+        conversion.source,
+        TypeConversionSource::Committed(_)
+    ));
     database.commit_transaction(&mut transaction).unwrap();
     assert!(
         database
@@ -689,15 +812,17 @@ fn nullable_values_survive_and_zero_row_dml_is_real_adopted_authority() {
             .unwrap(),
         ExecutionResult::AffectedRows(0)
     );
-    let using = query_expression(
-        &database,
-        Some(&transaction),
-        "SELECT legacy::BIGINT FROM users",
-    );
-    let outcome = database
-        .audit_alter_type_using(&mut transaction, spec(&database, using))
+    database
+        .execute_in(&mut transaction, ALTER_TYPE_SQL)
         .unwrap();
-    assert!(outcome.adopted_source);
+    let SchemaCompositionState::TypeConversionReady(conversion) = &transaction.schema_composition
+    else {
+        panic!("expected sealed type conversion")
+    };
+    assert!(matches!(
+        conversion.source,
+        TypeConversionSource::Adopted(_)
+    ));
     transaction.rollback().unwrap();
     database.close().unwrap();
     std::fs::remove_dir_all(path).unwrap();
@@ -707,12 +832,12 @@ fn nullable_values_survive_and_zero_row_dml_is_real_adopted_authority() {
 fn primary_key_same_physical_and_prior_read_boundaries_are_closed() {
     let path = root("same-physical");
     let mut database = seed(&path, false, false);
-    let using = query_expression(&database, None, "SELECT legacy FROM users");
-    let mut request = spec(&database, using);
-    request.target_type = SemanticType::physical(PhysicalType::Text);
     let mut transaction = database.begin_transaction().unwrap();
     assert!(matches!(
-        database.audit_alter_type_using(&mut transaction, request),
+        database.execute_in(
+            &mut transaction,
+            "ALTER TABLE users ALTER COLUMN legacy TYPE TEXT USING legacy",
+        ),
         Err(DatabaseError::SchemaMutation(
             SchemaMutationError::UnsupportedSchemaEvolution
         ))
@@ -724,18 +849,25 @@ fn primary_key_same_physical_and_prior_read_boundaries_are_closed() {
     database
         .execute_in(&mut prior_read, "SELECT id FROM users")
         .unwrap();
-    let using = query_expression(
-        &database,
-        Some(&prior_read),
-        "SELECT legacy::BIGINT FROM users",
-    );
     assert!(matches!(
-        database.audit_alter_type_using(&mut prior_read, spec(&database, using)),
+        database.execute_in(&mut prior_read, ALTER_TYPE_SQL),
         Err(DatabaseError::SchemaMutation(
             SchemaMutationError::UnsupportedBackfillRefinement(_)
         ))
     ));
     prior_read.rollback().unwrap();
+
+    let mut other_table_dml = database.begin_transaction().unwrap();
+    database
+        .execute_in(&mut other_table_dml, "UPDATE seed SET id = id")
+        .unwrap();
+    assert!(matches!(
+        database.execute_in(&mut other_table_dml, ALTER_TYPE_SQL),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::UnsupportedPlacement
+        ))
+    ));
+    other_table_dml.rollback().unwrap();
     database.close().unwrap();
     std::fs::remove_dir_all(path).unwrap();
 
@@ -772,10 +904,12 @@ fn primary_key_same_physical_and_prior_read_boundaries_are_closed() {
         Some(DatabaseCoordinatorConfig::new(path.join("coordinator"))),
     )
     .unwrap();
-    let using = query_expression(&database, None, "SELECT 0::BIGINT");
     let mut transaction = database.begin_transaction().unwrap();
     assert!(matches!(
-        database.audit_alter_type_using(&mut transaction, spec(&database, using)),
+        database.execute_in(
+            &mut transaction,
+            "ALTER TABLE users ALTER COLUMN legacy TYPE BIGINT USING 0::BIGINT",
+        ),
         Err(DatabaseError::SchemaMutation(
             SchemaMutationError::PrimaryKeyColumn(LEGACY)
         ))
@@ -787,11 +921,82 @@ fn primary_key_same_physical_and_prior_read_boundaries_are_closed() {
 }
 
 #[test]
-fn round61_crash_child() {
-    let Ok(path) = std::env::var("NETBADB_ROUND61_CRASH_ROOT") else {
+fn unnamed_source_index_shape_is_rejected() {
+    let path = root("unnamed-index");
+    let mut database = seed(&path, false, false);
+    database.execute("DROP INDEX users_legacy_idx").unwrap();
+    database.create_index(USERS, LEGACY).unwrap();
+    let mut transaction = database.begin_transaction().unwrap();
+    assert!(matches!(
+        database.execute_in(&mut transaction, ALTER_TYPE_SQL),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::UnsupportedSchemaEvolution
+        ))
+    ));
+    assert!(transaction.schema_composition.is_none());
+    assert_eq!(transaction.write_participant_count(), 0);
+    transaction.rollback().unwrap();
+    database.close().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn prepared_dependencies_survive_rollback_and_stale_after_commit() {
+    let path = root("prepared-lifecycle");
+    let mut database = seed(&path, false, false);
+    let PreparedSqlStatement::Relational(old_query) = database
+        .prepare_sql_statement("SELECT legacy FROM users ORDER BY id", &[])
+        .unwrap()
+    else {
+        panic!("expected relational statement")
+    };
+    let ddl = prepare_ddl(&database, ALTER_TYPE_SQL);
+    let stale_ddl = ddl.clone();
+
+    let mut rolled_back = database.begin_transaction().unwrap();
+    assert_eq!(
+        database.execute_ddl_in(&mut rolled_back, &ddl).unwrap(),
+        DdlOutcome::Altered
+    );
+    rolled_back.rollback().unwrap();
+    drop(rolled_back);
+    let ExecutionResult::Query(result) = database.execute_prepared(&old_query, &[]).unwrap() else {
+        panic!("expected query result")
+    };
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![ScalarValue::Text("43".into())],
+            vec![ScalarValue::Text("0".into())],
+            vec![ScalarValue::Text("99".into())],
+        ]
+    );
+
+    assert_eq!(database.execute_ddl(&ddl).unwrap(), DdlOutcome::Altered);
+    let storage_after_winner = database.next_storage_id();
+    assert!(matches!(
+        database.execute_prepared(&old_query, &[]),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::StalePreparedStatement
+        ))
+    ));
+    assert!(matches!(
+        database.execute_ddl(&stale_ddl),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::StaleSchemaDependency
+        ))
+    ));
+    assert_eq!(database.next_storage_id(), storage_after_winner);
+    database.close().unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn alter_type_crash_child() {
+    let Ok(path) = std::env::var("NETBADB_ROUND62_CRASH_ROOT") else {
         return;
     };
-    let adopted = std::env::var_os("NETBADB_ROUND61_ADOPTED").is_some();
+    let adopted = std::env::var_os("NETBADB_ROUND62_ADOPTED").is_some();
     let mut database = Database::open_catalog(Path::new(&path).join("catalog")).unwrap();
     let mut transaction = database.begin_transaction().unwrap();
     if adopted {
@@ -802,16 +1007,11 @@ fn round61_crash_child() {
             )
             .unwrap();
     }
-    let using = query_expression(
-        &database,
-        adopted.then_some(&transaction),
-        "SELECT legacy::BIGINT FROM users",
-    );
     database
-        .audit_alter_type_using(&mut transaction, spec(&database, using))
+        .execute_in(&mut transaction, ALTER_TYPE_SQL)
         .unwrap();
     database.commit_transaction(&mut transaction).unwrap();
-    panic!("configured Round 61 crash point was not reached");
+    panic!("configured Round 62 crash point was not reached");
 }
 
 fn assert_recovered(database: &mut Database, source: StorageId, winner: bool) {
@@ -875,9 +1075,9 @@ fn assert_no_stage(path: &Path) {
 #[test]
 fn pristine_and_adopted_crash_matrices_converge_without_using_replay() {
     let cases = [
-        ("round61-column-reservation-durable", false, false, false),
-        ("round61-index-reservation-durable", false, false, false),
-        ("round61-logical-plan-sealed", false, false, false),
+        ("alter-type-column-reservation-durable", false, false, false),
+        ("alter-type-index-reservation-durable", false, false, false),
+        ("alter-type-logical-plan-sealed", false, false, false),
         ("composition-intent-durable", false, false, false),
         ("composition-table-copy-complete", false, false, false),
         ("source-backfill-intent-durable", true, false, false),
@@ -900,12 +1100,12 @@ fn pristine_and_adopted_crash_matrices_converge_without_using_replay() {
         command
             .args([
                 "--exact",
-                "alter_type_using_audit_tests::round61_crash_child",
+                "alter_type_using_tests::alter_type_crash_child",
                 "--nocapture",
             ])
-            .env("NETBADB_ROUND61_CRASH_ROOT", &path);
+            .env("NETBADB_ROUND62_CRASH_ROOT", &path);
         if adopted {
-            command.env("NETBADB_ROUND61_ADOPTED", "1");
+            command.env("NETBADB_ROUND62_ADOPTED", "1");
         }
         if coordinator {
             crate::coordinator_crash::configure_child(&mut command, point, &path, point);
@@ -931,7 +1131,7 @@ fn pristine_and_adopted_crash_matrices_converge_without_using_replay() {
 }
 
 #[test]
-#[ignore = "manual Round 61 10K/100K cost observation"]
+#[ignore = "manual Round 62 10K/100K cost observation"]
 fn alter_type_using_cost_probe() {
     for rows in [10_000_usize, 100_000] {
         let path = root(&format!("cost-{rows}"));
@@ -946,7 +1146,7 @@ fn alter_type_using_cost_probe() {
         evaluation.columns.push(
             ColumnDef::new(
                 REPLACEMENT,
-                "__round61_cost_shadow",
+                "__round62_cost_shadow",
                 TypeSpec::Physical(PhysicalType::Int64),
             )
             .nullable(true),
@@ -957,7 +1157,7 @@ fn alter_type_using_cost_probe() {
             "legacy",
             TypeSpec::Physical(PhysicalType::Int64),
         );
-        let cost = crate::deferred_backfill::audit_synthetic_deferred_cost(
+        let cost = crate::deferred_backfill::synthetic_deferred_cost(
             using,
             &base,
             base_version,
@@ -977,7 +1177,7 @@ fn alter_type_using_cost_probe() {
         )
         .unwrap();
         println!(
-            "round61 rows={rows} validation_us={} finalization_us={} known_program_vec_allocations={} metadata_bytes={}",
+            "round62 rows={rows} validation_us={} finalization_us={} known_program_vec_allocations={} metadata_bytes={}",
             cost.validation.as_micros(),
             cost.finalization.as_micros(),
             cost.transient_vector_allocations,

@@ -130,8 +130,10 @@ impl AlterTableSpec {
 
 // SQL/HIR contributes only exact logical identity and a typed operation. Core
 // remains the sole owner of durable IDs, staging, row copy, indexes and recovery.
-impl From<&netbadb_compiler::TypedAlterTable> for AlterTableSpec {
-    fn from(statement: &netbadb_compiler::TypedAlterTable) -> Self {
+impl TryFrom<&netbadb_compiler::TypedAlterTable> for AlterTableSpec {
+    type Error = DatabaseError;
+
+    fn try_from(statement: &netbadb_compiler::TypedAlterTable) -> Result<Self, Self::Error> {
         let operation = match &statement.operation {
             netbadb_compiler::TypedAlterTableOperation::RenameTable { new_name } => {
                 AlterTableOperation::RenameTable {
@@ -166,15 +168,18 @@ impl From<&netbadb_compiler::TypedAlterTable> for AlterTableSpec {
                     column_id: *column_id,
                 }
             }
+            netbadb_compiler::TypedAlterTableOperation::AlterColumnTypeUsing { .. } => {
+                return Err(SchemaMutationError::UnsupportedSchemaEvolution.into());
+            }
         };
-        Self::new(
+        Ok(Self::new(
             SchemaDependency {
                 table_id: statement.target.table_id,
                 table_version: statement.target.table_version,
                 fingerprint: statement.target.fingerprint,
             },
             operation,
-        )
+        ))
     }
 }
 

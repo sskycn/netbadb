@@ -70,7 +70,7 @@ fn alter_spec(db: &Database, transaction: Option<&Transaction>, sql: &str) -> Al
     let CompiledDdlStatement::AlterTable(statement) = prepared.compiled else {
         panic!("expected prepared ALTER TABLE");
     };
-    AlterTableSpec::from(&statement)
+    AlterTableSpec::try_from(&statement).unwrap()
 }
 
 fn create_index_statement(db: &Database, transaction: &Transaction, sql: &str) -> TypedCreateIndex {
@@ -452,7 +452,7 @@ fn candidate_a_prepared_set_target_is_exact_and_executes_in_production() {
     let CompiledDdlStatement::AlterTable(statement) = &prepared.compiled else {
         panic!("expected ALTER");
     };
-    let exact = AlterTableSpec::from(statement);
+    let exact = AlterTableSpec::try_from(statement).unwrap();
     assert_eq!(exact.target.table_id, TableId(2));
     assert!(matches!(
         exact.operation,

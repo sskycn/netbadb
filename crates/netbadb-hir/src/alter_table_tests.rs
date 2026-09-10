@@ -49,9 +49,85 @@ fn alter_lowering_binds_exact_table_and_column_identities() {
             | TypedAlterTableOperation::DropColumn { column_id }
             | TypedAlterTableOperation::SetNotNull { column_id }
             | TypedAlterTableOperation::DropNotNull { column_id } => Some(column_id),
+            TypedAlterTableOperation::AlterColumnTypeUsing { column_id, .. } => Some(column_id),
             TypedAlterTableOperation::AddNullableColumn { .. } => unreachable!(),
         };
         assert_eq!(actual, expected, "{sql}");
+    }
+}
+
+#[test]
+fn alter_type_using_binds_the_old_table_scope_and_exact_target_type() {
+    let (schema, target) = fixture();
+    for (sql, expected_column) in [
+        (
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT",
+            ColumnId(9),
+        ),
+        (
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING id",
+            ColumnId(7),
+        ),
+        (
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING projects.name::BIGINT",
+            ColumnId(9),
+        ),
+    ] {
+        let AstStatement::AlterTable(ast) = netbadb_parser::parse_statement(sql).unwrap() else {
+            panic!("ALTER AST")
+        };
+        let typed = lower_alter_table(&schema, &ast, &[TableIdentityBinding { target }]).unwrap();
+        let TypedAlterTableOperation::AlterColumnTypeUsing {
+            column_id,
+            target_type,
+            using,
+        } = typed.operation
+        else {
+            panic!("typed ALTER TYPE USING")
+        };
+        assert_eq!(column_id, ColumnId(9));
+        assert_eq!(target_type, SemanticType::physical(PhysicalType::Int64));
+        assert_eq!(using.expr_type.data_type, target_type);
+        let actual = match &using.kind {
+            TypedExprKind::Column(column) => column.column_id,
+            TypedExprKind::Cast { expression } => match &expression.kind {
+                TypedExprKind::Column(column) => column.column_id,
+                _ => panic!("cast child column"),
+            },
+            _ => unreachable!(),
+        };
+        assert_eq!(actual, expected_column);
+    }
+}
+
+#[test]
+fn alter_type_using_rejects_parameters_mismatch_and_unsupported_casts() {
+    let (schema, target) = fixture();
+    for (sql, kind) in [
+        (
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING $1",
+            "parameter",
+        ),
+        (
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name",
+            "mismatch",
+        ),
+        (
+            "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING true::BIGINT",
+            "cast",
+        ),
+    ] {
+        let AstStatement::AlterTable(ast) = netbadb_parser::parse_statement(sql).unwrap() else {
+            panic!("ALTER AST")
+        };
+        let error =
+            lower_alter_table(&schema, &ast, &[TableIdentityBinding { target }]).unwrap_err();
+        assert!(matches!(
+            (kind, error),
+            ("parameter", HirError::InvalidTableDefinition { .. })
+                | ("mismatch", HirError::TypeMismatch { .. })
+                | ("cast", HirError::UnsupportedCast { .. })
+        ));
     }
 }
 

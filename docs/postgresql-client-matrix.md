@@ -47,7 +47,8 @@ production or build dependencies.
 | psql `CREATE INDEX` | yes | transactional commit/rollback; `\d` and `\di` refresh immediately |
 | psql `DROP INDEX` / `IF EXISTS` | yes | implicit and explicit commit/rollback; `\di` / `\d` removal |
 | psql production postfix CAST | yes, bounded | identity, checked integers, Text/integer and Bool/Text; `22P02`/`22003`/`42846` pinned |
-| psql atomic shadow type migration | yes, explicit workflow | repair, Cast backfill, DROP/RENAME/fresh index, one structural commit; `ALTER TYPE` remains unsupported |
+| psql atomic shadow type migration | yes, explicit workflow | repair, Cast backfill, DROP/RENAME/fresh index, one structural commit; remains available for staged repair |
+| psql `ALTER COLUMN TYPE ... USING` | yes, bounded | runtime Single Heap, one typed same-table USING expression, fresh ColumnId and optional fresh same-name secondary IndexId, Simple/Extended, pristine or post-DML authority |
 | SQLAlchemy ↔ existing psql connection | yes | both directions see committed removal without reconnect |
 | DROP legacy synthetic name | yes | adapter resolution to generic identity; durable retirement |
 | Basic Heap CREATE TABLE | partial | BIGINT/TEXT/BOOLEAN, NULL/NOT NULL; transactional native + PG |
@@ -235,3 +236,11 @@ identities across three catalog-only reopens. Server tests separately pin
 Extended Parse/Describe/Bind/Execute/Sync for both undeclared and declared Text
 parameters. PostgreSQL result reflection remains lossless-only, so UINT64 and
 128-bit integer outputs are not claimed.
+
+Round 62 reproduction from the repository root:
+`python3 scripts/test-alter-type-using-round62-sql.py`. It uses PostgreSQL 17.11
+and the ICU path above, covers autocommit and post-DML explicit transactions,
+nullable conversion, same-name index replacement, rollback, active-stream and
+conversion error SQLSTATEs, and verifies winners and losers across three
+catalog-only reopens. This is a bounded USING-required operation, not general
+PostgreSQL ALTER TYPE.

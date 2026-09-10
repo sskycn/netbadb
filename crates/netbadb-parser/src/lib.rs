@@ -114,12 +114,31 @@ pub struct AlterTableStatement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlterTableAction {
-    RenameTable { new_name: Ident },
-    RenameColumn { old_name: Ident, new_name: Ident },
-    AddColumn { column: CreateColumn },
-    DropColumn { name: Ident },
-    SetNotNull { column_name: Ident },
-    DropNotNull { column_name: Ident },
+    RenameTable {
+        new_name: Ident,
+    },
+    RenameColumn {
+        old_name: Ident,
+        new_name: Ident,
+    },
+    AddColumn {
+        column: CreateColumn,
+    },
+    DropColumn {
+        name: Ident,
+    },
+    SetNotNull {
+        column_name: Ident,
+    },
+    DropNotNull {
+        column_name: Ident,
+    },
+    AlterColumnTypeUsing {
+        column_name: Ident,
+        data_type: Ident,
+        using: Expr,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -982,6 +1001,7 @@ impl Parser {
                 name: self.expect_ident()?,
             }
         } else if self.contextual("alter") {
+            let action_start = self.current().span.start;
             self.position += 1;
             self.expect_contextual("column")?;
             let column_name = self.expect_ident()?;
@@ -1004,10 +1024,32 @@ impl Parser {
                 self.expect_simple(TokenKind::Not)?;
                 self.expect_simple(TokenKind::Null)?;
                 AlterTableAction::DropNotNull { column_name }
-            } else if self.contextual("type") || self.contextual("using") {
-                return Err(self.unsupported("ALTER COLUMN physical type conversion"));
+            } else if self.contextual("type") {
+                self.position += 1;
+                let data_type = self.expect_ident()?;
+                if self.matches(&TokenKind::LParen) {
+                    return Err(self.unsupported("type modifiers/length constraints"));
+                }
+                if !self.contextual("using") {
+                    return Err(self.unsupported("ALTER COLUMN TYPE without USING"));
+                }
+                self.position += 1;
+                let using = self.parse_expr(0)?;
+                AlterTableAction::AlterColumnTypeUsing {
+                    span: Span {
+                        start: action_start,
+                        end: expr_span(&using).end,
+                    },
+                    column_name,
+                    data_type,
+                    using,
+                }
+            } else if self.contextual("using") {
+                return Err(self.unsupported("ALTER COLUMN USING without TYPE"));
             } else {
-                return Err(self.error_here("expected SET NOT NULL or DROP NOT NULL"));
+                return Err(
+                    self.error_here("expected SET NOT NULL, DROP NOT NULL, or TYPE ... USING")
+                );
             }
         } else {
             return Err(self.unsupported("ALTER TABLE action"));

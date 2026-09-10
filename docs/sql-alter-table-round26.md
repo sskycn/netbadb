@@ -44,6 +44,7 @@ ALTER TABLE t ADD COLUMN c BIGINT NULL;
 ALTER TABLE t DROP COLUMN c;
 ALTER TABLE t ALTER COLUMN c SET NOT NULL;
 ALTER TABLE t ALTER COLUMN c DROP NOT NULL;
+ALTER TABLE t ALTER COLUMN c TYPE BIGINT USING c::BIGINT;
 ```
 
 The optional-COLUMN rename spelling is a harmless PostgreSQL grammar alias. Real
@@ -164,7 +165,7 @@ rewrite reservation. Core remains the final authority for every check.
 Rejected rather than ignored: ALTER TABLE IF EXISTS/ONLY; qualified or quoted
 table names; ADD NOT NULL, DEFAULT, PRIMARY KEY, UNIQUE, CHECK, REFERENCES, or
 constraints; VARCHAR(n)/CHAR(n); DROP IF EXISTS/CASCADE/RESTRICT; ALTER TYPE,
-SET DATA TYPE, USING, SET/DROP DEFAULT; ADD/DROP/RENAME CONSTRAINT; owner/schema/
+TYPE without USING, SET DATA TYPE, SET/DROP DEFAULT; ADD/DROP/RENAME CONSTRAINT; owner/schema/
 tablespace/partition/enable/disable operations; comma-separated/multiple actions.
 
 Core restrictions remain: physical or nominal SQL type alteration, indexed/PK
@@ -172,12 +173,12 @@ column DROP, imported/bootstrap Heap, LSM, range partition, online ALTER, multip
 schema mutations per transaction, automatic GC, and full multi-operation Alembic
 migration transactions.
 
-Round 60 does not change this grammar: `ALTER COLUMN TYPE` and `USING` remain
-unsupported. Physical replacement is nevertheless possible as an explicit,
-bounded transaction using nullable shadow ADD, repair DML, postfix
-`old_column::TARGET`, NOT NULL validation, index evacuation, old-column DROP,
-shadow RENAME and a fresh index. That workflow allocates a new ColumnId and is
-documented in [the Round 60 contract](deferred-type-conversion-round60.md).
+Round 62 adds only `ALTER COLUMN name TYPE target USING expression`. USING is
+mandatory and same-physical, PK, modifier, parameter, cross-table and broader
+constraint/index forms remain unsupported. It allocates a fresh ColumnId and
+optionally a fresh same-name secondary IndexId, then publishes one Heap
+replacement. The explicit Round 60 shadow workflow remains available for
+staged repair. See [the Round 62 contract](alter-type-using-round62.md).
 
 ## Real client evidence
 

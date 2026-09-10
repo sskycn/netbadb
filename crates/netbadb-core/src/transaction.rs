@@ -1175,6 +1175,8 @@ impl DatabaseTransaction {
             TransactionState::Active
             | TransactionState::RollbackRequired
             | TransactionState::Preparing => {
+                self.schema_composition
+                    .release_type_conversion_writer_on_rollback();
                 self.state = TransactionState::RollbackPending;
             }
             TransactionState::RollbackPending => {}

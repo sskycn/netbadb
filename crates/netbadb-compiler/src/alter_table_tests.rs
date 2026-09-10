@@ -59,3 +59,33 @@ fn generic_dispatch_rejects_alter_parameters() {
         Err(CompileError::Hir(HirError::InvalidTableDefinition { .. }))
     ));
 }
+
+#[test]
+fn compiler_lowers_alter_type_using_to_relational_expression_ir() {
+    let (schema, binding) = fixture();
+    let compiled = compile_ddl_statement(
+        &schema,
+        "ALTER TABLE projects ALTER COLUMN name TYPE BIGINT USING name::BIGINT",
+        &[],
+        &[binding],
+    )
+    .unwrap();
+    let CompiledDdlStatement::AlterTypeUsing(statement) = compiled else {
+        panic!("compiled ALTER TYPE USING")
+    };
+    assert_eq!(statement.target.table_id, TableId(8));
+    assert_eq!(statement.column_id, ColumnId(3));
+    assert_eq!(
+        statement.target_type,
+        SemanticType::physical(PhysicalType::Int64)
+    );
+    assert_eq!(statement.using.expr_type.data_type, statement.target_type);
+    let ExprKind::Cast { expression } = statement.using.kind else {
+        panic!("relational CAST")
+    };
+    let ExprKind::Column(column) = expression.kind else {
+        panic!("bound relational column")
+    };
+    assert_eq!(column.table_id, TableId(8));
+    assert_eq!(column.column_id, ColumnId(3));
+}

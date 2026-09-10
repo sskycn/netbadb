@@ -3,8 +3,10 @@
 Round 60 promotes the typed CAST architecture selected in Round 59 to the one
 production expression semantics used by native SQL, PostgreSQL, ordinary query
 execution, prepared execution, Columnar input and deferred migration replay.
-`CAST(expr AS TYPE)` and `ALTER COLUMN TYPE ... USING` remain absent; physical
-replacement is an explicit shadow-column workflow.
+`CAST(expr AS TYPE)` remains absent. Round 60's original production surface did
+not include `ALTER COLUMN TYPE ... USING`; Round 62 subsequently added the
+bounded USING-required operation while retaining this explicit shadow-column
+workflow for staged repair and broader migration choreography.
 
 ## Typed cast contract
 
@@ -116,8 +118,8 @@ IndexCatalog/BTree, NBCL, NBCM/NBCS/NBCD/NBPC, Partition/LSM, native Protocol
 v2, PostgreSQL framing, manifests, SDK schema and Inspection JSON version are
 unchanged. Inspection content is more truthful for Cast but retains JSON v7.
 
-Round 61 has now selected and executable-proved a fresh-ColumnId synthetic
-lowering for `ALTER COLUMN TYPE ... USING` without opening production syntax;
-see [`alter-type-using-round61.md`](alter-type-using-round61.md). Float
+Round 61 selected and executable-proved a fresh-ColumnId synthetic lowering;
+Round 62 productionized its bounded USING-required shape. See
+[`alter-type-using-round62.md`](alter-type-using-round62.md). Float
 conversion, Bytes conversion, imported/LSM/partitioned migration, general
 constraint rewriting and automatic type migration remain outside Round 60.

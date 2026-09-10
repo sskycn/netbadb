@@ -39,6 +39,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     let round56_probe = std::env::var("NETBADB_ROUND56_PROBE").ok();
     let round58_probe = std::env::var("NETBADB_ROUND58_PROBE").ok();
     let round60_probe = std::env::var("NETBADB_ROUND60_PROBE").ok();
+    let round62_probe = std::env::var("NETBADB_ROUND62_PROBE").ok();
     let round46_probe = std::env::var("NETBADB_ROUND46_PROBE").ok();
     let round46_email_not_null = round46_probe
         .as_deref()
@@ -60,14 +61,21 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         )],
         Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
     )?;
-    if round60_probe.is_some() {
-        db.execute(
-            "CREATE TABLE projects (id BIGINT NOT NULL, legacy TEXT NOT NULL, flag BOOLEAN)",
-        )?;
+    if round60_probe.is_some() || round62_probe.is_some() {
+        let nullable = round62_probe.as_deref() == Some("nullable");
+        db.execute(&format!(
+            "CREATE TABLE projects (id BIGINT NOT NULL, legacy TEXT{}, flag BOOLEAN)",
+            if nullable { "" } else { " NOT NULL" }
+        ))?;
         db.execute("CREATE INDEX projects_legacy_idx ON projects (legacy)")?;
         db.execute("INSERT INTO projects VALUES (1, '42', true)")?;
-        db.execute("INSERT INTO projects VALUES (2, '-7', false)")?;
-        db.execute("INSERT INTO projects VALUES (3, 'bad', NULL)")?;
+        if nullable {
+            db.execute("INSERT INTO projects VALUES (2, NULL, false)")?;
+            db.execute("INSERT INTO projects VALUES (3, '99', NULL)")?;
+        } else {
+            db.execute("INSERT INTO projects VALUES (2, '-7', false)")?;
+            db.execute("INSERT INTO projects VALUES (3, 'bad', NULL)")?;
+        }
     } else if round56_probe.is_some() || round58_probe.is_some() {
         db.execute("CREATE TABLE projects (id BIGINT NOT NULL, legacy TEXT, flag BOOLEAN)")?;
         if round56_probe.as_deref() == Some("indexed-drop")
@@ -143,6 +151,9 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
+    if round62_probe.as_deref() == Some("stream") {
+        db.enable_change_stream(TableId(2))?;
+    }
     db.close()?;
 
     let runtime_directory = std::fs::read_dir(root)?
@@ -162,10 +173,10 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         .ok_or("runtime storage path is not UTF-8")?;
 
     let manifest = root.join("server.json");
-    let project_columns = if round60_probe.is_some() {
+    let project_columns = if round60_probe.is_some() || round62_probe.is_some() {
         json!([
             {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false},
-            {"id": 2, "name": "legacy", "physical_type": "text", "semantic_type": null, "nullable": false, "primary_key": false},
+            {"id": 2, "name": "legacy", "physical_type": "text", "semantic_type": null, "nullable": round62_probe.as_deref() == Some("nullable"), "primary_key": false},
             {"id": 3, "name": "flag", "physical_type": "bool", "semantic_type": null, "nullable": true, "primary_key": false}
         ])
     } else if round56_probe.is_some() || round58_probe.is_some() {
@@ -215,6 +226,79 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     server.shutdown()?;
     if std::fs::read(&manifest)? != config {
         return Err("SQL ALTER changed the manifest".into());
+    }
+    if let Some(probe) = round62_probe {
+        let winner = matches!(probe.as_str(), "autocommit" | "adopted" | "nullable");
+        let expected_rows = match probe.as_str() {
+            "autocommit" => Some(vec![42_i64, -7, 0]),
+            "adopted" => Some(vec![43_i64, -7, 0]),
+            "nullable" => None,
+            "invalid" | "range" | "unsupported" | "missing" | "same" | "stream" | "rollback" => {
+                None
+            }
+            _ => return Err(format!("unknown Round 62 probe {probe}").into()),
+        };
+        for _ in 0..3 {
+            let mut reopened = Database::open_catalog(&catalog)?;
+            let projects = reopened
+                .schema()
+                .table("projects")
+                .ok_or("Round 62 table absent")?;
+            let indexes = reopened.indexes(TableId(2))?;
+            if winner {
+                if projects.column("legacy").is_none_or(|column| {
+                    column.id != ColumnId(4)
+                        || column.semantic_type().physical != PhysicalType::Int64
+                        || column.nullable != (probe == "nullable")
+                }) || projects.column_by_id(ColumnId(2)).is_some()
+                    || projects
+                        .columns
+                        .iter()
+                        .any(|column| column.name.starts_with("__netbadb_alter_type_"))
+                    || indexes.len() != 1
+                    || indexes[0].id != netbadb_types::IndexId(old_index_id.0 + 1)
+                    || indexes[0].column_id != ColumnId(4)
+                    || indexes[0].name.as_ref().map(|name| name.as_str())
+                        != Some("projects_legacy_idx")
+                {
+                    return Err("Round 62 committed schema/index mismatch".into());
+                }
+                let rows = reopened
+                    .query("SELECT legacy FROM projects ORDER BY id")?
+                    .rows;
+                if probe == "nullable" {
+                    if rows
+                        != vec![
+                            vec![ScalarValue::Int64(42)],
+                            vec![ScalarValue::Null],
+                            vec![ScalarValue::Int64(99)],
+                        ]
+                    {
+                        return Err("Round 62 nullable values mismatch".into());
+                    }
+                } else if rows
+                    != expected_rows
+                        .as_ref()
+                        .ok_or("Round 62 expected rows absent")?
+                        .iter()
+                        .map(|value| vec![ScalarValue::Int64(*value)])
+                        .collect::<Vec<_>>()
+                {
+                    return Err("Round 62 converted values mismatch".into());
+                }
+            } else if projects.column("legacy").is_none_or(|column| {
+                column.id != ColumnId(2) || column.semantic_type().physical != PhysicalType::Text
+            }) || indexes.len() != 1
+                || indexes[0].id != old_index_id
+                || indexes[0].column_id != ColumnId(2)
+                || reopened.next_storage_id() != Some(target_storage)
+            {
+                return Err("Round 62 loser changed public source authority".into());
+            }
+            reopened.close()?;
+        }
+        println!("REOPEN PASS Round 62 {probe}");
+        return Ok(());
     }
     if let Some(probe) = round60_probe {
         if probe != "cast-migration" {

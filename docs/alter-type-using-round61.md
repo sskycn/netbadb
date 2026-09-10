@@ -1,9 +1,12 @@
 # `ALTER COLUMN TYPE ... USING` synthetic lowering audit (Round 61)
 
+> Historical design record. Round 62 productionized the selected bounded
+> shape; see [`alter-type-using-round62.md`](alter-type-using-round62.md).
+
 Round 61 selects an architecture for a future high-level type-change statement
 without opening the production grammar, HIR, Core API, native protocol, or
 PostgreSQL surface. The executable proof is compiled only under `cfg(test)`.
-Production continues to reject both `ALTER COLUMN c TYPE T` and
+At the time of this audit, production rejected both `ALTER COLUMN c TYPE T` and
 `ALTER COLUMN c TYPE T USING expression`; `CAST(expression AS type)` also
 remains absent. The existing `expression::TYPE` syntax is unchanged.
 
@@ -289,8 +292,10 @@ online/resumable migration, and imported/partitioned/LSM sources.
 When productionized, expected PostgreSQL outcomes are ALTER TABLE success,
 `22P02` invalid text, `22003` range, `42846` unsupported explicit cast, `0A000`
 active Change Stream, and `25P02` after an error in an explicit transaction.
-In Round 61 the exact current rejection remains parser
+In Round 61 the exact then-current rejection was parser
 `UnsupportedFeature("ALTER COLUMN physical type conversion")`, mapped by the
-PostgreSQL adapter to `0A000`; the next command in the failed transaction is
+PostgreSQL adapter to `0A000`; the next command in the failed transaction was
 `25P02` until ROLLBACK. The real PostgreSQL 17.11 fixture is
-`scripts/test-alter-type-using-round61-sql.py`.
+`scripts/test-alter-type-using-round61-sql.py`. Round 62 replaces that
+production boundary for the exact supported form and adds
+`scripts/test-alter-type-using-round62-sql.py`.

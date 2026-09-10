@@ -1,9 +1,10 @@
-//! Transaction-local deferred value population for adopted Heap rewrites.
+//! Transaction-local deferred value population for Heap rewrites.
 //!
-//! The program records typed, bound UPDATE actions after an adopted source has
-//! entered schema refinement. Execute observes the exact S1 transaction view;
-//! finalization replays the program while projecting S1 rows into S2 and
-//! verifies that the replay produced the same ordered observation.
+//! Ordinary refinement records typed, bound UPDATE actions against an adopted
+//! transaction-visible source. Synthetic type conversion records one typed
+//! assignment against either committed S1 or that same adopted S1/P1 view.
+//! Finalization replays the program while projecting S1 rows into S2 and
+//! verifies the same ordered observation in either source mode.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
@@ -265,23 +266,16 @@ struct DeferredBackfillAction {
 /// change row evaluation or deferred-program semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeferredSourceAuthority {
-    #[cfg(test)]
-    CommittedStorageView {
-        storage: StorageId,
-    },
-    TransactionStorageView {
-        storage: StorageId,
-    },
+    CommittedStorageView { storage: StorageId },
+    TransactionStorageView { storage: StorageId },
 }
 
 /// An observed action that is not installed in a transaction-local program
 /// until all statement validation and durable identity reservations succeed.
-#[cfg(test)]
 pub(crate) struct PendingDeferredAction {
     action: DeferredBackfillAction,
 }
 
-#[cfg(test)]
 impl PendingDeferredAction {
     pub(crate) fn semantic_digest(&self) -> [u8; 32] {
         self.action.semantic_digest
@@ -354,7 +348,6 @@ impl DeferredBackfillProgram {
         self.actions.push(action);
     }
 
-    #[cfg(test)]
     pub(crate) fn accept_pending_action(
         &mut self,
         pending: PendingDeferredAction,
@@ -929,7 +922,6 @@ fn build_action(
     )
 }
 
-#[cfg(test)]
 fn collect_expression_columns(expression: &Expr, columns: &mut Vec<netbadb_rel::ColumnRef>) {
     match &expression.kind {
         ExprKind::Column(column) => {
@@ -950,10 +942,9 @@ fn collect_expression_columns(expression: &Expr, columns: &mut Vec<netbadb_rel::
     }
 }
 
-/// Builds the one assignment synthesized by the Round 61 test carrier. The
+/// Builds one synthetic type-conversion assignment. The
 /// input expression is already typed and bound against the pre-change schema;
 /// this function neither parses source text nor selects a conversion.
-#[cfg(test)]
 pub(crate) fn build_synthetic_assignment(
     using: Expr,
     base: &TableDef,
@@ -1064,21 +1055,16 @@ fn observe_action(
     evaluation: &TableDef,
 ) -> Result<ActionObservation, DatabaseError> {
     let storage = match authority {
-        #[cfg(test)]
         DeferredSourceAuthority::CommittedStorageView { storage }
         | DeferredSourceAuthority::TransactionStorageView { storage } => storage,
-        #[cfg(not(test))]
-        DeferredSourceAuthority::TransactionStorageView { storage } => storage,
     };
     let transaction_view = match authority {
-        #[cfg(test)]
         DeferredSourceAuthority::CommittedStorageView { .. } => None,
         DeferredSourceAuthority::TransactionStorageView { .. } => {
             Some(transaction.begin_read_view(&[storage], &mut database.registry)?)
         }
     };
     let committed_view = match authority {
-        #[cfg(test)]
         DeferredSourceAuthority::CommittedStorageView { .. } => Some(
             database
                 .registry
@@ -1158,10 +1144,9 @@ fn observe_action(
     Ok(observation.finish())
 }
 
-/// Executes the complete Round 61 acceptance scan without retaining converted
+/// Executes the complete type-conversion acceptance scan without retaining converted
 /// rows. The same pending action and frozen evaluation schema are installed
 /// only after this function succeeds.
-#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn observe_synthetic_assignment(
     database: &mut Database,
@@ -1212,7 +1197,7 @@ pub(crate) struct SyntheticDeferredCost {
 /// path. Heap I/O and fixture construction are deliberately excluded.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn audit_synthetic_deferred_cost<F>(
+pub(crate) fn synthetic_deferred_cost<F>(
     using: Expr,
     base: &TableDef,
     base_version: TableSchemaVersion,
