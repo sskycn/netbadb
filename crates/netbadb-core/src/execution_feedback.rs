@@ -14,6 +14,39 @@ use netbadb_types::{
 
 use crate::{AdaptiveError, Database, DatabaseError};
 
+/// The result of one prepared autocommit execution with explicit feedback.
+///
+/// Query feedback observes the same execution that produced `result`.
+/// Mutations retain their ordinary result and expose a typed reason why no
+/// query-work report applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedExecutionWithFeedback {
+    pub result: netbadb_executor::ExecutionResult,
+    pub feedback: PreparedExecutionFeedback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedExecutionFeedback {
+    Query(Box<ExecutionFeedbackReport>),
+    NotApplicable(PreparedFeedbackNotApplicableReason),
+}
+
+impl PreparedExecutionFeedback {
+    /// Returns the query report without erasing the typed mutation case.
+    #[must_use]
+    pub fn query_report(&self) -> Option<&ExecutionFeedbackReport> {
+        match self {
+            Self::Query(report) => Some(report.as_ref()),
+            Self::NotApplicable(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedFeedbackNotApplicableReason {
+    Mutation,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionFeedbackAnchor {
     pub global_commit_seq: Option<DatabaseCommitSeq>,

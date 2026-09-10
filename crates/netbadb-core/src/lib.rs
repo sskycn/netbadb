@@ -193,6 +193,7 @@ pub use coordinator_log::CoordinatorLogError;
 pub use execution_feedback::{
     AccessExecutionFeedback, AdaptiveExecutionFeedbackOutcome, AdaptiveExecutionFeedbackReport,
     ExecutionFeedbackAnchor, ExecutionFeedbackPolicy, ExecutionFeedbackReport,
+    PreparedExecutionFeedback, PreparedExecutionWithFeedback, PreparedFeedbackNotApplicableReason,
 };
 pub use maintenance::{
     LsmMaintenanceReport, MaintenanceAction, MaintenanceActionReport, MaintenanceBlocker,
@@ -4626,26 +4627,10 @@ impl Database {
             return Err(DatabaseError::ExpectedQuery);
         };
         let query_shape = LogicalQueryShape::from_plan(logical)?;
-        let plan_variant = PlanVariant::from_plan(&plan)?;
         let storage_ids = self.storage_ids_for_tables(compiled.logical_statement.read_tables())?;
         let view = self.autocommit_read_view(&storage_ids)?;
-        let anchor = ExecutionFeedbackAnchor {
-            global_commit_seq: view.snapshot().map(|snapshot| snapshot.commit_seq()),
-            schema_generation: self.schema_generation(),
-        };
-        let mut statistics = ExecutionStatistics::default();
-        match self.execute_query_plan(&plan, &view, None, None, Some(&mut statistics)) {
-            Ok(result) => Ok((
-                result,
-                execution_feedback::correlate_execution_feedback(
-                    anchor,
-                    self.planner_calibration.epoch,
-                    query_shape,
-                    plan_variant,
-                    &estimates,
-                    statistics,
-                ),
-            )),
+        match self.execute_planned_query_with_feedback(&plan, &view, &estimates, query_shape) {
+            Ok(executed) => Ok(executed),
             Err(error) => {
                 let Some((projection_id, detail)) = columnar_read_failure(&error) else {
                     return Err(error);
@@ -4662,21 +4647,12 @@ impl Database {
                     return Err(DatabaseError::ExpectedQuery);
                 };
                 let retry_query_shape = LogicalQueryShape::from_plan(retry_logical)?;
-                let retry_plan_variant = PlanVariant::from_plan(&retry)?;
-                statistics = ExecutionStatistics::default();
-                let result =
-                    self.execute_query_plan(&retry, &view, None, None, Some(&mut statistics))?;
-                Ok((
-                    result,
-                    execution_feedback::correlate_execution_feedback(
-                        anchor,
-                        self.planner_calibration.epoch,
-                        retry_query_shape,
-                        retry_plan_variant,
-                        &retry_estimates,
-                        statistics,
-                    ),
-                ))
+                self.execute_planned_query_with_feedback(
+                    &retry,
+                    &view,
+                    &retry_estimates,
+                    retry_query_shape,
+                )
             }
         }
     }
@@ -5503,8 +5479,57 @@ impl Database {
                 .map(ExecutionResult::Query);
         }
 
+        self.execute_bound_mutation_autocommit(&physical)
+    }
+
+    /// Executes one prepared autocommit statement and explicitly observes the
+    /// exact query plan and execution that produced the returned result.
+    /// Mutations use the ordinary autocommit path and report that query-work
+    /// feedback is not applicable.
+    pub fn execute_prepared_with_feedback(
+        &mut self,
+        prepared: &PreparedStatement,
+        values: &[ScalarValue],
+    ) -> Result<PreparedExecutionWithFeedback, DatabaseError> {
+        self.validate_prepared_dependencies(prepared, None)?;
+        let query_shape = match &prepared.compiled.logical_statement {
+            netbadb_rel::LogicalStatement::Query(logical) => {
+                Some(LogicalQueryShape::from_plan(logical)?)
+            }
+            _ => None,
+        };
+        let logical = bind_statement(&prepared.compiled, values)?;
+        let (physical, estimates) = self.plan_logical_statement_with_estimates(&logical);
+        if let PhysicalStatement::Query(plan) = &physical {
+            let storage_ids = self.storage_ids_for_tables(logical.read_tables())?;
+            let view = self.autocommit_read_view(&storage_ids)?;
+            let (result, feedback) = self.execute_planned_query_with_feedback(
+                plan,
+                &view,
+                &estimates,
+                query_shape.ok_or(DatabaseError::ExpectedQuery)?,
+            )?;
+            return Ok(PreparedExecutionWithFeedback {
+                result: ExecutionResult::Query(result),
+                feedback: PreparedExecutionFeedback::Query(Box::new(feedback)),
+            });
+        }
+
+        let result = self.execute_bound_mutation_autocommit(&physical)?;
+        Ok(PreparedExecutionWithFeedback {
+            result,
+            feedback: PreparedExecutionFeedback::NotApplicable(
+                PreparedFeedbackNotApplicableReason::Mutation,
+            ),
+        })
+    }
+
+    fn execute_bound_mutation_autocommit(
+        &mut self,
+        physical: &PhysicalStatement,
+    ) -> Result<ExecutionResult, DatabaseError> {
         let mut transaction = self.begin_database_transaction(IsolationLevel::ReadCommitted)?;
-        match self.execute_mutation_in(&mut transaction, &physical) {
+        match self.execute_mutation_in(&mut transaction, physical) {
             Ok(result) => {
                 transaction.commit()?;
                 Ok(result)
@@ -5710,13 +5735,25 @@ impl Database {
         DatabaseError,
     > {
         let compiled = compile_statement(&self.committed.schema, source)?;
+        let (physical, estimates) =
+            self.plan_logical_statement_with_estimates(&compiled.logical_statement);
+        Ok((compiled, physical, estimates))
+    }
+
+    fn plan_logical_statement_with_estimates(
+        &self,
+        logical: &netbadb_rel::LogicalStatement,
+    ) -> (
+        PhysicalStatement,
+        Vec<netbadb_planner::PlannerAccessEstimate>,
+    ) {
         let table_statistics = self.planner_table_statistics();
         let access_paths = self.planner_access_paths();
         let range_tables = self.planner_range_tables();
         let projections = self.planner_columnar_projections();
         let calibration = self.planner_calibration;
         let physical = plan_statement_with_columnar_snapshots_and_calibration(
-            &compiled.logical_statement,
+            logical,
             &table_statistics,
             &access_paths,
             &range_tables,
@@ -5734,7 +5771,7 @@ impl Database {
             ),
             _ => Vec::new(),
         };
-        Ok((compiled, physical, estimates))
+        (physical, estimates)
     }
 
     fn plan_logical_statement(&self, logical: &netbadb_rel::LogicalStatement) -> PhysicalStatement {
@@ -6150,6 +6187,33 @@ impl Database {
                 columnar_statistics,
             )?)
         }
+    }
+
+    fn execute_planned_query_with_feedback(
+        &mut self,
+        plan: &netbadb_planner::PhysicalPlan,
+        view: &DatabaseReadView,
+        estimates: &[netbadb_planner::PlannerAccessEstimate],
+        query_shape: LogicalQueryShape,
+    ) -> Result<(QueryResult, ExecutionFeedbackReport), DatabaseError> {
+        let plan_variant = PlanVariant::from_plan(plan)?;
+        let anchor = ExecutionFeedbackAnchor {
+            global_commit_seq: view.snapshot().map(|snapshot| snapshot.commit_seq()),
+            schema_generation: self.schema_generation(),
+        };
+        let mut statistics = ExecutionStatistics::default();
+        let result = self.execute_query_plan(plan, view, None, None, Some(&mut statistics))?;
+        Ok((
+            result,
+            execution_feedback::correlate_execution_feedback(
+                anchor,
+                self.planner_calibration.epoch,
+                query_shape,
+                plan_variant,
+                estimates,
+                statistics,
+            ),
+        ))
     }
 
     fn execute_query_plan_in(

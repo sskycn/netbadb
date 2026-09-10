@@ -6,9 +6,11 @@ use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
 
 use crate::{
-    AdaptiveExecutionFeedbackOutcome, AdaptiveMaintenanceOutcome, AdaptivePolicy,
-    ColumnarProjectionSpec, Database, DatabaseCoordinatorConfig, ExecutionAccessKind,
-    ExecutionFeedbackPolicy, MaintenanceBudget, TableStorageCreateSpec,
+    AdaptiveEvidencePool, AdaptiveEvidencePoolLimits, AdaptiveExecutionFeedbackOutcome,
+    AdaptiveMaintenanceOutcome, AdaptivePolicy, ColumnarProjectionSpec, Database,
+    DatabaseCoordinatorConfig, DatabaseError, ExecutionAccessKind, ExecutionFeedbackPolicy,
+    ExecutionResult, MaintenanceBudget, PreparedExecutionFeedback,
+    PreparedFeedbackNotApplicableReason, SchemaMutationError, TableStorageCreateSpec,
     cleanup_created_table_files,
 };
 
@@ -100,6 +102,335 @@ fn table() -> TableDef {
 
 fn cleanup_root(root: &Path, source: &Path) {
     cleanup_created_table_files(&[source.to_owned()]);
+    let _ = fs::remove_dir_all(root);
+}
+
+fn query_feedback(
+    executed: &crate::PreparedExecutionWithFeedback,
+) -> &crate::ExecutionFeedbackReport {
+    executed
+        .feedback
+        .query_report()
+        .expect("prepared query feedback")
+}
+
+#[test]
+fn prepared_parameter_feedback_is_transparent_typed_and_explicitly_ingested() {
+    let mut fixture = Fixture::create("prepared-parameters", false);
+    let prepared = fixture
+        .database
+        .prepare_statement(
+            "SELECT id FROM events WHERE category >= $1",
+            &[Some(PhysicalType::Int64)],
+        )
+        .expect("prepare parameterized query");
+
+    let ordinary = fixture
+        .database
+        .execute_prepared(&prepared, &[ScalarValue::Int64(5)])
+        .expect("ordinary prepared execution");
+    let before_g = fixture
+        .database
+        .current_database_snapshot()
+        .expect("snapshot")
+        .expect("global visibility")
+        .commit_seq();
+    let mut pool = AdaptiveEvidencePool::new(AdaptiveEvidencePoolLimits::default());
+    let initial_progress = pool.progress_token();
+    let observed = fixture
+        .database
+        .execute_prepared_with_feedback(&prepared, &[ScalarValue::Int64(5)])
+        .expect("prepared execution with feedback");
+    assert_eq!(observed.result, ordinary);
+    assert!(matches!(observed.result, ExecutionResult::Query(_)));
+    assert_eq!(pool.progress_token(), initial_progress);
+    assert_eq!(
+        fixture
+            .database
+            .current_database_snapshot()
+            .expect("snapshot after feedback")
+            .expect("global visibility after feedback")
+            .commit_seq(),
+        before_g
+    );
+
+    let feedback = query_feedback(&observed);
+    assert_eq!(feedback.accesses.len(), 1);
+    assert_eq!(
+        feedback.accesses[0].actual.kind,
+        ExecutionAccessKind::SeqScan
+    );
+    assert_eq!(feedback.accesses[0].actual.work.rows_examined, 512);
+    assert_eq!(feedback.filters.len(), 1);
+    assert_eq!(feedback.filters[0].work.filter_rows_evaluated, 512);
+    assert_eq!(feedback.filters[0].work.filter_rows_passed, 192);
+    assert_eq!(feedback.filters[0].work.filter_rows_rejected, 320);
+    assert!(feedback.accesses[0].planner.is_some());
+    assert!(feedback.accesses[0].calibration.is_some());
+
+    let other_value = fixture
+        .database
+        .execute_prepared_with_feedback(&prepared, &[ScalarValue::Int64(7)])
+        .expect("execute with another parameter");
+    assert_ne!(other_value.result, observed.result);
+    assert_eq!(
+        query_feedback(&other_value).query_shape,
+        feedback.query_shape
+    );
+    let (_, literal_feedback) = fixture
+        .database
+        .query_with_feedback("SELECT id FROM events WHERE category >= 5")
+        .expect("literal comparison feedback");
+    assert_ne!(literal_feedback.query_shape, feedback.query_shape);
+
+    pool.record_execution_feedback(feedback)
+        .expect("explicitly ingest prepared feedback");
+    assert_eq!(pool.progress_token().recorded_reports, 1);
+    assert_ne!(pool.progress_token(), initial_progress);
+
+    for values in [Vec::new(), vec![ScalarValue::Text("wrong".into())]] {
+        let ordinary_error = fixture
+            .database
+            .execute_prepared(&prepared, &values)
+            .expect_err("ordinary binding error");
+        let feedback_error = fixture
+            .database
+            .execute_prepared_with_feedback(&prepared, &values)
+            .expect_err("feedback binding error");
+        assert_eq!(feedback_error.kind(), ordinary_error.kind());
+    }
+    fixture.close();
+}
+
+#[test]
+fn prepared_feedback_preserves_point_and_range_access_evidence() {
+    let mut fixture = Fixture::create("prepared-index", false);
+    fixture
+        .database
+        .create_index(TABLE_ID, ColumnId(1))
+        .expect("create index");
+    fixture.database.analyze(TABLE_ID).expect("analyze index");
+
+    let point = fixture
+        .database
+        .prepare_statement(
+            "SELECT id FROM events WHERE id = $1",
+            &[Some(PhysicalType::Int64)],
+        )
+        .expect("prepare point query");
+    let point = fixture
+        .database
+        .execute_prepared_with_feedback(&point, &[ScalarValue::Int64(17)])
+        .expect("execute point query");
+    let point = query_feedback(&point)
+        .accesses
+        .iter()
+        .find(|sample| sample.actual.kind == ExecutionAccessKind::IndexPoint)
+        .expect("point sample");
+    assert_eq!(point.actual.work.index_point_probes, 1);
+    assert_eq!(point.actual.work.index_candidates_examined, 1);
+    assert_eq!(point.actual.work.rows_output, 1);
+    assert!(point.actual.access_path.is_some());
+    assert!(point.planner.is_some());
+    assert!(point.calibration.is_some());
+
+    let range = fixture
+        .database
+        .prepare_statement(
+            "SELECT id FROM events WHERE id >= $1 AND id < $2",
+            &[Some(PhysicalType::Int64), Some(PhysicalType::Int64)],
+        )
+        .expect("prepare range query");
+    let range = fixture
+        .database
+        .execute_prepared_with_feedback(&range, &[ScalarValue::Int64(10), ScalarValue::Int64(15)])
+        .expect("execute range query");
+    let range = query_feedback(&range)
+        .accesses
+        .iter()
+        .find(|sample| sample.actual.kind == ExecutionAccessKind::IndexRange)
+        .expect("range sample");
+    assert_eq!(range.actual.work.index_range_probes, 1);
+    assert_eq!(range.actual.work.index_candidates_examined, 5);
+    assert_eq!(range.actual.work.rows_output, 5);
+    assert!(range.planner.is_some());
+    assert!(range.calibration.is_some());
+    fixture.close();
+}
+
+#[test]
+fn prepared_columnar_feedback_preserves_exact_physical_identity() {
+    let mut fixture = Fixture::create("prepared-columnar", true);
+    let projection = fixture.database.inspect_columnar_projections().remove(0);
+    let projection_id = projection.projection_id.expect("projection id");
+    let generation = projection.generation.expect("projection generation");
+    let prepared = fixture
+        .database
+        .prepare_statement(
+            "SELECT id, category FROM events WHERE id >= $1",
+            &[Some(PhysicalType::Int64)],
+        )
+        .expect("prepare columnar query");
+    let executed = fixture
+        .database
+        .execute_prepared_with_feedback(&prepared, &[ScalarValue::Int64(400)])
+        .expect("execute columnar query");
+    let feedback = query_feedback(&executed);
+    let access = feedback
+        .accesses
+        .iter()
+        .find(|sample| sample.actual.kind == ExecutionAccessKind::Columnar)
+        .expect("columnar sample");
+    let planner = access.planner.as_ref().expect("columnar estimate");
+    let columnar = access.actual.work.columnar.as_ref().expect("columnar work");
+    assert_eq!(access.actual.table_id, TABLE_ID);
+    assert_eq!(
+        access.actual.storage_id,
+        planner.storage_id.expect("storage id")
+    );
+    assert_eq!(planner.table_id, TABLE_ID);
+    assert_eq!(planner.projection_id, Some(projection_id));
+    assert_eq!(planner.projection_generation, Some(generation));
+    assert_eq!(columnar.projection_id, Some(projection_id));
+    assert_eq!(columnar.generation, Some(generation));
+    assert_eq!(columnar.table_id, Some(TABLE_ID));
+    assert_eq!(columnar.storage_id, Some(access.actual.storage_id));
+    assert_eq!(access.actual.node, planner.node);
+    assert!(access.calibration.is_some());
+    fixture.close();
+}
+
+#[test]
+fn prepared_mutation_executes_once_and_stale_dependencies_match_ordinary_execution() {
+    let mut fixture = Fixture::create("prepared-mutation", false);
+    let insert = fixture
+        .database
+        .prepare_statement(
+            "INSERT INTO events (id, category, payload) VALUES ($1, $2, $3)",
+            &[
+                Some(PhysicalType::Int64),
+                Some(PhysicalType::Int64),
+                Some(PhysicalType::Text),
+            ],
+        )
+        .expect("prepare insert");
+    let before_g = fixture
+        .database
+        .current_database_snapshot()
+        .expect("snapshot")
+        .expect("global visibility")
+        .commit_seq();
+    let executed = fixture
+        .database
+        .execute_prepared_with_feedback(
+            &insert,
+            &[
+                ScalarValue::Int64(9_999),
+                ScalarValue::Int64(3),
+                ScalarValue::Text("inserted-once".into()),
+            ],
+        )
+        .expect("execute prepared insert");
+    assert_eq!(executed.result, ExecutionResult::AffectedRows(1));
+    assert_eq!(
+        executed.feedback,
+        PreparedExecutionFeedback::NotApplicable(PreparedFeedbackNotApplicableReason::Mutation)
+    );
+    assert_eq!(
+        fixture
+            .database
+            .query("SELECT id FROM events WHERE id = 9999")
+            .expect("verify one insert")
+            .rows,
+        vec![vec![ScalarValue::Int64(9_999)]]
+    );
+    assert_eq!(
+        fixture
+            .database
+            .current_database_snapshot()
+            .expect("snapshot after insert")
+            .expect("global visibility after insert")
+            .commit_seq()
+            .0,
+        before_g.0 + 1
+    );
+
+    let failed_before_g = fixture
+        .database
+        .current_database_snapshot()
+        .expect("snapshot before failed inserts")
+        .expect("global visibility before failed inserts")
+        .commit_seq();
+    let oversized = ScalarValue::Text("x".repeat(5_000));
+    let ordinary_error = fixture
+        .database
+        .execute_prepared(
+            &insert,
+            &[
+                ScalarValue::Int64(10_000),
+                ScalarValue::Int64(3),
+                oversized.clone(),
+            ],
+        )
+        .expect_err("ordinary oversized insert fails");
+    let feedback_error = fixture
+        .database
+        .execute_prepared_with_feedback(
+            &insert,
+            &[ScalarValue::Int64(10_001), ScalarValue::Int64(3), oversized],
+        )
+        .expect_err("feedback oversized insert fails");
+    assert_eq!(feedback_error.kind(), ordinary_error.kind());
+    assert!(
+        fixture
+            .database
+            .query("SELECT id FROM events WHERE id >= 10000")
+            .expect("verify failed inserts")
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        fixture
+            .database
+            .current_database_snapshot()
+            .expect("snapshot after failed inserts")
+            .expect("global visibility after failed inserts")
+            .commit_seq(),
+        failed_before_g
+    );
+
+    fixture.close();
+
+    let suffix = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "netbadb-prepared-feedback-stale-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).expect("create stale fixture root");
+    let mut database = Database::create_catalog(root.join("catalog"), vec![], None)
+        .expect("create schema catalog");
+    database
+        .execute("CREATE TABLE events (id BIGINT)")
+        .expect("create dynamic table");
+    let stale = database
+        .prepare_statement("SELECT id FROM events", &[])
+        .expect("prepare statement before schema change");
+    database
+        .execute("ALTER TABLE events ADD COLUMN note TEXT")
+        .expect("change dependent schema");
+    assert!(matches!(
+        database.execute_prepared(&stale, &[]),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::StalePreparedStatement
+        ))
+    ));
+    assert!(matches!(
+        database.execute_prepared_with_feedback(&stale, &[]),
+        Err(DatabaseError::SchemaMutation(
+            SchemaMutationError::StalePreparedStatement
+        ))
+    ));
+    database.close().expect("close stale fixture");
     let _ = fs::remove_dir_all(root);
 }
 
