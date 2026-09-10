@@ -622,7 +622,10 @@ impl DatabaseTransaction {
         Ok(())
     }
 
-    pub(crate) fn stage_and_park_group_member(&mut self) -> Result<(), CoordinatorError> {
+    pub(crate) fn stage_and_park_group_member(
+        &mut self,
+        batch_change_stream: bool,
+    ) -> Result<(), CoordinatorError> {
         self.ensure_active()?;
         if self.group_id.is_none() || self.group_barrier.get() != self.group_id {
             return Err(CoordinatorError::InvalidGroupCommit);
@@ -649,11 +652,14 @@ impl DatabaseTransaction {
                     reason: "group write participant identity has no context",
                 },
             )?;
-            if let Err(error) = participant
-                .context
-                .stage_group_prepare(self.id)
-                .map_err(CoordinatorError::from)
-            {
+            let result = if batch_change_stream {
+                participant
+                    .context
+                    .stage_group_prepare_with_batched_change_stream(self.id)
+            } else {
+                participant.context.stage_group_prepare(self.id)
+            };
+            if let Err(error) = result.map_err(CoordinatorError::from) {
                 self.state = TransactionState::RollbackPending;
                 let _ = self.resolve_failed_group_member();
                 return Err(CoordinatorError::PrepareFailed {
@@ -1775,6 +1781,9 @@ fn storage_prepare_state_reason(state: StorageTransactionState) -> &'static str 
     match state {
         StorageTransactionState::RollbackRequired => "participant requires rollback",
         StorageTransactionState::CommitPending => "participant commit is pending",
+        StorageTransactionState::ChangeFinalizePending => {
+            "participant Change Stream finalize is pending"
+        }
         StorageTransactionState::RollbackPending => "participant rollback is pending",
         StorageTransactionState::Committed => "participant is already committed",
         StorageTransactionState::RolledBack => "participant is already rolled back",
@@ -1801,6 +1810,9 @@ fn storage_commit_state_reason(state: StorageTransactionState) -> &'static str {
             "participant requires a coordinator decision"
         }
         StorageTransactionState::RolledBack => "participant is already rolled back",
+        StorageTransactionState::ChangeFinalizePending => {
+            "participant Change Stream finalize is pending"
+        }
         StorageTransactionState::Active
         | StorageTransactionState::CommitPending
         | StorageTransactionState::Committed => "invalid participant commit state",
@@ -1837,6 +1849,8 @@ pub enum CoordinatorError {
         existing: crate::GroupPrepareMode,
         requested: crate::GroupPrepareMode,
     },
+    UnsupportedGroupDurabilityCombination,
+    GroupChangePrepareDurabilityIncomplete,
     GroupPrepareBarrierInProgress,
     GroupPrepareResolutionRequired,
     GroupPrepareResolutionNotRequired,
@@ -1947,6 +1961,11 @@ impl fmt::Display for CoordinatorError {
                 formatter,
                 "group prepare mode is {existing:?}, not requested {requested:?}"
             ),
+            Self::UnsupportedGroupDurabilityCombination => formatter
+                .write_str("batched Change Stream barriers require batched authoritative Prepare"),
+            Self::GroupChangePrepareDurabilityIncomplete => {
+                formatter.write_str("group Change Stream Prepare durability is incomplete")
+            }
             Self::GroupPrepareBarrierInProgress => formatter
                 .write_str("group Prepare barrier has started; new members are not allowed"),
             Self::GroupPrepareResolutionRequired => {
@@ -2053,6 +2072,8 @@ impl Error for CoordinatorError {
             | Self::GroupCommitStructuralMutation
             | Self::GroupCommitMemberHasNoWrites
             | Self::GroupPrepareModeMismatch { .. }
+            | Self::UnsupportedGroupDurabilityCombination
+            | Self::GroupChangePrepareDurabilityIncomplete
             | Self::GroupPrepareBarrierInProgress
             | Self::GroupPrepareResolutionRequired
             | Self::GroupPrepareResolutionNotRequired

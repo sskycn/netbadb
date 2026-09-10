@@ -183,6 +183,18 @@ language or library features newer than the MSRV.
   the ownership or polymorphism requirement is real and understandable.
 - Avoid global mutable state. Lock ownership and ordering MUST be explicit.
 - Never hold a synchronous lock across `.await`.
+- The default authoritative mutation domain is `StorageId`. A `StorageId` MUST
+  have at most one active mutation owner.
+- Future write concurrency SHOULD come first from transactions whose mutation
+  domains are disjoint. Multiple active writers inside one `StorageId` MUST NOT
+  be introduced without an explicit architecture decision.
+- Multi-domain mutation ownership MUST use deterministic acquisition and
+  ordering rules; ascending `StorageId` is the preferred canonical order.
+- Partitioning authoritative state into additional independent `StorageId`s is
+  the preferred scale-out path for a hot write domain.
+- Execution concurrency, durability batching, and global visibility ordering
+  are independent. Disjoint-domain execution MUST NOT weaken deterministic
+  global commit ordering.
 
 The database core is synchronous by default. Parser, resolver, type checker,
 optimizer, planner, executor core, page, buffer, storage, index, transaction,

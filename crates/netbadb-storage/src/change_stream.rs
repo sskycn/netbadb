@@ -510,6 +510,37 @@ pub(crate) struct PreparedChange {
     after: StorageDataVersion,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChangePrepareBatchReport {
+    pub(crate) changing_member_count: usize,
+    pub(crate) records_staged: usize,
+    pub(crate) record_bytes: u64,
+    pub(crate) syncs: u64,
+    pub(crate) first_sequence: u64,
+    pub(crate) last_sequence: u64,
+    pub(crate) before_frontier: StorageDataVersion,
+    pub(crate) after_reserved_frontier: StorageDataVersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChangeFinalizeBatchReport {
+    pub(crate) finalized_member_count: usize,
+    pub(crate) markers_staged: usize,
+    pub(crate) marker_bytes: u64,
+    pub(crate) syncs: u64,
+    pub(crate) before_committed_frontier: StorageDataVersion,
+    pub(crate) after_committed_frontier: StorageDataVersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ChangeStreamSyncCounts {
+    pub(crate) total: u64,
+    pub(crate) member_prepare: u64,
+    pub(crate) group_prepare: u64,
+    pub(crate) member_finalize: u64,
+    pub(crate) group_finalize: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Header {
     version: u16,
@@ -534,6 +565,8 @@ struct PreparedRecord {
     batch: ChangeBatch,
     outcome: AuthoritativeOutcome,
     finalized: bool,
+    prepared_durable: bool,
+    staged_finalize: Option<Option<LsmCommitSeq>>,
     prepared_file_bytes: u64,
     retained_file_bytes: u64,
 }
@@ -573,7 +606,7 @@ pub(crate) struct ChangeStreamManager {
     table_id: TableId,
     fingerprint: SchemaFingerprint,
     state: State,
-    sync_count: u64,
+    sync_counts: ChangeStreamSyncCounts,
     retention_pins: Rc<RefCell<RetentionPinRegistry>>,
 }
 
@@ -593,7 +626,7 @@ impl ChangeStreamManager {
             state: State::Disabled {
                 generation: ChangeStreamGeneration(0),
             },
-            sync_count: 0,
+            sync_counts: ChangeStreamSyncCounts::default(),
             retention_pins: Rc::new(RefCell::new(RetentionPinRegistry::default())),
         })
     }
@@ -628,7 +661,7 @@ impl ChangeStreamManager {
                 table_id: table.id,
                 fingerprint,
                 state,
-                sync_count: 0,
+                sync_counts: ChangeStreamSyncCounts::default(),
                 retention_pins: Rc::new(RefCell::new(RetentionPinRegistry::default())),
             });
         }
@@ -690,13 +723,17 @@ impl ChangeStreamManager {
             table_id: table.id,
             fingerprint,
             state,
-            sync_count: 0,
+            sync_counts: ChangeStreamSyncCounts::default(),
             retention_pins: Rc::new(RefCell::new(RetentionPinRegistry::default())),
         })
     }
 
     pub(crate) const fn sync_count(&self) -> u64 {
-        self.sync_count
+        self.sync_counts.total
+    }
+
+    pub(crate) const fn sync_counts(&self) -> ChangeStreamSyncCounts {
+        self.sync_counts
     }
 
     pub(crate) fn requires_changes(&self) -> bool {
@@ -807,19 +844,65 @@ impl ChangeStreamManager {
         database_txn_id: Option<DatabaseTxnId>,
         changes: &[StorageChange],
     ) -> Result<Option<PreparedChange>, StorageError> {
-        let will_sync = !changes.is_empty()
-            && matches!(
-                &self.state,
-                State::Enabled { unresolved, .. } if !unresolved.contains_key(&txn_id)
-            );
-        let result = prepare_enabled(&mut self.state, txn_id, database_txn_id, changes);
-        if result.is_ok() && will_sync {
-            self.sync_count = self.sync_count.saturating_add(1);
-        }
+        let result = (|| {
+            let prepared =
+                stage_prepare_enabled(&mut self.state, txn_id, database_txn_id, changes)?;
+            if let Some(prepared) = prepared {
+                let report = durabilize_prepared_batch(
+                    &mut self.state,
+                    &[(txn_id, database_txn_id, prepared)],
+                    false,
+                )?;
+                if report.syncs != 0 {
+                    self.sync_counts.total = self.sync_counts.total.saturating_add(report.syncs);
+                    self.sync_counts.member_prepare =
+                        self.sync_counts.member_prepare.saturating_add(report.syncs);
+                }
+            }
+            Ok(prepared)
+        })();
         if let Err(error) = &result {
             self.poison_after_io_error(error);
         }
         result.map_err(Into::into)
+    }
+
+    /// Appends one group member's existing PreparedChange without claiming
+    /// durability. This is intentionally crate-private and group-only.
+    pub(crate) fn stage_group_prepare(
+        &mut self,
+        txn_id: TxnId,
+        database_txn_id: DatabaseTxnId,
+        changes: &[StorageChange],
+    ) -> Result<Option<PreparedChange>, StorageError> {
+        let result = stage_prepare_enabled(&mut self.state, txn_id, Some(database_txn_id), changes);
+        if let Err(error) = &result {
+            self.poison_after_io_error(error);
+        }
+        result.map_err(Into::into)
+    }
+
+    pub(crate) fn durabilize_group_prepared_batch(
+        &mut self,
+        candidates: &[(TxnId, DatabaseTxnId, PreparedChange)],
+    ) -> Result<ChangePrepareBatchReport, StorageError> {
+        let identities = candidates
+            .iter()
+            .map(|(txn_id, database_txn_id, prepared)| (*txn_id, Some(*database_txn_id), *prepared))
+            .collect::<Vec<_>>();
+        let result = durabilize_prepared_batch(&mut self.state, &identities, true);
+        match result {
+            Ok(report) => {
+                self.sync_counts.total = self.sync_counts.total.saturating_add(report.syncs);
+                self.sync_counts.group_prepare =
+                    self.sync_counts.group_prepare.saturating_add(report.syncs);
+                Ok(report)
+            }
+            Err(error) => {
+                self.poison_after_io_error(&error);
+                Err(error.into())
+            }
+        }
     }
 
     pub(crate) fn publish(
@@ -828,19 +911,37 @@ impl ChangeStreamManager {
         prepared: PreparedChange,
         lsm_commit: Option<LsmCommitSeq>,
     ) -> Result<(), StorageError> {
-        let will_sync = matches!(
-            &self.state,
-            State::Enabled { batches, .. }
-                if !batches.iter().any(|batch| batch.physical_txn_id == txn_id)
-        );
-        let result = publish_enabled(&mut self.state, txn_id, prepared, lsm_commit);
-        if result.is_ok() && will_sync {
-            self.sync_count = self.sync_count.saturating_add(1);
+        let result = finalize_batch(&mut self.state, &[(txn_id, prepared, lsm_commit)]);
+        if let Ok(report) = &result {
+            self.sync_counts.total = self.sync_counts.total.saturating_add(report.syncs);
+            self.sync_counts.member_finalize = self
+                .sync_counts
+                .member_finalize
+                .saturating_add(report.syncs);
         }
         if let Err(error) = &result {
             self.poison_after_io_error(error);
         }
-        result.map_err(Into::into)
+        result.map(|_| ()).map_err(Into::into)
+    }
+
+    pub(crate) fn finalize_group_batch(
+        &mut self,
+        candidates: &[(TxnId, PreparedChange, Option<LsmCommitSeq>)],
+    ) -> Result<ChangeFinalizeBatchReport, StorageError> {
+        let result = finalize_batch(&mut self.state, candidates);
+        match result {
+            Ok(report) => {
+                self.sync_counts.total = self.sync_counts.total.saturating_add(report.syncs);
+                self.sync_counts.group_finalize =
+                    self.sync_counts.group_finalize.saturating_add(report.syncs);
+                Ok(report)
+            }
+            Err(error) => {
+                self.poison_after_io_error(&error);
+                Err(error.into())
+            }
+        }
     }
 
     fn poison_after_io_error(&mut self, error: &ChangeStreamError) {
@@ -1308,7 +1409,7 @@ fn validate_cursor_identity_and_frontier(
     Ok(())
 }
 
-fn prepare_enabled(
+fn stage_prepare_enabled(
     state: &mut State,
     txn_id: TxnId,
     database_txn_id: Option<DatabaseTxnId>,
@@ -1372,7 +1473,6 @@ fn prepare_enabled(
         .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
     file.seek(SeekFrom::End(0))?;
     file.write_all(&encoded)?;
-    file.sync_data()?;
     *file_bytes = following_file_bytes;
     *next_sequence = following_sequence;
     unresolved.insert(
@@ -1381,6 +1481,8 @@ fn prepare_enabled(
             batch,
             outcome: AuthoritativeOutcome::Unresolved,
             finalized: false,
+            prepared_durable: false,
+            staged_finalize: None,
             prepared_file_bytes: encoded.len() as u64,
             retained_file_bytes: encoded.len() as u64,
         },
@@ -1392,12 +1494,113 @@ fn prepare_enabled(
     }))
 }
 
-fn publish_enabled(
+fn durabilize_prepared_batch(
     state: &mut State,
-    txn_id: TxnId,
-    prepared: PreparedChange,
-    lsm_commit: Option<LsmCommitSeq>,
-) -> Result<(), ChangeStreamError> {
+    candidates: &[(TxnId, Option<DatabaseTxnId>, PreparedChange)],
+    require_exact_prefix: bool,
+) -> Result<ChangePrepareBatchReport, ChangeStreamError> {
+    let Some((_, _, first_prepared)) = candidates.first().copied() else {
+        return Err(ChangeStreamError::InvalidRecord(
+            "prepared durability batch is empty",
+        ));
+    };
+    let State::Enabled {
+        file, unresolved, ..
+    } = state
+    else {
+        return Err(ChangeStreamError::Unavailable(
+            "enabled stream disappeared before prepared durability".into(),
+        ));
+    };
+
+    let mut ordered = unresolved
+        .values()
+        .map(|record| record.batch.physical_txn_id)
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|txn_id| {
+        unresolved
+            .get(txn_id)
+            .map_or(u64::MAX, |record| record.batch.sequence)
+    });
+    if require_exact_prefix && ordered.len() < candidates.len() {
+        return Err(ChangeStreamError::InvalidRecord(
+            "prepared durability batch is not an unresolved prefix",
+        ));
+    }
+    let mut record_bytes = 0_u64;
+    let mut needs_sync = false;
+    for (position, (txn_id, database_txn_id, prepared)) in candidates.iter().enumerate() {
+        let record_id = if require_exact_prefix {
+            ordered[position]
+        } else {
+            *txn_id
+        };
+        let record = unresolved
+            .get(&record_id)
+            .ok_or(ChangeStreamError::InvalidRecord(
+                "prepared transaction is missing",
+            ))?;
+        if record.batch.physical_txn_id != *txn_id
+            || record.batch.database_txn_id != *database_txn_id
+            || prepared_identity(&record.batch).sequence != prepared.sequence
+            || record.batch.before != prepared.before
+            || record.batch.after != prepared.after
+        {
+            return Err(ChangeStreamError::InvalidRecord(
+                "prepared durability batch is not the exact change-order prefix",
+            ));
+        }
+        if position != 0 && candidates[position - 1].2.after != prepared.before {
+            return Err(ChangeStreamError::ChangeGap {
+                expected: candidates[position - 1].2.after,
+                actual: prepared.before,
+            });
+        }
+        record_bytes = record_bytes
+            .checked_add(record.prepared_file_bytes)
+            .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
+        needs_sync |= !record.prepared_durable;
+    }
+    if needs_sync {
+        #[cfg(test)]
+        crate::crash_test::maybe_crash_named("change-group-before-prepare-sync");
+        file.sync_data()?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash_named("change-group-after-prepare-sync");
+        for (txn_id, _, _) in candidates {
+            let record = unresolved
+                .get_mut(txn_id)
+                .ok_or(ChangeStreamError::InvalidRecord(
+                    "prepared transaction disappeared during durability",
+                ))?;
+            record.prepared_durable = true;
+        }
+    }
+    Ok(ChangePrepareBatchReport {
+        changing_member_count: candidates.len(),
+        records_staged: candidates.len(),
+        record_bytes,
+        syncs: u64::from(needs_sync),
+        first_sequence: first_prepared.sequence,
+        last_sequence: candidates
+            .last()
+            .map_or(first_prepared.sequence, |candidate| candidate.2.sequence),
+        before_frontier: first_prepared.before,
+        after_reserved_frontier: candidates
+            .last()
+            .map_or(first_prepared.after, |candidate| candidate.2.after),
+    })
+}
+
+fn finalize_batch(
+    state: &mut State,
+    candidates: &[(TxnId, PreparedChange, Option<LsmCommitSeq>)],
+) -> Result<ChangeFinalizeBatchReport, ChangeStreamError> {
+    let Some((_, first_prepared, _)) = candidates.first().copied() else {
+        return Err(ChangeStreamError::InvalidRecord(
+            "finalize durability batch is empty",
+        ));
+    };
     let State::Enabled {
         header,
         file,
@@ -1413,54 +1616,129 @@ fn publish_enabled(
             "enabled stream disappeared before publication".into(),
         ));
     };
-    if batches.iter().any(|batch| batch.physical_txn_id == txn_id) {
-        return Ok(());
-    }
-    let mut record = unresolved
-        .get(&txn_id)
-        .cloned()
-        .ok_or(ChangeStreamError::InvalidRecord(
-            "prepared transaction is missing",
-        ))?;
-    if prepared_identity(&record.batch).sequence != prepared.sequence
-        || record.batch.before != prepared.before
-        || record.batch.after != prepared.after
+    if candidates
+        .iter()
+        .all(|(txn_id, _, _)| batches.iter().any(|batch| batch.physical_txn_id == *txn_id))
     {
-        return Err(ChangeStreamError::InvalidRecord(
-            "prepared identity changed",
-        ));
-    }
-    if let Some(commit) = lsm_commit {
-        resolve_lsm_versions(&mut record.batch, commit);
-    }
-    validate_committed_versions(&record.batch, header.kind)?;
-    let expected = effective_current(header, batches);
-    if record.batch.before != expected {
-        return Err(ChangeStreamError::ChangeGap {
-            expected,
-            actual: record.batch.before,
+        return Ok(ChangeFinalizeBatchReport {
+            finalized_member_count: candidates.len(),
+            markers_staged: 0,
+            marker_bytes: 0,
+            syncs: 0,
+            before_committed_frontier: first_prepared.before,
+            after_committed_frontier: candidates
+                .last()
+                .map_or(first_prepared.after, |candidate| candidate.1.after),
         });
     }
-    let marker = encode_finalize(txn_id, lsm_commit)?;
-    let following_file_bytes = file_bytes
-        .checked_add(marker.len() as u64)
-        .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
-    file.seek(SeekFrom::End(0))?;
-    file.write_all(&marker)?;
+    let before_committed_frontier = effective_current(header, batches);
+    if first_prepared.before != before_committed_frontier {
+        return Err(ChangeStreamError::ChangeGap {
+            expected: before_committed_frontier,
+            actual: first_prepared.before,
+        });
+    }
+    let mut markers_staged = 0_usize;
+    let mut marker_bytes = 0_u64;
+    for (position, (txn_id, prepared, lsm_commit)) in candidates.iter().enumerate() {
+        if position != 0 && candidates[position - 1].1.after != prepared.before {
+            return Err(ChangeStreamError::ChangeGap {
+                expected: candidates[position - 1].1.after,
+                actual: prepared.before,
+            });
+        }
+        let record = unresolved
+            .get_mut(txn_id)
+            .ok_or(ChangeStreamError::InvalidRecord(
+                "prepared transaction is missing",
+            ))?;
+        if prepared_identity(&record.batch).sequence != prepared.sequence
+            || record.batch.before != prepared.before
+            || record.batch.after != prepared.after
+            || !record.prepared_durable
+        {
+            return Err(ChangeStreamError::InvalidRecord(
+                "prepared identity is changed or not durable",
+            ));
+        }
+        let mut committed = record.batch.clone();
+        if let Some(commit) = *lsm_commit {
+            resolve_lsm_versions(&mut committed, commit);
+        }
+        validate_committed_versions(&committed, header.kind)?;
+        let marker = encode_finalize(*txn_id, *lsm_commit)?;
+        marker_bytes = marker_bytes
+            .checked_add(marker.len() as u64)
+            .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
+        match record.staged_finalize {
+            Some(existing) if existing == *lsm_commit => {}
+            Some(_) => {
+                return Err(ChangeStreamError::InvalidRecord(
+                    "finalize commit identity changed",
+                ));
+            }
+            None => {
+                let following_file_bytes = file_bytes
+                    .checked_add(marker.len() as u64)
+                    .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
+                file.seek(SeekFrom::End(0))?;
+                file.write_all(&marker)?;
+                *file_bytes = following_file_bytes;
+                record.retained_file_bytes = record
+                    .retained_file_bytes
+                    .checked_add(marker.len() as u64)
+                    .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
+                record.staged_finalize = Some(*lsm_commit);
+                markers_staged = markers_staged.saturating_add(1);
+                #[cfg(test)]
+                crate::crash_test::maybe_crash_indexed(
+                    "change-group-after-finalize-append",
+                    position + 1,
+                );
+                #[cfg(not(test))]
+                let _ = position;
+            }
+        }
+    }
+    #[cfg(test)]
+    crate::crash_test::maybe_crash_named("change-group-before-finalize-sync");
     file.sync_data()?;
-    *file_bytes = following_file_bytes;
-    record.retained_file_bytes = record
-        .retained_file_bytes
-        .checked_add(marker.len() as u64)
-        .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
-    unresolved.remove(&txn_id);
-    finalize_versions.insert(txn_id, lsm_commit);
-    batch_file_bytes.push(BatchFileBytes {
-        change_bytes: record.prepared_file_bytes,
-        retained_file_bytes: record.retained_file_bytes,
-    });
-    batches.push(record.batch);
-    Ok(())
+    #[cfg(test)]
+    crate::crash_test::maybe_crash_named("change-group-after-finalize-sync");
+
+    for (position, (txn_id, _, lsm_commit)) in candidates.iter().enumerate() {
+        let mut record = unresolved
+            .remove(txn_id)
+            .ok_or(ChangeStreamError::InvalidRecord(
+                "prepared transaction disappeared during publication",
+            ))?;
+        if let Some(commit) = *lsm_commit {
+            resolve_lsm_versions(&mut record.batch, commit);
+        }
+        finalize_versions.insert(*txn_id, *lsm_commit);
+        batch_file_bytes.push(BatchFileBytes {
+            change_bytes: record.prepared_file_bytes,
+            retained_file_bytes: record.retained_file_bytes,
+        });
+        batches.push(record.batch);
+        #[cfg(test)]
+        crate::crash_test::maybe_crash_indexed(
+            "change-group-after-finalize-promotion",
+            position + 1,
+        );
+        #[cfg(not(test))]
+        let _ = position;
+    }
+    Ok(ChangeFinalizeBatchReport {
+        finalized_member_count: candidates.len(),
+        markers_staged,
+        marker_bytes,
+        syncs: 1,
+        before_committed_frontier,
+        after_committed_frontier: candidates
+            .last()
+            .map_or(first_prepared.after, |candidate| candidate.1.after),
+    })
 }
 
 fn build_enabled_state(
@@ -2070,6 +2348,8 @@ where
                     outcome: outcome(batch.physical_txn_id),
                     batch,
                     finalized: false,
+                    prepared_durable: true,
+                    staged_finalize: None,
                     prepared_file_bytes: record_file_bytes,
                     retained_file_bytes: record_file_bytes,
                 });
@@ -2743,6 +3023,301 @@ mod tests {
         manager.abandon(TxnId(6)).unwrap();
         manager.publish(TxnId(5), first, None).unwrap();
         assert_eq!(manager.inspection().prepared_unresolved_count, 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn grouped_prepare_and_finalize_barriers_preserve_independent_batches() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-change-group-barriers-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_file(&path);
+        fs::write(&path, encode_header(&header())).unwrap();
+        let table = table();
+        let mut manager = ChangeStreamManager::open(
+            path.clone(),
+            ChangeStorageKind::Heap,
+            StorageId(8),
+            &table,
+            |_| AuthoritativeOutcome::Unresolved,
+        )
+        .unwrap();
+        let first_change = batch().mutations[0].clone();
+        let mut second_change = first_change.clone();
+        if let StorageChange::Insert { new_version, .. } = &mut second_change {
+            *new_version = StorageVersionKey::Heap {
+                storage_id: StorageId(8),
+                row_id: RowId {
+                    page: PageId(3),
+                    slot: 1,
+                    generation: 1,
+                },
+            };
+        }
+        let first = manager
+            .stage_group_prepare(TxnId(5), DatabaseTxnId(50), &[first_change])
+            .unwrap()
+            .unwrap();
+        let second = manager
+            .stage_group_prepare(TxnId(6), DatabaseTxnId(60), &[second_change])
+            .unwrap()
+            .unwrap();
+        assert_eq!(manager.sync_count(), 0);
+        assert_eq!(manager.inspection().prepared_unresolved_count, 2);
+        assert_eq!(manager.inspection().current_data_version, first.before);
+        assert!(
+            manager
+                .durabilize_group_prepared_batch(&[
+                    (TxnId(6), DatabaseTxnId(60), second),
+                    (TxnId(5), DatabaseTxnId(50), first),
+                ])
+                .is_err()
+        );
+        let prepare = manager
+            .durabilize_group_prepared_batch(&[
+                (TxnId(5), DatabaseTxnId(50), first),
+                (TxnId(6), DatabaseTxnId(60), second),
+            ])
+            .unwrap();
+        assert_eq!(prepare.syncs, 1);
+        assert_eq!(prepare.first_sequence, first.sequence);
+        assert_eq!(prepare.last_sequence, second.sequence);
+        assert_eq!(prepare.before_frontier, first.before);
+        assert_eq!(prepare.after_reserved_frontier, second.after);
+        assert_eq!(manager.inspection().current_data_version, first.before);
+        assert!(
+            manager
+                .finalize_group_batch(&[(TxnId(6), second, None), (TxnId(5), first, None),])
+                .is_err()
+        );
+        let finalize = manager
+            .finalize_group_batch(&[(TxnId(5), first, None), (TxnId(6), second, None)])
+            .unwrap();
+        assert_eq!(finalize.syncs, 1);
+        assert_eq!(finalize.finalized_member_count, 2);
+        assert_eq!(finalize.before_committed_frontier, first.before);
+        assert_eq!(finalize.after_committed_frontier, second.after);
+        let inspection = manager.inspection();
+        assert_eq!(inspection.prepared_unresolved_count, 0);
+        assert_eq!(inspection.current_data_version, second.after);
+        assert_eq!(inspection.committed_batch_count, 2);
+        let counts = manager.sync_counts();
+        assert_eq!(counts.total, 2);
+        assert_eq!(counts.member_prepare, 0);
+        assert_eq!(counts.group_prepare, 1);
+        assert_eq!(counts.member_finalize, 0);
+        assert_eq!(counts.group_finalize, 1);
+        let mut ordinary_change = batch().mutations[0].clone();
+        if let StorageChange::Insert { new_version, .. } = &mut ordinary_change {
+            *new_version = StorageVersionKey::Heap {
+                storage_id: StorageId(8),
+                row_id: RowId {
+                    page: PageId(3),
+                    slot: 2,
+                    generation: 1,
+                },
+            };
+        }
+        let ordinary = manager
+            .prepare(TxnId(7), Some(DatabaseTxnId(70)), &[ordinary_change])
+            .unwrap()
+            .unwrap();
+        manager.publish(TxnId(7), ordinary, None).unwrap();
+        let counts = manager.sync_counts();
+        assert_eq!(counts.total, 4);
+        assert_eq!(counts.member_prepare, 1);
+        assert_eq!(counts.group_prepare, 1);
+        assert_eq!(counts.member_finalize, 1);
+        assert_eq!(counts.group_finalize, 1);
+        drop(manager);
+
+        let reopened = ChangeStreamManager::open(
+            path.clone(),
+            ChangeStorageKind::Heap,
+            StorageId(8),
+            &table,
+            |_| AuthoritativeOutcome::Unresolved,
+        )
+        .unwrap();
+        assert_eq!(reopened.inspection().committed_batch_count, 3);
+        let _ = fs::remove_file(change_stream_guard_path(&path));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn grouped_finalize_crash_child() {
+        if std::env::var_os(crate::crash_test::CHILD_ENV).is_none()
+            || std::env::var_os(crate::crash_test::CASE_ENV).as_deref()
+                != Some(std::ffi::OsStr::new("phase3f-change-finalize"))
+        {
+            return;
+        }
+        let path = std::env::var_os(crate::crash_test::DATABASE_PATH_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("Phase 3F change crash path");
+        let mut manager = ChangeStreamManager::open(
+            path,
+            ChangeStorageKind::Heap,
+            StorageId(8),
+            &table(),
+            |_| AuthoritativeOutcome::Unresolved,
+        )
+        .unwrap();
+        let mut prepared = Vec::new();
+        for number in 0..3_u32 {
+            let txn_id = TxnId(50 + u64::from(number));
+            let database_txn_id = DatabaseTxnId(70 + u64::from(number));
+            let change = StorageChange::Insert {
+                new_version: StorageVersionKey::Heap {
+                    storage_id: StorageId(8),
+                    row_id: RowId {
+                        page: PageId(10 + u64::from(number)),
+                        slot: 1,
+                        generation: 1,
+                    },
+                },
+                after: vec![ScalarValue::Int64(i64::from(number))],
+            };
+            let identity = manager
+                .stage_group_prepare(txn_id, database_txn_id, &[change])
+                .unwrap()
+                .unwrap();
+            prepared.push((txn_id, database_txn_id, identity));
+        }
+        manager.durabilize_group_prepared_batch(&prepared).unwrap();
+        let finalize = prepared
+            .iter()
+            .map(|(txn_id, _, identity)| (*txn_id, *identity, None))
+            .collect::<Vec<_>>();
+        manager.finalize_group_batch(&finalize).unwrap();
+        panic!("Phase 3F change finalize child did not reach crash point");
+    }
+
+    #[test]
+    fn grouped_finalize_crash_windows_recover_exact_individual_batches() {
+        for point in [
+            "change-group-after-finalize-append-1",
+            "change-group-after-finalize-append-2",
+            "change-group-after-finalize-append-3",
+            "change-group-before-finalize-sync",
+            "change-group-after-finalize-sync",
+            "change-group-after-finalize-promotion-1",
+            "change-group-after-finalize-promotion-2",
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "netbadb-phase3f-change-finalize-{point}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_file(&path);
+            fs::write(&path, encode_header(&header())).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("change_stream::tests::grouped_finalize_crash_child")
+                .arg("--nocapture");
+            crate::crash_test::configure_named_child(
+                &mut command,
+                "phase3f-change-finalize",
+                &path,
+                point,
+            );
+            let status = command.status().expect("run Phase 3F finalize crash child");
+            assert_eq!(status.code(), Some(crate::crash_test::EXIT_CODE));
+
+            let manager = ChangeStreamManager::open(
+                path.clone(),
+                ChangeStorageKind::Heap,
+                StorageId(8),
+                &table(),
+                |_| AuthoritativeOutcome::Committed(None),
+            )
+            .unwrap_or_else(|error| panic!("recover {point}: {error}"));
+            let changes = manager
+                .read(cursor_for(&header(), StorageDataVersion(11)), 10, u64::MAX)
+                .unwrap();
+            assert_eq!(changes.batches.len(), 3, "point {point}");
+            assert_eq!(changes.current_frontier, StorageDataVersion(14));
+            assert!(
+                changes
+                    .batches
+                    .windows(2)
+                    .all(|pair| pair[0].after == pair[1].before)
+            );
+            drop(manager);
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn grouped_torn_finalize_tail_is_repaired_but_full_checksum_corruption_is_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-phase3f-torn-finalize-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut batches = Vec::new();
+        for number in 0..3_u64 {
+            let mut current = batch();
+            current.sequence = number + 1;
+            current.physical_txn_id = TxnId(80 + number);
+            current.database_txn_id = Some(DatabaseTxnId(90 + number));
+            current.before = StorageDataVersion(11 + number);
+            current.after = StorageDataVersion(12 + number);
+            if let StorageChange::Insert { new_version, after } = &mut current.mutations[0] {
+                *new_version = StorageVersionKey::Heap {
+                    storage_id: StorageId(8),
+                    row_id: RowId {
+                        page: PageId(20 + number),
+                        slot: 1,
+                        generation: 1,
+                    },
+                };
+                *after = vec![ScalarValue::Int64(number as i64)];
+            }
+            batches.push(current);
+        }
+        let mut bytes = encode_header(&header());
+        for current in &batches {
+            bytes.extend_from_slice(&encode_record(current).unwrap());
+        }
+        bytes.extend_from_slice(&encode_finalize(TxnId(80), None).unwrap());
+        let second_finalize = encode_finalize(TxnId(81), None).unwrap();
+        bytes.extend_from_slice(&second_finalize[..second_finalize.len() / 2]);
+        fs::write(&path, &bytes).unwrap();
+
+        let manager = ChangeStreamManager::open(
+            path.clone(),
+            ChangeStorageKind::Heap,
+            StorageId(8),
+            &table(),
+            |_| AuthoritativeOutcome::Committed(None),
+        )
+        .unwrap();
+        let recovered = manager
+            .read(cursor_for(&header(), StorageDataVersion(11)), 10, u64::MAX)
+            .unwrap();
+        assert_eq!(recovered.batches.len(), 3);
+        assert_eq!(recovered.current_frontier, StorageDataVersion(14));
+        drop(manager);
+
+        let mut corrupt = fs::read(&path).unwrap();
+        let final_payload_byte = corrupt.len() - 12;
+        corrupt[final_payload_byte] ^= 0x5a;
+        fs::write(&path, corrupt).unwrap();
+        let corrupt_manager = ChangeStreamManager::open(
+            path.clone(),
+            ChangeStorageKind::Heap,
+            StorageId(8),
+            &table(),
+            |_| AuthoritativeOutcome::Committed(None),
+        )
+        .unwrap();
+        assert_eq!(
+            corrupt_manager.inspection().status,
+            ChangeStreamStatus::Unavailable
+        );
         let _ = fs::remove_file(path);
     }
 

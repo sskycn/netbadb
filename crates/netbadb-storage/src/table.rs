@@ -5,7 +5,7 @@ use netbadb_index::{BTreeHandle, IndexDefinition, IndexRange, IndexStatistics, T
 use netbadb_schema::TableDef;
 use netbadb_types::{
     AccessPathId, ColumnId, DatabaseTxnId, IndexId, IndexName, Lsn, RowId, ScalarRef, ScalarValue,
-    StorageId, TableId, TxnId,
+    StorageDataVersion, StorageId, TableId, TxnId,
 };
 
 use crate::{
@@ -454,6 +454,33 @@ pub struct StoragePrepareBatchReport {
     pub last_local_boundary: u64,
 }
 
+/// Result of one storage-local NBCL PreparedChange durability barrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageChangePrepareBatchReport {
+    pub storage_id: StorageId,
+    pub changing_member_count: usize,
+    pub records_staged: usize,
+    pub record_bytes: u64,
+    pub syncs: u64,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub before_frontier: StorageDataVersion,
+    /// Reserved by staged records; this is not the committed stream frontier.
+    pub after_reserved_frontier: StorageDataVersion,
+}
+
+/// Result of one storage-local NBCL Finalize durability barrier and promotion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageChangeFinalizeBatchReport {
+    pub storage_id: StorageId,
+    pub finalized_member_count: usize,
+    pub markers_staged: usize,
+    pub marker_bytes: u64,
+    pub syncs: u64,
+    pub before_committed_frontier: StorageDataVersion,
+    pub after_committed_frontier: StorageDataVersion,
+}
+
 #[derive(Debug)]
 enum StorageTransactionKind {
     Heap(Transaction),
@@ -671,6 +698,23 @@ impl StorageTransaction {
         }
     }
 
+    /// Phase 3F group-only staging additionally leaves NBCL PreparedChange
+    /// records unsynchronized for the explicit storage-local barrier.
+    #[doc(hidden)]
+    pub fn stage_group_prepare_with_batched_change_stream(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+    ) -> Result<(), StorageError> {
+        match &mut self.inner {
+            StorageTransactionKind::Heap(txn) => {
+                txn.stage_group_prepare_with_batched_change_stream(database_txn_id)
+            }
+            StorageTransactionKind::Lsm(txn) => {
+                txn.stage_group_prepare_with_batched_change_stream(database_txn_id)
+            }
+        }
+    }
+
     pub fn park_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
         match &mut self.inner {
             StorageTransactionKind::Heap(txn) => txn.park_prepared(database_txn_id),
@@ -749,6 +793,124 @@ impl StorageTransaction {
         }
     }
 
+    /// Makes authoritative commit records durable and applies their local
+    /// winner state without publishing grouped Change Stream batches.
+    #[doc(hidden)]
+    pub fn commit_prepared_batch_authoritative(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<StorageCommitBatchReport, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedCommitBatch.into());
+        };
+        let storage_id = first.storage_id;
+        let table_id = first.table_id;
+        let heap = matches!(first.inner, StorageTransactionKind::Heap(_));
+        if heap {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Heap(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Lsm(_) => {
+                        return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                    }
+                }
+            }
+            let report = Transaction::commit_prepared_batch_authoritative(&mut batch)?;
+            Ok(StorageCommitBatchReport {
+                storage_id,
+                member_count: report.member_count,
+                commit_records_staged: report.commit_records_staged,
+                wal_syncs: report.wal_syncs,
+                first_local_boundary: report.first_local_boundary,
+                last_local_boundary: report.last_local_boundary,
+            })
+        } else {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Lsm(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Heap(_) => {
+                        return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                    }
+                }
+            }
+            let report = LsmTransaction::commit_prepared_batch_authoritative(&mut batch)?;
+            Ok(StorageCommitBatchReport {
+                storage_id,
+                member_count: report.member_count,
+                commit_records_staged: report.commit_records_staged,
+                wal_syncs: report.wal_syncs,
+                first_local_boundary: report.first_local_boundary,
+                last_local_boundary: report.last_local_boundary,
+            })
+        }
+    }
+
+    /// Durabilizes and promotes the exact Change Stream finalize subsequence.
+    #[doc(hidden)]
+    pub fn finalize_group_changes_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<Option<StorageChangeFinalizeBatchReport>, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedCommitBatch.into());
+        };
+        let storage_id = first.storage_id;
+        let table_id = first.table_id;
+        let heap = matches!(first.inner, StorageTransactionKind::Heap(_));
+        let report = if heap {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Heap(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Lsm(_) => {
+                        return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                    }
+                }
+            }
+            Transaction::finalize_group_changes_batch(&mut batch)?
+        } else {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Lsm(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Heap(_) => {
+                        return Err(TransactionError::PreparedCommitBatchStorageMismatch.into());
+                    }
+                }
+            }
+            LsmTransaction::finalize_group_changes_batch(&mut batch)?
+        };
+        Ok(report.map(|report| StorageChangeFinalizeBatchReport {
+            storage_id,
+            finalized_member_count: report.finalized_member_count,
+            markers_staged: report.markers_staged,
+            marker_bytes: report.marker_bytes,
+            syncs: report.syncs,
+            before_committed_frontier: report.before_committed_frontier,
+            after_committed_frontier: report.after_committed_frontier,
+        }))
+    }
+
     /// Durabilizes the exact parked staged-Prepare prefix with one WAL barrier.
     #[doc(hidden)]
     pub fn durabilize_group_prepare_batch(
@@ -809,6 +971,63 @@ impl StorageTransaction {
                 last_local_boundary: report.last_local_boundary,
             })
         }
+    }
+
+    /// Durabilizes the exact staged NBCL PreparedChange subsequence.
+    #[doc(hidden)]
+    pub fn durabilize_group_change_prepare_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<Option<StorageChangePrepareBatchReport>, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedPrepareBatch.into());
+        };
+        let storage_id = first.storage_id;
+        let table_id = first.table_id;
+        let heap = matches!(first.inner, StorageTransactionKind::Heap(_));
+        let report = if heap {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Heap(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Lsm(_) => {
+                        return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+                    }
+                }
+            }
+            Transaction::durabilize_group_change_prepare_batch(&mut batch)?
+        } else {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Lsm(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Heap(_) => {
+                        return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+                    }
+                }
+            }
+            LsmTransaction::durabilize_group_change_prepare_batch(&mut batch)?
+        };
+        Ok(report.map(|report| StorageChangePrepareBatchReport {
+            storage_id,
+            changing_member_count: report.changing_member_count,
+            records_staged: report.records_staged,
+            record_bytes: report.record_bytes,
+            syncs: report.syncs,
+            first_sequence: report.first_sequence,
+            last_sequence: report.last_sequence,
+            before_frontier: report.before_frontier,
+            after_reserved_frontier: report.after_reserved_frontier,
+        }))
     }
 
     pub fn rollback_prepared(

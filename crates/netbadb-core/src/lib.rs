@@ -205,7 +205,8 @@ pub use netbadb_storage::{
     IndexDefinition, IndexMaintenanceReport, IndexReclaimReport, IndexStatistics,
     IndexTailReclaimReport, IsolationLevel, LsmInspection, LsmLevelInspection,
     LsmReadAmplification, LsmWriteAmplification, PageReuseClass, PageReuseInspection,
-    PreparedRuntimeInspection, ReusablePageInspection, StorageChange, StorageCommitBatchReport,
+    PreparedRuntimeInspection, ReusablePageInspection, StorageChange,
+    StorageChangeFinalizeBatchReport, StorageChangePrepareBatchReport, StorageCommitBatchReport,
     StorageError, StorageKind, StoragePrepareBatchReport, StorageSnapshotToken, StorageVersionKey,
     TableStatistics,
 };
@@ -335,6 +336,29 @@ pub enum GroupPrepareMode {
     BatchedBarrier,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupChangeStreamDurabilityMode {
+    /// Every changing member durabilizes NBCL Prepare and Finalize separately.
+    PerMember,
+    /// One NBCL Prepare and Finalize barrier is used per participating storage.
+    BatchedBarriers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupCommitOptions {
+    pub prepare_mode: GroupPrepareMode,
+    pub change_stream_durability_mode: GroupChangeStreamDurabilityMode,
+}
+
+impl Default for GroupCommitOptions {
+    fn default() -> Self {
+        Self {
+            prepare_mode: GroupPrepareMode::DurablePerMember,
+            change_stream_durability_mode: GroupChangeStreamDurabilityMode::PerMember,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupCommitInspection {
     pub group_id: u64,
@@ -343,6 +367,7 @@ pub struct GroupCommitInspection {
     pub member_transaction_ids: Vec<DatabaseTxnId>,
     pub participating_storage_count: usize,
     pub prepare_mode: Option<GroupPrepareMode>,
+    pub change_stream_durability_mode: GroupChangeStreamDurabilityMode,
     pub decision_state: GroupDecisionState,
 }
 
@@ -358,25 +383,36 @@ pub struct GroupCommitBatch {
     base_snapshot: DatabaseSnapshot,
     members: Vec<Transaction>,
     resolving_member: Option<Transaction>,
+    configured_prepare_mode: Option<GroupPrepareMode>,
     prepare_mode: Option<GroupPrepareMode>,
+    change_stream_durability_mode: GroupChangeStreamDurabilityMode,
     prepare_barrier_started: bool,
+    change_prepare_completed_storages: BTreeSet<StorageId>,
+    change_stream_prepare_batches: BTreeMap<StorageId, StorageChangePrepareBatchReport>,
     storage_prepare_batches: BTreeMap<StorageId, StoragePrepareBatchReport>,
     commit_sequences: Option<Vec<DatabaseCommitSeq>>,
     storage_commit_batches: BTreeMap<StorageId, StorageCommitBatchReport>,
+    change_finalize_completed_storages: BTreeSet<StorageId>,
+    change_stream_finalize_batches: BTreeMap<StorageId, StorageChangeFinalizeBatchReport>,
     completed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupCommitReport {
     pub prepare_mode: GroupPrepareMode,
+    pub change_stream_durability_mode: GroupChangeStreamDurabilityMode,
     pub member_count: usize,
     pub first_commit_seq: DatabaseCommitSeq,
     pub last_commit_seq: DatabaseCommitSeq,
     pub participating_storage_count: usize,
     pub storage_prepare_batches: Vec<StoragePrepareBatchReport>,
     pub storage_prepare_wal_syncs: u64,
+    pub change_stream_prepare_batches: Vec<StorageChangePrepareBatchReport>,
+    pub change_stream_prepare_syncs: u64,
     pub storage_commit_batches: Vec<StorageCommitBatchReport>,
     pub storage_commit_wal_syncs: u64,
+    pub change_stream_finalize_batches: Vec<StorageChangeFinalizeBatchReport>,
+    pub change_stream_finalize_syncs: u64,
 }
 
 /// Result of one explicit, synchronous coordinator-history compaction.
@@ -2417,6 +2453,32 @@ impl Database {
     /// Opens one explicit synchronous group-commit builder at the current
     /// published database snapshot.
     pub fn begin_group_commit(&mut self) -> Result<GroupCommitBatch, DatabaseError> {
+        self.begin_group_commit_internal(None, GroupChangeStreamDurabilityMode::PerMember)
+    }
+
+    /// Opens an explicit group with its durability modes fixed before the
+    /// first member. Existing callers keep using [`Self::begin_group_commit`].
+    pub fn begin_group_commit_with_options(
+        &mut self,
+        options: GroupCommitOptions,
+    ) -> Result<GroupCommitBatch, DatabaseError> {
+        if options.prepare_mode == GroupPrepareMode::DurablePerMember
+            && options.change_stream_durability_mode
+                == GroupChangeStreamDurabilityMode::BatchedBarriers
+        {
+            return Err(CoordinatorError::UnsupportedGroupDurabilityCombination.into());
+        }
+        self.begin_group_commit_internal(
+            Some(options.prepare_mode),
+            options.change_stream_durability_mode,
+        )
+    }
+
+    fn begin_group_commit_internal(
+        &mut self,
+        configured_prepare_mode: Option<GroupPrepareMode>,
+        change_stream_durability_mode: GroupChangeStreamDurabilityMode,
+    ) -> Result<GroupCommitBatch, DatabaseError> {
         if self.visibility_mode() != DatabaseVisibilityMode::Global {
             return Err(CoordinatorError::GroupCommitRequiresGlobalVisibility.into());
         }
@@ -2443,6 +2505,7 @@ impl Database {
                 member_transaction_ids: Vec::new(),
                 participating_storage_count: 0,
                 prepare_mode: None,
+                change_stream_durability_mode,
                 decision_state: GroupDecisionState::Building,
             },
         });
@@ -2452,11 +2515,17 @@ impl Database {
             base_snapshot,
             members: Vec::new(),
             resolving_member: None,
+            configured_prepare_mode,
             prepare_mode: None,
+            change_stream_durability_mode,
             prepare_barrier_started: false,
+            change_prepare_completed_storages: BTreeSet::new(),
+            change_stream_prepare_batches: BTreeMap::new(),
             storage_prepare_batches: BTreeMap::new(),
             commit_sequences: None,
             storage_commit_batches: BTreeMap::new(),
+            change_finalize_completed_storages: BTreeSet::new(),
+            change_stream_finalize_batches: BTreeMap::new(),
             completed: false,
         })
     }
@@ -2527,6 +2596,21 @@ impl Database {
             }
             return Err(CoordinatorError::GroupPrepareBarrierInProgress.into());
         }
+        if let Some(configured) = group.configured_prepare_mode {
+            if configured != requested_mode {
+                if transaction.rollback().is_err()
+                    && transaction.state() != TransactionState::RolledBack
+                {
+                    group.resolving_member = Some(transaction);
+                    self.set_group_decision_state(GroupDecisionState::PrepareResolutionRequired)?;
+                }
+                return Err(CoordinatorError::GroupPrepareModeMismatch {
+                    existing: configured,
+                    requested: requested_mode,
+                }
+                .into());
+            }
+        }
         if let Some(existing) = group.prepare_mode {
             if existing != requested_mode {
                 if transaction.rollback().is_err()
@@ -2576,7 +2660,10 @@ impl Database {
         }
         let prepare_result = match requested_mode {
             GroupPrepareMode::DurablePerMember => transaction.prepare_and_park_group_member(),
-            GroupPrepareMode::BatchedBarrier => transaction.stage_and_park_group_member(),
+            GroupPrepareMode::BatchedBarrier => transaction.stage_and_park_group_member(
+                group.change_stream_durability_mode
+                    == GroupChangeStreamDurabilityMode::BatchedBarriers,
+            ),
         };
         if let Err(error) = prepare_result {
             if transaction.state() == TransactionState::Active {
@@ -2686,6 +2773,29 @@ impl Database {
                         let participant = member.group_prepare_participant_mut(storage_id)?;
                         participants.push((participant, database_txn_id));
                     }
+                    if group.change_stream_durability_mode
+                        == GroupChangeStreamDurabilityMode::BatchedBarriers
+                        && !group
+                            .change_prepare_completed_storages
+                            .contains(&storage_id)
+                    {
+                        #[cfg(test)]
+                        crate::coordinator_crash::maybe_crash_indexed(
+                            "group-before-change-prepare-barrier",
+                            position + 1,
+                        );
+                        if let Some(report) = netbadb_storage::StorageTransaction::durabilize_group_change_prepare_batch(&mut participants)? {
+                            group
+                                .change_stream_prepare_batches
+                                .insert(storage_id, report);
+                        }
+                        group.change_prepare_completed_storages.insert(storage_id);
+                        #[cfg(test)]
+                        crate::coordinator_crash::maybe_crash_indexed(
+                            "group-after-change-prepare-barrier",
+                            position + 1,
+                        );
+                    }
                     #[cfg(test)]
                     crate::coordinator_crash::maybe_crash_indexed(
                         "group-before-participant-prepare-barrier",
@@ -2703,6 +2813,18 @@ impl Database {
                     );
                     #[cfg(not(test))]
                     let _ = position;
+                }
+                if group.change_stream_durability_mode
+                    == GroupChangeStreamDurabilityMode::BatchedBarriers
+                {
+                    let required = group
+                        .members
+                        .iter()
+                        .flat_map(Transaction::group_write_storage_ids)
+                        .collect::<BTreeSet<_>>();
+                    if required != group.change_prepare_completed_storages {
+                        return Err(CoordinatorError::GroupChangePrepareDurabilityIncomplete.into());
+                    }
                 }
                 for member in &mut group.members {
                     member.finish_group_prepare_barrier()?;
@@ -2758,6 +2880,12 @@ impl Database {
             }
         }
         for (position, storage_id) in storage_ids.into_iter().enumerate() {
+            if group
+                .change_finalize_completed_storages
+                .contains(&storage_id)
+            {
+                continue;
+            }
             let mut participants = Vec::new();
             for member in &mut group.members {
                 if member.state() == TransactionState::Committed
@@ -2779,9 +2907,48 @@ impl Database {
                 "group-before-participant-commit",
                 position + 1,
             );
-            let report =
-                netbadb_storage::StorageTransaction::commit_prepared_batch(&mut participants)?;
-            group.storage_commit_batches.insert(storage_id, report);
+            if group.change_stream_durability_mode
+                == GroupChangeStreamDurabilityMode::BatchedBarriers
+            {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    group.storage_commit_batches.entry(storage_id)
+                {
+                    let report =
+                        netbadb_storage::StorageTransaction::commit_prepared_batch_authoritative(
+                            &mut participants,
+                        )?;
+                    entry.insert(report);
+                    #[cfg(test)]
+                    crate::coordinator_crash::maybe_crash_indexed(
+                        "group-after-authoritative-commit-barrier",
+                        position + 1,
+                    );
+                }
+                #[cfg(test)]
+                crate::coordinator_crash::maybe_crash_indexed(
+                    "group-before-change-finalize-barrier",
+                    position + 1,
+                );
+                if let Some(report) =
+                    netbadb_storage::StorageTransaction::finalize_group_changes_batch(
+                        &mut participants,
+                    )?
+                {
+                    group
+                        .change_stream_finalize_batches
+                        .insert(storage_id, report);
+                }
+                group.change_finalize_completed_storages.insert(storage_id);
+                #[cfg(test)]
+                crate::coordinator_crash::maybe_crash_indexed(
+                    "group-after-change-finalize-barrier",
+                    position + 1,
+                );
+            } else {
+                let report =
+                    netbadb_storage::StorageTransaction::commit_prepared_batch(&mut participants)?;
+                group.storage_commit_batches.insert(storage_id, report);
+            }
             #[cfg(test)]
             crate::coordinator_crash::maybe_crash_indexed(
                 "group-after-participant-commit",
@@ -2848,6 +3015,15 @@ impl Database {
             .iter()
             .map(|report| report.wal_syncs)
             .sum();
+        let change_stream_prepare_batches = group
+            .change_stream_prepare_batches
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let change_stream_prepare_syncs = change_stream_prepare_batches
+            .iter()
+            .map(|report| report.syncs)
+            .sum();
         let storage_commit_batches = group
             .storage_commit_batches
             .values()
@@ -2857,20 +3033,34 @@ impl Database {
             .iter()
             .map(|report| report.wal_syncs)
             .sum();
+        let change_stream_finalize_batches = group
+            .change_stream_finalize_batches
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let change_stream_finalize_syncs = change_stream_finalize_batches
+            .iter()
+            .map(|report| report.syncs)
+            .sum();
         group.completed = true;
         group.members.clear();
         self.group_barrier.set(None);
         self.active_group = None;
         Ok(GroupCommitReport {
             prepare_mode,
+            change_stream_durability_mode: group.change_stream_durability_mode,
             member_count,
             first_commit_seq,
             last_commit_seq,
             participating_storage_count,
             storage_prepare_batches,
             storage_prepare_wal_syncs,
+            change_stream_prepare_batches,
+            change_stream_prepare_syncs,
             storage_commit_batches,
             storage_commit_wal_syncs,
+            change_stream_finalize_batches,
+            change_stream_finalize_syncs,
         })
     }
 
@@ -2911,6 +3101,8 @@ impl Database {
         let id = member.id();
         member.abort_parked_group_member()?;
         group.members.pop();
+        group.change_prepare_completed_storages.clear();
+        group.change_stream_prepare_batches.clear();
         group.storage_prepare_batches.clear();
         let active = self
             .active_group
@@ -6827,7 +7019,7 @@ mod tests {
     };
     use netbadb_planner::PhysicalPlan;
     use netbadb_schema::{ColumnDef, Schema, TableDef, TypeSpec};
-    use netbadb_storage::{HeapStorage, TableStorage};
+    use netbadb_storage::{HeapStorage, StorageChange, StorageVersionKey, TableStorage};
     use netbadb_types::{
         AccessPathId, ColumnId, DatabaseCommitSeq, DatabaseTxnId, PartitionId, PhysicalType,
         ScalarValue, StorageId, TableId,
@@ -6935,8 +7127,15 @@ mod tests {
             .map(std::path::PathBuf::from)
             .expect("coordinator crash root");
         let case = std::env::var(crate::coordinator_crash::CASE_ENV).expect("crash case");
-        if case.starts_with("group:") || case.starts_with("group3e:") {
-            group_crash_child(&root, case.starts_with("group3e:"));
+        if case.starts_with("group:")
+            || case.starts_with("group3e:")
+            || case.starts_with("group3f:")
+        {
+            group_crash_child(
+                &root,
+                case.starts_with("group3e:") || case.starts_with("group3f:"),
+                case.starts_with("group3f:"),
+            );
             panic!("group crash child returned without reaching its crash point");
         }
         if case.starts_with("mixed:") {
@@ -7075,14 +7274,28 @@ mod tests {
             .expect("commit until mixed crash point");
     }
 
-    fn group_crash_child(root: &std::path::Path, batched_prepare: bool) {
+    fn group_crash_child(
+        root: &std::path::Path,
+        batched_prepare: bool,
+        batched_change_stream: bool,
+    ) {
         let (_, _, coordinator) = mixed_crash_paths(root);
         let mut database = Database::open_storages_with_coordinator(
             mixed_open_specs(root),
             DatabaseCoordinatorConfig::new(coordinator),
         )
         .expect("open group crash child database");
-        let mut group = database.begin_group_commit().expect("begin crash group");
+        let mut group = if batched_change_stream {
+            database
+                .begin_group_commit_with_options(super::GroupCommitOptions {
+                    prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                    change_stream_durability_mode:
+                        super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+                })
+                .expect("begin Phase 3F crash group")
+        } else {
+            database.begin_group_commit().expect("begin crash group")
+        };
         for id in 1..=3_i64 {
             let mut member = database.begin_group_member(&group).expect("begin member");
             database
@@ -10751,6 +10964,10 @@ mod tests {
             assert_eq!(runtime.group_prepare_barrier_sync_count, 1);
             assert_eq!(runtime.group_commit_barrier_sync_count, 1);
             assert_eq!(runtime.change_stream_sync_count, 6);
+            assert_eq!(runtime.change_stream_member_prepare_sync_count, 3);
+            assert_eq!(runtime.change_stream_group_prepare_barrier_sync_count, 0);
+            assert_eq!(runtime.change_stream_member_finalize_sync_count, 3);
+            assert_eq!(runtime.change_stream_group_finalize_barrier_sync_count, 0);
         }
         assert_eq!(
             database
@@ -10778,6 +10995,165 @@ mod tests {
         drop(group);
         database.close().unwrap();
         cleanup_mixed_crash_fixture(&root);
+    }
+
+    #[test]
+    fn phase3f_batches_change_stream_prepare_and_finalize_per_storage() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3f-batched-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_mixed_crash_fixture(&root);
+        let (_, _, coordinator_path) = mixed_crash_paths(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database =
+            Database::create_storages_with_coordinator(mixed_create_specs(&root), config).unwrap();
+        let heap_cursor = database.enable_change_stream(TableId(1)).unwrap();
+        let lsm_cursor = database.enable_change_stream(TableId(2)).unwrap();
+        let mut group = database
+            .begin_group_commit_with_options(super::GroupCommitOptions {
+                prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                change_stream_durability_mode:
+                    super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+            })
+            .unwrap();
+        for id in 1..=3_i64 {
+            let mut member = database.begin_group_member(&group).unwrap();
+            database
+                .insert_into_in(
+                    TableId(1),
+                    &mut member,
+                    &[
+                        ScalarValue::Int64(id),
+                        ScalarValue::Text(format!("phase3f-{id}")),
+                    ],
+                )
+                .unwrap();
+            database
+                .insert_into_in(TableId(2), &mut member, &[ScalarValue::Int64(id)])
+                .unwrap();
+            database.stage_group_member(&mut group, member).unwrap();
+        }
+        for table_id in [TableId(1), TableId(2)] {
+            let runtime = database.inspect_prepared_runtime(table_id).unwrap();
+            assert_eq!(runtime.change_stream_sync_count, 0);
+            assert_eq!(runtime.change_stream_member_prepare_sync_count, 0);
+            assert_eq!(runtime.change_stream_group_prepare_barrier_sync_count, 0);
+            assert_eq!(runtime.change_stream_member_finalize_sync_count, 0);
+            assert_eq!(runtime.change_stream_group_finalize_barrier_sync_count, 0);
+        }
+        let report = database.commit_group(&mut group).unwrap();
+        assert_eq!(report.prepare_mode, super::GroupPrepareMode::BatchedBarrier);
+        assert_eq!(
+            report.change_stream_durability_mode,
+            super::GroupChangeStreamDurabilityMode::BatchedBarriers
+        );
+        assert_eq!(report.storage_prepare_wal_syncs, 2);
+        assert_eq!(report.change_stream_prepare_syncs, 2);
+        assert_eq!(report.storage_commit_wal_syncs, 2);
+        assert_eq!(report.change_stream_finalize_syncs, 2);
+        assert_eq!(report.change_stream_prepare_batches.len(), 2);
+        assert_eq!(report.change_stream_finalize_batches.len(), 2);
+        for table_id in [TableId(1), TableId(2)] {
+            let runtime = database.inspect_prepared_runtime(table_id).unwrap();
+            assert_eq!(runtime.change_stream_sync_count, 2);
+            assert_eq!(runtime.change_stream_member_prepare_sync_count, 0);
+            assert_eq!(runtime.change_stream_group_prepare_barrier_sync_count, 1);
+            assert_eq!(runtime.change_stream_member_finalize_sync_count, 0);
+            assert_eq!(runtime.change_stream_group_finalize_barrier_sync_count, 1);
+            let cursor = if table_id == TableId(1) {
+                heap_cursor
+            } else {
+                lsm_cursor
+            };
+            let changes = database
+                .read_changes(table_id, cursor, 10, 1_000_000)
+                .unwrap();
+            assert_eq!(changes.batches.len(), 3);
+            assert!(
+                changes
+                    .batches
+                    .windows(2)
+                    .all(|pair| pair[0].after == pair[1].before)
+            );
+            if table_id == TableId(2) {
+                let versions = changes
+                    .batches
+                    .iter()
+                    .map(|batch| match &batch.mutations[0] {
+                        StorageChange::Insert {
+                            new_version: StorageVersionKey::Lsm { version, .. },
+                            ..
+                        } => *version,
+                        other => panic!("unexpected Phase 3F LSM mutation {other:?}"),
+                    })
+                    .collect::<Vec<_>>();
+                assert!(versions.iter().all(|version| version.0 != 0));
+                assert!(versions.windows(2).all(|pair| pair[0].0 < pair[1].0));
+            }
+        }
+        assert_eq!(
+            database
+                .current_database_snapshot()
+                .unwrap()
+                .unwrap()
+                .commit_seq(),
+            DatabaseCommitSeq(3)
+        );
+        drop(group);
+        database.close().unwrap();
+        cleanup_mixed_crash_fixture(&root);
+    }
+
+    #[test]
+    fn phase3f_mode_is_explicit_rejects_unsupported_pair_and_skips_disabled_streams() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-phase3f-mode-disabled-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        cleanup_coordinator_fixture(&root);
+        let (tables, coordinator_path) = coordinator_fixture_tables(&root);
+        let config = DatabaseCoordinatorConfig::new(&coordinator_path).with_global_visibility();
+        let mut database = Database::create_tables_with_coordinator(tables, config).unwrap();
+        assert!(matches!(
+            database.begin_group_commit_with_options(super::GroupCommitOptions {
+                prepare_mode: super::GroupPrepareMode::DurablePerMember,
+                change_stream_durability_mode:
+                    super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+            }),
+            Err(DatabaseError::Transaction(
+                CoordinatorError::UnsupportedGroupDurabilityCombination
+            ))
+        ));
+        assert!(database.inspect_group_commit().is_none());
+
+        let mut group = database
+            .begin_group_commit_with_options(super::GroupCommitOptions {
+                prepare_mode: super::GroupPrepareMode::BatchedBarrier,
+                change_stream_durability_mode:
+                    super::GroupChangeStreamDurabilityMode::BatchedBarriers,
+            })
+            .unwrap();
+        let mut member = database.begin_group_member(&group).unwrap();
+        database
+            .execute_in(
+                &mut member,
+                "INSERT INTO users (id, name) VALUES (1, 'disabled')",
+            )
+            .unwrap();
+        database.stage_group_member(&mut group, member).unwrap();
+        let report = database.commit_group(&mut group).unwrap();
+        assert!(report.change_stream_prepare_batches.is_empty());
+        assert!(report.change_stream_finalize_batches.is_empty());
+        assert_eq!(report.change_stream_prepare_syncs, 0);
+        assert_eq!(report.change_stream_finalize_syncs, 0);
+        let runtime = database.inspect_prepared_runtime(TableId(1)).unwrap();
+        assert_eq!(runtime.change_stream_sync_count, 0);
+        drop(group);
+        database.close().unwrap();
+        cleanup_coordinator_fixture(&root);
     }
 
     #[test]
@@ -11646,6 +12022,119 @@ mod tests {
                             .unwrap()
                             .commit_seq(),
                         DatabaseCommitSeq(if committed { 4 } else { 1 })
+                    );
+                    recovered.close().unwrap();
+                }
+                cleanup_mixed_crash_fixture(&root);
+            }
+        }
+    }
+
+    #[test]
+    fn subprocess_phase3f_change_barriers_recover_by_durable_group_decision() {
+        let cases = [
+            ("group-after-member-park-1", false),
+            ("group-after-member-park-2", false),
+            ("group-after-member-park-3", false),
+            ("group-before-change-prepare-barrier-1", false),
+            ("group-after-change-prepare-barrier-1", false),
+            ("group-after-participant-prepare-barrier-1", false),
+            ("group-after-all-prepare-barriers", false),
+            ("group-after-durable-decision", true),
+            ("group-after-authoritative-commit-barrier-1", true),
+            ("group-before-change-finalize-barrier-1", true),
+            ("group-after-change-finalize-barrier-1", true),
+            ("group-after-participant-commit-1", true),
+            ("group-after-all-participant-commits", true),
+            ("group-after-all-completes-before-publication", true),
+        ];
+        for reverse_storage_order in [false, true] {
+            for (point, committed) in cases {
+                let root = std::env::temp_dir().join(format!(
+                    "netbadb-phase3f-crash-{reverse_storage_order}-{point}-{}",
+                    std::process::id()
+                ));
+                cleanup_mixed_crash_fixture(&root);
+                let (_, _, coordinator) = mixed_crash_paths(&root);
+                let mut initial = Database::create_storages_with_coordinator(
+                    mixed_create_specs(&root),
+                    DatabaseCoordinatorConfig::new(&coordinator).with_global_visibility(),
+                )
+                .unwrap();
+                let heap_cursor = initial.enable_change_stream(TableId(1)).unwrap();
+                let lsm_cursor = initial.enable_change_stream(TableId(2)).unwrap();
+                initial.close().unwrap();
+
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .arg("--exact")
+                    .arg("tests::coordinator_crash_child_entrypoint")
+                    .arg("--nocapture");
+                if reverse_storage_order {
+                    command
+                        .env("NETBADB_REVERSE_GROUP_STORAGE_PREPARE", "1")
+                        .env("NETBADB_REVERSE_GROUP_STORAGE_COMMIT", "1");
+                }
+                crate::coordinator_crash::configure_child(
+                    &mut command,
+                    &format!("group3f:{point}"),
+                    &root,
+                    point,
+                );
+                let status = command.status().expect("start Phase 3F crash child");
+                assert_eq!(status.code(), Some(crate::coordinator_crash::EXIT_CODE));
+
+                for pass in 0..2 {
+                    let mut recovered = Database::open_storages_with_coordinator(
+                        mixed_open_specs(&root),
+                        DatabaseCoordinatorConfig::new(&coordinator),
+                    )
+                    .expect("recover Phase 3F crash fixture");
+                    let expected = if committed {
+                        vec![
+                            vec![ScalarValue::Int64(1)],
+                            vec![ScalarValue::Int64(2)],
+                            vec![ScalarValue::Int64(3)],
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(
+                        recovered
+                            .query("SELECT id FROM users ORDER BY id")
+                            .unwrap()
+                            .rows,
+                        expected,
+                        "Heap pass {pass}, point {point}"
+                    );
+                    assert_eq!(
+                        recovered
+                            .query("SELECT id FROM lsm_items ORDER BY id")
+                            .unwrap()
+                            .rows,
+                        expected,
+                        "LSM pass {pass}, point {point}"
+                    );
+                    for (table_id, cursor) in [(TableId(1), heap_cursor), (TableId(2), lsm_cursor)]
+                    {
+                        let changes = recovered
+                            .read_changes(table_id, cursor, 10, 1_000_000)
+                            .unwrap();
+                        assert_eq!(changes.batches.len(), if committed { 3 } else { 0 });
+                        assert!(
+                            changes
+                                .batches
+                                .windows(2)
+                                .all(|pair| pair[0].after == pair[1].before)
+                        );
+                    }
+                    assert_eq!(
+                        recovered
+                            .current_database_snapshot()
+                            .unwrap()
+                            .unwrap()
+                            .commit_seq(),
+                        DatabaseCommitSeq(if committed { 3 } else { 0 })
                     );
                     recovered.close().unwrap();
                 }

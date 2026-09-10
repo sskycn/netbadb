@@ -19,6 +19,45 @@
 
 See [`alter-type-using-round62.md`](alter-type-using-round62.md).
 
+## Batched Change Stream durability barriers (Phase 3F complete)
+
+- added explicit `GroupCommitOptions` and the opt-in
+  `GroupChangeStreamDurabilityMode::BatchedBarriers`, while preserving Phase 3E
+  and ordinary-transaction defaults;
+- split group-only NBCL Prepare staging from one exact-prefix durability
+  barrier per `StorageId`, ordered before authoritative Prepare and the
+  unchanged CORD v5 GroupDecision;
+- split existing per-transaction Finalize marker staging, one per-storage
+  durability barrier, and ordered in-memory frontier promotion after sync;
+- retained independent ChangeBatches, exact LSM commit versions, NBCL v1/v2
+  bytes, fail-closed recovery, unresolved reclamation blocking, and final
+  global publication only after all Finalize barriers;
+- added detailed sync counters/reports, recovery and corruption matrices, and
+  the `global_group_change_stream_barrier_phase3f` benchmark matrix.
+
+See [`phase3f-batched-change-stream-durability.md`](phase3f-batched-change-stream-durability.md).
+
+## Disjoint write-domain concurrency principle
+
+Architecture selected; runtime implementation intentionally deferred.
+
+- NetbaDB uses a partitioned single-writer model whose default authoritative
+  mutation domain is `StorageId`.
+- A storage domain has at most one active mutation owner. Future execution may
+  run transactions concurrently only when their write-domain sets are
+  disjoint; overlapping domains serialize.
+- Hot write domains should scale through additional independent `StorageId`s,
+  especially partitions, before same-domain multi-writer synchronization is
+  reconsidered.
+- Multi-domain ownership must use deterministic ordering, preferably complete
+  write-set discovery followed by ascending `StorageId` acquisition.
+- Execution concurrency remains separate from Phase 3C-3E durability batching
+  and from globally ordered `DatabaseCommitSeq` publication.
+- Implementation is workload-driven future work. This entry adds no writer
+  scheduler, lock manager, concurrent storage registry, or runtime guarantee.
+
+See [`disjoint-write-domains.md`](disjoint-write-domains.md).
+
 ## Batched participant Prepare barriers (Phase 3E complete)
 
 - preserved `park_group_member` as durable-per-member Prepare and added the

@@ -131,6 +131,22 @@ barriers must succeed before the unchanged CORD v5 GroupDecision is written.
 Change Stream Prepare/finalize durability remains per transaction, so this is
 not fully batched transaction durability.
 
+[Phase 3F](docs/phase3f-batched-change-stream-durability.md) lets an explicit
+`BatchedBarrier` group optionally share one Change Stream Prepare barrier and
+one Change Stream Finalize barrier per physical `StorageId`. The default group
+and ordinary transaction paths retain per-member NBCL durability. Existing
+NBCL v2 records, independent ChangeBatches, local frontiers, and CORD v5 remain
+unchanged; this is not asynchronous CDC or globally ordered CDC.
+
+NetbaDB's selected write-concurrency architecture is
+[partitioned single-writer](docs/disjoint-write-domains.md): each authoritative
+`StorageId` has at most one active mutation owner, while transactions whose
+write-domain sets are disjoint may eventually execute concurrently. This is an
+architectural direction, not a claim that the current runtime already performs
+disjoint-domain writes in parallel. Hot write paths should scale by adding
+independent partitions or storage domains, not by adding concurrent writers
+inside one Heap, B+Tree, LSM instance, MemTable, or WAL mutation path.
+
 [Columnar Phase 2A](docs/columnar-phase2a-change-stream.md) adds an opt-in,
 durable per-storage committed change stream for Heap and LSM, with exact
 row-version identities, transaction coalescing, bounded replay, gap detection,

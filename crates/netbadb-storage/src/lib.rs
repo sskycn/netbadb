@@ -65,9 +65,9 @@ pub use recovery::{
 pub use table::{
     AccessPathCapabilities, CommittedReadAnchor, HeapResourceComponent, HeapResourceComponentKind,
     HeapRewriteIndex, HeapRewriteIndexes, StorageAccessCostHints, StorageAccessPath,
-    StorageCommitBatchReport, StorageKind, StoragePrepareBatchReport, StorageReadView,
-    StorageRowHandle, StorageTransaction, StorageVisibilityBoundary, StorageVisibilityPin,
-    TableStorage, heap_resource_components,
+    StorageChangeFinalizeBatchReport, StorageChangePrepareBatchReport, StorageCommitBatchReport,
+    StorageKind, StoragePrepareBatchReport, StorageReadView, StorageRowHandle, StorageTransaction,
+    StorageVisibilityBoundary, StorageVisibilityPin, TableStorage, heap_resource_components,
 };
 pub use transaction::{Transaction, TransactionState};
 pub use txn_status::{TxnStatus, TxnStatusError, txn_status_path};
@@ -461,8 +461,12 @@ pub struct PreparedRuntimeInspection {
     pub single_commit_sync_count: u64,
     /// Post-decision barriers shared by explicit group members.
     pub group_commit_barrier_sync_count: u64,
-    /// NBCL prepare and finalize barriers. Phase 3E deliberately does not batch these.
+    /// All NBCL prepare and finalize sync calls issued by this live runtime.
     pub change_stream_sync_count: u64,
+    pub change_stream_member_prepare_sync_count: u64,
+    pub change_stream_group_prepare_barrier_sync_count: u64,
+    pub change_stream_member_finalize_sync_count: u64,
+    pub change_stream_group_finalize_barrier_sync_count: u64,
 }
 
 impl fmt::Display for TransactionError {
