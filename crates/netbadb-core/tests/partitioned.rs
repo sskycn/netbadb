@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use netbadb_core::{
-    Database, ExecutionResult, PartitionCatalogConfig, PartitionError, RangePartitionSpec,
-    TablePlacementSpec,
+    Database, ExecutionAccessKind, ExecutionResult, PartitionCatalogConfig, PartitionError,
+    RangePartitionSpec, TablePlacementSpec,
 };
 use netbadb_inspect::{PartitionAccessInspection, PlanNodeInspection, StatementPlanInspection};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
@@ -149,6 +149,62 @@ fn selected(plan: &PlanNodeInspection) -> Vec<(PartitionId, &'static str)> {
             (partition.partition_id, access)
         })
         .collect()
+}
+
+#[test]
+fn prepared_feedback_retains_each_partition_subscan() {
+    let fixture = Fixture::new("prepared-feedback");
+    let mut database = Database::create_with_placements(fixture.specs(), fixture.config.clone())
+        .expect("create range database");
+    for (key, payload) in [(-5, "neg"), (0, "zero"), (99, "last"), (200, "high")] {
+        database
+            .execute(&format!(
+                "INSERT INTO events (key, payload) VALUES ({key}, '{payload}')"
+            ))
+            .expect("route insert");
+    }
+    let prepared = database
+        .prepare_statement(
+            "SELECT key FROM events WHERE key >= $1 AND key < $2",
+            &[Some(PhysicalType::Int64), Some(PhysicalType::Int64)],
+        )
+        .expect("prepare partitioned query");
+    let executed = database
+        .execute_prepared_with_feedback(
+            &prepared,
+            &[ScalarValue::Int64(-10), ScalarValue::Int64(250)],
+        )
+        .expect("execute partitioned query");
+    let ExecutionResult::Query(result) = &executed.result else {
+        panic!("expected query result");
+    };
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![ScalarValue::Int64(-5)],
+            vec![ScalarValue::Int64(0)],
+            vec![ScalarValue::Int64(99)],
+            vec![ScalarValue::Int64(200)],
+        ]
+    );
+    let feedback = executed.feedback.query_report().expect("query feedback");
+    assert_eq!(feedback.accesses.len(), 3);
+    assert_eq!(
+        feedback
+            .accesses
+            .iter()
+            .map(|access| access.actual.partition_id.expect("partition id"))
+            .collect::<Vec<_>>(),
+        vec![PartitionId(10), PartitionId(20), PartitionId(30)]
+    );
+    assert!(feedback.accesses.iter().all(|access| {
+        access.actual.kind == ExecutionAccessKind::PartitionedSeqScan
+            && access
+                .planner
+                .as_ref()
+                .is_some_and(|planner| planner.node == access.actual.node)
+    }));
+    database.close().expect("close range database");
 }
 
 #[test]

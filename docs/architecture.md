@@ -243,6 +243,16 @@ The scheduler owns no Database, evidence pool, candidate safety, lane service,
 or mutation authority, and adds no thread, wall clock, async runtime, server
 worker, persistent format, protocol, manifest, or Inspection JSON change.
 
+[Adaptive Operations Phase 14](adaptive-operations-phase14.md) adds explicit
+prepared/parameterized autocommit execution feedback. It binds parameters once,
+plans from one immutable snapshot set, and observes the exact single execution
+that returned the result; query reports reuse the Phase 2 planner/executor/Core
+authority split while successful DML has typed `NotApplicable(Mutation)`
+semantics. Evidence ingestion remains caller-owned, explicit-transaction
+feedback remains excluded pending a separate authority theorem, and there is no
+background collection, Server capture, protocol, manifest, or Inspection JSON
+change.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,
