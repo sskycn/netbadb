@@ -1697,6 +1697,120 @@ HASH/LIST/DEFAULT partitioning, partition DDL/split/merge, global indexes,
 remote placement, Columnar, Raft, replication, and distributed transactions
 are not implemented.
 
+## Mutation domains and write concurrency
+
+NetbaDB uses a **Disjoint Write Domains** model, also called **Partitioned
+Single-Writer**. "Single writer" means one active mutation owner per
+authoritative mutation domain, not one active writer for the entire database.
+The current default domain boundary is the physical `StorageId`:
+
+```text
+Database
+   │
+   ├── S1 → at most one active mutation owner
+   ├── S2 → at most one active mutation owner
+   ├── S3 → at most one active mutation owner
+   └── S4 → at most one active mutation owner
+```
+
+Conceptually, a transaction owns a set of write domains:
+
+```text
+Transaction.write_domains = Set<StorageId>
+
+A.write_domains ∩ B.write_domains = ∅  → may execute concurrently
+A.write_domains ∩ B.write_domains ≠ ∅  → serialize the overlapping domain
+```
+
+This permits the future execution direction:
+
+```text
+W1 → S1
+W2 → S2
+W3 → S3
+
+allowed architectural direction
+```
+
+It rejects multiple active mutation owners inside one domain as the default:
+
+```text
+W1 ─┐
+W2 ─┼→ S1
+W3 ─┘
+
+not the default architecture
+```
+
+`StorageId` is the authority boundary because it identifies one coherent
+physical state: a Heap and its B+Tree inventory, or an LSM instance and its
+MemTable/WAL/SSTable publication state, together with storage-local transaction
+and Change Stream state. B+Tree mutation ownership follows its authoritative
+Heap `StorageId`; a single LSM domain does not share one MemTable mutation path
+among active writers. Page-, row-, and key-range locking are therefore not the
+initial scaling model.
+
+Different tables may map to different domains and eventually write in
+parallel. A partitioned logical table may do the same after routing each
+`PartitionId` to its current authoritative `StorageId`:
+
+```text
+orders
+├── P1 → S11 → W1
+├── P2 → S12 → W2
+├── P3 → S13 → W3
+└── P4 → S14 → W4
+```
+
+Mutation authority follows `StorageId`, not merely `TableId` or `PartitionId`.
+After physical replacement, routing must resolve the logical target to the new
+authoritative storage identity before mutation ownership is established. When
+a domain becomes a bottleneck, the preferred response is to split the
+authoritative state into more independent `StorageId`s rather than add more
+synchronization inside the original domain.
+
+A transaction may own several domains. `{S1, S4}` is compatible with `{S7}`
+but not `{S4, S7}`. Future dynamic acquisition must be deterministic—preferably
+discover the complete write set before mutation and acquire in ascending
+`StorageId` order. An initial implementation may conservatively serialize
+multi-domain transactions while allowing single-domain transactions on
+disjoint storages to proceed; arbitrary acquire-while-holding order is not an
+acceptable shortcut.
+
+Execution concurrency, durability batching, and visibility ordering are
+separate concerns:
+
+```text
+execution   disjoint StorageIds may eventually run concurrently
+durability  Phase 3C-3E may share ordered Prepare/Commit barriers
+visibility  DatabaseCommitSeq retains one deterministic global commit order
+```
+
+Parallel physical execution therefore does not imply unordered publication.
+Phase 3C's CORD v5 group decision, Phase 3D's participant Commit barriers, and
+Phase 3E's participant Prepare barriers optimize coordination and durability;
+they do not establish simultaneous active writers within one `StorageId`.
+
+Writer serialization also does not serialize readers: the long-term model may
+combine many valid snapshot readers with one mutation owner per domain. Schema
+and catalog mutation, storage replacement, partition-topology changes, and
+maintenance retain their stronger existing authority and quiescence rules.
+Disjoint DML domains alone do not authorize concurrent DDL, compaction,
+reclamation, or physical replacement.
+
+The current synchronous, mutable `Database` path drives participant work
+serially. It already enforces per-storage writer exclusion and supports
+coordinated multi-storage transactions, but it does **not** yet promise parallel
+execution of disjoint `StorageId` writers. This section is a constraint on
+future work, not a completed concurrency feature. The complete rationale and
+performance escalation policy are in
+[`disjoint-write-domains.md`](disjoint-write-domains.md).
+
+> Parallelize independent state; serialize shared state.
+
+Serialize mutation within a domain. Parallelize disjoint domains. Batch
+durability. Preserve ordered visibility.
+
 ## Storage boundary
 
 The synchronous storage path is now:
