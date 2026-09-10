@@ -9,8 +9,8 @@ use crate::{
     AdaptiveChangeStreamGcAbortReason, AdaptiveChangeStreamGcDecision,
     AdaptiveChangeStreamGcOutcome, AdaptiveChangeStreamGcPolicy,
     AdaptiveChangeStreamGcSafetyBlocker, AdaptiveEvidencePool, AutomaticAdmissionScope,
-    AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy, AutomaticSafeModeLane,
-    AutomaticSafeModeMutation, AutomaticSafeModeOutcome, ChangeStreamCursor,
+    AutomaticCandidateReadiness, AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy,
+    AutomaticSafeModeLane, AutomaticSafeModeMutation, AutomaticSafeModeOutcome, ChangeStreamCursor,
     ChangeStreamRetentionConsumer, ColumnarAdvanceBudget, ColumnarProjectionSpec, Database,
     DatabaseCoordinatorConfig, MaintenanceBudget, TableStorageCreateSpec,
     cleanup_created_table_files,
@@ -171,6 +171,34 @@ fn staged_group_prepare_blocks_reclamation_and_invalidates_stale_proposal() {
         observation.blocker,
         Some(AdaptiveChangeStreamGcSafetyBlocker::PreparedChangesUnresolved)
     );
+    let automatic = fixture
+        .database
+        .automatic_safe_step_multi(
+            &AdaptiveEvidencePool::default(),
+            AutomaticMultiSafeModeInput {
+                scope: AutomaticAdmissionScope {
+                    table_ids: &[TABLE_ID],
+                    calibration_classes: &[],
+                },
+                maintenance_budget: generous_budget(),
+            },
+            AutomaticMultiSafeModePolicy {
+                allow_change_stream_gc: true,
+                change_stream_gc_policy: AdaptiveChangeStreamGcPolicy::new(1, 0),
+                cross_lane_service: crate::AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle,
+                ..AutomaticMultiSafeModePolicy::default()
+            },
+        )
+        .expect("four-lane service observes retention blocker");
+    assert_eq!(automatic.selected_candidate, None);
+    assert!(automatic.candidates.iter().any(|candidate| {
+        candidate.readiness
+            == AutomaticCandidateReadiness::ChangeStreamGcBlocked(
+                crate::AdaptiveChangeStreamGcNoActionReason::Safety(
+                    AdaptiveChangeStreamGcSafetyBlocker::PreparedChangesUnresolved,
+                ),
+            )
+    }));
     let execution = fixture
         .database
         .execute_change_stream_reclamation(&proposal, generous_budget())
@@ -511,6 +539,7 @@ fn automatic_reclamation_is_opt_in_one_shot_and_starts_no_trial() {
         completed.action.mutation,
         Some(AutomaticSafeModeMutation::ChangeStreamReclamation { .. })
     ));
+    assert_eq!(completed.evidence_renewal_recommendation, None);
     assert_eq!(
         fixture.database.automatic_safe_mode_state().active_trial(),
         None

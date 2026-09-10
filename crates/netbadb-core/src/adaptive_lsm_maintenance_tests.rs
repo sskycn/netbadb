@@ -10,9 +10,11 @@ use crate::{
     AdaptiveLsmMaintenanceAbortReason, AdaptiveLsmMaintenanceDecision,
     AdaptiveLsmMaintenanceNoActionReason, AdaptiveLsmMaintenanceOutcome,
     AdaptiveLsmMaintenanceProposal, AutomaticAdmissionScope, AutomaticCandidateKey,
-    AutomaticCandidateReadiness, AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy,
-    AutomaticSafeModeLane, AutomaticSafeModeMutation, AutomaticSafeModeOutcome, Database,
-    DatabaseCoordinatorConfig, MaintenanceBlocker, MaintenanceBudget, TableStorageCreateSpec,
+    AutomaticCandidateReadiness, AutomaticEvidenceRenewalReason,
+    AutomaticEvidenceRenewalRecommendation, AutomaticMultiSafeModeInput,
+    AutomaticMultiSafeModePolicy, AutomaticSafeModeLane, AutomaticSafeModeMutation,
+    AutomaticSafeModeOutcome, Database, DatabaseCoordinatorConfig, MaintenanceBlocker,
+    MaintenanceBudget, TableStorageCreateSpec,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -373,6 +375,12 @@ fn automatic_flush_uses_production_writer_preserves_truth_and_has_no_trial() {
             ..
         })
     ));
+    assert_eq!(
+        report.evidence_renewal_recommendation,
+        Some(AutomaticEvidenceRenewalRecommendation {
+            reason: AutomaticEvidenceRenewalReason::AuthoritativeLsmLayoutChanged,
+        })
+    );
     assert_eq!(report.action.trial_after, None);
     let execution = report.action.lsm_maintenance.expect("execution report");
     let measurement = execution.measurement.expect("physical measurement");
@@ -396,6 +404,61 @@ fn automatic_flush_uses_production_writer_preserves_truth_and_has_no_trial() {
         measurement.change_stream_after
     );
     assert!(execution.consumed.write_bytes <= execution.conservative_bound.write_bytes);
+    fixture.close();
+}
+
+#[test]
+fn four_lane_service_cannot_bypass_phase3e_staged_lsm_quiescence() {
+    let mut fixture = Fixture::create("phase11-staged-lsm", false);
+    make_compaction_ready(&mut fixture.database);
+    let mut group = fixture.database.begin_group_commit().unwrap();
+    let mut member = fixture.database.begin_group_member(&group).unwrap();
+    fixture
+        .database
+        .insert_into_in(
+            EVENTS,
+            &mut member,
+            &[
+                ScalarValue::Int64(50_000),
+                ScalarValue::Text("staged".into()),
+            ],
+        )
+        .unwrap();
+    fixture
+        .database
+        .stage_group_member(&mut group, member)
+        .unwrap();
+
+    let policy = AutomaticMultiSafeModePolicy {
+        cross_lane_service: crate::AutomaticCrossLaneServicePolicy::BoundedFourLaneCycle,
+        ..lsm_policy(false, true)
+    };
+    let before = fixture.database.automatic_safe_mode_state();
+    let report = fixture
+        .database
+        .automatic_safe_step_multi(
+            &AdaptiveEvidencePool::default(),
+            automatic_input(&[EVENTS]),
+            policy,
+        )
+        .expect("staged work is a typed blocker");
+    assert_eq!(report.selected_candidate, None);
+    assert!(
+        report.candidates.iter().any(|candidate| {
+            matches!(candidate.key, AutomaticCandidateKey::LsmCompaction { .. })
+                && candidate.readiness
+                    == AutomaticCandidateReadiness::LsmMaintenanceBlocked(
+                        AdaptiveLsmMaintenanceNoActionReason::MaintenanceBlocked(
+                            MaintenanceBlocker::Busy,
+                        ),
+                    )
+        }),
+        "unexpected staged LSM candidates: {:?}",
+        report.candidates
+    );
+    assert_eq!(fixture.database.automatic_safe_mode_state(), before);
+    fixture.database.abort_group(&mut group).unwrap();
+    drop(group);
     fixture.close();
 }
 
@@ -627,6 +690,12 @@ fn flush_then_compaction_requires_two_explicit_safe_steps() {
     assert_eq!(
         second.action.outcome,
         AutomaticSafeModeOutcome::LsmMaintenanceCompleted
+    );
+    assert_eq!(
+        second.evidence_renewal_recommendation,
+        Some(AutomaticEvidenceRenewalRecommendation {
+            reason: AutomaticEvidenceRenewalReason::AuthoritativeLsmLayoutChanged,
+        })
     );
     fixture.close();
 }
