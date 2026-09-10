@@ -50,6 +50,16 @@ symmetric and SHOULD be reviewed together.
   and page identity MUST be explicit invariants.
 - Prefer `PageId`, `FrameId`, `RowId`, and short-lived guards. Arbitrary page
   references MUST NOT escape into planner or executor layers.
+- Heap, LSM, and `TableStorage` instances are single-mutation-owner domains by
+  default. Each authoritative `StorageId` MUST have at most one active mutation
+  owner; B+Tree mutation ownership follows the owning Heap `StorageId`.
+- Independent `StorageId`s may eventually execute mutations concurrently.
+  Storage code MUST avoid database-global mutable state or assumptions that all
+  other storage domains are idle unless a documented correctness theorem
+  requires global quiescence.
+- Page-, row-, and key-range multi-writer synchronization MUST NOT be added
+  without a new explicit architecture decision showing why partitioning into
+  independent `StorageId`s is insufficient.
 - A future buffer pool MAY use RAII guards for pin/unpin and latches, but guard
   lifetimes SHOULD remain local to storage operations.
 - Unsafe code requires a concrete measured need, a safe wrapper, and a

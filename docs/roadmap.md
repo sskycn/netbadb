@@ -18,6 +18,27 @@
 
 See [`phase3f-batched-change-stream-durability.md`](phase3f-batched-change-stream-durability.md).
 
+## Disjoint write-domain concurrency principle
+
+Architecture selected; runtime implementation intentionally deferred.
+
+- NetbaDB uses a partitioned single-writer model whose default authoritative
+  mutation domain is `StorageId`.
+- A storage domain has at most one active mutation owner. Future execution may
+  run transactions concurrently only when their write-domain sets are
+  disjoint; overlapping domains serialize.
+- Hot write domains should scale through additional independent `StorageId`s,
+  especially partitions, before same-domain multi-writer synchronization is
+  reconsidered.
+- Multi-domain ownership must use deterministic ordering, preferably complete
+  write-set discovery followed by ascending `StorageId` acquisition.
+- Execution concurrency remains separate from Phase 3C-3E durability batching
+  and from globally ordered `DatabaseCommitSeq` publication.
+- Implementation is workload-driven future work. This entry adds no writer
+  scheduler, lock manager, concurrent storage registry, or runtime guarantee.
+
+See [`disjoint-write-domains.md`](disjoint-write-domains.md).
+
 ## Batched participant Prepare barriers (Phase 3E complete)
 
 - preserved `park_group_member` as durable-per-member Prepare and added the
