@@ -111,7 +111,8 @@ Heap+LSM at 100/1,000 transactions and group sizes 1/4/8/10/16/32, plus a
 100-member Heap Change Stream case. It asserts no latency threshold; structural
 sync counts and final data are the correctness result.
 
-Prepare durability batching, background/server group formation, timers,
-parallel participant apply, NBCL finalize batching, Serializable/SSI,
-historical snapshots, global CDC ordering, RowEntityId and authoritative
-Columnar storage remain deferred.
+Prepare durability batching is implemented by the explicit opt-in successor
+[Phase 3E](phase3e-batched-participant-prepare.md). Background/server group
+formation, timers, parallel participant apply, NBCL finalize batching,
+Serializable/SSI, historical snapshots, global CDC ordering, RowEntityId and
+authoritative Columnar storage remain deferred.

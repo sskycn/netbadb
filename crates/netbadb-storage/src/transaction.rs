@@ -29,8 +29,10 @@ struct TransactionRuntime {
     writer: Cell<WriterState>,
     outstanding: Cell<u64>,
     parked_prepared: RefCell<VecDeque<TxnId>>,
+    parked_prepare_pending: RefCell<std::collections::HashSet<TxnId>>,
     prepared_write_conflict_count: Cell<u64>,
     prepare_sync_count: Cell<u64>,
+    group_prepare_barrier_sync_count: Cell<u64>,
     single_commit_sync_count: Cell<u64>,
     group_commit_barrier_sync_count: Cell<u64>,
 }
@@ -39,6 +41,15 @@ struct TransactionRuntime {
 pub(crate) struct PreparedCommitBatchReport {
     pub(crate) member_count: usize,
     pub(crate) commit_records_staged: usize,
+    pub(crate) wal_syncs: u64,
+    pub(crate) first_local_boundary: u64,
+    pub(crate) last_local_boundary: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedPrepareBatchReport {
+    pub(crate) member_count: usize,
+    pub(crate) prepare_records_staged: usize,
     pub(crate) wal_syncs: u64,
     pub(crate) first_local_boundary: u64,
     pub(crate) last_local_boundary: u64,
@@ -54,6 +65,9 @@ pub enum TransactionState {
     RollbackRequired,
     PreparePending,
     Prepared,
+    /// A group Prepare is staged and the writer is released, but its storage
+    /// durability barrier has not yet succeeded.
+    ParkedPreparePending,
     ParkedPrepared,
     CommitPending,
     RollbackPending,
@@ -226,6 +240,67 @@ impl Transaction {
             .prepare_sync_count
             .set(self.runtime.prepare_sync_count.get().saturating_add(1));
         self.state = TransactionState::Prepared;
+        Ok(())
+    }
+
+    /// Stages and parks an existing Prepare record for an explicit group.
+    ///
+    /// Unlike [`Self::prepare`], success does not establish authoritative WAL
+    /// durability. The transaction is frozen, ordered with the other parked
+    /// members, and no longer owns the single writer.
+    pub(crate) fn stage_group_prepare(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+    ) -> Result<(), StorageError> {
+        if database_txn_id.0 == 0 {
+            return Err(TransactionError::InvalidDatabaseTxnId.into());
+        }
+        match self.state {
+            TransactionState::Active => {
+                self.prepare_changes(Some(database_txn_id))?;
+                let lsn = self
+                    .wal
+                    .try_borrow_mut()
+                    .map_err(|_| TransactionError::WalBusy)?
+                    .append(
+                        self.id,
+                        Some(self.last_lsn),
+                        WalRecordKind::Prepare { database_txn_id },
+                    )?;
+                self.last_lsn = lsn;
+                self.prepared_database_txn_id = Some(database_txn_id);
+                self.state = TransactionState::PreparePending;
+            }
+            TransactionState::PreparePending
+                if self.prepared_database_txn_id == Some(database_txn_id) => {}
+            TransactionState::ParkedPreparePending
+                if self.prepared_database_txn_id == Some(database_txn_id) =>
+            {
+                return Ok(());
+            }
+            TransactionState::PreparePending | TransactionState::ParkedPreparePending => {
+                return Err(TransactionError::DatabaseTxnMismatch {
+                    txn_id: self.id,
+                    expected: self.prepared_database_txn_id,
+                    actual: database_txn_id,
+                }
+                .into());
+            }
+            state => {
+                return Err(TransactionError::NotActive {
+                    txn_id: self.id,
+                    state,
+                }
+                .into());
+            }
+        }
+        self.runtime.parked_prepared.borrow_mut().push_back(self.id);
+        self.runtime
+            .parked_prepare_pending
+            .borrow_mut()
+            .insert(self.id);
+        self.release_writer();
+        self.state = TransactionState::ParkedPreparePending;
         Ok(())
     }
 
@@ -406,6 +481,92 @@ impl Transaction {
         })
     }
 
+    pub(crate) fn durabilize_group_prepare_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<PreparedPrepareBatchReport, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedPrepareBatch.into());
+        };
+        let wal = first.wal.clone();
+        let runtime = first.runtime.clone();
+        let statuses = first.statuses.clone();
+        let expected_prefix = runtime
+            .parked_prepared
+            .borrow()
+            .iter()
+            .take(participants.len())
+            .copied()
+            .collect::<Vec<_>>();
+        if expected_prefix.len() != participants.len() {
+            return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+        }
+        for (position, (participant, database_txn_id)) in participants.iter().enumerate() {
+            if !Rc::ptr_eq(&participant.wal, &wal)
+                || !Rc::ptr_eq(&participant.runtime, &runtime)
+                || !Rc::ptr_eq(&participant.statuses, &statuses)
+            {
+                return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+            }
+            participant.validate_prepared_database_txn(*database_txn_id)?;
+            if !matches!(
+                participant.state,
+                TransactionState::ParkedPreparePending | TransactionState::ParkedPrepared
+            ) {
+                return Err(TransactionError::NotPrepared {
+                    txn_id: participant.id,
+                    state: participant.state,
+                }
+                .into());
+            }
+            if expected_prefix[position] != participant.id {
+                return Err(TransactionError::PreparedResolutionOrder {
+                    txn_id: participant.id,
+                    expected: expected_prefix[position],
+                }
+                .into());
+            }
+        }
+        let first_lsn = participants
+            .first()
+            .map(|(participant, _)| participant.last_lsn)
+            .ok_or(TransactionError::EmptyPreparedPrepareBatch)?;
+        let last_lsn = participants
+            .last()
+            .map(|(participant, _)| participant.last_lsn)
+            .ok_or(TransactionError::EmptyPreparedPrepareBatch)?;
+        #[cfg(test)]
+        crate::crash_test::maybe_crash_named("heap-group-before-prepare-sync");
+        wal.try_borrow_mut()
+            .map_err(|_| TransactionError::WalBusy)?
+            .flush_through(last_lsn)?;
+        runtime.group_prepare_barrier_sync_count.set(
+            runtime
+                .group_prepare_barrier_sync_count
+                .get()
+                .saturating_add(1),
+        );
+        #[cfg(test)]
+        crate::crash_test::maybe_crash_named("heap-group-after-prepare-sync");
+        for (position, (participant, _)) in participants.iter_mut().enumerate() {
+            participant.state = TransactionState::ParkedPrepared;
+            runtime
+                .parked_prepare_pending
+                .borrow_mut()
+                .remove(&participant.id);
+            #[cfg(test)]
+            crate::crash_test::maybe_crash_indexed("heap-group-after-prepare-state", position + 1);
+            #[cfg(not(test))]
+            let _ = position;
+        }
+        Ok(PreparedPrepareBatchReport {
+            member_count: participants.len(),
+            prepare_records_staged: participants.len(),
+            wal_syncs: 1,
+            first_local_boundary: first_lsn.0,
+            last_local_boundary: last_lsn.0,
+        })
+    }
+
     /// Rolls back a prepared participant only while no durable global commit
     /// decision exists. The caller is responsible for that coordinator proof.
     pub fn rollback_prepared(
@@ -444,10 +605,14 @@ impl Transaction {
             }
             TransactionState::PreparePending
             | TransactionState::Prepared
+            | TransactionState::ParkedPreparePending
             | TransactionState::ParkedPrepared
                 if allow_prepared =>
             {
-                if self.state == TransactionState::ParkedPrepared {
+                if matches!(
+                    self.state,
+                    TransactionState::ParkedPreparePending | TransactionState::ParkedPrepared
+                ) {
                     self.acquire_parked_resolution(true)?;
                 }
                 let rollback_start_lsn = self.last_lsn;
@@ -891,6 +1056,10 @@ impl Transaction {
                 }
                 .into());
             }
+            self.runtime
+                .parked_prepare_pending
+                .borrow_mut()
+                .remove(&self.id);
         }
         Ok(())
     }
@@ -1210,9 +1379,11 @@ impl TransactionManager {
             .collect::<Vec<_>>();
         crate::PreparedRuntimeInspection {
             parked_prepared_count: chain.len(),
+            parked_prepare_pending_count: self.runtime.parked_prepare_pending.borrow().len(),
             active_group_chain: chain,
             prepared_write_conflict_count: self.runtime.prepared_write_conflict_count.get(),
             prepare_sync_count: self.runtime.prepare_sync_count.get(),
+            group_prepare_barrier_sync_count: self.runtime.group_prepare_barrier_sync_count.get(),
             single_commit_sync_count: self.runtime.single_commit_sync_count.get(),
             group_commit_barrier_sync_count: self.runtime.group_commit_barrier_sync_count.get(),
             change_stream_sync_count: self
@@ -1241,8 +1412,10 @@ impl TransactionManager {
                 writer: Cell::new(WriterState::Idle),
                 outstanding: Cell::new(0),
                 parked_prepared: RefCell::new(VecDeque::new()),
+                parked_prepare_pending: RefCell::new(std::collections::HashSet::new()),
                 prepared_write_conflict_count: Cell::new(0),
                 prepare_sync_count: Cell::new(0),
+                group_prepare_barrier_sync_count: Cell::new(0),
                 single_commit_sync_count: Cell::new(0),
                 group_commit_barrier_sync_count: Cell::new(0),
             }),
@@ -1819,6 +1992,81 @@ mod tests {
         drop(first);
         drop(second);
         drop(third);
+        drop(manager);
+        drop(wal);
+        cleanup(page_path, wal_path);
+    }
+
+    #[test]
+    fn staged_prepare_batch_releases_writer_retries_same_heap_prefix_and_aborts_tail_first() {
+        let (page_path, wal_path, wal, mut manager) = test_manager("txn-staged-prepare-batch");
+        let mut first = manager.begin().unwrap();
+        first.acquire_writer().unwrap();
+        first.stage_group_prepare(DatabaseTxnId(41)).unwrap();
+        let first_lsn = first.last_lsn();
+        let mut second = manager.begin().unwrap();
+        second
+            .acquire_writer()
+            .expect("staging releases the writer");
+        second.stage_group_prepare(DatabaseTxnId(42)).unwrap();
+        let second_lsn = second.last_lsn();
+        assert_eq!(first.state(), TransactionState::ParkedPreparePending);
+        assert_eq!(second.state(), TransactionState::ParkedPreparePending);
+        let pending = manager.prepared_runtime_inspection();
+        assert_eq!(pending.parked_prepare_pending_count, 2);
+        assert_eq!(pending.prepare_sync_count, 0);
+
+        assert!(matches!(
+            Transaction::durabilize_group_prepare_batch(&mut [
+                (&mut second, DatabaseTxnId(42)),
+                (&mut first, DatabaseTxnId(41)),
+            ]),
+            Err(StorageError::Transaction(
+                TransactionError::PreparedResolutionOrder { .. }
+            ))
+        ));
+        wal.borrow_mut().inject_flush_failure();
+        assert!(
+            Transaction::durabilize_group_prepare_batch(&mut [
+                (&mut first, DatabaseTxnId(41)),
+                (&mut second, DatabaseTxnId(42)),
+            ])
+            .is_err()
+        );
+        assert_eq!(first.last_lsn(), first_lsn);
+        assert_eq!(second.last_lsn(), second_lsn);
+        let report = Transaction::durabilize_group_prepare_batch(&mut [
+            (&mut first, DatabaseTxnId(41)),
+            (&mut second, DatabaseTxnId(42)),
+        ])
+        .unwrap();
+        assert_eq!(report.prepare_records_staged, 2);
+        assert_eq!(report.wal_syncs, 1);
+        assert_eq!(first.state(), TransactionState::ParkedPrepared);
+        assert_eq!(second.state(), TransactionState::ParkedPrepared);
+        let durable = manager.prepared_runtime_inspection();
+        assert_eq!(durable.parked_prepare_pending_count, 0);
+        assert_eq!(durable.group_prepare_barrier_sync_count, 1);
+        assert_eq!(
+            wal.borrow_mut()
+                .scan()
+                .unwrap()
+                .into_iter()
+                .filter(|record| matches!(record.kind, WalRecordKind::Prepare { .. }))
+                .count(),
+            2
+        );
+        second.rollback_prepared(DatabaseTxnId(42)).unwrap();
+        first.rollback_prepared(DatabaseTxnId(41)).unwrap();
+        assert!(
+            manager
+                .prepared_runtime_inspection()
+                .active_group_chain
+                .is_empty()
+        );
+
+        drop(first);
+        drop(second);
         drop(manager);
         drop(wal);
         cleanup(page_path, wal_path);

@@ -9411,6 +9411,60 @@ mod tests {
                 crate::Transaction::commit_prepared_batch(&mut batch)
                     .expect("commit batch until crash");
             }
+            "staged-prepare-steal" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open staged heap");
+                let mut first = storage
+                    .begin_transaction()
+                    .expect("begin first staged member");
+                update_crash_test_value(&mut storage, &mut first, "staged-first");
+                first
+                    .stage_group_prepare(DatabaseTxnId(951))
+                    .expect("stage first member");
+                storage.flush().expect("steal first staged page");
+                let mut second = storage
+                    .begin_transaction()
+                    .expect("begin second staged member");
+                storage
+                    .insert_in(
+                        &mut second,
+                        &[
+                            ScalarValue::Int64(2),
+                            ScalarValue::Text("staged-second".into()),
+                        ],
+                    )
+                    .expect("write second staged member");
+                second
+                    .stage_group_prepare(DatabaseTxnId(952))
+                    .expect("stage second member");
+                storage.flush().expect("steal second staged page");
+                crash_test::maybe_crash_named("heap-staged-prepare-after-steal");
+            }
+            "staged-prepare-batch" => {
+                let mut storage = HeapStorage::open(path, table()).expect("open staged batch");
+                let mut transactions = Vec::new();
+                for id in 1..=3_i64 {
+                    let mut transaction = storage.begin_transaction().unwrap();
+                    storage
+                        .insert_in(
+                            &mut transaction,
+                            &[
+                                ScalarValue::Int64(id),
+                                ScalarValue::Text(format!("staged-{id}")),
+                            ],
+                        )
+                        .unwrap();
+                    let database_txn_id = DatabaseTxnId(970 + id as u64);
+                    transaction.stage_group_prepare(database_txn_id).unwrap();
+                    crash_test::maybe_crash_named(&format!("heap-group-after-staged-member-{id}"));
+                    transactions.push((transaction, database_txn_id));
+                }
+                let mut batch = transactions
+                    .iter_mut()
+                    .map(|(transaction, database_txn_id)| (transaction, *database_txn_id))
+                    .collect::<Vec<_>>();
+                crate::Transaction::durabilize_group_prepare_batch(&mut batch)
+                    .expect("durabilize Prepare batch until crash");
+            }
             other => panic!("unknown process crash case `{other}`"),
         }
         panic!("process crash child `{case}` returned without reaching its crash point");
@@ -9498,6 +9552,84 @@ mod tests {
                         ScalarValue::Int64(2),
                         ScalarValue::Int64(3),
                     ],
+                    "point {point}, pass {pass}"
+                );
+                reopened.close().unwrap();
+            }
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn staged_prepare_page_steal_before_barrier_recovers_exact_baseline() {
+        let (path, _, _) = prepare_process_crash_baseline("phase3e-staged-prepare-steal");
+        spawn_named_crash_child(
+            &path,
+            "staged-prepare-steal",
+            "heap-staged-prepare-after-steal",
+        );
+        let inspection = HeapStorage::inspect_recovery(&path, &table()).unwrap();
+        let resolutions = inspection
+            .prepared_transactions
+            .iter()
+            .map(|prepared| PreparedTxnResolution {
+                database_txn_id: prepared.database_txn_id,
+                physical_txn_id: prepared.physical_txn_id,
+                decision: PreparedDecision::Abort,
+            })
+            .collect::<Vec<_>>();
+        let mut reopened =
+            HeapStorage::open_with_prepared_resolutions(&path, table(), &resolutions).unwrap();
+        let rows = reopened.scan().unwrap();
+        assert_eq!(
+            rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>(),
+            vec![vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Text("before".into())
+            ]]
+        );
+        reopened.close().unwrap();
+        assert_reopens_twice_with(&path, "before");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn staged_prepare_batch_crash_matrix_aborts_without_global_decision() {
+        for point in [
+            "heap-group-after-staged-member-1",
+            "heap-group-after-staged-member-2",
+            "heap-group-after-staged-member-3",
+            "heap-group-before-prepare-sync",
+            "heap-group-after-prepare-sync",
+            "heap-group-after-prepare-state-1",
+            "heap-group-after-prepare-state-2",
+        ] {
+            let path = test_path(&format!("staged-prepare-batch-{point}"));
+            cleanup(&path);
+            HeapStorage::create(&path, table())
+                .unwrap()
+                .close()
+                .unwrap();
+            spawn_named_crash_child(&path, "staged-prepare-batch", point);
+            let resolutions = HeapStorage::inspect_recovery(&path, &table())
+                .unwrap()
+                .prepared_transactions
+                .into_iter()
+                .map(|transaction| PreparedTxnResolution {
+                    database_txn_id: transaction.database_txn_id,
+                    physical_txn_id: transaction.physical_txn_id,
+                    decision: PreparedDecision::Abort,
+                })
+                .collect::<Vec<_>>();
+            for pass in 0..2 {
+                let mut reopened = if pass == 0 {
+                    HeapStorage::open_with_prepared_resolutions(&path, table(), &resolutions)
+                        .unwrap()
+                } else {
+                    HeapStorage::open(&path, table()).unwrap()
+                };
+                assert!(
+                    reopened.scan().unwrap().is_empty(),
                     "point {point}, pass {pass}"
                 );
                 reopened.close().unwrap();

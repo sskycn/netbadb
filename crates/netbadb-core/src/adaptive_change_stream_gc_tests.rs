@@ -7,11 +7,13 @@ use netbadb_types::{ColumnId, PhysicalType, ScalarValue, StorageDataVersion, Tab
 
 use crate::{
     AdaptiveChangeStreamGcAbortReason, AdaptiveChangeStreamGcDecision,
-    AdaptiveChangeStreamGcOutcome, AdaptiveChangeStreamGcPolicy, AdaptiveEvidencePool,
-    AutomaticAdmissionScope, AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy,
-    AutomaticSafeModeLane, AutomaticSafeModeMutation, AutomaticSafeModeOutcome, ChangeStreamCursor,
+    AdaptiveChangeStreamGcOutcome, AdaptiveChangeStreamGcPolicy,
+    AdaptiveChangeStreamGcSafetyBlocker, AdaptiveEvidencePool, AutomaticAdmissionScope,
+    AutomaticMultiSafeModeInput, AutomaticMultiSafeModePolicy, AutomaticSafeModeLane,
+    AutomaticSafeModeMutation, AutomaticSafeModeOutcome, ChangeStreamCursor,
     ChangeStreamRetentionConsumer, ColumnarAdvanceBudget, ColumnarProjectionSpec, Database,
-    MaintenanceBudget, TableStorageCreateSpec, cleanup_created_table_files,
+    DatabaseCoordinatorConfig, MaintenanceBudget, TableStorageCreateSpec,
+    cleanup_created_table_files,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -31,7 +33,19 @@ impl Fixture {
         Self::with_projection_count(name, 1)
     }
 
+    fn global(name: &str) -> Self {
+        Self::with_projection_count_and_global_visibility(name, 1, true)
+    }
+
     fn with_projection_count(name: &str, projection_count: usize) -> Self {
+        Self::with_projection_count_and_global_visibility(name, projection_count, false)
+    }
+
+    fn with_projection_count_and_global_visibility(
+        name: &str,
+        projection_count: usize,
+        global_visibility: bool,
+    ) -> Self {
         let suffix = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "netbadb-adaptive-gc-{name}-{}-{suffix}",
@@ -52,10 +66,13 @@ impl Fixture {
                 ),
             ],
         );
+        let coordinator = global_visibility.then(|| {
+            DatabaseCoordinatorConfig::new(root.join("coordinator.nbco")).with_global_visibility()
+        });
         let mut database = Database::create_catalog(
             &catalog,
             vec![TableStorageCreateSpec::heap(&heap, table)],
-            None,
+            coordinator,
         )
         .expect("create fixture database");
         let origin = database
@@ -124,6 +141,50 @@ impl Fixture {
         cleanup_created_table_files(&[self.heap]);
         let _ = fs::remove_dir_all(self.root);
     }
+}
+
+#[test]
+fn staged_group_prepare_blocks_reclamation_and_invalidates_stale_proposal() {
+    let mut fixture = Fixture::global("phase3e-staged");
+    let proposal = fixture.proposal();
+    let mut group = fixture.database.begin_group_commit().unwrap();
+    let mut member = fixture.database.begin_group_member(&group).unwrap();
+    fixture
+        .database
+        .insert_into_in(
+            TABLE_ID,
+            &mut member,
+            &[ScalarValue::Int64(99), ScalarValue::Int64(990)],
+        )
+        .unwrap();
+    fixture
+        .database
+        .stage_group_member(&mut group, member)
+        .unwrap();
+
+    let observation = fixture
+        .database
+        .observe_change_stream_reclamation(TABLE_ID)
+        .unwrap();
+    assert_eq!(observation.prepared_unresolved_count, 1);
+    assert_eq!(
+        observation.blocker,
+        Some(AdaptiveChangeStreamGcSafetyBlocker::PreparedChangesUnresolved)
+    );
+    let execution = fixture
+        .database
+        .execute_change_stream_reclamation(&proposal, generous_budget())
+        .unwrap();
+    assert_eq!(
+        execution.outcome,
+        AdaptiveChangeStreamGcOutcome::Aborted(
+            AdaptiveChangeStreamGcAbortReason::PreconditionsChanged
+        )
+    );
+    assert!(execution.actual.is_none());
+    fixture.database.abort_group(&mut group).unwrap();
+    drop(group);
+    fixture.cleanup();
 }
 
 fn generous_budget() -> MaintenanceBudget {

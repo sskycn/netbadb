@@ -1,5 +1,21 @@
 # NetbaDB roadmap
 
+## Batched participant Prepare barriers (Phase 3E complete)
+
+- preserved `park_group_member` as durable-per-member Prepare and added the
+  explicit `stage_group_member` opt-in mode;
+- added Heap and LSM `ParkedPreparePending` states, immediate parked ordering
+  and dirty-write exclusion, and one exact-prefix Prepare WAL barrier per
+  `StorageId`;
+- ordered every storage Prepare barrier before the unchanged CORD v5
+  GroupDecision and retained Phase 3D post-decision Commit barriers;
+- retained per-member NBCL Prepare/finalize durability, reverse pre-decision
+  rollback, single-active-writer execution, and recovery from WAL alone;
+- added mode/report inspection, sync counters, retry/crash/reclamation tests,
+  and the `global_group_prepare_barrier_phase3e` comparison benchmark.
+
+See [`phase3e-batched-participant-prepare.md`](phase3e-batched-participant-prepare.md).
+
 ## Batched participant commit barriers (Phase 3D complete)
 
 - retained per-member durable Prepare and the CORD v5 GroupDecision protocol;

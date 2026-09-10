@@ -101,6 +101,7 @@ pub enum TransactionState {
     Active,
     RollbackRequired,
     Preparing,
+    ParkedPreparePending,
     ParkedPrepared,
     DecisionPending,
     CommitDecided,
@@ -621,6 +622,50 @@ impl DatabaseTransaction {
         Ok(())
     }
 
+    pub(crate) fn stage_and_park_group_member(&mut self) -> Result<(), CoordinatorError> {
+        self.ensure_active()?;
+        if self.group_id.is_none() || self.group_barrier.get() != self.group_id {
+            return Err(CoordinatorError::InvalidGroupCommit);
+        }
+        if self.has_pending_schema_mutations() {
+            return Err(CoordinatorError::GroupCommitStructuralMutation);
+        }
+        if self.write_participants.is_empty() {
+            return Err(CoordinatorError::GroupCommitMemberHasNoWrites);
+        }
+        self.state = TransactionState::Preparing;
+        for (storage_id, participant) in self
+            .participants
+            .iter_mut()
+            .filter(|(_, participant)| participant.mode == ParticipantMode::Read)
+        {
+            commit_participant(*storage_id, participant)?;
+        }
+        let write_order = self.write_participants.iter().copied().collect::<Vec<_>>();
+        for storage_id in write_order.iter().copied() {
+            let participant = self.participants.get_mut(&storage_id).ok_or(
+                CoordinatorError::ParticipantStateViolation {
+                    storage_id,
+                    reason: "group write participant identity has no context",
+                },
+            )?;
+            if let Err(error) = participant
+                .context
+                .stage_group_prepare(self.id)
+                .map_err(CoordinatorError::from)
+            {
+                self.state = TransactionState::RollbackPending;
+                let _ = self.resolve_failed_group_member();
+                return Err(CoordinatorError::PrepareFailed {
+                    storage_id,
+                    source: Box::new(error),
+                });
+            }
+        }
+        self.state = TransactionState::ParkedPreparePending;
+        Ok(())
+    }
+
     pub(crate) fn resolve_failed_group_member(&mut self) -> Result<(), CoordinatorError> {
         if self.state == TransactionState::RolledBack {
             return Ok(());
@@ -651,7 +696,10 @@ impl DatabaseTransaction {
     pub(crate) fn coordinator_group_member(
         &self,
     ) -> Result<CoordinatorGroupMember, CoordinatorError> {
-        if self.state != TransactionState::ParkedPrepared {
+        if !matches!(
+            self.state,
+            TransactionState::ParkedPreparePending | TransactionState::ParkedPrepared
+        ) {
             return Err(CoordinatorError::NotActive {
                 transaction_id: self.id,
                 state: self.state,
@@ -677,6 +725,57 @@ impl DatabaseTransaction {
             database_txn_id: self.id,
             participants,
         })
+    }
+
+    pub(crate) fn group_prepare_participant_mut(
+        &mut self,
+        storage_id: StorageId,
+    ) -> Result<&mut StorageTransaction, CoordinatorError> {
+        if !matches!(
+            self.state,
+            TransactionState::ParkedPreparePending | TransactionState::ParkedPrepared
+        ) || !self.write_participants.contains(&storage_id)
+        {
+            return Err(CoordinatorError::ParticipantStateViolation {
+                storage_id,
+                reason: "group participant is not awaiting Prepare durability",
+            });
+        }
+        self.participants
+            .get_mut(&storage_id)
+            .map(|participant| &mut participant.context)
+            .ok_or(CoordinatorError::ParticipantStateViolation {
+                storage_id,
+                reason: "group staged participant identity has no context",
+            })
+    }
+
+    pub(crate) fn finish_group_prepare_barrier(&mut self) -> Result<(), CoordinatorError> {
+        if self.state == TransactionState::ParkedPrepared {
+            return Ok(());
+        }
+        if self.state != TransactionState::ParkedPreparePending {
+            return Err(CoordinatorError::NotActive {
+                transaction_id: self.id,
+                state: self.state,
+            });
+        }
+        for storage_id in self.write_participants.iter().copied() {
+            let participant = self.participants.get(&storage_id).ok_or(
+                CoordinatorError::ParticipantStateViolation {
+                    storage_id,
+                    reason: "group staged participant identity has no context",
+                },
+            )?;
+            if participant.context.state() != StorageTransactionState::ParkedPrepared {
+                return Err(CoordinatorError::ParticipantStateViolation {
+                    storage_id,
+                    reason: "group participant Prepare is not durable",
+                });
+            }
+        }
+        self.state = TransactionState::ParkedPrepared;
+        Ok(())
     }
 
     pub(crate) fn begin_group_participant_apply(
@@ -815,7 +914,9 @@ impl DatabaseTransaction {
     pub(crate) fn abort_parked_group_member(&mut self) -> Result<(), CoordinatorError> {
         if !matches!(
             self.state,
-            TransactionState::ParkedPrepared | TransactionState::RollbackPending
+            TransactionState::ParkedPreparePending
+                | TransactionState::ParkedPrepared
+                | TransactionState::RollbackPending
         ) {
             return Err(CoordinatorError::NotActive {
                 transaction_id: self.id,
@@ -1650,6 +1751,7 @@ fn rollback_participant(
         StorageTransactionState::Committed if participant.mode == ParticipantMode::Read => Ok(()),
         StorageTransactionState::PreparePending
         | StorageTransactionState::Prepared
+        | StorageTransactionState::ParkedPreparePending
         | StorageTransactionState::ParkedPrepared => participant
             .context
             .rollback_prepared(database_txn_id)
@@ -1677,6 +1779,7 @@ fn storage_prepare_state_reason(state: StorageTransactionState) -> &'static str 
         StorageTransactionState::Active
         | StorageTransactionState::PreparePending
         | StorageTransactionState::Prepared
+        | StorageTransactionState::ParkedPreparePending
         | StorageTransactionState::ParkedPrepared => "invalid participant prepare state",
     }
 }
@@ -1689,7 +1792,9 @@ fn storage_commit_state_reason(state: StorageTransactionState) -> &'static str {
         StorageTransactionState::RollbackPending => {
             "participant rollback is pending and cannot commit"
         }
-        StorageTransactionState::PreparePending => "participant prepare is pending",
+        StorageTransactionState::PreparePending | StorageTransactionState::ParkedPreparePending => {
+            "participant prepare is pending"
+        }
         StorageTransactionState::Prepared | StorageTransactionState::ParkedPrepared => {
             "participant requires a coordinator decision"
         }
@@ -1726,6 +1831,11 @@ pub enum CoordinatorError {
     GroupCommitAlreadyDecided,
     GroupCommitStructuralMutation,
     GroupCommitMemberHasNoWrites,
+    GroupPrepareModeMismatch {
+        existing: crate::GroupPrepareMode,
+        requested: crate::GroupPrepareMode,
+    },
+    GroupPrepareBarrierInProgress,
     GroupPrepareResolutionRequired,
     GroupPrepareResolutionNotRequired,
     ResourceLimit {
@@ -1828,6 +1938,15 @@ impl fmt::Display for CoordinatorError {
             Self::GroupCommitMemberHasNoWrites => {
                 formatter.write_str("group commit member has no data writes")
             }
+            Self::GroupPrepareModeMismatch {
+                existing,
+                requested,
+            } => write!(
+                formatter,
+                "group prepare mode is {existing:?}, not requested {requested:?}"
+            ),
+            Self::GroupPrepareBarrierInProgress => formatter
+                .write_str("group Prepare barrier has started; new members are not allowed"),
             Self::GroupPrepareResolutionRequired => {
                 formatter.write_str("group member prepare outcome requires explicit resolution")
             }
@@ -1931,6 +2050,8 @@ impl Error for CoordinatorError {
             | Self::GroupCommitAlreadyDecided
             | Self::GroupCommitStructuralMutation
             | Self::GroupCommitMemberHasNoWrites
+            | Self::GroupPrepareModeMismatch { .. }
+            | Self::GroupPrepareBarrierInProgress
             | Self::GroupPrepareResolutionRequired
             | Self::GroupPrepareResolutionNotRequired
             | Self::ResourceLimit { .. }

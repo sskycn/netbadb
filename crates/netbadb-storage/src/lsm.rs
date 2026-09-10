@@ -482,9 +482,11 @@ struct Runtime {
     outstanding_transactions: Cell<u64>,
     outstanding_read_views: Cell<u64>,
     parked_prepared: RefCell<VecDeque<TxnId>>,
+    parked_prepare_pending: RefCell<std::collections::HashSet<TxnId>>,
     parked_writes: RefCell<BTreeMap<LsmRowId, (TxnId, LsmCommitSeq)>>,
     prepared_write_conflict_count: Cell<u64>,
     prepare_sync_count: Cell<u64>,
+    group_prepare_barrier_sync_count: Cell<u64>,
     single_commit_sync_count: Cell<u64>,
     group_commit_barrier_sync_count: Cell<u64>,
     amplification: AmplificationCounters,
@@ -658,6 +660,15 @@ pub(crate) struct PreparedCommitBatchReport {
     pub(crate) last_local_boundary: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedPrepareBatchReport {
+    pub(crate) member_count: usize,
+    pub(crate) prepare_records_staged: usize,
+    pub(crate) wal_syncs: u64,
+    pub(crate) first_local_boundary: u64,
+    pub(crate) last_local_boundary: u64,
+}
+
 #[derive(Debug, Clone)]
 enum WalMutation {
     Put { key: PhysicalKey, row: Vec<u8> },
@@ -812,9 +823,11 @@ impl LsmStorage {
             .collect::<Vec<_>>();
         crate::PreparedRuntimeInspection {
             parked_prepared_count: chain.len(),
+            parked_prepare_pending_count: shared.runtime.parked_prepare_pending.borrow().len(),
             active_group_chain: chain,
             prepared_write_conflict_count: shared.runtime.prepared_write_conflict_count.get(),
             prepare_sync_count: shared.runtime.prepare_sync_count.get(),
+            group_prepare_barrier_sync_count: shared.runtime.group_prepare_barrier_sync_count.get(),
             single_commit_sync_count: shared.runtime.single_commit_sync_count.get(),
             group_commit_barrier_sync_count: shared.runtime.group_commit_barrier_sync_count.get(),
             change_stream_sync_count: shared.change_stream.sync_count(),
@@ -903,9 +916,11 @@ impl LsmStorage {
                 outstanding_transactions: Cell::new(0),
                 outstanding_read_views: Cell::new(0),
                 parked_prepared: RefCell::new(VecDeque::new()),
+                parked_prepare_pending: RefCell::new(std::collections::HashSet::new()),
                 parked_writes: RefCell::new(BTreeMap::new()),
                 prepared_write_conflict_count: Cell::new(0),
                 prepare_sync_count: Cell::new(0),
+                group_prepare_barrier_sync_count: Cell::new(0),
                 single_commit_sync_count: Cell::new(0),
                 group_commit_barrier_sync_count: Cell::new(0),
                 amplification: AmplificationCounters::default(),
@@ -1047,9 +1062,11 @@ impl LsmStorage {
             outstanding_transactions: Cell::new(0),
             outstanding_read_views: Cell::new(0),
             parked_prepared: RefCell::new(VecDeque::new()),
+            parked_prepare_pending: RefCell::new(std::collections::HashSet::new()),
             parked_writes: RefCell::new(BTreeMap::new()),
             prepared_write_conflict_count: Cell::new(0),
             prepare_sync_count: Cell::new(0),
+            group_prepare_barrier_sync_count: Cell::new(0),
             single_commit_sync_count: Cell::new(0),
             group_commit_barrier_sync_count: Cell::new(0),
             amplification: AmplificationCounters::default(),
@@ -2153,6 +2170,115 @@ impl LsmTransaction {
         Ok(())
     }
 
+    pub(crate) fn stage_group_prepare(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+    ) -> Result<(), StorageError> {
+        self.ensure_recovery_not_required()?;
+        if database_txn_id.0 == 0 {
+            return Err(TransactionError::InvalidDatabaseTxnId.into());
+        }
+        match self.state {
+            TransactionState::Active => {
+                if !self.owns_writer {
+                    return Err(TransactionError::NotActive {
+                        txn_id: self.id,
+                        state: self.state,
+                    }
+                    .into());
+                }
+                let batch = self.canonical_batch()?;
+                let mut shared = self.shared.borrow_mut();
+                if shared.change_stream.requires_changes() {
+                    let changes = self.canonical_changes(
+                        shared.manifest.storage_id,
+                        &shared.table,
+                        LsmCommitSeq(0),
+                    )?;
+                    self.prepared_change = shared.change_stream.prepare(
+                        self.id,
+                        Some(database_txn_id),
+                        changes.as_slice(),
+                    )?;
+                }
+                self.last_lsn = shared.wal.append(&WalRecord::MutationBatch {
+                    txn_id: self.id,
+                    mutations: batch.clone(),
+                })?;
+                self.durable_batch = Some(batch);
+                self.prepared_database_txn_id = Some(database_txn_id);
+                self.state = TransactionState::PreparePending;
+                self.last_lsn = shared.wal.append(&WalRecord::Prepare {
+                    txn_id: self.id,
+                    database_txn_id,
+                })?;
+            }
+            TransactionState::PreparePending
+                if self.prepared_database_txn_id == Some(database_txn_id) =>
+            {
+                let mut shared = self.shared.borrow_mut();
+                self.last_lsn =
+                    ensure_prepare_record(&mut shared, self.id, database_txn_id, self.last_lsn)?;
+            }
+            TransactionState::ParkedPreparePending
+                if self.prepared_database_txn_id == Some(database_txn_id) =>
+            {
+                return Ok(());
+            }
+            TransactionState::PreparePending | TransactionState::ParkedPreparePending => {
+                return Err(TransactionError::DatabaseTxnMismatch {
+                    txn_id: self.id,
+                    expected: self.prepared_database_txn_id,
+                    actual: database_txn_id,
+                }
+                .into());
+            }
+            state => {
+                return Err(TransactionError::NotActive {
+                    txn_id: self.id,
+                    state,
+                }
+                .into());
+            }
+        }
+        {
+            let shared = self.shared.borrow();
+            let mut writes = shared.runtime.parked_writes.borrow_mut();
+            for (row_id, pending) in &self.pending {
+                if pending.base_version.is_some() {
+                    if let Some((conflicting_txn_id, _)) = writes.get(row_id) {
+                        return Err(TransactionError::PreparedWriteConflict {
+                            txn_id: self.id,
+                            conflicting_txn_id: *conflicting_txn_id,
+                        }
+                        .into());
+                    }
+                }
+            }
+            for (row_id, pending) in &self.pending {
+                if let Some(base_version) = pending.base_version {
+                    writes.insert(*row_id, (self.id, base_version));
+                }
+            }
+            shared
+                .runtime
+                .parked_prepared
+                .borrow_mut()
+                .push_back(self.id);
+            shared
+                .runtime
+                .parked_prepare_pending
+                .borrow_mut()
+                .insert(self.id);
+            if shared.runtime.writer.get() == Some(self.id) {
+                shared.runtime.writer.set(None);
+            }
+        }
+        self.owns_writer = false;
+        self.state = TransactionState::ParkedPreparePending;
+        Ok(())
+    }
+
     /// Parks a durably prepared participant and releases the LSM writer lease.
     pub fn park_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
         self.validate_database_txn(database_txn_id)?;
@@ -2387,6 +2513,88 @@ impl LsmTransaction {
         })
     }
 
+    pub(crate) fn durabilize_group_prepare_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<PreparedPrepareBatchReport, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedPrepareBatch.into());
+        };
+        let shared_handle = first.shared.clone();
+        let expected_prefix = shared_handle
+            .borrow()
+            .runtime
+            .parked_prepared
+            .borrow()
+            .iter()
+            .take(participants.len())
+            .copied()
+            .collect::<Vec<_>>();
+        if expected_prefix.len() != participants.len() {
+            return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+        }
+        for (position, (participant, database_txn_id)) in participants.iter().enumerate() {
+            if !Rc::ptr_eq(&participant.shared, &shared_handle) {
+                return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+            }
+            participant.ensure_recovery_not_required()?;
+            participant.validate_database_txn(*database_txn_id)?;
+            if !matches!(
+                participant.state,
+                TransactionState::ParkedPreparePending | TransactionState::ParkedPrepared
+            ) {
+                return Err(TransactionError::NotPrepared {
+                    txn_id: participant.id,
+                    state: participant.state,
+                }
+                .into());
+            }
+            if expected_prefix[position] != participant.id {
+                return Err(TransactionError::PreparedResolutionOrder {
+                    txn_id: participant.id,
+                    expected: expected_prefix[position],
+                }
+                .into());
+            }
+        }
+        let first_lsn = participants
+            .first()
+            .map(|(participant, _)| participant.last_lsn)
+            .ok_or(TransactionError::EmptyPreparedPrepareBatch)?;
+        let last_lsn = participants
+            .last()
+            .map(|(participant, _)| participant.last_lsn)
+            .ok_or(TransactionError::EmptyPreparedPrepareBatch)?;
+        {
+            let mut shared = shared_handle.borrow_mut();
+            #[cfg(test)]
+            maybe_lsm_crash("group-before-prepare-sync");
+            shared.wal.sync()?;
+            increment(&shared.runtime.group_prepare_barrier_sync_count, 1);
+            #[cfg(test)]
+            maybe_lsm_crash("group-after-prepare-sync");
+        }
+        for (position, (participant, _)) in participants.iter_mut().enumerate() {
+            participant.state = TransactionState::ParkedPrepared;
+            shared_handle
+                .borrow()
+                .runtime
+                .parked_prepare_pending
+                .borrow_mut()
+                .remove(&participant.id);
+            #[cfg(test)]
+            maybe_lsm_crash(&format!("group-after-prepare-state-{}", position + 1));
+            #[cfg(not(test))]
+            let _ = position;
+        }
+        Ok(PreparedPrepareBatchReport {
+            member_count: participants.len(),
+            prepare_records_staged: participants.len(),
+            wal_syncs: 1,
+            first_local_boundary: first_lsn.0,
+            last_local_boundary: last_lsn.0,
+        })
+    }
+
     pub fn rollback_prepared(
         &mut self,
         database_txn_id: DatabaseTxnId,
@@ -2400,6 +2608,7 @@ impl LsmTransaction {
             self.state,
             TransactionState::Prepared
                 | TransactionState::ParkedPrepared
+                | TransactionState::ParkedPreparePending
                 | TransactionState::PreparePending
                 | TransactionState::RollbackPending
         ) {
@@ -2410,7 +2619,10 @@ impl LsmTransaction {
             .into());
         }
         if self.state != TransactionState::RollbackPending {
-            if self.state == TransactionState::ParkedPrepared {
+            if matches!(
+                self.state,
+                TransactionState::ParkedPreparePending | TransactionState::ParkedPrepared
+            ) {
                 self.acquire_parked_resolution(true)?;
             }
             let mut shared = self.shared.borrow_mut();
@@ -2770,6 +2982,11 @@ impl LsmTransaction {
                 _ => None,
             };
             if removed.is_some() {
+                shared
+                    .runtime
+                    .parked_prepare_pending
+                    .borrow_mut()
+                    .remove(&self.id);
                 shared
                     .runtime
                     .parked_writes
@@ -7355,6 +7572,74 @@ mod tests {
     }
 
     #[test]
+    fn staged_prepare_batch_releases_writer_retries_same_lsm_records_and_aborts_tail_first() {
+        let root = root("staged-prepare-batch");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let mut first = storage.begin_transaction().unwrap();
+        storage.insert_in(&mut first, &row(1, "one")).unwrap();
+        first.stage_group_prepare(DatabaseTxnId(841)).unwrap();
+        let first_lsn = first.last_lsn();
+        let mut second = storage.begin_transaction().unwrap();
+        storage
+            .insert_in(&mut second, &row(2, "two"))
+            .expect("staging releases the LSM writer");
+        second.stage_group_prepare(DatabaseTxnId(842)).unwrap();
+        let second_lsn = second.last_lsn();
+        assert_eq!(first.state(), TransactionState::ParkedPreparePending);
+        assert_eq!(second.state(), TransactionState::ParkedPreparePending);
+        let pending = storage.prepared_runtime_inspection();
+        assert_eq!(pending.parked_prepare_pending_count, 2);
+        assert_eq!(pending.prepare_sync_count, 0);
+
+        first.shared.borrow_mut().wal.fail_next_sync = true;
+        assert!(
+            LsmTransaction::durabilize_group_prepare_batch(&mut [
+                (&mut first, DatabaseTxnId(841)),
+                (&mut second, DatabaseTxnId(842)),
+            ])
+            .is_err()
+        );
+        assert_eq!(first.last_lsn(), first_lsn);
+        assert_eq!(second.last_lsn(), second_lsn);
+        let report = LsmTransaction::durabilize_group_prepare_batch(&mut [
+            (&mut first, DatabaseTxnId(841)),
+            (&mut second, DatabaseTxnId(842)),
+        ])
+        .unwrap();
+        assert_eq!(report.prepare_records_staged, 2);
+        assert_eq!(report.wal_syncs, 1);
+        assert_eq!(first.state(), TransactionState::ParkedPrepared);
+        assert_eq!(second.state(), TransactionState::ParkedPrepared);
+        let durable = storage.prepared_runtime_inspection();
+        assert_eq!(durable.parked_prepare_pending_count, 0);
+        assert_eq!(durable.group_prepare_barrier_sync_count, 1);
+        let manifest = super::read_manifest(&root).unwrap();
+        let (_, records) =
+            super::LsmWal::open(&root, manifest.storage_id, manifest.wal_generation).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, super::WalRecord::Prepare { .. }))
+                .count(),
+            2
+        );
+        second.rollback_prepared(DatabaseTxnId(842)).unwrap();
+        first.rollback_prepared(DatabaseTxnId(841)).unwrap();
+        assert!(
+            storage
+                .prepared_runtime_inspection()
+                .active_group_chain
+                .is_empty()
+        );
+
+        drop(first);
+        drop(second);
+        storage.close().unwrap();
+        cleanup(&root);
+    }
+
+    #[test]
     fn prepared_batch_sync_retry_reuses_lsm_commit_sequences() {
         let root = root("prepared-batch-retry");
         cleanup(&root);
@@ -7954,7 +8239,8 @@ mod tests {
 
     #[test]
     fn lsm_group_commit_crash_child() {
-        if std::env::var_os("NETBADB_LSM_GROUP_CRASH_CHILD").is_none() {
+        let prepare_batch = std::env::var_os("NETBADB_LSM_GROUP_PREPARE_CRASH_CHILD").is_some();
+        if std::env::var_os("NETBADB_LSM_GROUP_CRASH_CHILD").is_none() && !prepare_batch {
             return;
         }
         let root = std::env::var_os("NETBADB_LSM_CRASH_ROOT")
@@ -7968,15 +8254,25 @@ mod tests {
                 .insert_in(&mut transaction, &row(id, &format!("member-{id}")))
                 .unwrap();
             let database_txn_id = DatabaseTxnId(950 + id as u64);
-            transaction.prepare(database_txn_id).unwrap();
-            transaction.park_prepared(database_txn_id).unwrap();
+            if prepare_batch {
+                transaction.stage_group_prepare(database_txn_id).unwrap();
+                super::maybe_lsm_crash(&format!("group-after-staged-member-{id}"));
+            } else {
+                transaction.prepare(database_txn_id).unwrap();
+                transaction.park_prepared(database_txn_id).unwrap();
+            }
             transactions.push((transaction, database_txn_id));
         }
         let mut batch = transactions
             .iter_mut()
             .map(|(transaction, database_txn_id)| (transaction, *database_txn_id))
             .collect::<Vec<_>>();
-        LsmTransaction::commit_prepared_batch(&mut batch).expect("commit group until crash");
+        if prepare_batch {
+            LsmTransaction::durabilize_group_prepare_batch(&mut batch)
+                .expect("durabilize group Prepare until crash");
+        } else {
+            LsmTransaction::commit_prepared_batch(&mut batch).expect("commit group until crash");
+        }
         panic!("group commit returned without reaching configured crash point");
     }
 
@@ -8071,6 +8367,64 @@ mod tests {
                     .scan_columns_with_view(&[ColumnId(1)], &view)
                     .unwrap();
                 assert_eq!(rows.len(), 3, "point {point}, pass {pass}");
+                drop(view);
+                reopened.close().unwrap();
+            }
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn lsm_staged_prepare_batch_crash_matrix_aborts_without_global_decision() {
+        for point in [
+            "group-after-staged-member-1",
+            "group-after-staged-member-2",
+            "group-after-staged-member-3",
+            "group-before-prepare-sync",
+            "group-after-prepare-sync",
+            "group-after-prepare-state-1",
+            "group-after-prepare-state-2",
+        ] {
+            let root = root(&format!("group-prepare-crash-{point}"));
+            cleanup(&root);
+            LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("lsm::tests::lsm_group_commit_crash_child")
+                .arg("--nocapture")
+                .env("NETBADB_LSM_GROUP_PREPARE_CRASH_CHILD", "1")
+                .env("NETBADB_LSM_CRASH_CHILD", "1")
+                .env("NETBADB_LSM_CRASH_ROOT", &root)
+                .env("NETBADB_LSM_CRASH_POINT", point)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(86), "point {point}");
+            for pass in 0..2 {
+                let resolutions = LsmStorage::inspect_recovery(&root, &table())
+                    .unwrap()
+                    .prepared_transactions
+                    .into_iter()
+                    .filter(|transaction| transaction.state != PreparedTransactionState::Committed)
+                    .map(|transaction| PreparedTxnResolution {
+                        database_txn_id: transaction.database_txn_id,
+                        physical_txn_id: transaction.physical_txn_id,
+                        decision: PreparedDecision::Abort,
+                    })
+                    .collect::<Vec<_>>();
+                let mut reopened = if resolutions.is_empty() {
+                    LsmStorage::open(&root, table()).unwrap()
+                } else {
+                    LsmStorage::open_with_prepared_resolutions(&root, table(), &resolutions)
+                        .unwrap()
+                };
+                let view = reopened.read_view().unwrap();
+                assert!(
+                    reopened
+                        .scan_columns_with_view(&[ColumnId(1)], &view)
+                        .unwrap()
+                        .is_empty(),
+                    "point {point}, pass {pass}"
+                );
                 drop(view);
                 reopened.close().unwrap();
             }
