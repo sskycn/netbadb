@@ -20,6 +20,9 @@ mod adaptive_workload;
 mod adaptive_workload_tests;
 #[cfg(test)]
 mod automatic_multi_safe_mode_tests;
+mod automatic_orchestration;
+#[cfg(test)]
+mod automatic_orchestration_tests;
 mod automatic_safe_mode;
 #[cfg(test)]
 mod automatic_safe_mode_tests;
@@ -149,6 +152,13 @@ pub use adaptive_workload::{
     AdaptiveWorkloadRecordError, AdaptiveWorkloadRecordOutcome, AdaptiveWorkloadStaleReason,
     AdaptiveWorkloadTarget, AdaptiveWorkloadWindow, AggregatedCalibrationEvidence,
     CalibrationVisibilityEvidence,
+};
+pub use automatic_orchestration::{
+    AutomaticOrchestrationConsumptionOverflow, AutomaticOrchestrationEnvelope,
+    AutomaticOrchestrationError, AutomaticOrchestrationInput,
+    AutomaticOrchestrationInvalidEnvelope, AutomaticOrchestrationReport,
+    AutomaticOrchestrationStepFailure, AutomaticOrchestrationStepReport,
+    AutomaticOrchestrationStopReason, MAX_AUTOMATIC_ORCHESTRATION_STEPS,
 };
 pub use automatic_safe_mode::{
     AutomaticAdmissionScope, AutomaticBoundedColumnarBurstServiceState,

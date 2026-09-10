@@ -224,6 +224,16 @@ but only the caller may rotate its evidence pool. Defaults, active-trial
 exclusivity, one-mutation steps, durable formats, protocol, and Inspection JSON
 v7 remain unchanged.
 
+[Adaptive Operations Phase 12](adaptive-operations-phase12.md) adds one
+caller-driven synchronous envelope that may invoke the existing multi-target
+safe step several times under a structural step cap plus distinct per-step and
+run-wide maintenance budgets. Checked physical consumption, trials,
+layout-sensitive evidence renewal, selected no-progress outcomes, and lower
+errors form typed run boundaries; completed prefix actions are never treated as
+one rollbackable transaction. Candidate discovery, four-lane service,
+ready-age, mutation authority, evidence ownership, durable formats, protocol,
+and Inspection JSON v7 remain unchanged.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,
