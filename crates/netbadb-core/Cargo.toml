@@ -75,5 +75,9 @@ harness = false
 name = "global_group_storage_barrier_phase3d"
 harness = false
 
+[[bench]]
+name = "global_group_prepare_barrier_phase3e"
+harness = false
+
 [lints]
 workspace = true

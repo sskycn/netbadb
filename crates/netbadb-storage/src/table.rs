@@ -442,6 +442,18 @@ pub struct StorageCommitBatchReport {
     pub last_local_boundary: u64,
 }
 
+/// Result of durabilizing one exact staged-Prepare prefix for one storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoragePrepareBatchReport {
+    pub storage_id: StorageId,
+    pub member_count: usize,
+    pub prepare_records_staged: usize,
+    pub wal_syncs: u64,
+    /// Heap reports Prepare LSNs and LSM reports WAL record boundaries.
+    pub first_local_boundary: u64,
+    pub last_local_boundary: u64,
+}
+
 #[derive(Debug)]
 enum StorageTransactionKind {
     Heap(Transaction),
@@ -646,6 +658,19 @@ impl StorageTransaction {
         }
     }
 
+    /// Group-only staged Prepare. Success freezes the transaction and releases
+    /// its writer without claiming authoritative WAL durability.
+    #[doc(hidden)]
+    pub fn stage_group_prepare(
+        &mut self,
+        database_txn_id: DatabaseTxnId,
+    ) -> Result<(), StorageError> {
+        match &mut self.inner {
+            StorageTransactionKind::Heap(txn) => txn.stage_group_prepare(database_txn_id),
+            StorageTransactionKind::Lsm(txn) => txn.stage_group_prepare(database_txn_id),
+        }
+    }
+
     pub fn park_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
         match &mut self.inner {
             StorageTransactionKind::Heap(txn) => txn.park_prepared(database_txn_id),
@@ -717,6 +742,68 @@ impl StorageTransaction {
                 storage_id,
                 member_count: report.member_count,
                 commit_records_staged: report.commit_records_staged,
+                wal_syncs: report.wal_syncs,
+                first_local_boundary: report.first_local_boundary,
+                last_local_boundary: report.last_local_boundary,
+            })
+        }
+    }
+
+    /// Durabilizes the exact parked staged-Prepare prefix with one WAL barrier.
+    #[doc(hidden)]
+    pub fn durabilize_group_prepare_batch(
+        participants: &mut [(&mut Self, DatabaseTxnId)],
+    ) -> Result<StoragePrepareBatchReport, StorageError> {
+        let Some((first, _)) = participants.first() else {
+            return Err(TransactionError::EmptyPreparedPrepareBatch.into());
+        };
+        let storage_id = first.storage_id;
+        let table_id = first.table_id;
+        let heap = matches!(first.inner, StorageTransactionKind::Heap(_));
+        if heap {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Heap(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Lsm(_) => {
+                        return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+                    }
+                }
+            }
+            let report = Transaction::durabilize_group_prepare_batch(&mut batch)?;
+            Ok(StoragePrepareBatchReport {
+                storage_id,
+                member_count: report.member_count,
+                prepare_records_staged: report.prepare_records_staged,
+                wal_syncs: report.wal_syncs,
+                first_local_boundary: report.first_local_boundary,
+                last_local_boundary: report.last_local_boundary,
+            })
+        } else {
+            let mut batch = Vec::with_capacity(participants.len());
+            for (participant, database_txn_id) in participants {
+                if participant.storage_id != storage_id || participant.table_id != table_id {
+                    return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+                }
+                match &mut participant.inner {
+                    StorageTransactionKind::Lsm(transaction) => {
+                        batch.push((transaction, *database_txn_id));
+                    }
+                    StorageTransactionKind::Heap(_) => {
+                        return Err(TransactionError::PreparedPrepareBatchStorageMismatch.into());
+                    }
+                }
+            }
+            let report = LsmTransaction::durabilize_group_prepare_batch(&mut batch)?;
+            Ok(StoragePrepareBatchReport {
+                storage_id,
+                member_count: report.member_count,
+                prepare_records_staged: report.prepare_records_staged,
                 wal_syncs: report.wal_syncs,
                 first_local_boundary: report.first_local_boundary,
                 last_local_boundary: report.last_local_boundary,

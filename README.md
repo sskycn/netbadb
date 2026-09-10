@@ -122,6 +122,15 @@ Heap and LSM stage existing Commit records, synchronize once per participating
 storage, then finalize members in parked order; this is not fully batched WAL,
 async commit, or active multi-writer execution.
 
+[Phase 3E](docs/phase3e-batched-participant-prepare.md) adds an explicit
+`stage_group_member` path that shares one authoritative Prepare WAL barrier per
+participating `StorageId`. The established `park_group_member` API still means
+durable Prepare on successful return. Staged members are frozen and release the
+single writer while remaining `ParkedPreparePending`; all storage Prepare
+barriers must succeed before the unchanged CORD v5 GroupDecision is written.
+Change Stream Prepare/finalize durability remains per transaction, so this is
+not fully batched transaction durability.
+
 [Columnar Phase 2A](docs/columnar-phase2a-change-stream.md) adds an opt-in,
 durable per-storage committed change stream for Heap and LSM, with exact
 row-version identities, transaction coalescing, bounded replay, gap detection,
