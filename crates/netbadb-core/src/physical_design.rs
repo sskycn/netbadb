@@ -6,11 +6,15 @@ use netbadb_planner::PlanVariant;
 use netbadb_rel::{
     BinaryOp, LogicalQueryShape, QueryColumnShape, QueryExpressionShape, QueryExpressionShapeKind,
 };
+use netbadb_schema::SchemaFingerprint;
 use netbadb_storage::StorageKind;
-use netbadb_types::{ColumnId, DatabaseCommitSeq, SchemaGeneration, TableId};
+use netbadb_types::{
+    ColumnId, DatabaseCommitSeq, IndexId, IndexName, SchemaGeneration, StorageId, TableId,
+    TableSchemaVersion,
+};
 
 use crate::registry::TablePlacement;
-use crate::{Database, DatabaseError, ExecutionFeedbackReport};
+use crate::{Database, DatabaseError, ExecutionFeedbackReport, PartitionError, SchemaCatalogError};
 
 /// Fixed-width cardinality limits for one caller-owned in-memory window.
 /// These are memory/evidence bounds, not recommendation thresholds.
@@ -568,6 +572,299 @@ pub struct PhysicalDesignAdvisorReport {
     pub columnar_candidates: Vec<PhysicalColumnarRecommendationInspection>,
 }
 
+/// A typed request snapshot for explicitly applying one observed index
+/// recommendation. This is runtime control data, not a capability token or a
+/// persisted database object. Applying it always revalidates current state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalIndexDesignProposal {
+    database_incarnation: [u8; 16],
+    candidate: PhysicalIndexCandidate,
+    evidence_epoch: PhysicalDesignEvidenceEpoch,
+    evidence_schema_generation: SchemaGeneration,
+    first_global_commit_seq: DatabaseCommitSeq,
+    last_global_commit_seq: DatabaseCommitSeq,
+    proposed_at_global_commit_seq: DatabaseCommitSeq,
+    table_schema_version: TableSchemaVersion,
+    table_fingerprint: SchemaFingerprint,
+    storage_id: StorageId,
+    point_report_count: u64,
+    range_report_count: u64,
+    evidence: PhysicalDesignEvidenceSummary,
+    policy: PhysicalDesignAdvisorPolicy,
+}
+
+impl PhysicalIndexDesignProposal {
+    #[must_use]
+    pub const fn candidate(&self) -> PhysicalIndexCandidate {
+        self.candidate
+    }
+
+    #[must_use]
+    pub const fn evidence_epoch(&self) -> PhysicalDesignEvidenceEpoch {
+        self.evidence_epoch
+    }
+
+    #[must_use]
+    pub const fn evidence_schema_generation(&self) -> SchemaGeneration {
+        self.evidence_schema_generation
+    }
+
+    #[must_use]
+    pub const fn first_global_commit_seq(&self) -> DatabaseCommitSeq {
+        self.first_global_commit_seq
+    }
+
+    #[must_use]
+    pub const fn last_global_commit_seq(&self) -> DatabaseCommitSeq {
+        self.last_global_commit_seq
+    }
+
+    #[must_use]
+    pub const fn proposed_at_global_commit_seq(&self) -> DatabaseCommitSeq {
+        self.proposed_at_global_commit_seq
+    }
+
+    #[must_use]
+    pub const fn table_schema_version(&self) -> TableSchemaVersion {
+        self.table_schema_version
+    }
+
+    #[must_use]
+    pub fn table_fingerprint(&self) -> &SchemaFingerprint {
+        &self.table_fingerprint
+    }
+
+    #[must_use]
+    pub const fn storage_id(&self) -> StorageId {
+        self.storage_id
+    }
+
+    #[must_use]
+    pub const fn point_report_count(&self) -> u64 {
+        self.point_report_count
+    }
+
+    #[must_use]
+    pub const fn range_report_count(&self) -> u64 {
+        self.range_report_count
+    }
+
+    #[must_use]
+    pub const fn evidence(&self) -> PhysicalDesignEvidenceSummary {
+        self.evidence
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> PhysicalDesignAdvisorPolicy {
+        self.policy
+    }
+}
+
+#[derive(Debug)]
+pub enum PhysicalIndexDesignProposalError {
+    Advisor(PhysicalDesignAdvisorError),
+    CandidateNotObserved(PhysicalIndexCandidate),
+    CandidateNotRecommended {
+        candidate: PhysicalIndexCandidate,
+        reason: PhysicalDesignNoActionReason,
+    },
+    GlobalVisibilityRequired,
+    DurableCatalogRequired,
+    Database(DatabaseError),
+}
+
+impl fmt::Display for PhysicalIndexDesignProposalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Advisor(error) => error.fmt(formatter),
+            Self::CandidateNotObserved(candidate) => write!(
+                formatter,
+                "physical-index candidate ({}, {}) was not observed",
+                candidate.table_id.0, candidate.column_id.0
+            ),
+            Self::CandidateNotRecommended { candidate, reason } => write!(
+                formatter,
+                "physical-index candidate ({}, {}) was not recommended: {reason:?}",
+                candidate.table_id.0, candidate.column_id.0
+            ),
+            Self::GlobalVisibilityRequired => {
+                formatter.write_str("physical-index proposals require global visibility")
+            }
+            Self::DurableCatalogRequired => {
+                formatter.write_str("physical-index proposals require a durable schema catalog")
+            }
+            Self::Database(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PhysicalIndexDesignProposalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Advisor(error) => Some(error),
+            Self::Database(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<PhysicalDesignAdvisorError> for PhysicalIndexDesignProposalError {
+    fn from(error: PhysicalDesignAdvisorError) -> Self {
+        Self::Advisor(error)
+    }
+}
+
+impl From<DatabaseError> for PhysicalIndexDesignProposalError {
+    fn from(error: DatabaseError) -> Self {
+        Self::Database(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalIndexDesignProposalStaleReason {
+    SchemaGenerationChanged {
+        expected: SchemaGeneration,
+        actual: SchemaGeneration,
+    },
+    TableVersionChanged {
+        expected: TableSchemaVersion,
+        actual: TableSchemaVersion,
+    },
+    TableFingerprintChanged,
+    StorageChanged {
+        expected: StorageId,
+        actual: StorageId,
+    },
+    ColumnMissing,
+    UnsupportedCurrentLayout,
+    VisibilityMovedBackward {
+        proposed_at: DatabaseCommitSeq,
+        current: DatabaseCommitSeq,
+    },
+}
+
+#[derive(Debug)]
+pub enum PhysicalIndexDesignApplyError {
+    DatabaseIdentityChanged,
+    EvidenceEpochChanged {
+        expected: PhysicalDesignEvidenceEpoch,
+        actual: PhysicalDesignEvidenceEpoch,
+    },
+    StaleProposal(PhysicalIndexDesignProposalStaleReason),
+    CandidateNotObserved(PhysicalIndexCandidate),
+    RecommendationNoLongerValid(PhysicalDesignNoActionReason),
+    Advisor(PhysicalDesignAdvisorError),
+    IndexNameConflict(IndexName),
+    Database(DatabaseError),
+}
+
+impl fmt::Display for PhysicalIndexDesignProposalStaleReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SchemaGenerationChanged { expected, actual } => write!(
+                formatter,
+                "schema generation changed from {} to {}",
+                expected.0, actual.0
+            ),
+            Self::TableVersionChanged { expected, actual } => write!(
+                formatter,
+                "table schema version changed from {} to {}",
+                expected.0, actual.0
+            ),
+            Self::TableFingerprintChanged => {
+                formatter.write_str("table schema fingerprint changed")
+            }
+            Self::StorageChanged { expected, actual } => write!(
+                formatter,
+                "table storage changed from {} to {}",
+                expected.0, actual.0
+            ),
+            Self::ColumnMissing => formatter.write_str("proposal column is missing"),
+            Self::UnsupportedCurrentLayout => {
+                formatter.write_str("current table layout cannot build this index")
+            }
+            Self::VisibilityMovedBackward {
+                proposed_at,
+                current,
+            } => write!(
+                formatter,
+                "global visibility moved backward from {} to {}",
+                proposed_at.0, current.0
+            ),
+        }
+    }
+}
+
+impl fmt::Display for PhysicalIndexDesignApplyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DatabaseIdentityChanged => {
+                formatter.write_str("physical-index proposal belongs to another database")
+            }
+            Self::EvidenceEpochChanged { expected, actual } => write!(
+                formatter,
+                "physical-design evidence epoch changed from {} to {}",
+                expected.0, actual.0
+            ),
+            Self::StaleProposal(reason) => reason.fmt(formatter),
+            Self::CandidateNotObserved(candidate) => write!(
+                formatter,
+                "physical-index candidate ({}, {}) is no longer observed",
+                candidate.table_id.0, candidate.column_id.0
+            ),
+            Self::RecommendationNoLongerValid(reason) => {
+                write!(
+                    formatter,
+                    "physical-index recommendation is no longer valid: {reason:?}"
+                )
+            }
+            Self::Advisor(error) => error.fmt(formatter),
+            Self::IndexNameConflict(name) => write!(formatter, "index name `{name}` conflicts"),
+            Self::Database(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PhysicalIndexDesignApplyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Advisor(error) => Some(error),
+            Self::Database(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<PhysicalDesignAdvisorError> for PhysicalIndexDesignApplyError {
+    fn from(error: PhysicalDesignAdvisorError) -> Self {
+        Self::Advisor(error)
+    }
+}
+
+impl From<DatabaseError> for PhysicalIndexDesignApplyError {
+    fn from(error: DatabaseError) -> Self {
+        Self::Database(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalIndexDesignApplyOutcome {
+    Created { index_id: IndexId },
+    AlreadyApplied { index_id: IndexId },
+    AlreadyCovered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalIndexDesignApplyReport {
+    pub candidate: PhysicalIndexCandidate,
+    pub evidence_epoch: PhysicalDesignEvidenceEpoch,
+    pub index_name: IndexName,
+    pub global_commit_seq_before: DatabaseCommitSeq,
+    pub global_commit_seq_after: DatabaseCommitSeq,
+    pub schema_generation: SchemaGeneration,
+    pub outcome: PhysicalIndexDesignApplyOutcome,
+}
+
 #[derive(Debug)]
 pub enum PhysicalDesignAdvisorError {
     NoEvidence,
@@ -681,6 +978,333 @@ impl Database {
         })
     }
 
+    /// Creates a runtime-only, typed request snapshot for one current index
+    /// recommendation. No identity, catalog, visibility, or filesystem state
+    /// is reserved or changed.
+    pub fn propose_physical_index_design(
+        &self,
+        evidence: &PhysicalDesignEvidenceWindow,
+        policy: PhysicalDesignAdvisorPolicy,
+        candidate: PhysicalIndexCandidate,
+    ) -> Result<PhysicalIndexDesignProposal, PhysicalIndexDesignProposalError> {
+        let advice = self.advise_physical_design(evidence, policy)?;
+        if self.visibility_mode() != crate::DatabaseVisibilityMode::Global {
+            return Err(PhysicalIndexDesignProposalError::GlobalVisibilityRequired);
+        }
+        let Some(catalog_path) = self.catalog_path.as_deref() else {
+            return Err(PhysicalIndexDesignProposalError::DurableCatalogRequired);
+        };
+        let database_incarnation = crate::schema_catalog_file::load(catalog_path)
+            .map_err(DatabaseError::from)?
+            .incarnation;
+        let inspection = advice
+            .index_candidates
+            .iter()
+            .find(|inspection| inspection.candidate == candidate)
+            .ok_or(PhysicalIndexDesignProposalError::CandidateNotObserved(
+                candidate,
+            ))?;
+        if let PhysicalDesignCandidateDecision::NoAction(reason) = inspection.decision {
+            return Err(PhysicalIndexDesignProposalError::CandidateNotRecommended {
+                candidate,
+                reason,
+            });
+        }
+
+        let (table_schema_version, table_fingerprint, storage_id) =
+            self.current_index_table_anchor(candidate)?;
+        let proposed_at_global_commit_seq = self.current_global_commit_seq()?;
+
+        Ok(PhysicalIndexDesignProposal {
+            database_incarnation,
+            candidate,
+            evidence_epoch: advice.evidence_epoch,
+            evidence_schema_generation: advice.schema_generation,
+            first_global_commit_seq: advice.first_global_commit_seq,
+            last_global_commit_seq: advice.last_global_commit_seq,
+            proposed_at_global_commit_seq,
+            table_schema_version,
+            table_fingerprint,
+            storage_id,
+            point_report_count: inspection.point_report_count,
+            range_report_count: inspection.range_report_count,
+            evidence: inspection.evidence,
+            policy,
+        })
+    }
+
+    /// Explicitly applies one current, still-valid single-column Heap index
+    /// recommendation. All preflight failures occur before the existing
+    /// `create_named_index` authority can reserve an IndexId.
+    pub fn apply_physical_index_design(
+        &mut self,
+        evidence: &PhysicalDesignEvidenceWindow,
+        proposal: &PhysicalIndexDesignProposal,
+        index_name: IndexName,
+    ) -> Result<PhysicalIndexDesignApplyReport, PhysicalIndexDesignApplyError> {
+        let current_incarnation = self.current_catalog_incarnation()?;
+        if current_incarnation != proposal.database_incarnation {
+            return Err(PhysicalIndexDesignApplyError::DatabaseIdentityChanged);
+        }
+        let current_before = self.current_global_commit_seq()?;
+        if current_before < proposal.proposed_at_global_commit_seq {
+            return Err(PhysicalIndexDesignApplyError::StaleProposal(
+                PhysicalIndexDesignProposalStaleReason::VisibilityMovedBackward {
+                    proposed_at: proposal.proposed_at_global_commit_seq,
+                    current: current_before,
+                },
+            ));
+        }
+
+        if let Some(index_id) = self.active_index_named_for(proposal.candidate, &index_name) {
+            return Ok(self.index_design_report(
+                evidence,
+                proposal,
+                index_name,
+                current_before,
+                current_before,
+                PhysicalIndexDesignApplyOutcome::AlreadyApplied { index_id },
+            ));
+        }
+        if self.active_index_has_name(&index_name) {
+            return Err(PhysicalIndexDesignApplyError::IndexNameConflict(index_name));
+        }
+
+        self.revalidate_index_proposal(proposal)?;
+        if self.current_access_path_covers(
+            proposal.candidate,
+            proposal.point_report_count,
+            proposal.range_report_count,
+        )? {
+            return Ok(self.index_design_report(
+                evidence,
+                proposal,
+                index_name,
+                current_before,
+                current_before,
+                PhysicalIndexDesignApplyOutcome::AlreadyCovered,
+            ));
+        }
+
+        if evidence.epoch() != proposal.evidence_epoch {
+            return Err(PhysicalIndexDesignApplyError::EvidenceEpochChanged {
+                expected: proposal.evidence_epoch,
+                actual: evidence.epoch(),
+            });
+        }
+        let advice = self.advise_physical_design(evidence, proposal.policy)?;
+        let inspection = advice
+            .index_candidates
+            .iter()
+            .find(|inspection| inspection.candidate == proposal.candidate)
+            .ok_or(PhysicalIndexDesignApplyError::CandidateNotObserved(
+                proposal.candidate,
+            ))?;
+        match inspection.decision {
+            PhysicalDesignCandidateDecision::Recommend => {}
+            PhysicalDesignCandidateDecision::NoAction(
+                PhysicalDesignNoActionReason::ExistingDesignCovers,
+            ) => {
+                return Ok(self.index_design_report(
+                    evidence,
+                    proposal,
+                    index_name,
+                    current_before,
+                    current_before,
+                    PhysicalIndexDesignApplyOutcome::AlreadyCovered,
+                ));
+            }
+            PhysicalDesignCandidateDecision::NoAction(reason) => {
+                return Err(PhysicalIndexDesignApplyError::RecommendationNoLongerValid(
+                    reason,
+                ));
+            }
+        }
+
+        let definition = self.create_named_index(
+            index_name.clone(),
+            proposal.candidate.table_id,
+            proposal.candidate.column_id,
+        )?;
+        let current_after = self.current_global_commit_seq()?;
+        Ok(self.index_design_report(
+            evidence,
+            proposal,
+            index_name,
+            current_before,
+            current_after,
+            PhysicalIndexDesignApplyOutcome::Created {
+                index_id: definition.id,
+            },
+        ))
+    }
+
+    fn current_global_commit_seq(&self) -> Result<DatabaseCommitSeq, DatabaseError> {
+        if self.visibility_mode() != crate::DatabaseVisibilityMode::Global {
+            return Err(crate::CoordinatorError::GlobalVisibilityNotEnabled.into());
+        }
+        self.current_database_snapshot()?
+            .map(|snapshot| snapshot.commit_seq())
+            .ok_or(crate::CoordinatorError::GlobalVisibilityNotEnabled.into())
+    }
+
+    fn current_catalog_incarnation(&self) -> Result<[u8; 16], PhysicalIndexDesignApplyError> {
+        let Some(catalog_path) = self.catalog_path.as_deref() else {
+            return Err(PhysicalIndexDesignApplyError::DatabaseIdentityChanged);
+        };
+        Ok(crate::schema_catalog_file::load(catalog_path)
+            .map_err(DatabaseError::from)?
+            .incarnation)
+    }
+
+    fn current_index_table_anchor(
+        &self,
+        candidate: PhysicalIndexCandidate,
+    ) -> Result<(TableSchemaVersion, SchemaFingerprint, StorageId), DatabaseError> {
+        let table_schema_version = self.table_schema_version(candidate.table_id).ok_or(
+            SchemaCatalogError::ExpectationMissingTable(candidate.table_id),
+        )?;
+        let table = self
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == candidate.table_id)
+            .ok_or(SchemaCatalogError::ExpectationMissingTable(
+                candidate.table_id,
+            ))?;
+        let table_fingerprint = table.fingerprint()?;
+        let storage_id = match self.bindings.placement(candidate.table_id)? {
+            TablePlacement::Single { storage_id, .. } => *storage_id,
+            TablePlacement::RangePartitioned { .. } => {
+                return Err(PartitionError::PartitionedIndexCreationNotSupported(
+                    candidate.table_id,
+                )
+                .into());
+            }
+        };
+        Ok((table_schema_version, table_fingerprint, storage_id))
+    }
+
+    fn active_index_named_for(
+        &self,
+        candidate: PhysicalIndexCandidate,
+        name: &IndexName,
+    ) -> Option<IndexId> {
+        self.registry.iter().find_map(|entry| {
+            (entry.storage.table().id == candidate.table_id)
+                .then(|| {
+                    entry
+                        .storage
+                        .indexes()
+                        .iter()
+                        .find(|definition| {
+                            definition.name.as_ref() == Some(name)
+                                && definition.column_id == candidate.column_id
+                        })
+                        .map(|definition| definition.id)
+                })
+                .flatten()
+        })
+    }
+
+    fn active_index_has_name(&self, name: &IndexName) -> bool {
+        self.registry.iter().any(|entry| {
+            entry
+                .storage
+                .indexes()
+                .iter()
+                .any(|definition| definition.name.as_ref() == Some(name))
+        })
+    }
+
+    fn revalidate_index_proposal(
+        &self,
+        proposal: &PhysicalIndexDesignProposal,
+    ) -> Result<(), PhysicalIndexDesignApplyError> {
+        let current_schema = self.schema_generation();
+        if current_schema != proposal.evidence_schema_generation {
+            return Err(PhysicalIndexDesignApplyError::StaleProposal(
+                PhysicalIndexDesignProposalStaleReason::SchemaGenerationChanged {
+                    expected: proposal.evidence_schema_generation,
+                    actual: current_schema,
+                },
+            ));
+        }
+        let (current_version, current_fingerprint, current_storage) = self
+            .current_index_table_anchor(proposal.candidate)
+            .map_err(PhysicalIndexDesignApplyError::Database)?;
+        if current_version != proposal.table_schema_version {
+            return Err(PhysicalIndexDesignApplyError::StaleProposal(
+                PhysicalIndexDesignProposalStaleReason::TableVersionChanged {
+                    expected: proposal.table_schema_version,
+                    actual: current_version,
+                },
+            ));
+        }
+        if current_fingerprint != proposal.table_fingerprint {
+            return Err(PhysicalIndexDesignApplyError::StaleProposal(
+                PhysicalIndexDesignProposalStaleReason::TableFingerprintChanged,
+            ));
+        }
+        if current_storage != proposal.storage_id {
+            return Err(PhysicalIndexDesignApplyError::StaleProposal(
+                PhysicalIndexDesignProposalStaleReason::StorageChanged {
+                    expected: proposal.storage_id,
+                    actual: current_storage,
+                },
+            ));
+        }
+        let table = self
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == proposal.candidate.table_id)
+            .ok_or(PhysicalIndexDesignApplyError::StaleProposal(
+                PhysicalIndexDesignProposalStaleReason::ColumnMissing,
+            ))?;
+        if table.column_by_id(proposal.candidate.column_id).is_none() {
+            return Err(PhysicalIndexDesignApplyError::StaleProposal(
+                PhysicalIndexDesignProposalStaleReason::ColumnMissing,
+            ));
+        }
+        let storage = self.registry.get(current_storage).ok_or(
+            PhysicalIndexDesignApplyError::StaleProposal(
+                PhysicalIndexDesignProposalStaleReason::StorageChanged {
+                    expected: proposal.storage_id,
+                    actual: current_storage,
+                },
+            ),
+        )?;
+        if storage.kind() != StorageKind::Heap {
+            return Err(PhysicalIndexDesignApplyError::StaleProposal(
+                PhysicalIndexDesignProposalStaleReason::UnsupportedCurrentLayout,
+            ));
+        }
+        Ok(())
+    }
+
+    fn index_design_report(
+        &self,
+        evidence: &PhysicalDesignEvidenceWindow,
+        proposal: &PhysicalIndexDesignProposal,
+        index_name: IndexName,
+        global_commit_seq_before: DatabaseCommitSeq,
+        global_commit_seq_after: DatabaseCommitSeq,
+        outcome: PhysicalIndexDesignApplyOutcome,
+    ) -> PhysicalIndexDesignApplyReport {
+        PhysicalIndexDesignApplyReport {
+            candidate: proposal.candidate,
+            evidence_epoch: evidence.epoch(),
+            index_name,
+            global_commit_seq_before,
+            global_commit_seq_after,
+            schema_generation: self.schema_generation(),
+            outcome,
+        }
+    }
+
     fn inspect_index_candidate(
         &self,
         entry: &IndexCandidateEvidence,
@@ -691,7 +1315,11 @@ impl Database {
             PhysicalDesignCandidateDecision::NoAction(
                 PhysicalDesignNoActionReason::IncompleteEvidence,
             )
-        } else if self.current_access_path_covers(entry)? {
+        } else if self.current_access_path_covers(
+            entry.candidate,
+            entry.point_report_count,
+            entry.range_report_count,
+        )? {
             PhysicalDesignCandidateDecision::NoAction(
                 PhysicalDesignNoActionReason::ExistingDesignCovers,
             )
@@ -713,11 +1341,13 @@ impl Database {
 
     fn current_access_path_covers(
         &self,
-        entry: &IndexCandidateEvidence,
+        candidate: PhysicalIndexCandidate,
+        point_report_count: u64,
+        range_report_count: u64,
     ) -> Result<bool, PhysicalDesignAdvisorError> {
         let storage_id = match self
             .bindings
-            .placement(entry.candidate.table_id)
+            .placement(candidate.table_id)
             .map_err(DatabaseError::from)?
         {
             TablePlacement::Single { storage_id, .. } => *storage_id,
@@ -725,13 +1355,13 @@ impl Database {
         };
         let storage = self.registry.get(storage_id).ok_or({
             DatabaseError::InspectionStorageMissing {
-                table_id: entry.candidate.table_id,
+                table_id: candidate.table_id,
             }
         })?;
         Ok(storage.access_paths().into_iter().any(|path| {
-            path.column_id == entry.candidate.column_id
-                && (entry.point_report_count == 0 || path.capabilities.point_lookup)
-                && (entry.range_report_count == 0 || path.capabilities.range_lookup)
+            path.column_id == candidate.column_id
+                && (point_report_count == 0 || path.capabilities.point_lookup)
+                && (range_report_count == 0 || path.capabilities.range_lookup)
         }))
     }
 

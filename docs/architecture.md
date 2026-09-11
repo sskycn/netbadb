@@ -339,6 +339,18 @@ advice returns `response_too_large` rather than changing or truncating the
 report. No Database owner, DDL/apply authority, scheduler lane, persistent
 format, Native/PG wire, or Inspection JSON contract changes.
 
+[Adaptive Operations Phase 23](adaptive-operations-phase23.md) adds the first
+explicit physical-design mutation authority in `netbadb-core`. A caller can
+turn one current `Recommend` single-column Heap index candidate into a typed
+runtime proposal, supply an explicit `IndexName`, and pass current database,
+schema, storage, evidence-epoch, inventory, and advisor revalidation before
+the existing named `CREATE INDEX` transaction runs. Proposal creation remains
+`&self` and pure; apply is explicit and idempotent for an exact active name.
+The existing transaction/WAL/coordinator/recovery path remains the only B+Tree
+mutation authority. No Columnar apply, automatic design, scheduler, server or
+operator surface, SQL syntax, wire/manifest/inspection contract, or persistent
+format is added.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

@@ -8,7 +8,8 @@ use crate::{
     PhysicalDesignCandidateDecision, PhysicalDesignEvidenceEpoch, PhysicalDesignEvidenceLimits,
     PhysicalDesignEvidenceRecordError, PhysicalDesignEvidenceRecordOutcome,
     PhysicalDesignEvidenceWindow, PhysicalDesignNoActionReason, PhysicalDesignRecommendationPolicy,
-    PhysicalIndexCandidate, PlanVariant, QueryExpressionShape, QueryExpressionShapeKind,
+    PhysicalIndexCandidate, PhysicalIndexDesignApplyError, PhysicalIndexDesignApplyOutcome,
+    PhysicalIndexDesignProposalError, PlanVariant, QueryExpressionShape, QueryExpressionShapeKind,
 };
 
 fn policy(
@@ -26,6 +27,13 @@ fn policy(
     PhysicalDesignAdvisorPolicy {
         index: lane,
         columnar: lane,
+    }
+}
+
+fn index_candidate() -> PhysicalIndexCandidate {
+    PhysicalIndexCandidate {
+        table_id: TABLE_ID,
+        column_id: ColumnId(2),
     }
 }
 
@@ -601,4 +609,273 @@ fn advising_is_read_only_and_creates_no_files() {
         files_before
     );
     fixture.close();
+}
+
+#[test]
+fn explicit_index_proposal_applies_through_named_create_and_is_idempotent() {
+    let mut fixture = Fixture::create("phase23-create-retry", false);
+    let report = feedback(&mut fixture, "SELECT id FROM events WHERE category = 3");
+    let mut window = PhysicalDesignEvidenceWindow::default();
+    window
+        .record_execution_feedback(&report)
+        .expect("record recommendation evidence");
+    let candidate = index_candidate();
+    let proposal = fixture
+        .database
+        .propose_physical_index_design(&window, policy(1, 1, 0, 8), candidate)
+        .expect("proposal");
+    let g_before = fixture
+        .database
+        .current_database_snapshot()
+        .expect("snapshot")
+        .expect("global visibility")
+        .commit_seq();
+    fixture
+        .database
+        .insert(&[
+            netbadb_types::ScalarValue::Int64(513),
+            netbadb_types::ScalarValue::Int64(3),
+            netbadb_types::ScalarValue::Text("post-proposal-dml".into()),
+        ])
+        .expect("ordinary DML after proposal");
+    let extra_report = feedback(&mut fixture, "SELECT id FROM events WHERE category = 3");
+    window
+        .record_execution_feedback(&extra_report)
+        .expect("same-epoch evidence");
+    let name = netbadb_types::IndexName::new("events_category_phase23_idx").unwrap();
+    let applied = fixture
+        .database
+        .apply_physical_index_design(&window, &proposal, name.clone())
+        .expect("apply");
+    let index_id = match applied.outcome {
+        PhysicalIndexDesignApplyOutcome::Created { index_id } => index_id,
+        other => panic!("unexpected apply outcome: {other:?}"),
+    };
+    assert!(applied.global_commit_seq_after > g_before);
+    assert_eq!(
+        applied.schema_generation,
+        fixture.database.schema_generation()
+    );
+    assert_eq!(fixture.database.indexes(TABLE_ID).unwrap().len(), 1);
+    assert_eq!(
+        fixture.database.indexes(TABLE_ID).unwrap()[0].name,
+        Some(name.clone())
+    );
+    assert_eq!(
+        fixture.database.indexes(TABLE_ID).unwrap()[0].column_id,
+        ColumnId(2)
+    );
+
+    let retry = fixture
+        .database
+        .apply_physical_index_design(&window, &proposal, name)
+        .expect("idempotent retry");
+    assert_eq!(
+        retry.outcome,
+        PhysicalIndexDesignApplyOutcome::AlreadyApplied { index_id }
+    );
+    assert_eq!(
+        retry.global_commit_seq_before,
+        applied.global_commit_seq_after
+    );
+    assert_eq!(
+        retry.global_commit_seq_after,
+        applied.global_commit_seq_after
+    );
+    assert_eq!(fixture.database.indexes(TABLE_ID).unwrap().len(), 1);
+    fixture.close();
+}
+
+#[test]
+fn retained_proposal_recognizes_created_index_after_reopen() {
+    let fixture = Fixture::create("phase23-reopen", false);
+    let Fixture {
+        root,
+        source,
+        mut database,
+    } = fixture;
+    let report = database
+        .query_with_feedback("SELECT id FROM events WHERE category >= 3")
+        .expect("query feedback")
+        .1;
+    let mut window = PhysicalDesignEvidenceWindow::default();
+    window
+        .record_execution_feedback(&report)
+        .expect("record evidence");
+    let proposal = database
+        .propose_physical_index_design(&window, policy(1, 1, 0, 8), index_candidate())
+        .expect("proposal");
+    let name = netbadb_types::IndexName::new("events_category_reopen_idx").unwrap();
+    let created = database
+        .apply_physical_index_design(&window, &proposal, name.clone())
+        .expect("create index");
+    assert!(matches!(
+        created.outcome,
+        PhysicalIndexDesignApplyOutcome::Created { .. }
+    ));
+    database.close().expect("close database");
+
+    let mut reopened = crate::Database::open_catalog(root.join("catalog")).expect("reopen");
+    let retry = reopened
+        .apply_physical_index_design(&window, &proposal, name)
+        .expect("retry after reopen");
+    assert!(matches!(
+        retry.outcome,
+        PhysicalIndexDesignApplyOutcome::AlreadyApplied { .. }
+    ));
+    reopened.close().expect("close reopened database");
+    crate::cleanup_created_table_files(std::slice::from_ref(&source));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn proposal_requires_recommendation_and_apply_revalidates_epoch_and_identity() {
+    let mut fixture = Fixture::create("phase23-revalidation", false);
+    let report = feedback(&mut fixture, "SELECT id FROM events WHERE category = 3");
+    let mut window = PhysicalDesignEvidenceWindow::default();
+    window
+        .record_execution_feedback(&report)
+        .expect("record evidence");
+    let candidate = index_candidate();
+    assert!(matches!(
+        fixture.database.propose_physical_index_design(
+            &window,
+            policy(1, 1, 0, 8),
+            PhysicalIndexCandidate {
+                table_id: TABLE_ID,
+                column_id: ColumnId(1),
+            },
+        ),
+        Err(PhysicalIndexDesignProposalError::CandidateNotObserved(_))
+    ));
+    assert!(matches!(
+        fixture
+            .database
+            .propose_physical_index_design(&window, policy(2, 1, 0, 8), candidate),
+        Err(PhysicalIndexDesignProposalError::CandidateNotRecommended { .. })
+    ));
+    let proposal = fixture
+        .database
+        .propose_physical_index_design(&window, policy(1, 1, 0, 8), candidate)
+        .expect("proposal");
+    window.rotate_window().expect("rotate evidence");
+    assert!(matches!(
+        fixture.database.apply_physical_index_design(
+            &window,
+            &proposal,
+            netbadb_types::IndexName::new("events_category_epoch_idx").unwrap(),
+        ),
+        Err(PhysicalIndexDesignApplyError::EvidenceEpochChanged { .. })
+    ));
+    fixture.close();
+}
+
+#[test]
+fn apply_recognizes_coverage_and_name_conflicts_before_mutation() {
+    let mut fixture = Fixture::create("phase23-preflight", false);
+    let report = feedback(&mut fixture, "SELECT id FROM events WHERE category = 3");
+    let mut window = PhysicalDesignEvidenceWindow::default();
+    window
+        .record_execution_feedback(&report)
+        .expect("record evidence");
+    let proposal = fixture
+        .database
+        .propose_physical_index_design(&window, policy(1, 1, 0, 8), index_candidate())
+        .expect("proposal");
+    fixture
+        .database
+        .create_named_index(
+            netbadb_types::IndexName::new("events_id_conflict").unwrap(),
+            TABLE_ID,
+            ColumnId(1),
+        )
+        .expect("create conflicting name target");
+    let before = fixture
+        .database
+        .current_database_snapshot()
+        .unwrap()
+        .unwrap()
+        .commit_seq();
+    assert!(matches!(
+        fixture.database.apply_physical_index_design(
+            &window,
+            &proposal,
+            netbadb_types::IndexName::new("events_id_conflict").unwrap(),
+        ),
+        Err(PhysicalIndexDesignApplyError::IndexNameConflict(_))
+    ));
+    assert_eq!(fixture.database.indexes(TABLE_ID).unwrap().len(), 1);
+    assert_eq!(
+        fixture
+            .database
+            .current_database_snapshot()
+            .unwrap()
+            .unwrap()
+            .commit_seq(),
+        before
+    );
+
+    fixture
+        .database
+        .create_named_index(
+            netbadb_types::IndexName::new("events_category_existing").unwrap(),
+            TABLE_ID,
+            ColumnId(2),
+        )
+        .expect("create covering design");
+    let covered = fixture
+        .database
+        .apply_physical_index_design(
+            &window,
+            &proposal,
+            netbadb_types::IndexName::new("events_category_new").unwrap(),
+        )
+        .expect("covered apply");
+    assert_eq!(
+        covered.outcome,
+        PhysicalIndexDesignApplyOutcome::AlreadyCovered
+    );
+    assert_eq!(fixture.database.indexes(TABLE_ID).unwrap().len(), 2);
+    fixture.close();
+}
+
+#[test]
+fn proposal_is_bound_to_durable_database_incarnation() {
+    let mut first = Fixture::create("phase23-identity-a", false);
+    let mut second = Fixture::create("phase23-identity-b", false);
+    let report = feedback(&mut first, "SELECT id FROM events WHERE category = 3");
+    let mut window = PhysicalDesignEvidenceWindow::default();
+    window
+        .record_execution_feedback(&report)
+        .expect("record evidence");
+    let proposal = first
+        .database
+        .propose_physical_index_design(&window, policy(1, 1, 0, 8), index_candidate())
+        .expect("proposal");
+    let before = second
+        .database
+        .current_database_snapshot()
+        .unwrap()
+        .unwrap()
+        .commit_seq();
+    assert!(matches!(
+        second.database.apply_physical_index_design(
+            &window,
+            &proposal,
+            netbadb_types::IndexName::new("events_category_foreign_idx").unwrap(),
+        ),
+        Err(PhysicalIndexDesignApplyError::DatabaseIdentityChanged)
+    ));
+    assert!(second.database.indexes(TABLE_ID).unwrap().is_empty());
+    assert_eq!(
+        second
+            .database
+            .current_database_snapshot()
+            .unwrap()
+            .unwrap()
+            .commit_seq(),
+        before
+    );
+    first.close();
+    second.close();
 }
