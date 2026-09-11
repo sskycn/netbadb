@@ -83,7 +83,7 @@ impl Fixture {
         database.close().unwrap();
 
         let manifest = directory.join("server.json");
-        write_manifest(&manifest, 4, "users");
+        write_manifest(&manifest, 5, "users");
         Self {
             directory,
             manifest,
@@ -290,6 +290,61 @@ fn catalog_text_and_json_are_complete_deterministic_and_ignore_network_acl_filte
 }
 
 #[test]
+fn inspect_accepts_and_validates_v5_adaptive_without_rewriting_the_manifest() {
+    let fixture = Fixture::new("adaptive-manifest");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+    manifest["adaptive"] = json!({
+        "mode": "feedback_only",
+        "feedback": {
+            "limits": {
+                "max_target_windows": 2,
+                "workload": {
+                    "max_query_shapes": 3,
+                    "max_plan_variants_per_shape": 4
+                },
+                "max_calibration_epochs": 5,
+                "max_calibration_query_shapes": 6,
+                "max_calibration_plan_variants_per_shape": 7
+            }
+        }
+    });
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    std::fs::write(&fixture.manifest, &bytes).unwrap();
+
+    let inspected = catalog(&fixture, "json");
+    assert!(inspected.status.success(), "{}", stderr(&inspected));
+    assert_eq!(std::fs::read(&fixture.manifest).unwrap(), bytes);
+
+    let document = include_str!("../../../docs/server-manifest-v5.md");
+    let documented: Value = serde_json::from_str(
+        document
+            .split_once("```json\n")
+            .and_then(|(_, remainder)| remainder.split_once("\n```"))
+            .map(|(example, _)| example)
+            .expect("v5 documentation contains a JSON example"),
+    )
+    .unwrap();
+    manifest["adaptive"] = documented["adaptive"].clone();
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    std::fs::write(&fixture.manifest, &bytes).unwrap();
+    let driven = catalog(&fixture, "json");
+    assert!(driven.status.success(), "{}", stderr(&driven));
+    assert_eq!(std::fs::read(&fixture.manifest).unwrap(), bytes);
+
+    manifest["adaptive"]["feedback"]["limits"]["magic"] = json!(true);
+    std::fs::write(
+        &fixture.manifest,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let invalid = catalog(&fixture, "json");
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stdout.is_empty());
+    assert!(stderr(&invalid).contains("invalid deployment manifest JSON"));
+}
+
+#[test]
 fn statement_commands_report_real_plans_sql_files_bindings_and_aggregate_provenance() {
     let fixture = Fixture::new("statement");
     let indexed_sql = "SELECT name FROM users WHERE id = 42";
@@ -429,19 +484,19 @@ fn dml_is_never_executed_and_failures_leave_stdout_empty_with_coarse_exit_codes(
 #[test]
 fn manifest_and_input_failures_precede_output_and_schema_mismatch_is_rejected() {
     let fixture = Fixture::new("manifest-errors");
-    let version_three = fixture.directory.join("v3.json");
-    write_manifest(&version_three, 3, "users");
+    let version_four = fixture.directory.join("v4.json");
+    write_manifest(&version_four, 4, "users");
     let old_manifest = netbadb()
         .args(["inspect", "catalog", "--manifest"])
-        .arg(&version_three)
+        .arg(&version_four)
         .output()
         .unwrap();
     assert_eq!(old_manifest.status.code(), Some(1));
     assert!(old_manifest.stdout.is_empty());
-    assert!(stderr(&old_manifest).contains("unsupported deployment manifest version 3"));
+    assert!(stderr(&old_manifest).contains("unsupported deployment manifest version 4"));
 
     let mismatch = fixture.directory.join("mismatch.json");
-    write_manifest(&mismatch, 4, "other_users");
+    write_manifest(&mismatch, 5, "other_users");
     let mismatch = netbadb()
         .args(["inspect", "catalog", "--manifest"])
         .arg(&mismatch)

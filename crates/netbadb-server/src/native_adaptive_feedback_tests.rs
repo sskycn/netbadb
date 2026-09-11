@@ -276,7 +276,7 @@ fn native_server_builder_is_default_disabled_and_explicitly_enabled() {
     let manifest = root.join("server.json");
     let source = format!(
         r#"{{
-            "version": 4,
+            "version": 5,
             "listen": "127.0.0.1:0",
             "authorization": {{
                 "local_plaintext": {{
@@ -303,15 +303,12 @@ fn native_server_builder_is_default_disabled_and_explicitly_enabled() {
     let config = ServerConfig::from_manifest_path(&manifest).expect("parse manifest");
 
     let disabled = TcpServer::new(config);
-    assert!(matches!(
-        disabled.adaptive_mode,
-        crate::adaptive_driver::ServerAdaptiveStartupMode::Disabled
-    ));
+    assert!(disabled.adaptive_override.is_none());
     let limits = AdaptiveEvidencePoolLimits::default();
     let enabled = disabled.with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits));
     assert!(matches!(
-        enabled.adaptive_mode,
-        crate::adaptive_driver::ServerAdaptiveStartupMode::FeedbackOnly(config)
+        enabled.adaptive_override,
+        Some(crate::adaptive_driver::ServerAdaptiveStartupMode::FeedbackOnly(config))
             if config.limits() == limits
     ));
 

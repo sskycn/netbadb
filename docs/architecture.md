@@ -275,6 +275,17 @@ pool, or scheduler moves to a timer or connection thread, and Manifest v4,
 `netbadbd`, Protocol v2, PostgreSQL wire, and Inspection JSON v7 remain
 unchanged.
 
+[Adaptive Operations Phase 17](adaptive-operations-phase17.md) freezes strict
+deployment manifest v5 as the operator-facing mapping to the existing Server
+runtime. Omitted Adaptive configuration is Disabled; explicit feedback-only
+and driven tagged objects construct the established Phase 15/16 configs with
+all limits, budgets, scopes, and policies required. Both Native and PostgreSQL
+builders consume the manifest-derived mode unless an explicit programmatic
+builder replacement wins. Manifest decoding reuses Core ratio, scheduler, and
+driver validation and adds no safety, scheduling, visibility, coordinator,
+runtime-state persistence, hot reload, metrics, protocol, or daemon admin
+authority.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,
@@ -287,7 +298,7 @@ defer retirement until the last reader is gone. See [Columnar Phase
 The `netbadb` CLI is an offline adapter, not a new compiler or planner layer:
 
 ```text
-deployment manifest v4
+deployment manifest v5
           ↓
 netbadb-server ServerConfig bootstrap
           ↓
@@ -1919,7 +1930,7 @@ TableStorage capability API
   read-only physical inspection including clustering identity, MemTable/SSTable
   entries, per-level counts/bytes, Bloom bytes, amplification counters, and
   last-`ANALYZE` row/min/max statistics. Deployment
-  manifest v4 still bootstraps Heap only, so the offline CLI and Inspection JSON
+  manifest v5 still bootstraps Heap only, so the offline CLI and Inspection JSON
   v4 remain unchanged; LSM CLI/server bootstrap is deliberately deferred.
 
 LSM maintenance is synchronous and quiescent. `compact()` deterministically
@@ -3238,11 +3249,11 @@ keeps `SELECT 1`, `SELECT true`, `SELECT 'x'`, and `SELECT NULL` out of the
 PostgreSQL compatibility-query string matcher.
 
 The first executable boundary is deliberately an exclusive listener mode:
-`netbadbd --postgres` uses manifest v4's existing loopback listen address for
+`netbadbd --postgres` uses manifest v5's existing loopback listen address for
 PostgreSQL instead of Protocol v2. It has the same dedicated synchronous
 Database owner/worker model, compiler-resolved table authorization, connection
 cap, and socket timeouts. A future versioned deployment manifest may configure
-simultaneous native and PostgreSQL listeners backed by one worker; manifest v4
+simultaneous native and PostgreSQL listeners backed by one worker; manifest v5
 was not silently reinterpreted to add a second address.
 
 The blocking TCP runtime uses one OS thread per accepted connection and one
@@ -3276,7 +3287,7 @@ than dropping a retryable transaction and continuing service. Graceful server
 shutdown closes connection sockets, joins their threads, closes remaining
 sessions, explicitly closes the Database, and joins the worker.
 
-`netbadbd` reads deployment manifest v4 before startup. Relative heap and TLS
+`netbadbd` reads deployment manifest v5 before startup. Relative heap and TLS
 paths are resolved against the manifest directory. Certificate, private-key,
 and client-CA material is parsed into a mandatory-client-auth rustls config
 before the database worker starts; the worker then calls
@@ -3341,7 +3352,7 @@ planner, executor, page, storage, WAL, or recovery. Protocol v2 is a network
 contract, not a database-file format. The current independent persistent
 contracts are Canonical Schema v1, Heap metadata v5, MVCC tuple v1,
 transaction-status v1, Page v5, WAL v4/record v3 plus v4 reservations and v5 transitions, BTree
-v1/v2/v3, and IndexCatalog v9 (backward decode v2 through v8). Deployment manifest v4 is configuration, not a database format or canonical
+v1/v2/v3, and IndexCatalog v9 (backward decode v2 through v8). Deployment manifest v5 is configuration, not a database format or canonical
 schema identity.
 
 Rust applications choose either the default embedded SDK or the optional

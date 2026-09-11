@@ -155,7 +155,7 @@ impl From<ManifestError> for TcpServerError {
 
 pub struct TcpServer {
     config: ServerConfig,
-    adaptive_mode: ServerAdaptiveStartupMode,
+    adaptive_override: Option<ServerAdaptiveStartupMode>,
 }
 
 impl TcpServer {
@@ -163,37 +163,39 @@ impl TcpServer {
     pub fn new(config: ServerConfig) -> Self {
         Self {
             config,
-            adaptive_mode: ServerAdaptiveStartupMode::Disabled,
+            adaptive_override: None,
         }
     }
 
     /// Enables bounded autocommit Core-query feedback capture in this
-    /// server's database worker. Deployment manifest v4 remains unchanged.
+    /// server's database worker. This explicitly replaces any manifest mode.
     #[must_use]
     pub fn with_adaptive_feedback(mut self, config: ServerAdaptiveFeedbackConfig) -> Self {
-        self.adaptive_mode = ServerAdaptiveStartupMode::FeedbackOnly(config);
+        self.adaptive_override = Some(ServerAdaptiveStartupMode::FeedbackOnly(config));
         self
     }
 
     /// Enables feedback capture plus host-time logical scheduling in the
-    /// existing database worker. Deployment manifest v4 remains unchanged.
+    /// existing database worker. This explicitly replaces any manifest mode.
     #[must_use]
     pub fn with_adaptive_driver(mut self, config: ServerAdaptiveDriverConfig) -> Self {
-        self.adaptive_mode = ServerAdaptiveStartupMode::Driven(Box::new(config));
+        self.adaptive_override = Some(ServerAdaptiveStartupMode::Driven(Box::new(config)));
         self
     }
 
     pub fn start(self) -> Result<ServerHandle, TcpServerError> {
-        let (listen, tables, limits, security, authorization) = self.config.into_parts();
+        let (listen, tables, limits, security, authorization, manifest_adaptive_mode) =
+            self.config.into_parts();
+        let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
         validate_listener_security(listen, security.kind() == TransportKind::MutualTls)?;
         let table_count = tables.len();
         let transport_kind = security.kind();
-        let tick_interval = self.adaptive_mode.tick_interval();
+        let tick_interval = adaptive_mode.tick_interval();
         let worker = DatabaseWorker::start(
             tables,
             limits.session_policy(),
             authorization,
-            self.adaptive_mode,
+            adaptive_mode,
         )?;
         let metrics = ServerMetricsHandle::new();
         let listener = match TcpListener::bind(listen) {

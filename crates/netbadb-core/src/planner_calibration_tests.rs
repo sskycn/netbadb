@@ -35,6 +35,24 @@ pub(super) fn permissive_policy() -> PlannerCalibrationPolicy {
     }
 }
 
+#[test]
+fn planner_policy_shared_validation_covers_ratio_relationships() {
+    let valid = PlannerCalibrationPolicy::default();
+    assert!(valid.is_valid());
+
+    let mut inverted_bounds = valid;
+    inverted_bounds.global_min_ratio = CalibrationRatio::new(3, 1).expect("ratio");
+    assert!(!inverted_bounds.is_valid());
+
+    let mut sub_identity_step_up = valid;
+    sub_identity_step_up.maximum_step_up_ratio = CalibrationRatio::HALF;
+    assert!(!sub_identity_step_up.is_valid());
+
+    let mut sub_identity_step_down = valid;
+    sub_identity_step_down.maximum_step_down_ratio = CalibrationRatio::HALF;
+    assert!(!sub_identity_step_down.is_valid());
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn calibration_report(
     database: &mut Database,

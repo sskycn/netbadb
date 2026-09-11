@@ -118,7 +118,7 @@ fn manifest_json_with_transport(
     let tls = tls.map_or_else(String::new, |tls| format!("\"tls\": {tls},"));
     format!(
         r#"{{
-            "version": 4,
+            "version": 5,
             "listen": "127.0.0.1:0",
             {limits}
             {tls}
@@ -216,7 +216,7 @@ fn create_two_table_server(name: &str, authorization: &str) -> (PathBuf, ServerH
         &manifest,
         format!(
             r#"{{
-                "version":4,
+                "version":5,
                 "listen":"127.0.0.1:0",
                 "authorization":{authorization},
                 "tables":[
@@ -1080,7 +1080,7 @@ fn assert_tls_handshake_rejected(address: SocketAddr, config: Arc<ClientConfig>)
 }
 
 #[test]
-fn manifest_v4_validates_tls_material_and_allows_secure_remote_configuration() {
+fn manifest_v5_validates_tls_material_and_allows_secure_remote_configuration() {
     let directory = test_directory("tls-manifest");
     cleanup(&directory);
     std::fs::create_dir_all(&directory).unwrap();

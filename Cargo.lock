@@ -415,7 +415,10 @@ version = "0.1.0"
 name = "netbadbd"
 version = "0.1.0"
 dependencies = [
+ "netbadb-core",
+ "netbadb-schema",
  "netbadb-server",
+ "netbadb-types",
 ]
 
 [[package]]

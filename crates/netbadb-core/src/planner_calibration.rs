@@ -45,6 +45,18 @@ impl Default for PlannerCalibrationPolicy {
     }
 }
 
+impl PlannerCalibrationPolicy {
+    /// Returns whether the policy's ratio bounds can be used by the planner
+    /// calibration advisor. This is the shared structural validation authority
+    /// for callers that must reject invalid policy before evidence is available.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        self.global_min_ratio <= self.global_max_ratio
+            && self.maximum_step_up_ratio >= CalibrationRatio::IDENTITY
+            && self.maximum_step_down_ratio >= CalibrationRatio::IDENTITY
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannerCalibrationQueryShapeEvidence {
     pub query_shape: LogicalQueryShape,
@@ -561,10 +573,7 @@ enum PlannerCalibrationDirection {
 }
 
 fn validate_policy(policy: PlannerCalibrationPolicy) -> Result<(), PlannerCalibrationAdvisorError> {
-    if policy.global_min_ratio > policy.global_max_ratio
-        || policy.maximum_step_up_ratio < CalibrationRatio::IDENTITY
-        || policy.maximum_step_down_ratio < CalibrationRatio::IDENTITY
-    {
+    if !policy.is_valid() {
         return Err(PlannerCalibrationAdvisorError::InvalidPolicy);
     }
     Ok(())

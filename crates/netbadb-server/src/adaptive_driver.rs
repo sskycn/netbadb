@@ -77,6 +77,13 @@ impl ServerAdaptiveDriverConfig {
         ) {
             return Err(ServerAdaptiveDriverConfigError::InvalidCrossLaneServicePolicy);
         }
+        if !automatic_policy
+            .safe_mode
+            .planner_calibration_policy
+            .is_valid()
+        {
+            return Err(ServerAdaptiveDriverConfigError::InvalidPlannerCalibrationPolicy);
+        }
         let table_count = u64::try_from(table_ids.len()).unwrap_or(u64::MAX);
         if table_count > automatic_policy.max_candidate_tables {
             return Err(ServerAdaptiveDriverConfigError::TableScopeTooLarge {
@@ -164,6 +171,7 @@ pub enum ServerAdaptiveDriverConfigError {
     InvalidColumnarCompactionPolicy,
     InvalidChangeStreamGcPolicy,
     InvalidCrossLaneServicePolicy,
+    InvalidPlannerCalibrationPolicy,
     UnknownTableId(TableId),
 }
 
@@ -203,6 +211,9 @@ impl fmt::Display for ServerAdaptiveDriverConfigError {
             }
             Self::InvalidCrossLaneServicePolicy => {
                 formatter.write_str("adaptive cross-lane service policy is invalid")
+            }
+            Self::InvalidPlannerCalibrationPolicy => {
+                formatter.write_str("adaptive planner calibration policy is invalid")
             }
             Self::UnknownTableId(table_id) => write!(
                 formatter,
@@ -357,6 +368,14 @@ pub(crate) struct ServerAdaptiveHostConfig {
 }
 
 impl ServerAdaptiveStartupMode {
+    pub(crate) const fn mode(&self) -> ServerAdaptiveMode {
+        match self {
+            Self::Disabled => ServerAdaptiveMode::Disabled,
+            Self::FeedbackOnly(_) => ServerAdaptiveMode::FeedbackOnly,
+            Self::Driven(_) => ServerAdaptiveMode::Driven,
+        }
+    }
+
     pub(crate) const fn tick_interval(&self) -> Option<Duration> {
         match self {
             Self::Driven(config) => Some(config.tick_interval()),
@@ -892,6 +911,23 @@ mod tests {
                 received: 17,
                 maximum: 16,
             })
+        );
+        let mut invalid_planner = base.automatic_policy();
+        invalid_planner
+            .safe_mode
+            .planner_calibration_policy
+            .maximum_step_up_ratio = netbadb_core::CalibrationRatio::HALF;
+        assert_eq!(
+            ServerAdaptiveDriverConfig::new(
+                base.feedback(),
+                base.tick_interval(),
+                base.scheduler_policy(),
+                base.orchestration_envelope(),
+                invalid_planner,
+                base.table_ids().to_vec(),
+                base.calibration_classes().to_vec(),
+            ),
+            Err(ServerAdaptiveDriverConfigError::InvalidPlannerCalibrationPolicy)
         );
 
         let (root, database) = fixture("unknown-scope");

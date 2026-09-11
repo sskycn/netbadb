@@ -1,6 +1,6 @@
 # `netbadb` offline inspection CLI
 
-`netbadb` opens the existing tables declared by deployment manifest v4 and
+`netbadb` opens the existing tables declared by deployment manifest v5 and
 reports catalog metadata or the physical plan chosen for one SQL statement.
 It does not create databases, execute queries or DML, start a server, connect
 remotely, refresh `ANALYZE`, create indexes, or checkpoint.
