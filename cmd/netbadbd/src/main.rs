@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use netbadb_server::{PostgresTcpServer, ServerConfig, TcpServer};
+use netbadb_server::{PostgresTcpServer, ServerAdaptiveMode, ServerConfig, TcpServer};
 
 const HELP: &str = "Usage: netbadbd --manifest <path> [--postgres]\n\nStarts the manifest-configured native server, or the experimental PostgreSQL wire listener with --postgres.";
 
@@ -36,10 +36,11 @@ fn main() -> ExitCode {
 fn run_server(manifest: PathBuf, postgres: bool) -> Result<(), Box<dyn Error>> {
     let config = ServerConfig::from_manifest_path(manifest)?;
     let max_connections = config.limits().max_connections();
+    let adaptive = adaptive_label(config.adaptive_mode());
     if postgres {
         let server = PostgresTcpServer::new(config).start()?;
         eprintln!(
-            "netbadbd experimental PostgreSQL listener on {}, max {} connections, transport plaintext-loopback",
+            "netbadbd experimental PostgreSQL listener on {}, max {} connections, transport plaintext-loopback, adaptive {adaptive}",
             server.local_addr(),
             max_connections,
         );
@@ -48,7 +49,7 @@ fn run_server(manifest: PathBuf, postgres: bool) -> Result<(), Box<dyn Error>> {
     }
     let server = TcpServer::new(config).start()?;
     eprintln!(
-        "netbadbd listening on {} with {} table(s), max {} connections, transport {}",
+        "netbadbd listening on {} with {} table(s), max {} connections, transport {}, adaptive {adaptive}",
         server.local_addr(),
         server.table_count(),
         max_connections,
@@ -56,6 +57,14 @@ fn run_server(manifest: PathBuf, postgres: bool) -> Result<(), Box<dyn Error>> {
     );
     server.wait()?;
     Ok(())
+}
+
+const fn adaptive_label(mode: ServerAdaptiveMode) -> &'static str {
+    match mode {
+        ServerAdaptiveMode::Disabled => "disabled",
+        ServerAdaptiveMode::FeedbackOnly => "feedback-only",
+        ServerAdaptiveMode::Driven => "driven",
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -183,5 +192,15 @@ mod tests {
             parse_args(args(&["--manifest", "a", "b"])),
             Err(CliError::UnknownArgument(_))
         ));
+    }
+
+    #[test]
+    fn startup_adaptive_labels_expose_only_the_stable_mode_keyword() {
+        assert_eq!(adaptive_label(ServerAdaptiveMode::Disabled), "disabled");
+        assert_eq!(
+            adaptive_label(ServerAdaptiveMode::FeedbackOnly),
+            "feedback-only"
+        );
+        assert_eq!(adaptive_label(ServerAdaptiveMode::Driven), "driven");
     }
 }

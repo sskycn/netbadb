@@ -46,7 +46,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
     .close()?;
     let manifest = root.join("server.json");
     let config = serde_json::to_vec_pretty(&json!({
-        "version": 4, "listen": "127.0.0.1:0",
+        "version": 5, "listen": "127.0.0.1:0",
         "authorization": {"local_plaintext": {"schema_admin": true, "tables": []}, "clients": []},
         "tables": [{"path": "users", "id": 1, "name": "users", "columns": [
             {"id": 1, "name": "id", "physical_type": "int64", "semantic_type": null, "nullable": false, "primary_key": false}

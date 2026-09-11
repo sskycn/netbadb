@@ -414,7 +414,7 @@ so enable this diagnostic trace only in a controlled test environment.
 
 ## Running
 
-Use an existing manifest v4 configured for a loopback plaintext address:
+Use an existing manifest v5 configured for a loopback plaintext address:
 
 ```bash
 cargo run -p netbadbd -- \
@@ -430,7 +430,7 @@ psql -h 127.0.0.1 -p 5432 -U netbadb -d test
 ```
 
 Phase 1 uses an exclusive listener mode: omit `--postgres` for native Protocol
-v1. It does not silently change manifest v4 or open a second port. Only
+v1. It does not silently change manifest v5 or open a second port. Only
 loopback plaintext manifests are accepted. PostgreSQL `SSLRequest` receives
 the protocol-defined `N`; NetbaDB's existing native mTLS configuration is not
 misrepresented as PostgreSQL TLS.
@@ -447,7 +447,7 @@ The listener supports bounded decoding for:
   compatibility functions; unknown parameters are retained by the typed
   decoder and otherwise ignored safely.
 
-Successful loopback admission maps to manifest v4's `local_plaintext`
+Successful loopback admission maps to manifest v5's `local_plaintext`
 principal and returns `AuthenticationOk`. This is a local development
 authentication mode, not PostgreSQL password authentication. Authorization is
 still checked after compiler name/type resolution and before execution using

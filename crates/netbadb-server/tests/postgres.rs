@@ -71,7 +71,7 @@ fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
     std::fs::write(
         &manifest,
         r#"{
-            "version": 4,
+            "version": 5,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -117,7 +117,7 @@ fn postgres_adaptive_driver_reaches_worker_without_changing_wire_state() {
     std::fs::write(
         &manifest,
         r#"{
-            "version": 4,
+            "version": 5,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,

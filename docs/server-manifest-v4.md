@@ -1,8 +1,10 @@
 # NetbaDB deployment manifest v4
 
-Deployment manifest v4 is the current experimental `netbadbd` startup
-configuration. It adds required deployment authorization without changing
-Protocol v1 or any persistent database format.
+> Historical format. Current `netbadbd` requires
+> [deployment manifest v5](server-manifest-v5.md); v4 is rejected explicitly.
+
+Deployment manifest v4 added required deployment authorization without
+changing Protocol v1 or any persistent database format.
 
 ```json
 {

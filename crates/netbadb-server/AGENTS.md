@@ -76,5 +76,8 @@
   state, fail an unrelated foreground request, kill the worker, or create a
   second Database owner. Evidence-window renewal and faulted-scheduler reset
   remain explicit operator-controlled runtime actions.
+- Deployment Adaptive configuration is versioned through the strict current
+  Server Manifest. Manifest decoding may construct existing Server/Core policy
+  values but MUST NOT duplicate their safety or scheduling authority.
 - Wire responses MUST expose stable protocol domain values and errors, never
   internal Rust layouts, discriminants, debug strings, pages, or row locators.

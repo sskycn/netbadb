@@ -407,7 +407,7 @@ The current code genuinely supports:
   explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
 - a blocking TCP runtime with loopback plaintext or mandatory mutual TLS whose
   dedicated synchronous worker owns the Database and every SessionState, plus
-  strict deployment manifest v4 bootstrap, authenticated certificate identity,
+  strict deployment manifest v5 bootstrap, authenticated certificate identity,
   per-certificate and local-plaintext table/operation authorization, secure
   remote listen, bounded connections/socket inactivity, response-row policy,
   in-process metrics, and the standalone `netbadbd` executable;
@@ -415,7 +415,7 @@ The current code genuinely supports:
 - stable, read-only embedded catalog and chosen-plan inspection DTOs with an
   explicit deterministic text renderer that exposes no planner objects or
   storage internals and never drives execution;
-- an offline `netbadb inspect` CLI that reuses deployment manifest v4 and the
+- an offline `netbadb inspect` CLI that reuses deployment manifest v5 and the
   embedded inspection API, with deterministic human text and explicit
   current versioned Inspection JSON v7 output (with v1-v6 retained
   historically);
@@ -433,10 +433,10 @@ Current Protocol v2 is specified in
 [`docs/protocol-v2.md`](docs/protocol-v2.md); the frozen v1 byte contract remains
 in [`docs/protocol-v1.md`](docs/protocol-v1.md). Current standalone
 configuration is documented in
-[`docs/server-manifest-v4.md`](docs/server-manifest-v4.md). The generated SDK
+[`docs/server-manifest-v5.md`](docs/server-manifest-v5.md). The generated SDK
 input contract is documented in
 [`docs/sdk-schema-v2.md`](docs/sdk-schema-v2.md), with v1 retained as a readable
-historical contract. Manifests v1 through v3 are
+historical contract. Manifests v1 through v4 are
 retained as historical documentation and rejected by current
 `netbadbd`. Phase 5 is complete: mTLS authenticates transport peers, while the
 database worker authorizes compiler-resolved TableIds before execution.
