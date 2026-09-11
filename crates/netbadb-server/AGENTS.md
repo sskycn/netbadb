@@ -81,3 +81,11 @@
   values but MUST NOT duplicate their safety or scheduling authority.
 - Wire responses MUST expose stable protocol domain values and errors, never
   internal Rust layouts, discriminants, debug strings, pages, or row locators.
+- The live operator plane MUST remain outside the Database owner. Local
+  operator requests may reach Adaptive runtime only through the existing typed
+  Server adaptive control path.
+- A mutating operator protocol action MUST have explicit retry and outcome
+  semantics. An ambiguous transport retry MUST NOT cause a second evidence
+  rotation.
+- The first operator plane is local Unix-domain only and MUST NOT be exposed as
+  Native or PostgreSQL SQL or database-protocol traffic.

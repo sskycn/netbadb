@@ -58,7 +58,7 @@ fn run(directory: &Path) -> Result<(), Box<dyn Error>> {
     std::fs::write(
         &manifest,
         serde_json::to_vec_pretty(&json!({
-            "version": 5,
+            "version": 6,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,"tables": [

@@ -10,8 +10,9 @@ use netbadb_core::{
 use netbadb_pgwire::{CANCEL_REQUEST_CODE, PROTOCOL_VERSION_3, SSL_REQUEST_CODE};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
-    PostgresTcpServer, ServerAdaptiveControlError, ServerAdaptiveDriverConfig,
-    ServerAdaptiveFeedbackConfig, ServerAdaptiveMode, ServerConfig,
+    OperatorAdaptiveModeV1, PostgresTcpServer, ServerAdaptiveControlError,
+    ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig, ServerAdaptiveMode, ServerConfig,
+    ServerOperatorClient,
 };
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 
@@ -71,7 +72,7 @@ fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
     std::fs::write(
         &manifest,
         r#"{
-            "version": 5,
+            "version": 6,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -117,7 +118,7 @@ fn postgres_adaptive_driver_reaches_worker_without_changing_wire_state() {
     std::fs::write(
         &manifest,
         r#"{
-            "version": 5,
+            "version": 6,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -183,6 +184,84 @@ fn postgres_adaptive_driver_reaches_worker_without_changing_wire_state() {
         control.status(),
         Err(ServerAdaptiveControlError::ServerStopped)
     );
+    cleanup(&directory);
+}
+
+#[cfg(unix)]
+#[test]
+fn postgres_query_and_transaction_status_are_isolated_from_live_operator_requests() {
+    let directory = test_directory("operator-plane");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    Database::create(directory.join("users.ndb"), users_table())
+        .unwrap()
+        .close()
+        .unwrap();
+    let socket = PathBuf::from(format!("/tmp/netbadb-pg-op-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let manifest = directory.join("server.json");
+    let source = format!(
+        r#"{{
+            "version": 6,
+            "listen": "127.0.0.1:0",
+            "authorization": {{
+                "local_plaintext": {{"schema_admin": true,
+                    "tables": [{{"table_id":1,"read":true,"write":true,"transaction":true,"analyze":false}}]
+                }},
+                "clients": []
+            }},
+            "tables": [{{
+                "path":"users.ndb","id":1,"name":"users",
+                "columns":[
+                    {{"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false,"primary_key":true}},
+                    {{"id":2,"name":"name","physical_type":"text","semantic_type":null,"nullable":true,"primary_key":false}},
+                    {{"id":3,"name":"active","physical_type":"bool","semantic_type":null,"nullable":false,"primary_key":false}}
+                ]
+            }}],
+            "adaptive": {{
+                "mode": "feedback_only",
+                "feedback": {{"limits": {{
+                    "max_target_windows": 4,
+                    "workload": {{"max_query_shapes":4,"max_plan_variants_per_shape":4}},
+                    "max_calibration_epochs": 4,
+                    "max_calibration_query_shapes": 4,
+                    "max_calibration_plan_variants_per_shape": 4
+                }}}}
+            }},
+            "operator": {{
+                "unix_socket": "{}",
+                "io_timeout_ms": 1000
+            }}
+        }}"#,
+        socket.display()
+    );
+    std::fs::write(&manifest, source).unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    let operator_config = config.operator_config().unwrap().clone();
+    let server = PostgresTcpServer::new(config).start().unwrap();
+    let operator = ServerOperatorClient::new(&operator_config);
+    assert_eq!(
+        operator.status().unwrap().mode,
+        OperatorAdaptiveModeV1::FeedbackOnly
+    );
+
+    let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+    startup(&mut stream);
+    let begin = query(&mut stream, "BEGIN");
+    assert_eq!(begin.last().unwrap().1, [b'T']);
+    let status = operator.status().unwrap();
+    assert_eq!(status.feedback.window_epoch, 0);
+    let rotation = operator.rotate_evidence(0).unwrap();
+    assert_eq!(rotation.new_window_epoch, 1);
+    let select = query(&mut stream, "SELECT id FROM users");
+    assert_eq!(select.last().unwrap().1, [b'T']);
+    let rollback = query(&mut stream, "ROLLBACK");
+    assert_eq!(rollback.last().unwrap().1, [b'I']);
+    stream.write_all(&frontend(b'X', &[])).unwrap();
+    drop(stream);
+
+    server.shutdown().unwrap();
+    assert!(!socket.exists());
     cleanup(&directory);
 }
 

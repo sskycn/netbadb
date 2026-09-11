@@ -24,11 +24,12 @@ use crate::authorization::{
     AuthorizationAction, AuthorizationDenied, AuthorizationPolicy, PrincipalAuthorization,
 };
 use crate::manifest::validate_listener_security;
+use crate::operator::ServerOperatorPlane;
 use crate::tls::{ConnectionStream, TlsHandshakeError, TransportSecurity};
 use crate::{
     ClientIdentity, ManifestError, ResponseBatch, ServerAdaptiveFeedbackConfig, ServerConfig,
-    ServerLimits, ServerMetricsHandle, SessionPolicy, SessionResponse, SessionState,
-    TableBootstrap, TransportKind,
+    ServerLimits, ServerMetricsHandle, ServerOperatorError, SessionPolicy, SessionResponse,
+    SessionState, TableBootstrap, TransportKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,6 +78,7 @@ pub enum TcpServerError {
     Manifest(ManifestError),
     Database(DatabaseError),
     AdaptiveConfig(ServerAdaptiveDriverConfigError),
+    Operator(ServerOperatorError),
     Bind {
         address: SocketAddr,
         source: io::Error,
@@ -87,6 +89,10 @@ pub enum TcpServerError {
     StartupCleanup {
         startup: Box<TcpServerError>,
         cleanup: Box<TcpServerError>,
+    },
+    OperatorAndServerCleanup {
+        operator: Box<ServerOperatorError>,
+        server: Box<TcpServerError>,
     },
     WorkerStopped,
     WorkerPanicked,
@@ -103,6 +109,7 @@ impl fmt::Display for TcpServerError {
             Self::AdaptiveConfig(error) => {
                 write!(formatter, "adaptive driver startup failed: {error}")
             }
+            Self::Operator(error) => error.fmt(formatter),
             Self::Bind { address, source } => {
                 write!(
                     formatter,
@@ -117,6 +124,10 @@ impl fmt::Display for TcpServerError {
             Self::StartupCleanup { startup, cleanup } => write!(
                 formatter,
                 "server startup failed: {startup}; database worker cleanup also failed: {cleanup}"
+            ),
+            Self::OperatorAndServerCleanup { operator, server } => write!(
+                formatter,
+                "operator shutdown failed: {operator}; server cleanup also failed: {server}"
             ),
             Self::WorkerStopped => formatter.write_str("database worker stopped unexpectedly"),
             Self::WorkerPanicked => formatter.write_str("database worker thread panicked"),
@@ -133,11 +144,13 @@ impl Error for TcpServerError {
             Self::Manifest(error) => Some(error),
             Self::Database(error) => Some(error),
             Self::AdaptiveConfig(error) => Some(error),
+            Self::Operator(error) => Some(error),
             Self::Bind { source, .. }
             | Self::ListenerConfiguration(source)
             | Self::Accept(source)
             | Self::ThreadSpawn(source) => Some(source),
             Self::StartupCleanup { cleanup, .. } => Some(cleanup.as_ref()),
+            Self::OperatorAndServerCleanup { server, .. } => Some(server.as_ref()),
             Self::WorkerFatal(error) => Some(error),
             Self::WorkerStopped
             | Self::WorkerPanicked
@@ -184,8 +197,15 @@ impl TcpServer {
     }
 
     pub fn start(self) -> Result<ServerHandle, TcpServerError> {
-        let (listen, tables, limits, security, authorization, manifest_adaptive_mode) =
-            self.config.into_parts();
+        let (
+            listen,
+            tables,
+            limits,
+            security,
+            authorization,
+            manifest_adaptive_mode,
+            operator_config,
+        ) = self.config.into_parts();
         let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
         validate_listener_security(listen, security.kind() == TransportKind::MutualTls)?;
         let table_count = tables.len();
@@ -227,6 +247,7 @@ impl TcpServer {
         };
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let (adaptive_control_tx, adaptive_control_rx) = mpsc::channel();
+        let (operator_failure_tx, operator_failure_rx) = mpsc::channel();
         let (worker_tx, worker_rx) = mpsc::sync_channel(0);
         let server_metrics = metrics.clone();
         let join = match thread::Builder::new()
@@ -245,6 +266,7 @@ impl TcpServer {
                     ServerAdaptiveHostConfig {
                         tick_interval,
                         controls: adaptive_control_rx,
+                        operator_failures: operator_failure_rx,
                     },
                 )
             }) {
@@ -264,13 +286,39 @@ impl TcpServer {
             };
             return Err(finish_startup_failure(error.0, startup));
         }
+        let adaptive_control = ServerAdaptiveControlHandle::new(adaptive_control_tx);
+        let operator = match operator_config {
+            Some(config) => match ServerOperatorPlane::start(
+                config,
+                adaptive_control.clone(),
+                operator_failure_tx,
+            ) {
+                Ok(operator) => Some(operator),
+                Err(error) => {
+                    let _ = shutdown_tx.send(());
+                    let cleanup = join
+                        .join()
+                        .map_err(|_| TcpServerError::ServerThreadPanicked)
+                        .and_then(|result| result);
+                    return Err(match cleanup {
+                        Ok(()) => TcpServerError::Operator(error),
+                        Err(server) => TcpServerError::OperatorAndServerCleanup {
+                            operator: Box::new(error),
+                            server: Box::new(server),
+                        },
+                    });
+                }
+            },
+            None => None,
+        };
         Ok(ServerHandle {
             local_addr,
             table_count,
             transport_kind,
             metrics,
             shutdown_tx,
-            adaptive_control: ServerAdaptiveControlHandle::new(adaptive_control_tx),
+            adaptive_control,
+            operator,
             join: Some(join),
         })
     }
@@ -287,6 +335,7 @@ pub struct ServerHandle {
     metrics: ServerMetricsHandle,
     shutdown_tx: Sender<()>,
     adaptive_control: ServerAdaptiveControlHandle,
+    operator: Option<ServerOperatorPlane>,
     join: Option<JoinHandle<Result<(), TcpServerError>>>,
 }
 
@@ -322,12 +371,15 @@ impl ServerHandle {
     }
 
     pub fn shutdown(mut self) -> Result<(), TcpServerError> {
+        let operator = self.operator.take().map(ServerOperatorPlane::shutdown);
         let _ = self.shutdown_tx.send(());
-        self.join_server()
+        combine_operator_and_server(operator, self.join_server())
     }
 
     pub fn wait(mut self) -> Result<(), TcpServerError> {
-        self.join_server()
+        let server = self.join_server();
+        let operator = self.operator.take().map(ServerOperatorPlane::shutdown);
+        combine_operator_and_server(operator, server)
     }
 
     fn join_server(&mut self) -> Result<(), TcpServerError> {
@@ -337,6 +389,21 @@ impl ServerHandle {
             .ok_or(TcpServerError::ServerThreadPanicked)?;
         join.join()
             .map_err(|_| TcpServerError::ServerThreadPanicked)?
+    }
+}
+
+fn combine_operator_and_server(
+    operator: Option<Result<(), ServerOperatorError>>,
+    server: Result<(), TcpServerError>,
+) -> Result<(), TcpServerError> {
+    match (operator.transpose(), server) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Ok(_), Err(server)) => Err(server),
+        (Err(operator), Ok(())) => Err(TcpServerError::Operator(operator)),
+        (Err(operator), Err(server)) => Err(TcpServerError::OperatorAndServerCleanup {
+            operator: Box::new(operator),
+            server: Box::new(server),
+        }),
     }
 }
 
@@ -928,6 +995,9 @@ fn run_accept_loop(
         match shutdown.try_recv() {
             Ok(()) | Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {}
+        }
+        if adaptive_host_config.operator_failures.try_recv().is_ok() {
+            break;
         }
         match worker.poll_fatal() {
             Ok(Some(error)) => {

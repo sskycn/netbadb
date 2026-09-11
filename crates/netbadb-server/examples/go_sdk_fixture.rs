@@ -67,7 +67,7 @@ fn run(directory: &Path, transport: &str) -> Result<(), Box<dyn Error>> {
     };
 
     let mut manifest = json!({
-        "version": 5,
+        "version": 6,
         "listen": "127.0.0.1:0",
         "authorization": authorization,
         "tables": [{
