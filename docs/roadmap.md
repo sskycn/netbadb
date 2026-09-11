@@ -1,5 +1,22 @@
 # NetbaDB roadmap
 
+## Explicit Core physical index apply (Adaptive Operations Phase 23 complete)
+
+- added typed `PhysicalIndexDesignProposal` snapshots for exact current
+  single-column Heap recommendations, anchored to the durable catalog
+  incarnation, evidence epoch, policy, schema, table, and storage identity;
+- added explicit typed apply with caller-supplied `IndexName`, exact retry
+  recognition, current covering-design suppression, name-conflict detection,
+  stale/current-state revalidation, and advisor rerun;
+- routed the only mutation through the existing named `CREATE INDEX` authority,
+  preserving its IndexId allocation, global G publication, WAL, coordinator,
+  catalog, rollback, and recovery semantics;
+- kept proposals/evidence runtime-only and caller-owned, with no automatic
+  apply, scheduler, trial/revert, Columnar mutation, Server/NBOP/Manifest,
+  protocol, inspection, or persistent-format change.
+
+See [`adaptive-operations-phase23.md`](adaptive-operations-phase23.md).
+
 ## Physical Design deployment/operator presentation (Adaptive Operations Phase 22 complete)
 
 - upgraded the sole current deployment contract to strict Manifest v7 with an
