@@ -1,5 +1,21 @@
 # NetbaDB roadmap
 
+## Observe-only Physical Design Advisor (Adaptive Operations Phase 20 complete)
+
+- added an independent caller-owned, bounded, runtime-only design evidence
+  window with required nondecreasing G ordering and schema-cohort rotation;
+- derives conservative single-column point/range index opportunities and exact
+  strict-subset Columnar scan-column sets only from formal execution feedback;
+- rechecks current active indexes, projection coverage, and production layout
+  capability before returning typed candidate decisions;
+- keeps observed work distinct from predicted savings, ranks Index and
+  Columnar separately, and blocks positive advice after capacity truncation;
+- retains `&self` purity with no ID/path reservation, catalog/file/schema/G
+  mutation, automatic lane, Server capture, protocol, inspection, or durable
+  format change.
+
+See [`adaptive-operations-phase20.md`](adaptive-operations-phase20.md).
+
 ## Pipelined Change Stream Finalize checkpoints (Phase 3G complete)
 
 - added an explicit source-compatible Finalize policy while retaining all

@@ -308,6 +308,16 @@ library remains signal-unaware, Manifest v6 and NBOP v1 remain unchanged, and
 there is no forced timeout, hot reload, daemonization, health protocol, or new
 maintenance authority.
 
+[Adaptive Operations Phase 20](adaptive-operations-phase20.md) adds the
+observe-only Physical Design Advisor in `netbadb-core`. Callers explicitly
+record formal `ExecutionFeedbackReport` values into a separate bounded,
+runtime-only `PhysicalDesignEvidenceWindow`; `Database::advise_physical_design`
+then combines that structural evidence with current schema and active physical
+inventory through `&self`. V1 advises only production-actionable single-column
+Heap B+Tree opportunities and exact strict-subset Columnar column sets. It
+creates no design or identity, persists nothing, and does not join the four
+automatic lanes or Server capture.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

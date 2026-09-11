@@ -42,6 +42,9 @@ mod maintenance;
 #[cfg(test)]
 mod maintenance_tests;
 mod partition_catalog;
+mod physical_design;
+#[cfg(test)]
+mod physical_design_tests;
 mod planner_calibration;
 #[cfg(test)]
 mod planner_calibration_tests;
@@ -234,6 +237,16 @@ pub use netbadb_types::{
 };
 pub use partition_catalog::{
     PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
+};
+pub use physical_design::{
+    PhysicalColumnarCandidate, PhysicalColumnarRecommendationInspection,
+    PhysicalDesignAdvisorError, PhysicalDesignAdvisorPolicy, PhysicalDesignAdvisorReport,
+    PhysicalDesignCandidateDecision, PhysicalDesignEvidenceEpoch, PhysicalDesignEvidenceLimits,
+    PhysicalDesignEvidenceRecordError, PhysicalDesignEvidenceRecordOutcome,
+    PhysicalDesignEvidenceSummary, PhysicalDesignEvidenceWindow,
+    PhysicalDesignEvidenceWindowInspection, PhysicalDesignNoActionReason,
+    PhysicalDesignRecommendationPolicy, PhysicalIndexCandidate,
+    PhysicalIndexRecommendationInspection,
 };
 pub use planner_calibration::{
     PlannerCalibrationAdvisorError, PlannerCalibrationDecision, PlannerCalibrationEvidence,
