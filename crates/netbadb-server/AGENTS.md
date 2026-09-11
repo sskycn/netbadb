@@ -89,3 +89,12 @@
   rotation.
 - The first operator plane is local Unix-domain only and MUST NOT be exposed as
   Native or PostgreSQL SQL or database-protocol traffic.
+- Unix process-signal ownership belongs to `netbadbd`, not this library.
+  `TcpServer::run`, `PostgresTcpServer::run`, database workers, sessions, and
+  the operator listener MUST remain signal-unaware.
+- Server-handle `is_finished` is a pure owned-thread lifecycle observation, not
+  a health check. When an operator listener is configured, its termination
+  MUST be included so a daemon cannot outlive a failed control plane.
+- Daemon readiness MUST follow successful startup of the database worker, TCP
+  listener thread, and configured operator socket. It MUST NOT expose operator
+  paths or authorization identities or create a protocol-level health claim.

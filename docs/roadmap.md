@@ -809,6 +809,27 @@ TLS establishes identity before Hello.
 Protocol v1 remains byte-for-byte unchanged and maps operation denials to its
 generic Database error code.
 
+### Phase 5C3 — Unix daemon lifecycle and readiness (complete)
+
+- `netbadbd` installs atomic-only SIGINT/SIGTERM intent before manifest parsing
+  and routes graceful requests through the existing Native/PostgreSQL
+  operator-first shutdown authority;
+- public server-handle lifecycle observation lets the daemon preserve natural
+  server and operator failures through `wait()`;
+- one flushed `netbadbd ready:` stderr boundary follows complete database,
+  TCP, and optional operator startup and is never emitted for startup failure
+  or an already-observed shutdown request;
+- real subprocess tests cover Native SIGINT/SIGTERM, PostgreSQL SIGTERM,
+  Driven+operator, Disabled without operator, socket cleanup, database reopen,
+  bounded test deadlines, and startup failure without false readiness.
+
+The lifecycle has no internal forced timeout, second-signal escalation, SIGHUP
+reload, PID/ready file, systemd notification, daemonizing fork, HTTP health, or
+wire shutdown command. Manifest v6, NBOP v1, Native Protocol v2, PostgreSQL
+wire, Inspection JSON v7, metrics, SDK schema, and persistent formats remain
+unchanged. See [Daemon lifecycle v1](daemon-lifecycle-v1.md) and
+[Adaptive Operations Phase 19](adaptive-operations-phase19.md).
+
 ### PostgreSQL Compatibility Foundation — phase 1 (experimental)
 
 - added a real `netbadb-pgwire` boundary with bounded PostgreSQL v3 startup and

@@ -298,6 +298,16 @@ are never auto-unlinked, shutdown removes only the captured socket device/inode,
 and no Native/PG/SQL/HTTP surface, automatic maintenance authority, persistent
 format, Server metrics, or Inspection JSON contract changes.
 
+[Adaptive Operations Phase 19](adaptive-operations-phase19.md) adds the Unix
+[`netbadbd` lifecycle v1](daemon-lifecycle-v1.md) around that existing Server
+authority. SIGINT and SIGTERM record one atomic shutdown intent; the executable
+then invokes the same Native or PostgreSQL operator-first `shutdown()` path.
+One explicitly flushed `netbadbd ready:` stderr line follows complete startup,
+provided no signal or owned-thread termination has been observed. The Server
+library remains signal-unaware, Manifest v6 and NBOP v1 remain unchanged, and
+there is no forced timeout, hot reload, daemonization, health protocol, or new
+maintenance authority.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,
