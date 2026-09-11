@@ -7,6 +7,7 @@ mod limits;
 mod manifest;
 mod metrics;
 mod operator;
+mod physical_design;
 mod postgres;
 mod runtime;
 mod tls;
@@ -47,6 +48,11 @@ pub use operator::{
     OperatorOrchestrationStopReasonV1, OperatorRemoteErrorV1, OperatorSchedulerDelayClassV1,
     OperatorSchedulerFaultV1, OperatorSchedulerGateV1, OperatorStatusV1, ServerOperatorClient,
     ServerOperatorConfig, ServerOperatorConfigError, ServerOperatorError,
+};
+pub use physical_design::{
+    ServerPhysicalDesignAdvisorConfig, ServerPhysicalDesignControlError,
+    ServerPhysicalDesignControlHandle, ServerPhysicalDesignDiagnostics,
+    ServerPhysicalDesignRotationReport, ServerPhysicalDesignStatus,
 };
 pub use postgres::{PostgresServerHandle, PostgresTcpServer, PostgresTcpServerError};
 pub use runtime::{ServerHandle, SessionId, TcpServer, TcpServerError, WorkerFatalError};
@@ -204,16 +210,18 @@ impl DatabaseSession {
         }
     }
 
-    fn execute_sql_prepared_with_optional_server_feedback(
+    fn execute_sql_prepared_with_optional_server_observation(
         &mut self,
-        runtime: Option<&mut adaptive_feedback::ServerAdaptiveFeedbackRuntime>,
+        adaptive: Option<&mut adaptive_feedback::ServerAdaptiveFeedbackRuntime>,
+        physical_design: Option<&mut physical_design::ServerPhysicalDesignRuntime>,
         database: &mut Database,
         prepared: &PreparedSqlStatement,
     ) -> Result<ExecutionResult, DatabaseError> {
         match prepared {
             PreparedSqlStatement::Relational(statement) => {
-                adaptive_feedback::execute_prepared_with_optional_server_feedback(
-                    runtime,
+                adaptive_feedback::execute_prepared_with_optional_server_observation(
+                    adaptive,
+                    physical_design,
                     self,
                     database,
                     statement,
@@ -489,13 +497,15 @@ impl SessionState {
         &mut self,
         database: &mut Database,
         adaptive_feedback: Option<&mut adaptive_feedback::ServerAdaptiveFeedbackRuntime>,
+        physical_design: Option<&mut physical_design::ServerPhysicalDesignRuntime>,
         request_id: u64,
         prepared: &PreparedSqlStatement,
     ) -> SessionResponse {
         match self
             .execution
-            .execute_sql_prepared_with_optional_server_feedback(
+            .execute_sql_prepared_with_optional_server_observation(
                 adaptive_feedback,
+                physical_design,
                 database,
                 prepared,
             ) {

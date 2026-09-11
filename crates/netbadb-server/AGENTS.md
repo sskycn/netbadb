@@ -62,6 +62,15 @@
   execution owner, after authorization, and only for eligible autocommit Core
   queries. Its bounded `AdaptiveEvidencePool` belongs to that worker, never a
   connection thread, `SessionState`, protocol message, or `Database`.
+- Explicit Server physical-design evidence belongs to the same Database
+  execution owner but remains an independent bounded runtime beside, never
+  inside, `AdaptiveEvidencePool`. One successful eligible query may feed both
+  concrete telemetry consumers, but it MUST be bound, planned, and executed
+  only once.
+- Physical-design recommendation requests are read-only evaluations against
+  current Database inventory. They MUST remain explicit worker commands and
+  MUST NOT invoke DDL, scheduling, maintenance, identity reservation, or
+  automatic evidence rotation.
 - Adaptive evidence admission failure is telemetry-only. It MUST NOT change an
   otherwise successful client result, protocol transaction state, or worker
   lifetime, and the Server MUST NOT retry, clear, rotate, schedule, or run

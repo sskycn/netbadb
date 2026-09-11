@@ -4,13 +4,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use netbadb_core::{
     AdaptiveEvidencePoolLimits, AdaptiveEvidenceRecordError, AdaptiveEvidenceRecordOutcome,
-    DatabaseCoordinatorConfig, TableStorageCreateSpec,
+    DatabaseCoordinatorConfig, PhysicalDesignAdvisorPolicy, PhysicalDesignEvidenceLimits,
+    PhysicalDesignEvidenceRecordError, PhysicalDesignRecommendationPolicy, TableStorageCreateSpec,
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 
 use super::*;
 use crate::adaptive_feedback::{ServerAdaptiveFeedbackConfig, ServerAdaptiveFeedbackRuntime};
 use crate::authorization::{PrincipalGrants, TablePermissions};
+use crate::physical_design::{ServerPhysicalDesignAdvisorConfig, ServerPhysicalDesignRuntime};
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 const TABLE_ID: TableId = TableId(51_520);
@@ -114,6 +116,22 @@ fn new_session(
 fn runtime() -> ServerAdaptiveFeedbackRuntime {
     ServerAdaptiveFeedbackRuntime::new(ServerAdaptiveFeedbackConfig::new(
         AdaptiveEvidencePoolLimits::default(),
+    ))
+}
+
+fn design_runtime() -> ServerPhysicalDesignRuntime {
+    let recommendation = PhysicalDesignRecommendationPolicy {
+        minimum_reports: 1,
+        minimum_distinct_query_shapes: 1,
+        minimum_actual_scan_work_units: 0,
+        max_recommendations: 8,
+    };
+    ServerPhysicalDesignRuntime::new(ServerPhysicalDesignAdvisorConfig::new(
+        PhysicalDesignEvidenceLimits::default(),
+        PhysicalDesignAdvisorPolicy {
+            index: recommendation,
+            columnar: recommendation,
+        },
     ))
 }
 
@@ -271,15 +289,42 @@ fn postgres_server_builder_is_default_disabled_and_explicitly_enabled() {
     .expect("write PostgreSQL manifest");
     let config = ServerConfig::from_manifest_path(&manifest).expect("parse PostgreSQL manifest");
 
-    let disabled = PostgresTcpServer::new(config);
+    let disabled = PostgresTcpServer::new(config.clone());
     assert!(disabled.adaptive_override.is_none());
+    assert!(disabled.physical_design.is_none());
     let limits = AdaptiveEvidencePoolLimits::default();
-    let enabled = disabled.with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits));
+    let design = design_runtime().status().evidence.limits;
+    let recommendation = PhysicalDesignRecommendationPolicy {
+        minimum_reports: 1,
+        minimum_distinct_query_shapes: 1,
+        minimum_actual_scan_work_units: 0,
+        max_recommendations: 8,
+    };
+    let design = ServerPhysicalDesignAdvisorConfig::new(
+        design,
+        PhysicalDesignAdvisorPolicy {
+            index: recommendation,
+            columnar: recommendation,
+        },
+    );
+    let enabled = disabled
+        .with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits))
+        .with_physical_design_advisor(design);
     assert!(matches!(
         enabled.adaptive_override,
         Some(crate::adaptive_driver::ServerAdaptiveStartupMode::FeedbackOnly(config))
             if config.limits() == limits
     ));
+    assert_eq!(enabled.physical_design, Some(design));
+    let reverse = PostgresTcpServer::new(config)
+        .with_physical_design_advisor(design)
+        .with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits));
+    assert!(matches!(
+        reverse.adaptive_override,
+        Some(crate::adaptive_driver::ServerAdaptiveStartupMode::FeedbackOnly(config))
+            if config.limits() == limits
+    ));
+    assert_eq!(reverse.physical_design, Some(design));
     fs::remove_dir_all(root).expect("remove PostgreSQL config root");
 }
 
@@ -538,4 +583,131 @@ fn schema_advance_rotates_naturally_on_the_next_query_report() {
     );
     database.close().expect("close schema rotation database");
     fs::remove_dir_all(root).expect("remove schema rotation root");
+}
+
+#[test]
+fn postgres_design_only_extended_portal_records_once_and_keeps_eligibility() {
+    let mut fixture = Fixture::create("design-extended", true);
+    let mut session = new_session(
+        &fixture.database,
+        SessionPolicy::default(),
+        principal(true, true, true),
+    );
+    let mut design = design_runtime();
+
+    assert_eq!(
+        session.handle_with_server_observation(
+            &mut fixture.database,
+            None,
+            Some(&mut design),
+            FrontendMessage::Parse {
+                statement: "by_category".into(),
+                query: "SELECT id FROM events WHERE category = $1".into(),
+                parameter_types: vec![PostgresType::Int8.oid()],
+            },
+        ),
+        vec![BackendMessage::ParseComplete]
+    );
+    assert_eq!(
+        session.handle_with_server_observation(
+            &mut fixture.database,
+            None,
+            Some(&mut design),
+            FrontendMessage::Bind {
+                portal: "events_portal".into(),
+                statement: "by_category".into(),
+                parameter_formats: Vec::new(),
+                parameters: vec![Some(b"7".to_vec())],
+                result_formats: Vec::new(),
+            },
+        ),
+        vec![BackendMessage::BindComplete]
+    );
+    let first = session.handle_with_server_observation(
+        &mut fixture.database,
+        None,
+        Some(&mut design),
+        FrontendMessage::Execute {
+            portal: "events_portal".into(),
+            max_rows: 1,
+        },
+    );
+    assert!(matches!(
+        first.last(),
+        Some(BackendMessage::PortalSuspended)
+    ));
+    assert_eq!(design.status().evidence.recorded_reports, 1);
+
+    for _ in 0..3 {
+        session.handle_with_server_observation(
+            &mut fixture.database,
+            None,
+            Some(&mut design),
+            FrontendMessage::Execute {
+                portal: "events_portal".into(),
+                max_rows: 1,
+            },
+        );
+        assert_eq!(design.status().evidence.recorded_reports, 1);
+    }
+
+    session.handle_with_server_observation(
+        &mut fixture.database,
+        None,
+        Some(&mut design),
+        FrontendMessage::Query("SELECT version()".into()),
+    );
+    session.handle_with_server_observation(
+        &mut fixture.database,
+        None,
+        Some(&mut design),
+        FrontendMessage::Query("BEGIN".into()),
+    );
+    session.handle_with_server_observation(
+        &mut fixture.database,
+        None,
+        Some(&mut design),
+        FrontendMessage::Query("SELECT id FROM events".into()),
+    );
+    session.handle_with_server_observation(
+        &mut fixture.database,
+        None,
+        Some(&mut design),
+        FrontendMessage::Query("COMMIT".into()),
+    );
+    session.handle_with_server_observation(
+        &mut fixture.database,
+        None,
+        Some(&mut design),
+        FrontendMessage::Query("INSERT INTO events (id, category) VALUES (4, 8)".into()),
+    );
+    assert_eq!(design.status().evidence.recorded_reports, 1);
+    assert_eq!(design.status().diagnostics.eligible_query_count, 1);
+    fixture.close();
+}
+
+#[test]
+fn postgres_design_only_legacy_local_rejection_preserves_success() {
+    let mut fixture = Fixture::create("design-legacy-local", false);
+    let mut session = new_session(
+        &fixture.database,
+        SessionPolicy::default(),
+        principal(true, false, false),
+    );
+    let mut design = design_runtime();
+    let messages = session.handle_with_server_observation(
+        &mut fixture.database,
+        None,
+        Some(&mut design),
+        FrontendMessage::Query("SELECT id FROM events".into()),
+    );
+    assert_successful_query(&messages);
+    let status = design.status();
+    assert_eq!(status.evidence.recorded_reports, 0);
+    assert_eq!(status.diagnostics.record_error_count, 1);
+    assert_eq!(
+        status.diagnostics.last_record_error,
+        Some(PhysicalDesignEvidenceRecordError::GlobalVisibilityRequired)
+    );
+    fixture.close();
 }

@@ -1,5 +1,21 @@
 # NetbaDB roadmap
 
+## Server Physical Design evidence bridge (Adaptive Operations Phase 21 complete)
+
+- added explicit programmatic Native and PostgreSQL opt-in with independent
+  evidence limits and fixed advisor policy, without a hidden default;
+- gave the sole Database worker an independent bounded design window beside the
+  Adaptive runtime and fanned one eligible execution report into both enabled
+  concrete sinks without duplicate bind, plan, execution, or SQL parsing;
+- added bounded status, on-demand current-inventory recommendations, and atomic
+  conditional design-cohort rotation through host-mediated control handles;
+- kept telemetry failures nonfatal and sink-local, preserved LegacyLocal and
+  schema-cohort behavior, and kept Adaptive/design rotations independent;
+- retained Manifest v6, NBOP v1, `netbadbd`, `netbadb operator`, both wire
+  contracts, Server metrics, Inspection JSON v7, and all persistent formats.
+
+See [`adaptive-operations-phase21.md`](adaptive-operations-phase21.md).
+
 ## Observe-only Physical Design Advisor (Adaptive Operations Phase 20 complete)
 
 - added an independent caller-owned, bounded, runtime-only design evidence

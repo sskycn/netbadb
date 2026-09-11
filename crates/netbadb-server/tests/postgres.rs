@@ -5,14 +5,16 @@ use std::time::{Duration, Instant};
 
 use netbadb_core::{
     AdaptiveEvidencePoolLimits, AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope,
-    AutomaticSchedulerPolicy, Database, MaintenanceBudget,
+    AutomaticSchedulerPolicy, Database, DatabaseCoordinatorConfig, MaintenanceBudget,
+    PhysicalDesignAdvisorError, PhysicalDesignAdvisorPolicy, PhysicalDesignEvidenceLimits,
+    PhysicalDesignEvidenceRecordError, PhysicalDesignRecommendationPolicy, TableStorageCreateSpec,
 };
 use netbadb_pgwire::{CANCEL_REQUEST_CODE, PROTOCOL_VERSION_3, SSL_REQUEST_CODE};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
     OperatorAdaptiveModeV1, PostgresTcpServer, ServerAdaptiveControlError,
     ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig, ServerAdaptiveMode, ServerConfig,
-    ServerOperatorClient,
+    ServerOperatorClient, ServerPhysicalDesignAdvisorConfig, ServerPhysicalDesignControlError,
 };
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 
@@ -40,6 +42,22 @@ fn adaptive_driver_config(table_id: TableId) -> ServerAdaptiveDriverConfig {
         Vec::new(),
     )
     .unwrap()
+}
+
+fn physical_design_config() -> ServerPhysicalDesignAdvisorConfig {
+    let recommendation = PhysicalDesignRecommendationPolicy {
+        minimum_reports: 1,
+        minimum_distinct_query_shapes: 1,
+        minimum_actual_scan_work_units: 0,
+        max_recommendations: 8,
+    };
+    ServerPhysicalDesignAdvisorConfig::new(
+        PhysicalDesignEvidenceLimits::default(),
+        PhysicalDesignAdvisorPolicy {
+            index: recommendation,
+            columnar: recommendation,
+        },
+    )
 }
 
 fn users_table() -> TableDef {
@@ -103,6 +121,168 @@ fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
         .start()
         .unwrap();
     (directory, server)
+}
+
+#[test]
+fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonfatal() {
+    let directory = test_directory("physical-design-legacy-local");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    Database::create(directory.join("users.ndb"), users_table())
+        .unwrap()
+        .close()
+        .unwrap();
+    let manifest = directory.join("server.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+            "version": 6,
+            "listen": "127.0.0.1:0",
+            "authorization": {
+                "local_plaintext": {"schema_admin": true,
+                    "tables": [{"table_id":1,"read":true,"write":true,"transaction":true,"analyze":false}]
+                },
+                "clients": []
+            },
+            "tables": [{
+                "path":"users.ndb","id":1,"name":"users",
+                "columns":[
+                    {"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false,"primary_key":true},
+                    {"id":2,"name":"name","physical_type":"text","semantic_type":null,"nullable":true,"primary_key":false},
+                    {"id":3,"name":"active","physical_type":"bool","semantic_type":null,"nullable":false,"primary_key":false}
+                ]
+            }]
+        }"#,
+    )
+    .unwrap();
+    let server = PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .with_physical_design_advisor(physical_design_config())
+        .start()
+        .unwrap();
+    let design = server.physical_design_control();
+    assert!(matches!(
+        design.recommendations(),
+        Err(ServerPhysicalDesignControlError::Advisor(
+            PhysicalDesignAdvisorError::NoEvidence
+        ))
+    ));
+    assert_eq!(
+        server.adaptive_control().status().unwrap().mode,
+        ServerAdaptiveMode::Disabled
+    );
+
+    let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+    startup(&mut stream);
+    let messages = query(&mut stream, "SELECT id FROM users");
+    assert_eq!(messages.last().map(|message| message.0), Some(b'Z'));
+    assert_eq!(messages.last().unwrap().1, [b'I']);
+    let status = design.status().unwrap();
+    assert_eq!(status.evidence.recorded_reports, 0);
+    assert_eq!(status.diagnostics.eligible_query_count, 1);
+    assert_eq!(status.diagnostics.record_error_count, 1);
+    assert_eq!(
+        status.diagnostics.last_record_error,
+        Some(PhysicalDesignEvidenceRecordError::GlobalVisibilityRequired)
+    );
+
+    stream.write_all(&frontend(b'X', &[])).unwrap();
+    drop(stream);
+    server.shutdown().unwrap();
+    assert!(matches!(
+        design.status(),
+        Err(ServerPhysicalDesignControlError::ServerStopped)
+    ));
+    cleanup(&directory);
+}
+
+#[test]
+fn postgres_extended_physical_design_capture_records_only_initial_portal_execution() {
+    let directory = test_directory("physical-design-extended");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut database = Database::create_catalog(
+        directory.join("catalog"),
+        vec![TableStorageCreateSpec::heap(
+            directory.join("users.ndb"),
+            users_table(),
+        )],
+        Some(
+            DatabaseCoordinatorConfig::new(directory.join("coordinator")).with_global_visibility(),
+        ),
+    )
+    .unwrap();
+    database
+        .execute("INSERT INTO users (id, name, active) VALUES (1, 'Ada', true)")
+        .unwrap();
+    database
+        .execute("INSERT INTO users (id, name, active) VALUES (2, 'Lin', true)")
+        .unwrap();
+    database.close().unwrap();
+    let manifest = directory.join("server.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+            "version": 6,
+            "listen": "127.0.0.1:0",
+            "authorization": {
+                "local_plaintext": {"schema_admin": false,
+                    "tables": [{"table_id":1,"read":true,"write":false,"transaction":false,"analyze":false}]
+                },
+                "clients": []
+            },
+            "tables": [{
+                "path":"users.ndb","id":1,"name":"users",
+                "columns":[
+                    {"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false,"primary_key":true},
+                    {"id":2,"name":"name","physical_type":"text","semantic_type":null,"nullable":true,"primary_key":false},
+                    {"id":3,"name":"active","physical_type":"bool","semantic_type":null,"nullable":false,"primary_key":false}
+                ]
+            }]
+        }"#,
+    )
+    .unwrap();
+    let server = PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .with_physical_design_advisor(physical_design_config())
+        .start()
+        .unwrap();
+    let design = server.physical_design_control();
+    let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+    startup(&mut stream);
+
+    let mut parse = b"by_active\0SELECT id FROM users WHERE active = $1 ORDER BY id\0".to_vec();
+    parse.extend_from_slice(&0_i16.to_be_bytes());
+    stream.write_all(&frontend(b'P', &parse)).unwrap();
+    let mut bind = b"active_portal\0by_active\0".to_vec();
+    bind.extend_from_slice(&0_i16.to_be_bytes());
+    bind.extend_from_slice(&1_i16.to_be_bytes());
+    bind.extend_from_slice(&4_i32.to_be_bytes());
+    bind.extend_from_slice(b"true");
+    bind.extend_from_slice(&0_i16.to_be_bytes());
+    stream.write_all(&frontend(b'B', &bind)).unwrap();
+    let mut execute = b"active_portal\0".to_vec();
+    execute.extend_from_slice(&1_u32.to_be_bytes());
+    stream.write_all(&frontend(b'E', &execute)).unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let first = read_until_ready(&mut stream);
+    assert_eq!(
+        first.iter().map(|message| message.0).collect::<Vec<_>>(),
+        [b'1', b'2', b'D', b's', b'Z']
+    );
+    assert_eq!(design.status().unwrap().evidence.recorded_reports, 1);
+
+    stream.write_all(&frontend(b'E', &execute)).unwrap();
+    stream.write_all(&frontend(b'S', &[])).unwrap();
+    let second = read_until_ready(&mut stream);
+    assert_eq!(
+        second.iter().map(|message| message.0).collect::<Vec<_>>(),
+        [b'D', b'C', b'Z']
+    );
+    assert_eq!(design.status().unwrap().evidence.recorded_reports, 1);
+
+    stream.write_all(&frontend(b'X', &[])).unwrap();
+    drop(stream);
+    server.shutdown().unwrap();
+    cleanup(&directory);
 }
 
 #[test]

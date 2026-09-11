@@ -30,10 +30,16 @@ use crate::adaptive_driver::{
     handle_disabled_worker_command,
 };
 use crate::adaptive_feedback::{
-    ServerAdaptiveFeedbackRuntime, execute_prepared_with_optional_server_feedback,
+    ServerAdaptiveFeedbackRuntime, execute_prepared_with_optional_server_observation,
 };
 use crate::authorization::{AuthorizationPolicy, PrincipalAuthorization};
 use crate::operator::ServerOperatorPlane;
+use crate::physical_design::{
+    ServerHostObservationConfig, ServerPhysicalDesignAdvisorConfig,
+    ServerPhysicalDesignControlHandle, ServerPhysicalDesignRuntime,
+    ServerPhysicalDesignWorkerCommand, forward_physical_design_control_requests,
+    handle_disabled_physical_design_worker_command,
+};
 use crate::{
     ClientIdentity, DatabaseSession, ServerAdaptiveFeedbackConfig, ServerConfig, ServerLimits,
     ServerOperatorError, SessionPolicy, TableBootstrap, TransportKind,
@@ -50,6 +56,7 @@ const MAX_CATALOG_PATTERN_ATOMS: usize = 1_024;
 pub struct PostgresTcpServer {
     config: ServerConfig,
     adaptive_override: Option<ServerAdaptiveStartupMode>,
+    physical_design: Option<ServerPhysicalDesignAdvisorConfig>,
 }
 
 impl PostgresTcpServer {
@@ -58,6 +65,7 @@ impl PostgresTcpServer {
         Self {
             config,
             adaptive_override: None,
+            physical_design: None,
         }
     }
 
@@ -77,6 +85,17 @@ impl PostgresTcpServer {
         self
     }
 
+    /// Enables worker-owned physical-design evidence and read-only, on-demand
+    /// recommendations without changing the PostgreSQL wire surface.
+    #[must_use]
+    pub fn with_physical_design_advisor(
+        mut self,
+        config: ServerPhysicalDesignAdvisorConfig,
+    ) -> Self {
+        self.physical_design = Some(config);
+        self
+    }
+
     pub fn start(self) -> Result<PostgresServerHandle, PostgresTcpServerError> {
         let (
             listen,
@@ -88,6 +107,7 @@ impl PostgresTcpServer {
             operator_config,
         ) = self.config.into_parts();
         let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
+        let physical_design = self.physical_design;
         if security.kind() != TransportKind::PlaintextLoopback {
             return Err(PostgresTcpServerError::TlsManifestUnsupported);
         }
@@ -97,6 +117,7 @@ impl PostgresTcpServer {
             limits.session_policy(),
             authorization,
             adaptive_mode,
+            physical_design,
         )?;
         let listener = match TcpListener::bind(listen) {
             Ok(listener) => listener,
@@ -127,6 +148,7 @@ impl PostgresTcpServer {
         };
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let (adaptive_control_tx, adaptive_control_rx) = mpsc::channel();
+        let (physical_design_control_tx, physical_design_control_rx) = mpsc::channel();
         let (operator_failure_tx, operator_failure_rx) = mpsc::channel();
         let (worker_tx, worker_rx) = mpsc::sync_channel(0);
         let join = match thread::Builder::new()
@@ -140,10 +162,13 @@ impl PostgresTcpServer {
                     shutdown_rx,
                     worker,
                     limits,
-                    ServerAdaptiveHostConfig {
-                        tick_interval,
-                        controls: adaptive_control_rx,
-                        operator_failures: operator_failure_rx,
+                    ServerHostObservationConfig {
+                        adaptive: ServerAdaptiveHostConfig {
+                            tick_interval,
+                            controls: adaptive_control_rx,
+                            operator_failures: operator_failure_rx,
+                        },
+                        physical_design_controls: physical_design_control_rx,
                     },
                 )
             }) {
@@ -164,6 +189,8 @@ impl PostgresTcpServer {
             return Err(finish_pg_startup_failure(error.0, startup));
         }
         let adaptive_control = ServerAdaptiveControlHandle::new(adaptive_control_tx);
+        let physical_design_control =
+            ServerPhysicalDesignControlHandle::new(physical_design_control_tx);
         let operator = match operator_config {
             Some(config) => match ServerOperatorPlane::start(
                 config,
@@ -192,6 +219,7 @@ impl PostgresTcpServer {
             local_addr,
             shutdown_tx,
             adaptive_control,
+            physical_design_control,
             operator,
             join: Some(join),
         })
@@ -206,6 +234,7 @@ pub struct PostgresServerHandle {
     local_addr: SocketAddr,
     shutdown_tx: Sender<()>,
     adaptive_control: ServerAdaptiveControlHandle,
+    physical_design_control: ServerPhysicalDesignControlHandle,
     operator: Option<ServerOperatorPlane>,
     join: Option<JoinHandle<Result<(), PostgresTcpServerError>>>,
 }
@@ -219,6 +248,11 @@ impl PostgresServerHandle {
     #[must_use]
     pub fn adaptive_control(&self) -> ServerAdaptiveControlHandle {
         self.adaptive_control.clone()
+    }
+
+    #[must_use]
+    pub fn physical_design_control(&self) -> ServerPhysicalDesignControlHandle {
+        self.physical_design_control.clone()
     }
 
     /// Returns whether the main server thread or configured operator listener
@@ -383,11 +417,12 @@ fn run_pg_accept_loop(
     shutdown: Receiver<()>,
     worker: PgDatabaseWorker,
     limits: ServerLimits,
-    adaptive_host_config: ServerAdaptiveHostConfig,
+    host_config: ServerHostObservationConfig,
 ) -> Result<(), PostgresTcpServerError> {
     let mut connections = Vec::new();
     let mut next_session_id = 1_u64;
-    let mut adaptive_host = adaptive_host_config
+    let mut adaptive_host = host_config
+        .adaptive
         .tick_interval
         .map(ServerAdaptiveHostDriver::new);
     loop {
@@ -395,7 +430,7 @@ fn run_pg_accept_loop(
             Ok(()) | Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {}
         }
-        if adaptive_host_config.operator_failures.try_recv().is_ok() {
+        if host_config.adaptive.operator_failures.try_recv().is_ok() {
             break;
         }
         reap_pg_connections(&mut connections);
@@ -411,13 +446,23 @@ fn run_pg_accept_loop(
         let host_snapshot = adaptive_host
             .as_ref()
             .map(ServerAdaptiveHostDriver::snapshot);
-        forward_control_requests(&adaptive_host_config.controls, host_snapshot, |command| {
+        forward_control_requests(&host_config.adaptive.controls, host_snapshot, |command| {
             worker
                 .client
                 .commands
                 .send(PgWorkerCommand::Adaptive(command))
                 .map_err(|_| ())
         });
+        forward_physical_design_control_requests(
+            &host_config.physical_design_controls,
+            |command| {
+                worker
+                    .client
+                    .commands
+                    .send(PgWorkerCommand::PhysicalDesign(command))
+                    .map_err(|_| ())
+            },
+        );
         match listener.accept() {
             Ok((stream, _)) => {
                 if connections.len() >= limits.max_connections() {
@@ -623,6 +668,7 @@ impl PgDatabaseWorker {
         policy: SessionPolicy,
         authorization: AuthorizationPolicy,
         adaptive_mode: ServerAdaptiveStartupMode,
+        physical_design_config: Option<ServerPhysicalDesignAdvisorConfig>,
     ) -> Result<Self, PostgresTcpServerError> {
         let (commands, receiver) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -647,10 +693,18 @@ impl PgDatabaseWorker {
                         return database.close().map_err(|error| error.to_string());
                     }
                 };
+                let physical_design = physical_design_config.map(ServerPhysicalDesignRuntime::new);
                 if ready_tx.send(Ok(())).is_err() {
                     return database.close().map_err(|error| error.to_string());
                 }
-                run_pg_worker(database, policy, authorization, adaptive, receiver)
+                run_pg_worker(
+                    database,
+                    policy,
+                    authorization,
+                    adaptive,
+                    physical_design,
+                    receiver,
+                )
             })
             .map_err(PostgresTcpServerError::ThreadSpawn)?;
         match ready_rx
@@ -706,6 +760,7 @@ enum PgWorkerCommand {
         reply: SyncSender<Result<(), PgConnectionError>>,
     },
     Adaptive(ServerAdaptiveWorkerCommand),
+    PhysicalDesign(ServerPhysicalDesignWorkerCommand),
     Shutdown {
         reply: SyncSender<()>,
     },
@@ -721,6 +776,7 @@ fn run_pg_worker(
     policy: SessionPolicy,
     authorization: AuthorizationPolicy,
     mut adaptive: Option<ServerAdaptiveWorkerRuntime>,
+    mut physical_design: Option<ServerPhysicalDesignRuntime>,
     commands: Receiver<PgWorkerCommand>,
 ) -> Result<(), String> {
     let mut sessions: HashMap<u64, PgWorkerSession> = HashMap::new();
@@ -767,11 +823,12 @@ fn run_pg_worker(
                     let _ = reply.send(Err(PgConnectionError::WorkerStopped));
                     continue;
                 };
-                let messages = session.handle_with_adaptive_feedback(
+                let messages = session.handle_with_server_observation(
                     &mut database,
                     adaptive
                         .as_mut()
                         .map(ServerAdaptiveWorkerRuntime::feedback_mut),
+                    physical_design.as_mut(),
                     message,
                 );
                 let _ = reply.send(Ok(messages));
@@ -792,6 +849,10 @@ fn run_pg_worker(
             PgWorkerCommand::Adaptive(command) => match adaptive.as_mut() {
                 Some(adaptive) => adaptive.handle(&mut database, command),
                 None => handle_disabled_worker_command(command),
+            },
+            PgWorkerCommand::PhysicalDesign(command) => match physical_design.as_mut() {
+                Some(runtime) => runtime.handle(&database, command),
+                None => handle_disabled_physical_design_worker_command(command),
             },
             PgWorkerCommand::Shutdown { reply } => {
                 for session in sessions.values_mut() {
@@ -902,6 +963,11 @@ struct Portal {
     values: Vec<ScalarValue>,
     fields: Vec<FieldDescription>,
     result: Option<PortalResult>,
+}
+
+struct PgObservationRuntimes<'a> {
+    adaptive: Option<&'a mut ServerAdaptiveFeedbackRuntime>,
+    physical_design: Option<&'a mut ServerPhysicalDesignRuntime>,
 }
 
 struct ReadOnlySavepoint {
@@ -1249,13 +1315,24 @@ impl PgWorkerSession {
 
     #[cfg(test)]
     fn handle(&mut self, database: &mut Database, message: FrontendMessage) -> Vec<BackendMessage> {
-        self.handle_with_adaptive_feedback(database, None, message)
+        self.handle_with_server_observation(database, None, None, message)
     }
 
+    #[cfg(test)]
     fn handle_with_adaptive_feedback(
         &mut self,
         database: &mut Database,
         adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
+        message: FrontendMessage,
+    ) -> Vec<BackendMessage> {
+        self.handle_with_server_observation(database, adaptive_feedback, None, message)
+    }
+
+    fn handle_with_server_observation(
+        &mut self,
+        database: &mut Database,
+        adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
+        physical_design: Option<&mut ServerPhysicalDesignRuntime>,
         message: FrontendMessage,
     ) -> Vec<BackendMessage> {
         self.trace_frontend(&message);
@@ -1269,7 +1346,9 @@ impl PgWorkerSession {
             }
         } else {
             match message {
-                FrontendMessage::Query(sql) => self.simple_query(database, adaptive_feedback, &sql),
+                FrontendMessage::Query(sql) => {
+                    self.simple_query(database, adaptive_feedback, physical_design, &sql)
+                }
                 FrontendMessage::Parse {
                     statement,
                     query,
@@ -1289,9 +1368,13 @@ impl PgWorkerSession {
                     result_formats,
                 ),
                 FrontendMessage::Describe { target, name } => self.describe(target, &name),
-                FrontendMessage::Execute { portal, max_rows } => {
-                    self.execute_portal(database, adaptive_feedback, &portal, max_rows)
-                }
+                FrontendMessage::Execute { portal, max_rows } => self.execute_portal(
+                    database,
+                    adaptive_feedback,
+                    physical_design,
+                    &portal,
+                    max_rows,
+                ),
                 FrontendMessage::Close { target, name } => self.close_object(target, &name),
                 FrontendMessage::Sync => {
                     vec![BackendMessage::ReadyForQuery(self.status.ready_byte())]
@@ -1373,6 +1456,7 @@ impl PgWorkerSession {
         &mut self,
         database: &mut Database,
         mut adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
+        mut physical_design: Option<&mut ServerPhysicalDesignRuntime>,
         sql: &str,
     ) -> Vec<BackendMessage> {
         self.prepared.remove("");
@@ -1386,7 +1470,12 @@ impl PgWorkerSession {
         }
         let mut messages = Vec::new();
         for statement in statements {
-            match self.execute_statement(database, adaptive_feedback.as_deref_mut(), statement) {
+            match self.execute_statement(
+                database,
+                adaptive_feedback.as_deref_mut(),
+                physical_design.as_deref_mut(),
+                statement,
+            ) {
                 Ok(mut statement_messages) => messages.append(&mut statement_messages),
                 Err(error) => {
                     messages.push(BackendMessage::ErrorResponse(error));
@@ -1757,6 +1846,7 @@ impl PgWorkerSession {
         &mut self,
         database: &mut Database,
         adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
+        physical_design: Option<&mut ServerPhysicalDesignRuntime>,
         name: &str,
         max_rows: u32,
     ) -> Vec<BackendMessage> {
@@ -1772,7 +1862,10 @@ impl PgWorkerSession {
         if portal.result.is_none() {
             let result = match self.execute_to_portal(
                 database,
-                adaptive_feedback,
+                PgObservationRuntimes {
+                    adaptive: adaptive_feedback,
+                    physical_design,
+                },
                 &portal.sql,
                 &portal.execution,
                 &portal.values,
@@ -1798,16 +1891,20 @@ impl PgWorkerSession {
     fn execute_to_portal(
         &mut self,
         database: &mut Database,
-        adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
+        observation: PgObservationRuntimes<'_>,
         sql: &str,
         execution: &PreparedExecution,
         values: &[ScalarValue],
         fields: &[FieldDescription],
     ) -> Result<PortalResult, ErrorResponse> {
         let result = match execution {
-            PreparedExecution::Core(prepared) => {
-                self.execute_prepared_core(database, adaptive_feedback, prepared, values)?
-            }
+            PreparedExecution::Core(prepared) => self.execute_prepared_core(
+                database,
+                observation.adaptive,
+                observation.physical_design,
+                prepared,
+                values,
+            )?,
             PreparedExecution::Ddl(prepared) => {
                 if !values.is_empty() {
                     return Err(fixed_error("08P01", "DDL does not accept parameters"));
@@ -1926,6 +2023,7 @@ impl PgWorkerSession {
         &mut self,
         database: &mut Database,
         adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
+        physical_design: Option<&mut ServerPhysicalDesignRuntime>,
         sql: &str,
     ) -> Result<Vec<BackendMessage>, ErrorResponse> {
         let normalized = normalize_sql(sql);
@@ -2047,9 +2145,13 @@ impl PgWorkerSession {
             .prepare(database, sql, &[])
             .map_err(|error| self.record_error(&error))?;
         let result = match prepared {
-            PreparedSqlStatement::Relational(prepared) => {
-                self.execute_prepared_core(database, adaptive_feedback, &prepared, &[])?
-            }
+            PreparedSqlStatement::Relational(prepared) => self.execute_prepared_core(
+                database,
+                adaptive_feedback,
+                physical_design,
+                &prepared,
+                &[],
+            )?,
             PreparedSqlStatement::Ddl(prepared) => {
                 preflight_ddl_types(&prepared).map_err(|e| self.record_protocol_error(e))?;
                 self.authorize_access(&prepared.access())?;
@@ -2081,6 +2183,7 @@ impl PgWorkerSession {
         &mut self,
         database: &mut Database,
         adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
+        physical_design: Option<&mut ServerPhysicalDesignRuntime>,
         prepared: &CorePrepared,
         values: &[ScalarValue],
     ) -> Result<ExecutionResult, ErrorResponse> {
@@ -2091,8 +2194,9 @@ impl PgWorkerSession {
             ));
         }
         self.authorize_access(&prepared.access())?;
-        execute_prepared_with_optional_server_feedback(
+        execute_prepared_with_optional_server_observation(
             adaptive_feedback,
+            physical_design,
             &mut self.execution,
             database,
             prepared,
@@ -5078,6 +5182,7 @@ mod tests {
     fn postgres_handle_is_finished_observes_main_thread_completion() {
         let (shutdown_tx, _shutdown_rx) = mpsc::channel();
         let (adaptive_tx, _adaptive_rx) = mpsc::channel();
+        let (physical_design_tx, _physical_design_rx) = mpsc::channel();
         let join = thread::spawn(|| Ok(()));
         while !join.is_finished() {
             thread::yield_now();
@@ -5086,6 +5191,7 @@ mod tests {
             local_addr: "127.0.0.1:1".parse().unwrap(),
             shutdown_tx,
             adaptive_control: ServerAdaptiveControlHandle::new(adaptive_tx),
+            physical_design_control: ServerPhysicalDesignControlHandle::new(physical_design_tx),
             operator: None,
             join: Some(join),
         };

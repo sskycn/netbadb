@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use netbadb_core::{
-    AdaptiveEvidencePoolLimits, Database, DatabaseCoordinatorConfig, TableStorageCreateSpec,
+    AdaptiveEvidencePoolLimits, Database, DatabaseCoordinatorConfig, PhysicalDesignAdvisorPolicy,
+    PhysicalDesignEvidenceLimits, PhysicalDesignRecommendationPolicy, TableStorageCreateSpec,
 };
 use netbadb_protocol::{ClientMessage, ProtocolErrorCode, ServerMessage};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
@@ -99,6 +100,22 @@ fn runtime() -> ServerAdaptiveFeedbackRuntime {
     ServerAdaptiveFeedbackRuntime::new(ServerAdaptiveFeedbackConfig::new(
         AdaptiveEvidencePoolLimits::default(),
     ))
+}
+
+fn design_config() -> crate::ServerPhysicalDesignAdvisorConfig {
+    let recommendation = PhysicalDesignRecommendationPolicy {
+        minimum_reports: 1,
+        minimum_distinct_query_shapes: 1,
+        minimum_actual_scan_work_units: 0,
+        max_recommendations: 1,
+    };
+    crate::ServerPhysicalDesignAdvisorConfig::new(
+        PhysicalDesignEvidenceLimits::default(),
+        PhysicalDesignAdvisorPolicy {
+            index: recommendation,
+            columnar: recommendation,
+        },
+    )
 }
 
 #[test]
@@ -302,15 +319,29 @@ fn native_server_builder_is_default_disabled_and_explicitly_enabled() {
     fs::write(&manifest, source).expect("write manifest");
     let config = ServerConfig::from_manifest_path(&manifest).expect("parse manifest");
 
-    let disabled = TcpServer::new(config);
+    let disabled = TcpServer::new(config.clone());
     assert!(disabled.adaptive_override.is_none());
+    assert!(disabled.physical_design.is_none());
     let limits = AdaptiveEvidencePoolLimits::default();
-    let enabled = disabled.with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits));
+    let design = design_config();
+    let enabled = disabled
+        .with_physical_design_advisor(design)
+        .with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits));
     assert!(matches!(
         enabled.adaptive_override,
         Some(crate::adaptive_driver::ServerAdaptiveStartupMode::FeedbackOnly(config))
             if config.limits() == limits
     ));
+    assert_eq!(enabled.physical_design, Some(design));
+    let reverse = TcpServer::new(config)
+        .with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits))
+        .with_physical_design_advisor(design);
+    assert!(matches!(
+        reverse.adaptive_override,
+        Some(crate::adaptive_driver::ServerAdaptiveStartupMode::FeedbackOnly(config))
+            if config.limits() == limits
+    ));
+    assert_eq!(reverse.physical_design, Some(design));
 
     fs::remove_dir_all(root).expect("remove config root");
 }

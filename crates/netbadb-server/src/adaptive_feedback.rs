@@ -8,6 +8,7 @@ use netbadb_core::{
 use netbadb_types::ScalarValue;
 
 use crate::DatabaseSession;
+use crate::physical_design::ServerPhysicalDesignRuntime;
 
 /// Explicit, bounded Server-side capture configuration.
 ///
@@ -145,28 +146,41 @@ impl ServerAdaptiveFeedbackRuntime {
 
 /// Executes one already-authorized prepared Core statement, optionally
 /// capturing the exact successful autocommit query execution.
-pub(crate) fn execute_prepared_with_optional_server_feedback(
-    runtime: Option<&mut ServerAdaptiveFeedbackRuntime>,
+pub(crate) fn execute_prepared_with_optional_server_observation(
+    adaptive: Option<&mut ServerAdaptiveFeedbackRuntime>,
+    physical_design: Option<&mut ServerPhysicalDesignRuntime>,
     session: &mut DatabaseSession,
     database: &mut Database,
     prepared: &PreparedStatement,
     values: &[ScalarValue],
 ) -> Result<ExecutionResult, DatabaseError> {
-    let Some(runtime) = runtime else {
+    if adaptive.is_none() && physical_design.is_none() {
         return session.execute_prepared(database, prepared, values);
-    };
+    }
     if session.has_explicit_transaction() || !prepared.description().is_query {
         return session.execute_prepared(database, prepared, values);
     }
 
     let executed = database.execute_prepared_with_feedback(prepared, values)?;
     if let Some(report) = executed.feedback.query_report() {
-        runtime.record_successful_query(report);
+        // Admissions are deliberately independent. Either sink may reject
+        // the report without skipping or rolling back the other sink.
+        if let Some(runtime) = adaptive {
+            runtime.record_successful_query(report);
+        }
+        if let Some(runtime) = physical_design {
+            runtime.record_successful_query(report);
+        }
     } else {
         // The typed description and Core result should agree. If they do not,
         // preserve the successful user result and classify the missing report
         // as telemetry failure rather than inventing evidence.
-        runtime.increment(|diagnostics| &mut diagnostics.record_error_count);
+        if let Some(runtime) = adaptive {
+            runtime.increment(|diagnostics| &mut diagnostics.record_error_count);
+        }
+        if let Some(runtime) = physical_design {
+            runtime.record_missing_report();
+        }
     }
     Ok(executed.result)
 }
@@ -176,12 +190,21 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
 
-    use netbadb_core::{ColumnarProjectionSpec, DatabaseCoordinatorConfig, TableStorageCreateSpec};
+    use netbadb_core::{
+        ColumnarProjectionSpec, DatabaseCoordinatorConfig, PhysicalDesignAdvisorError,
+        PhysicalDesignAdvisorPolicy, PhysicalDesignEvidenceLimits,
+        PhysicalDesignRecommendationPolicy, TableStorageCreateSpec,
+    };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, PhysicalType, TableId};
 
     use super::*;
+    use crate::physical_design::{
+        ServerPhysicalDesignAdvisorConfig, ServerPhysicalDesignControlError,
+        ServerPhysicalDesignRuntime, ServerPhysicalDesignWorkerCommand,
+    };
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 
@@ -228,6 +251,24 @@ mod tests {
         fs::remove_dir_all(root).expect("remove feedback fixture root");
     }
 
+    fn physical_design_runtime(
+        evidence_limits: PhysicalDesignEvidenceLimits,
+    ) -> ServerPhysicalDesignRuntime {
+        let recommendation = PhysicalDesignRecommendationPolicy {
+            minimum_reports: 1,
+            minimum_distinct_query_shapes: 1,
+            minimum_actual_scan_work_units: 0,
+            max_recommendations: 8,
+        };
+        ServerPhysicalDesignRuntime::new(ServerPhysicalDesignAdvisorConfig::new(
+            evidence_limits,
+            PhysicalDesignAdvisorPolicy {
+                index: recommendation,
+                columnar: recommendation,
+            },
+        ))
+    }
+
     #[test]
     fn shared_bridge_captures_only_successful_autocommit_queries() {
         let (root, mut database) = fixture("eligibility", true);
@@ -252,8 +293,9 @@ mod tests {
             .execute_prepared(&mut database, &query, &[ScalarValue::Int64(7)])
             .expect("execute ordinary comparison query");
 
-        let result = execute_prepared_with_optional_server_feedback(
+        let result = execute_prepared_with_optional_server_observation(
             Some(&mut runtime),
+            None,
             &mut session,
             &mut database,
             &query,
@@ -263,8 +305,9 @@ mod tests {
         assert_eq!(result, ordinary);
         assert_eq!(runtime.inspection().progress.recorded_reports, 1);
 
-        execute_prepared_with_optional_server_feedback(
+        execute_prepared_with_optional_server_observation(
             Some(&mut runtime),
+            None,
             &mut session,
             &mut database,
             &mutation,
@@ -276,8 +319,9 @@ mod tests {
         session
             .begin(&mut database, None)
             .expect("begin transaction");
-        execute_prepared_with_optional_server_feedback(
+        execute_prepared_with_optional_server_observation(
             Some(&mut runtime),
+            None,
             &mut session,
             &mut database,
             &query,
@@ -288,8 +332,9 @@ mod tests {
         assert_eq!(runtime.inspection().progress.recorded_reports, 1);
 
         assert!(
-            execute_prepared_with_optional_server_feedback(
+            execute_prepared_with_optional_server_observation(
                 Some(&mut runtime),
+                None,
                 &mut session,
                 &mut database,
                 &query,
@@ -322,8 +367,9 @@ mod tests {
         );
 
         for _ in 0..2 {
-            let result = execute_prepared_with_optional_server_feedback(
+            let result = execute_prepared_with_optional_server_observation(
                 Some(&mut runtime),
+                None,
                 &mut session,
                 &mut database,
                 &query,
@@ -354,7 +400,8 @@ mod tests {
         let query = database
             .prepare_statement("SELECT id FROM events", &[])
             .expect("prepare query");
-        let result = execute_prepared_with_optional_server_feedback(
+        let result = execute_prepared_with_optional_server_observation(
+            None,
             None,
             &mut session,
             &mut database,
@@ -377,8 +424,9 @@ mod tests {
             .prepare(&database, "CREATE INDEX events_id_idx ON events (id)", &[])
             .expect("prepare DDL");
         let result = session
-            .execute_sql_prepared_with_optional_server_feedback(
+            .execute_sql_prepared_with_optional_server_observation(
                 Some(&mut runtime),
+                None,
                 &mut database,
                 &ddl,
             )
@@ -424,8 +472,9 @@ mod tests {
             .prepare_statement("SELECT id FROM events", &[])
             .expect("prepare columnar query");
 
-        let result = execute_prepared_with_optional_server_feedback(
+        let result = execute_prepared_with_optional_server_observation(
             Some(&mut runtime),
+            None,
             &mut session,
             &mut database,
             &query,
@@ -466,5 +515,136 @@ mod tests {
             reopened.diagnostics,
             ServerAdaptiveFeedbackDiagnostics::default()
         );
+    }
+
+    #[test]
+    fn one_feedback_execution_fans_out_to_independent_concrete_sinks() {
+        let (root, mut database) = fixture("dual-sink", true);
+        let mut session = DatabaseSession::default();
+        let mut adaptive = ServerAdaptiveFeedbackRuntime::new(ServerAdaptiveFeedbackConfig::new(
+            AdaptiveEvidencePoolLimits::default(),
+        ));
+        let mut physical_design = physical_design_runtime(PhysicalDesignEvidenceLimits {
+            max_index_candidates: 0,
+            ..PhysicalDesignEvidenceLimits::default()
+        });
+        let query = database
+            .prepare_statement(
+                "SELECT id FROM events WHERE category = $1",
+                &[Some(PhysicalType::Int64)],
+            )
+            .expect("prepare dual-sink query");
+
+        let result = execute_prepared_with_optional_server_observation(
+            Some(&mut adaptive),
+            Some(&mut physical_design),
+            &mut session,
+            &mut database,
+            &query,
+            &[ScalarValue::Int64(7)],
+        )
+        .expect("execute query once for both sinks");
+        assert!(matches!(result, ExecutionResult::Query(_)));
+        assert_eq!(adaptive.inspection().progress.recorded_reports, 1);
+        assert_eq!(adaptive.inspection().diagnostics.record_success_count, 1);
+        let design = physical_design.status();
+        assert_eq!(design.evidence.recorded_reports, 1);
+        assert_eq!(design.diagnostics.record_success_count, 1);
+        assert_eq!(design.diagnostics.capacity_rejection_count, 1);
+        assert!(design.evidence.truncated);
+
+        let adaptive_before = adaptive.inspection().progress;
+        let design_epoch = design.evidence.epoch;
+        let (reply, response) = mpsc::sync_channel(1);
+        physical_design.handle(
+            &database,
+            ServerPhysicalDesignWorkerCommand::RotateEvidenceIfEpoch {
+                expected: design_epoch,
+                reply,
+            },
+        );
+        let rotated = response.recv().expect("design rotation response").unwrap();
+        assert_eq!(rotated.new_epoch.0, design_epoch.0 + 1);
+        assert_eq!(adaptive.inspection().progress, adaptive_before);
+        adaptive.rotate_window().expect("adaptive rotation");
+        assert_eq!(physical_design.status().evidence.epoch, rotated.new_epoch);
+        cleanup(root, database);
+    }
+
+    #[test]
+    fn design_advice_reports_stale_schema_until_new_evidence_rotates_the_cohort() {
+        let suffix = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-server-feedback-design-schema-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create design schema fixture root");
+        let mut database = Database::create_catalog(
+            root.join("catalog"),
+            Vec::new(),
+            Some(DatabaseCoordinatorConfig::new(root.join("coordinator")).with_global_visibility()),
+        )
+        .expect("create runtime schema database");
+        database
+            .execute("CREATE TABLE events (id BIGINT, category BIGINT)")
+            .expect("create runtime table");
+        database
+            .enable_global_visibility()
+            .expect("explicitly enable global visibility");
+        database
+            .execute("INSERT INTO events (id, category) VALUES (1, 7)")
+            .expect("seed runtime table");
+        let mut session = DatabaseSession::default();
+        let mut design = physical_design_runtime(PhysicalDesignEvidenceLimits::default());
+        let first = database
+            .prepare_statement("SELECT id FROM events WHERE category = 7", &[])
+            .expect("prepare first schema query");
+        execute_prepared_with_optional_server_observation(
+            None,
+            Some(&mut design),
+            &mut session,
+            &mut database,
+            &first,
+            &[],
+        )
+        .expect("record first schema query");
+        let first_status = design.status();
+
+        database
+            .execute("ALTER TABLE events ADD COLUMN note TEXT")
+            .expect("advance schema");
+        let (reply, response) = mpsc::sync_channel(1);
+        design.handle(
+            &database,
+            ServerPhysicalDesignWorkerCommand::Recommendations { reply },
+        );
+        assert!(matches!(
+            response.recv().expect("advisor response"),
+            Err(ServerPhysicalDesignControlError::Advisor(
+                PhysicalDesignAdvisorError::StaleSchema { .. }
+            ))
+        ));
+
+        let second = database
+            .prepare_statement("SELECT id FROM events WHERE category = 7", &[])
+            .expect("prepare second schema query");
+        execute_prepared_with_optional_server_observation(
+            None,
+            Some(&mut design),
+            &mut session,
+            &mut database,
+            &second,
+            &[],
+        )
+        .expect("record second schema query");
+        let status = design.status();
+        assert_eq!(status.evidence.epoch.0, first_status.evidence.epoch.0 + 1);
+        assert_eq!(status.evidence.recorded_reports, 1);
+        assert_eq!(status.diagnostics.schema_rotation_count, 1);
+        assert_eq!(
+            status.diagnostics.last_record_outcome,
+            Some(netbadb_core::PhysicalDesignEvidenceRecordOutcome::SchemaRotated)
+        );
+        cleanup(root, database);
     }
 }

@@ -25,6 +25,11 @@ use crate::authorization::{
 };
 use crate::manifest::validate_listener_security;
 use crate::operator::ServerOperatorPlane;
+use crate::physical_design::{
+    ServerHostObservationConfig, ServerPhysicalDesignAdvisorConfig,
+    ServerPhysicalDesignControlHandle, ServerPhysicalDesignRuntime,
+    ServerPhysicalDesignWorkerCommand, forward_physical_design_control_requests,
+};
 use crate::tls::{ConnectionStream, TlsHandshakeError, TransportSecurity};
 use crate::{
     ClientIdentity, ManifestError, ResponseBatch, ServerAdaptiveFeedbackConfig, ServerConfig,
@@ -169,6 +174,7 @@ impl From<ManifestError> for TcpServerError {
 pub struct TcpServer {
     config: ServerConfig,
     adaptive_override: Option<ServerAdaptiveStartupMode>,
+    physical_design: Option<ServerPhysicalDesignAdvisorConfig>,
 }
 
 impl TcpServer {
@@ -177,6 +183,7 @@ impl TcpServer {
         Self {
             config,
             adaptive_override: None,
+            physical_design: None,
         }
     }
 
@@ -196,6 +203,17 @@ impl TcpServer {
         self
     }
 
+    /// Enables worker-owned physical-design evidence and read-only, on-demand
+    /// recommendations. This setting is independent of the adaptive mode.
+    #[must_use]
+    pub fn with_physical_design_advisor(
+        mut self,
+        config: ServerPhysicalDesignAdvisorConfig,
+    ) -> Self {
+        self.physical_design = Some(config);
+        self
+    }
+
     pub fn start(self) -> Result<ServerHandle, TcpServerError> {
         let (
             listen,
@@ -207,6 +225,7 @@ impl TcpServer {
             operator_config,
         ) = self.config.into_parts();
         let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
+        let physical_design = self.physical_design;
         validate_listener_security(listen, security.kind() == TransportKind::MutualTls)?;
         let table_count = tables.len();
         let transport_kind = security.kind();
@@ -216,6 +235,7 @@ impl TcpServer {
             limits.session_policy(),
             authorization,
             adaptive_mode,
+            physical_design,
         )?;
         let metrics = ServerMetricsHandle::new();
         let listener = match TcpListener::bind(listen) {
@@ -247,6 +267,7 @@ impl TcpServer {
         };
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let (adaptive_control_tx, adaptive_control_rx) = mpsc::channel();
+        let (physical_design_control_tx, physical_design_control_rx) = mpsc::channel();
         let (operator_failure_tx, operator_failure_rx) = mpsc::channel();
         let (worker_tx, worker_rx) = mpsc::sync_channel(0);
         let server_metrics = metrics.clone();
@@ -263,10 +284,13 @@ impl TcpServer {
                     limits,
                     security,
                     server_metrics,
-                    ServerAdaptiveHostConfig {
-                        tick_interval,
-                        controls: adaptive_control_rx,
-                        operator_failures: operator_failure_rx,
+                    ServerHostObservationConfig {
+                        adaptive: ServerAdaptiveHostConfig {
+                            tick_interval,
+                            controls: adaptive_control_rx,
+                            operator_failures: operator_failure_rx,
+                        },
+                        physical_design_controls: physical_design_control_rx,
                     },
                 )
             }) {
@@ -287,6 +311,8 @@ impl TcpServer {
             return Err(finish_startup_failure(error.0, startup));
         }
         let adaptive_control = ServerAdaptiveControlHandle::new(adaptive_control_tx);
+        let physical_design_control =
+            ServerPhysicalDesignControlHandle::new(physical_design_control_tx);
         let operator = match operator_config {
             Some(config) => match ServerOperatorPlane::start(
                 config,
@@ -318,6 +344,7 @@ impl TcpServer {
             metrics,
             shutdown_tx,
             adaptive_control,
+            physical_design_control,
             operator,
             join: Some(join),
         })
@@ -335,6 +362,7 @@ pub struct ServerHandle {
     metrics: ServerMetricsHandle,
     shutdown_tx: Sender<()>,
     adaptive_control: ServerAdaptiveControlHandle,
+    physical_design_control: ServerPhysicalDesignControlHandle,
     operator: Option<ServerOperatorPlane>,
     join: Option<JoinHandle<Result<(), TcpServerError>>>,
 }
@@ -368,6 +396,11 @@ impl ServerHandle {
     #[must_use]
     pub fn adaptive_control(&self) -> ServerAdaptiveControlHandle {
         self.adaptive_control.clone()
+    }
+
+    #[must_use]
+    pub fn physical_design_control(&self) -> ServerPhysicalDesignControlHandle {
+        self.physical_design_control.clone()
     }
 
     /// Returns whether the main server thread or configured operator listener
@@ -479,6 +512,7 @@ impl DatabaseWorker {
         session_policy: SessionPolicy,
         authorization: AuthorizationPolicy,
         adaptive_mode: ServerAdaptiveStartupMode,
+        physical_design_config: Option<ServerPhysicalDesignAdvisorConfig>,
     ) -> Result<Self, TcpServerError> {
         let (commands, command_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
@@ -508,6 +542,7 @@ impl DatabaseWorker {
                         });
                     }
                 };
+                let physical_design = physical_design_config.map(ServerPhysicalDesignRuntime::new);
                 if ready_tx.send(Ok(())).is_err() {
                     return database.close().map_err(|error| {
                         WorkerFatalError::DatabaseCloseFailed {
@@ -520,6 +555,7 @@ impl DatabaseWorker {
                     session_policy,
                     authorization,
                     adaptive,
+                    physical_design,
                     command_rx,
                     events_tx,
                 )
@@ -630,6 +666,7 @@ enum WorkerCommand {
         reply: SyncSender<Result<(), WorkerRequestError>>,
     },
     Adaptive(ServerAdaptiveWorkerCommand),
+    PhysicalDesign(ServerPhysicalDesignWorkerCommand),
     Shutdown {
         reply: SyncSender<Result<(), WorkerFatalError>>,
     },
@@ -672,6 +709,7 @@ impl fmt::Display for WorkerRequestError {
 struct DatabaseWorkerState {
     database: Option<Database>,
     adaptive: Option<ServerAdaptiveWorkerRuntime>,
+    physical_design: Option<ServerPhysicalDesignRuntime>,
     sessions: HashMap<SessionId, WorkerSession>,
     session_policy: SessionPolicy,
     authorization: AuthorizationPolicy,
@@ -707,13 +745,25 @@ impl WorkerSession {
         request_id: u64,
         request: ClientMessage,
     ) -> SessionResponse {
-        self.handle_with_adaptive_feedback(database, None, request_id, request)
+        self.handle_with_server_observation(database, None, None, request_id, request)
     }
 
+    #[cfg(test)]
     fn handle_with_adaptive_feedback(
         &mut self,
         database: &mut Database,
         adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
+        request_id: u64,
+        request: ClientMessage,
+    ) -> SessionResponse {
+        self.handle_with_server_observation(database, adaptive_feedback, None, request_id, request)
+    }
+
+    fn handle_with_server_observation(
+        &mut self,
+        database: &mut Database,
+        adaptive_feedback: Option<&mut ServerAdaptiveFeedbackRuntime>,
+        physical_design: Option<&mut ServerPhysicalDesignRuntime>,
         request_id: u64,
         request: ClientMessage,
     ) -> SessionResponse {
@@ -748,9 +798,13 @@ impl WorkerSession {
             {
                 return authorization_denied_response(&self.state, request_id, denial);
             }
-            return self
-                .state
-                .handle_prepared(database, adaptive_feedback, request_id, &prepared);
+            return self.state.handle_prepared(
+                database,
+                adaptive_feedback,
+                physical_design,
+                request_id,
+                &prepared,
+            );
         }
 
         let denial = match &request {
@@ -824,10 +878,12 @@ impl DatabaseWorkerState {
         session_policy: SessionPolicy,
         authorization: AuthorizationPolicy,
         adaptive: Option<ServerAdaptiveWorkerRuntime>,
+        physical_design: Option<ServerPhysicalDesignRuntime>,
     ) -> Self {
         Self {
             database: Some(database),
             adaptive,
+            physical_design,
             sessions: HashMap::new(),
             session_policy,
             authorization,
@@ -876,10 +932,17 @@ fn run_database_worker(
     session_policy: SessionPolicy,
     authorization: AuthorizationPolicy,
     adaptive: Option<ServerAdaptiveWorkerRuntime>,
+    physical_design: Option<ServerPhysicalDesignRuntime>,
     commands: Receiver<WorkerCommand>,
     events: Sender<WorkerFatalError>,
 ) -> Result<(), WorkerFatalError> {
-    let mut state = DatabaseWorkerState::new(database, session_policy, authorization, adaptive);
+    let mut state = DatabaseWorkerState::new(
+        database,
+        session_policy,
+        authorization,
+        adaptive,
+        physical_design,
+    );
     while let Ok(command) = commands.recv() {
         match command {
             WorkerCommand::OpenSession {
@@ -925,12 +988,13 @@ fn run_database_worker(
                     let _ = events.send(error.clone());
                     return Err(error);
                 };
-                let response = session.handle_with_adaptive_feedback(
+                let response = session.handle_with_server_observation(
                     database,
                     state
                         .adaptive
                         .as_mut()
                         .map(ServerAdaptiveWorkerRuntime::feedback_mut),
+                    state.physical_design.as_mut(),
                     frame.request_id,
                     frame.message,
                 );
@@ -960,6 +1024,18 @@ fn run_database_worker(
                 match state.adaptive.as_mut() {
                     Some(adaptive) => adaptive.handle(database, command),
                     None => handle_disabled_worker_command(command),
+                }
+            }
+            WorkerCommand::PhysicalDesign(command) => {
+                let Some(database) = state.database.as_ref() else {
+                    crate::physical_design::handle_disabled_physical_design_worker_command(command);
+                    continue;
+                };
+                match state.physical_design.as_mut() {
+                    Some(runtime) => runtime.handle(database, command),
+                    None => crate::physical_design::handle_disabled_physical_design_worker_command(
+                        command,
+                    ),
                 }
             }
             WorkerCommand::Shutdown { reply } => {
@@ -992,13 +1068,14 @@ fn run_accept_loop(
     limits: ServerLimits,
     security: TransportSecurity,
     metrics: ServerMetricsHandle,
-    adaptive_host_config: ServerAdaptiveHostConfig,
+    host_config: ServerHostObservationConfig,
 ) -> Result<(), TcpServerError> {
     let client = worker.client();
     let mut connections = Vec::new();
     let mut next_session_id = 1_u64;
     let mut fatal = None;
-    let mut adaptive_host = adaptive_host_config
+    let mut adaptive_host = host_config
+        .adaptive
         .tick_interval
         .map(ServerAdaptiveHostDriver::new);
 
@@ -1007,7 +1084,7 @@ fn run_accept_loop(
             Ok(()) | Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {}
         }
-        if adaptive_host_config.operator_failures.try_recv().is_ok() {
+        if host_config.adaptive.operator_failures.try_recv().is_ok() {
             break;
         }
         match worker.poll_fatal() {
@@ -1032,12 +1109,21 @@ fn run_accept_loop(
         let host_snapshot = adaptive_host
             .as_ref()
             .map(ServerAdaptiveHostDriver::snapshot);
-        forward_control_requests(&adaptive_host_config.controls, host_snapshot, |command| {
+        forward_control_requests(&host_config.adaptive.controls, host_snapshot, |command| {
             client
                 .commands
                 .send(WorkerCommand::Adaptive(command))
                 .map_err(|_| ())
         });
+        forward_physical_design_control_requests(
+            &host_config.physical_design_controls,
+            |command| {
+                client
+                    .commands
+                    .send(WorkerCommand::PhysicalDesign(command))
+                    .map_err(|_| ())
+            },
+        );
 
         match listener.accept() {
             Ok((stream, _peer)) => {
@@ -1366,6 +1452,7 @@ mod tests {
     fn server_handle_is_finished_observes_main_thread_completion() {
         let (shutdown_tx, _shutdown_rx) = mpsc::channel();
         let (adaptive_tx, _adaptive_rx) = mpsc::channel();
+        let (physical_design_tx, _physical_design_rx) = mpsc::channel();
         let join = thread::spawn(|| Ok(()));
         while !join.is_finished() {
             thread::yield_now();
@@ -1377,6 +1464,7 @@ mod tests {
             metrics: ServerMetricsHandle::new(),
             shutdown_tx,
             adaptive_control: ServerAdaptiveControlHandle::new(adaptive_tx),
+            physical_design_control: ServerPhysicalDesignControlHandle::new(physical_design_tx),
             operator: None,
             join: Some(join),
         };

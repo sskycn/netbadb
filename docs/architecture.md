@@ -318,6 +318,16 @@ Heap B+Tree opportunities and exact strict-subset Columnar column sets. It
 creates no design or identity, persists nothing, and does not join the four
 automatic lanes or Server capture.
 
+[Adaptive Operations Phase 21](adaptive-operations-phase21.md) adds an explicit
+programmatic Server bridge for Phase 20. Each Native or PostgreSQL Database
+worker may own one independent `PhysicalDesignEvidenceWindow` beside its
+optional Adaptive runtime. One eligible authorized autocommit query executes
+with feedback once and fans that same formal report out to both enabled concrete
+sinks. A host-mediated `ServerPhysicalDesignControlHandle` provides bounded
+status, on-demand read-only current-inventory recommendations, and atomic
+compare-and-rotate by design epoch. There is no automatic advisor, apply path,
+scheduler lane, persistence, Manifest v7, NBOP change, or wire change.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,
