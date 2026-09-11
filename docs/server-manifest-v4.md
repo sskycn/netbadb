@@ -1,7 +1,7 @@
 # NetbaDB deployment manifest v4
 
 > Historical format. Current `netbadbd` requires
-> [deployment manifest v5](server-manifest-v5.md); v4 is rejected explicitly.
+> [deployment manifest v6](server-manifest-v6.md); v4 is rejected explicitly.
 
 Deployment manifest v4 added required deployment authorization without
 changing Protocol v1 or any persistent database format.

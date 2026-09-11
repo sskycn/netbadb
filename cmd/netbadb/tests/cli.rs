@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use netbadb_sdk::{
     ColumnDef, ColumnId, Database, PhysicalType, ScalarValue, TableDef, TableId, TypeSpec,
 };
+use netbadb_server::{ServerConfig, TcpServer};
 use serde_json::{Value, json};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -83,7 +84,7 @@ impl Fixture {
         database.close().unwrap();
 
         let manifest = directory.join("server.json");
-        write_manifest(&manifest, 5, "users");
+        write_manifest(&manifest, 6, "users");
         Self {
             directory,
             manifest,
@@ -290,7 +291,7 @@ fn catalog_text_and_json_are_complete_deterministic_and_ignore_network_acl_filte
 }
 
 #[test]
-fn inspect_accepts_and_validates_v5_adaptive_without_rewriting_the_manifest() {
+fn inspect_accepts_and_validates_v6_adaptive_without_rewriting_the_manifest() {
     let fixture = Fixture::new("adaptive-manifest");
     let mut manifest: Value =
         serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
@@ -316,13 +317,13 @@ fn inspect_accepts_and_validates_v5_adaptive_without_rewriting_the_manifest() {
     assert!(inspected.status.success(), "{}", stderr(&inspected));
     assert_eq!(std::fs::read(&fixture.manifest).unwrap(), bytes);
 
-    let document = include_str!("../../../docs/server-manifest-v5.md");
+    let document = include_str!("../../../docs/server-manifest-v6.md");
     let documented: Value = serde_json::from_str(
         document
             .split_once("```json\n")
             .and_then(|(_, remainder)| remainder.split_once("\n```"))
             .map(|(example, _)| example)
-            .expect("v5 documentation contains a JSON example"),
+            .expect("v6 documentation contains a JSON example"),
     )
     .unwrap();
     manifest["adaptive"] = documented["adaptive"].clone();
@@ -484,19 +485,19 @@ fn dml_is_never_executed_and_failures_leave_stdout_empty_with_coarse_exit_codes(
 #[test]
 fn manifest_and_input_failures_precede_output_and_schema_mismatch_is_rejected() {
     let fixture = Fixture::new("manifest-errors");
-    let version_four = fixture.directory.join("v4.json");
-    write_manifest(&version_four, 4, "users");
+    let version_five = fixture.directory.join("v5.json");
+    write_manifest(&version_five, 5, "users");
     let old_manifest = netbadb()
         .args(["inspect", "catalog", "--manifest"])
-        .arg(&version_four)
+        .arg(&version_five)
         .output()
         .unwrap();
     assert_eq!(old_manifest.status.code(), Some(1));
     assert!(old_manifest.stdout.is_empty());
-    assert!(stderr(&old_manifest).contains("unsupported deployment manifest version 4"));
+    assert!(stderr(&old_manifest).contains("unsupported deployment manifest version 5"));
 
     let mismatch = fixture.directory.join("mismatch.json");
-    write_manifest(&mismatch, 5, "other_users");
+    write_manifest(&mismatch, 6, "other_users");
     let mismatch = netbadb()
         .args(["inspect", "catalog", "--manifest"])
         .arg(&mismatch)
@@ -521,4 +522,133 @@ fn manifest_and_input_failures_precede_output_and_schema_mismatch_is_rejected() 
     assert_eq!(missing_input.status.code(), Some(1));
     assert!(missing_input.stdout.is_empty());
     assert!(stderr(&missing_input).contains("failed to read SQL file"));
+}
+
+#[cfg(unix)]
+#[test]
+fn operator_cli_uses_live_nbop_and_never_infers_rotation_epoch() {
+    let fixture = Fixture::new("operator-live");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+    manifest["listen"] = json!("127.0.0.1:0");
+    manifest["adaptive"] = json!({
+        "mode": "feedback_only",
+        "feedback": {
+            "limits": {
+                "max_target_windows": 4,
+                "workload": {
+                    "max_query_shapes": 4,
+                    "max_plan_variants_per_shape": 4
+                },
+                "max_calibration_epochs": 4,
+                "max_calibration_query_shapes": 4,
+                "max_calibration_plan_variants_per_shape": 4
+            }
+        }
+    });
+    let socket = PathBuf::from(format!("/tmp/netbadb-cli-op-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    manifest["operator"] = json!({
+        "unix_socket": socket,
+        "io_timeout_ms": 1000
+    });
+    std::fs::write(
+        &fixture.manifest,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let server = TcpServer::new(ServerConfig::from_manifest_path(&fixture.manifest).unwrap())
+        .start()
+        .unwrap();
+
+    let status = netbadb()
+        .args(["operator", "status", "--manifest"])
+        .arg(&fixture.manifest)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert!(stdout(&status).contains("adaptive mode: feedback_only"));
+    assert!(stdout(&status).contains("evidence window epoch: 0"));
+
+    let missing_epoch = netbadb()
+        .args(["operator", "rotate-evidence", "--manifest"])
+        .arg(&fixture.manifest)
+        .output()
+        .unwrap();
+    assert_eq!(missing_epoch.status.code(), Some(2));
+    assert!(stderr(&missing_epoch).contains("--expected-window-epoch is required"));
+
+    let rotated = netbadb()
+        .args(["operator", "rotate-evidence", "--manifest"])
+        .arg(&fixture.manifest)
+        .args(["--expected-window-epoch", "0"])
+        .output()
+        .unwrap();
+    assert!(rotated.status.success(), "{}", stderr(&rotated));
+    assert!(stdout(&rotated).contains("previous epoch 0, new epoch 1"));
+
+    let stale = netbadb()
+        .args(["operator", "rotate-evidence", "--manifest"])
+        .arg(&fixture.manifest)
+        .args(["--expected-window-epoch", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(stale.status.code(), Some(1));
+    assert!(stderr(&stale).contains("evidence window changed"));
+
+    let reset = netbadb()
+        .args(["operator", "reset-faulted-scheduler", "--manifest"])
+        .arg(&fixture.manifest)
+        .output()
+        .unwrap();
+    assert_eq!(reset.status.code(), Some(1));
+    assert!(stderr(&reset).contains("adaptive driver is not enabled"));
+
+    server.shutdown().unwrap();
+    assert!(!socket.exists());
+}
+
+#[test]
+fn operator_cli_reports_unconfigured_and_offline_planes_without_opening_database() {
+    let fixture = Fixture::new("operator-errors");
+    let unconfigured = netbadb()
+        .args(["operator", "status", "--manifest"])
+        .arg(&fixture.manifest)
+        .output()
+        .unwrap();
+    assert_eq!(unconfigured.status.code(), Some(1));
+    assert!(stderr(&unconfigured).contains("operator plane is not configured"));
+
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
+    manifest["adaptive"] = json!({
+        "mode": "feedback_only",
+        "feedback": {
+            "limits": {
+                "max_target_windows": 1,
+                "workload": {
+                    "max_query_shapes": 1,
+                    "max_plan_variants_per_shape": 1
+                },
+                "max_calibration_epochs": 1,
+                "max_calibration_query_shapes": 1,
+                "max_calibration_plan_variants_per_shape": 1
+            }
+        }
+    });
+    manifest["operator"] = json!({
+        "unix_socket": "offline.sock",
+        "io_timeout_ms": 50
+    });
+    std::fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let inspected = catalog(&fixture, "text");
+    assert!(inspected.status.success(), "{}", stderr(&inspected));
+    assert!(!fixture.directory.join("offline.sock").exists());
+    let offline = netbadb()
+        .args(["operator", "status", "--manifest"])
+        .arg(&fixture.manifest)
+        .output()
+        .unwrap();
+    assert_eq!(offline.status.code(), Some(1));
+    assert!(stderr(&offline).contains("failed to connect to operator socket"));
 }

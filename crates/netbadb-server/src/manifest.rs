@@ -28,9 +28,10 @@ use crate::{
     ServerAdaptiveDriverConfig, ServerAdaptiveDriverConfigError, ServerAdaptiveFeedbackConfig,
     ServerAdaptiveMode,
 };
+use crate::{ServerOperatorConfig, ServerOperatorConfigError};
 use crate::{TlsConfigError, TransportKind};
 
-pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 5;
+pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 6;
 pub const DEFAULT_LISTEN_ADDRESS: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878);
 
@@ -50,6 +51,7 @@ pub struct ServerConfig {
     tls: Option<MutualTlsConfig>,
     authorization: AuthorizationPolicy,
     adaptive_mode: ServerAdaptiveStartupMode,
+    operator: Option<ServerOperatorConfig>,
 }
 
 impl ServerConfig {
@@ -69,11 +71,15 @@ impl ServerConfig {
         if manifest.tables.is_empty() {
             return Err(ManifestError::EmptyTables);
         }
+        let operator = manifest.operator;
         let adaptive_mode = manifest
             .adaptive
             .map_or(Ok(ServerAdaptiveStartupMode::Disabled), |adaptive| {
                 adaptive.into_runtime()
             })?;
+        if operator.is_some() && matches!(adaptive_mode, ServerAdaptiveStartupMode::Disabled) {
+            return Err(ManifestError::OperatorRequiresAdaptive);
+        }
 
         let listen = match manifest.listen {
             Some(value) => value
@@ -95,6 +101,9 @@ impl ServerConfig {
                 path: path.to_path_buf(),
                 source,
             })?;
+        let operator = operator
+            .map(|operator| operator.into_config(&manifest_directory))
+            .transpose()?;
         let tls = manifest
             .tls
             .map(|tls| {
@@ -166,6 +175,7 @@ impl ServerConfig {
             tls,
             authorization,
             adaptive_mode,
+            operator,
         })
     }
 
@@ -200,6 +210,13 @@ impl ServerConfig {
         self.adaptive_mode.mode()
     }
 
+    /// Returns the resolved local operator configuration without binding or
+    /// connecting to its socket.
+    #[must_use]
+    pub const fn operator_config(&self) -> Option<&ServerOperatorConfig> {
+        self.operator.as_ref()
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -209,6 +226,7 @@ impl ServerConfig {
         TransportSecurity,
         AuthorizationPolicy,
         ServerAdaptiveStartupMode,
+        Option<ServerOperatorConfig>,
     ) {
         let security = self
             .tls
@@ -222,6 +240,7 @@ impl ServerConfig {
             security,
             self.authorization,
             self.adaptive_mode,
+            self.operator,
         )
     }
 }
@@ -279,6 +298,14 @@ pub enum ManifestError {
         source: CalibrationRatioError,
     },
     AdaptiveDriverConfig(ServerAdaptiveDriverConfigError),
+    OperatorRequiresAdaptive,
+    OperatorSocketPath(PathBuf),
+    OperatorSocketParent {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    OperatorSocketParentNotDirectory(PathBuf),
+    OperatorConfig(ServerOperatorConfigError),
     Schema(SchemaError),
 }
 
@@ -354,6 +381,27 @@ impl fmt::Display for ManifestError {
             Self::AdaptiveDriverConfig(error) => {
                 write!(formatter, "invalid adaptive driver configuration: {error}")
             }
+            Self::OperatorRequiresAdaptive => {
+                formatter.write_str("operator plane requires Adaptive to be enabled")
+            }
+            Self::OperatorSocketPath(path) => write!(
+                formatter,
+                "operator Unix socket path `{}` must name a file",
+                path.display()
+            ),
+            Self::OperatorSocketParent { path, source } => write!(
+                formatter,
+                "failed to resolve parent directory for operator socket `{}`: {source}",
+                path.display()
+            ),
+            Self::OperatorSocketParentNotDirectory(path) => write!(
+                formatter,
+                "operator socket parent `{}` is not a directory",
+                path.display()
+            ),
+            Self::OperatorConfig(error) => {
+                write!(formatter, "invalid operator configuration: {error}")
+            }
             Self::Schema(error) => error.fmt(formatter),
         }
     }
@@ -365,7 +413,8 @@ impl Error for ManifestError {
             Self::Read { source, .. }
             | Self::ManifestDirectory { source, .. }
             | Self::TablePath { source, .. }
-            | Self::TlsPath { source, .. } => Some(source),
+            | Self::TlsPath { source, .. }
+            | Self::OperatorSocketParent { source, .. } => Some(source),
             Self::Json(error) => Some(error),
             Self::InvalidListen { source, .. } => Some(source),
             Self::Limits(error) => Some(error),
@@ -374,13 +423,17 @@ impl Error for ManifestError {
             Self::AdaptiveSchedulerPolicy(error) => Some(error),
             Self::CalibrationRatio { source, .. } => Some(source),
             Self::AdaptiveDriverConfig(error) => Some(error),
+            Self::OperatorConfig(error) => Some(error),
             Self::Schema(error) => Some(error),
             Self::UnsupportedVersion(_)
             | Self::EmptyTables
             | Self::RemoteListenRequiresMutualTls(_)
             | Self::TablePathIsNotFile(_)
             | Self::DuplicateStoragePath(_)
-            | Self::TlsPathIsNotFile { .. } => None,
+            | Self::TlsPathIsNotFile { .. }
+            | Self::OperatorRequiresAdaptive
+            | Self::OperatorSocketPath(_)
+            | Self::OperatorSocketParentNotDirectory(_) => None,
         }
     }
 }
@@ -402,6 +455,57 @@ struct DeploymentManifest {
     tables: Vec<ManifestTable>,
     #[serde(default, deserialize_with = "deserialize_optional_adaptive")]
     adaptive: Option<ManifestAdaptive>,
+    #[serde(default, deserialize_with = "deserialize_optional_operator")]
+    operator: Option<ManifestOperator>,
+}
+
+fn deserialize_optional_operator<'de, D>(
+    deserializer: D,
+) -> Result<Option<ManifestOperator>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    ManifestOperator::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestOperator {
+    unix_socket: String,
+    io_timeout_ms: u64,
+}
+
+impl ManifestOperator {
+    fn into_config(self, manifest_directory: &Path) -> Result<ServerOperatorConfig, ManifestError> {
+        let configured = PathBuf::from(self.unix_socket);
+        let joined = if configured.is_absolute() {
+            configured
+        } else {
+            manifest_directory.join(configured)
+        };
+        let file_name = joined
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| ManifestError::OperatorSocketPath(joined.clone()))?;
+        let parent = joined
+            .parent()
+            .ok_or_else(|| ManifestError::OperatorSocketPath(joined.clone()))?;
+        let parent =
+            parent
+                .canonicalize()
+                .map_err(|source| ManifestError::OperatorSocketParent {
+                    path: joined.clone(),
+                    source,
+                })?;
+        if !parent.is_dir() {
+            return Err(ManifestError::OperatorSocketParentNotDirectory(parent));
+        }
+        ServerOperatorConfig::new(
+            parent.join(file_name),
+            Duration::from_millis(self.io_timeout_ms),
+        )
+        .map_err(ManifestError::OperatorConfig)
+    }
 }
 
 fn deserialize_optional_adaptive<'de, D>(
@@ -1106,7 +1210,7 @@ mod tests {
         let listen = listen.map_or_else(String::new, |listen| format!("\"listen\": \"{listen}\","));
         format!(
             r#"{{
-                "version": 5,
+                "version": 6,
                 {listen}
                 "authorization": {{
                     "local_plaintext": {{
@@ -1304,6 +1408,36 @@ mod tests {
     }
 
     #[test]
+    fn changing_only_v5_version_to_v6_preserves_non_operator_runtime_behavior() {
+        let directory = test_directory("v5-v6-migration");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        create_heap(&directory.join("users.ndb"));
+        let manifest = directory.join("server.json");
+        let v6 = manifest_json(Some("127.0.0.1:0"), "users.ndb", "UserId");
+        let v5 = v6.replacen("\"version\": 6", "\"version\": 5", 1);
+        std::fs::write(&manifest, &v5).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::UnsupportedVersion(5))
+        ));
+
+        std::fs::write(
+            &manifest,
+            v5.replacen("\"version\": 5", "\"version\": 6", 1),
+        )
+        .unwrap();
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        assert_eq!(config.listen(), "127.0.0.1:0".parse().unwrap());
+        assert_eq!(config.limits(), ServerLimits::default());
+        assert_eq!(config.adaptive_mode(), ServerAdaptiveMode::Disabled);
+        assert!(config.operator_config().is_none());
+        assert_eq!(config.tables()[0].table, users_table("UserId"));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn adaptive_modes_map_exactly_without_hidden_defaults() {
         let directory = test_directory("adaptive-mapping");
         let _ = std::fs::remove_dir_all(&directory);
@@ -1374,18 +1508,267 @@ mod tests {
     }
 
     #[test]
-    fn documented_v5_driven_example_is_a_golden_manifest() {
-        let directory = test_directory("documented-v5-example");
+    fn operator_is_optional_requires_adaptive_and_resolves_from_manifest_directory() {
+        let directory = test_directory("operator-config");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("run")).unwrap();
+        create_heap(&directory.join("users.ndb"));
+        let manifest = directory.join("server.json");
+
+        let disabled: serde_json::Value =
+            serde_json::from_str(&manifest_json(None, "users.ndb", "UserId")).unwrap();
+        std::fs::write(&manifest, serde_json::to_vec(&disabled).unwrap()).unwrap();
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        assert_eq!(config.adaptive_mode(), ServerAdaptiveMode::Disabled);
+        assert!(config.operator_config().is_none());
+
+        let mut invalid = disabled.clone();
+        invalid["operator"] = json!({
+            "unix_socket": "run/operator.sock",
+            "io_timeout_ms": 5000
+        });
+        std::fs::write(&manifest, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::OperatorRequiresAdaptive)
+        ));
+
+        for adaptive in [
+            json!({"mode": "feedback_only", "feedback": feedback_json()}),
+            driven_adaptive_json(),
+        ] {
+            let mut value = disabled.clone();
+            value["adaptive"] = adaptive;
+            value["operator"] = json!({
+                "unix_socket": "run/operator.sock",
+                "io_timeout_ms": 5000
+            });
+            std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+            let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+            let operator = config.operator_config().unwrap();
+            assert_eq!(
+                operator.unix_socket(),
+                directory.canonicalize().unwrap().join("run/operator.sock")
+            );
+            assert_eq!(operator.io_timeout(), Duration::from_millis(5000));
+            assert!(!operator.unix_socket().exists());
+        }
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn operator_json_is_strict_non_null_and_requires_an_existing_parent() {
+        let directory = test_directory("operator-strict");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         create_heap(&directory.join("users.ndb"));
         let manifest = directory.join("server.json");
-        let document = include_str!("../../../docs/server-manifest-v5.md");
+        let base = write_adaptive_manifest(
+            &manifest,
+            json!({"mode": "feedback_only", "feedback": feedback_json()}),
+        );
+
+        for operator in [
+            json!(null),
+            json!({"unix_socket": "operator.sock"}),
+            json!({"unix_socket": "operator.sock", "io_timeout_ms": 0}),
+            json!({
+                "unix_socket": "operator.sock",
+                "io_timeout_ms": 1,
+                "token": "forbidden"
+            }),
+        ] {
+            let mut value = base.clone();
+            value["operator"] = operator;
+            std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(matches!(
+                ServerConfig::from_manifest_path(&manifest),
+                Err(ManifestError::Json(_) | ManifestError::OperatorConfig(_))
+            ));
+        }
+
+        let mut value = base;
+        value["operator"] = json!({
+            "unix_socket": "missing/operator.sock",
+            "io_timeout_ms": 1
+        });
+        std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::OperatorSocketParent { .. })
+        ));
+
+        std::fs::write(directory.join("not-a-directory"), b"file").unwrap();
+        let mut value =
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&manifest).unwrap())
+                .unwrap();
+        value["operator"]["unix_socket"] = json!("not-a-directory/operator.sock");
+        std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::OperatorSocketParentNotDirectory(_))
+        ));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_feedback_operator_status_and_conditional_rotation_are_retry_safe() {
+        use std::io::Write;
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+
+        let directory = test_directory("operator-live");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        create_heap(&directory.join("users.ndb"));
+        let manifest = directory.join("server.json");
+        let socket = PathBuf::from(format!(
+            "/tmp/netbadb-manifest-op-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let mut value = write_adaptive_manifest(
+            &manifest,
+            json!({"mode": "feedback_only", "feedback": feedback_json()}),
+        );
+        value["operator"] = json!({
+            "unix_socket": socket,
+            "io_timeout_ms": 1000
+        });
+        std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        let operator_config = config.operator_config().unwrap().clone();
+        let server = crate::TcpServer::new(config).start().unwrap();
+        let client = crate::ServerOperatorClient::new(&operator_config);
+        let before = client.status().unwrap();
+        assert_eq!(before.mode, crate::OperatorAdaptiveModeV1::FeedbackOnly);
+        assert_eq!(before.feedback.window_epoch, 0);
+        assert!(before.driver.is_none());
+        for _ in 0..100 {
+            assert_eq!(client.status().unwrap(), before);
+        }
+
+        let payload = serde_json::to_vec(&json!({
+            "request_id": 42,
+            "operation": {
+                "type": "rotate_evidence",
+                "expected_window_epoch": 0
+            }
+        }))
+        .unwrap();
+        let mut frame = b"NBOP\0\x01\0\0".to_vec();
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let mut lost_response = UnixStream::connect(operator_config.unix_socket()).unwrap();
+        lost_response.write_all(&frame).unwrap();
+        lost_response.shutdown(Shutdown::Both).unwrap();
+        for _ in 0..100 {
+            if client.status().unwrap().feedback.window_epoch == 1 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(client.status().unwrap().feedback.window_epoch, 1);
+        assert!(matches!(
+            client.rotate_evidence(0),
+            Err(crate::OperatorClientError::Remote(
+                crate::OperatorRemoteErrorV1 {
+                    code: crate::OperatorErrorCodeV1::EvidenceWindowChanged,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(client.status().unwrap().feedback.window_epoch, 1);
+        assert!(matches!(
+            client.reset_faulted_scheduler(),
+            Err(crate::OperatorClientError::Remote(
+                crate::OperatorRemoteErrorV1 {
+                    code: crate::OperatorErrorCodeV1::DriverNotEnabled,
+                    ..
+                }
+            ))
+        ));
+
+        server.shutdown().unwrap();
+        assert!(!operator_config.unix_socket().exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_bind_failure_stops_native_and_postgres_workers_without_removing_path() {
+        let directory = test_directory("operator-startup-failure");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let heap = directory.join("users.ndb");
+        create_heap(&heap);
+        let manifest = directory.join("server.json");
+        let socket = PathBuf::from(format!(
+            "/tmp/netbadb-existing-op-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        std::fs::write(&socket, b"must survive").unwrap();
+        let mut value = write_adaptive_manifest(
+            &manifest,
+            json!({"mode": "feedback_only", "feedback": feedback_json()}),
+        );
+        value["operator"] = json!({
+            "unix_socket": socket,
+            "io_timeout_ms": 100
+        });
+        std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let native =
+            crate::TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap()).start();
+        assert!(matches!(
+            native,
+            Err(crate::TcpServerError::Operator(
+                crate::ServerOperatorError::PathExists(_)
+            ))
+        ));
+        assert_eq!(std::fs::read(&socket).unwrap(), b"must survive");
+        Database::open(&heap, users_table("UserId"))
+            .unwrap()
+            .close()
+            .unwrap();
+
+        let postgres =
+            crate::PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+                .start();
+        assert!(matches!(
+            postgres,
+            Err(crate::PostgresTcpServerError::Operator(
+                crate::ServerOperatorError::PathExists(_)
+            ))
+        ));
+        assert_eq!(std::fs::read(&socket).unwrap(), b"must survive");
+        Database::open(&heap, users_table("UserId"))
+            .unwrap()
+            .close()
+            .unwrap();
+
+        std::fs::remove_file(socket).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn documented_v6_driven_example_is_a_golden_manifest() {
+        let directory = test_directory("documented-v6-example");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("run")).unwrap();
+        create_heap(&directory.join("users.ndb"));
+        let manifest = directory.join("server.json");
+        let document = include_str!("../../../docs/server-manifest-v6.md");
         let example = document
             .split_once("```json\n")
             .and_then(|(_, remainder)| remainder.split_once("\n```"))
             .map(|(example, _)| example)
-            .expect("v5 documentation contains a JSON example")
+            .expect("v6 documentation contains a JSON example")
             .replace("127.0.0.1:7878", "127.0.0.1:0")
             .replace("data/users.ndb", "users.ndb");
         std::fs::write(&manifest, example).unwrap();
@@ -1815,7 +2198,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let manifest = directory.join("server.json");
 
-        for version in [1, 2, 3, 4, 6] {
+        for version in [1, 2, 3, 4, 5, 7] {
             std::fs::write(&manifest, format!(r#"{{"version":{version},"tables":[]}}"#)).unwrap();
             assert!(matches!(
                 ServerConfig::from_manifest_path(&manifest),
@@ -1825,7 +2208,7 @@ mod tests {
 
         std::fs::write(
             &manifest,
-            r#"{"version":5,"unexpected":true,"authorization":{"local_plaintext":{"tables":[{"table_id":1,"read":true}]}},"tables":[]}"#,
+            r#"{"version":6,"unexpected":true,"authorization":{"local_plaintext":{"tables":[{"table_id":1,"read":true}]}},"tables":[]}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -1900,7 +2283,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_v5_authorization_is_required_strict_and_schema_bound() {
+    fn manifest_v6_authorization_is_required_strict_and_schema_bound() {
         let directory = test_directory("authorization");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();

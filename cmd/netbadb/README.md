@@ -1,9 +1,9 @@
-# `netbadb` offline inspection CLI
+# `netbadb` inspection and local operator CLI
 
-`netbadb` opens the existing tables declared by deployment manifest v5 and
-reports catalog metadata or the physical plan chosen for one SQL statement.
-It does not create databases, execute queries or DML, start a server, connect
-remotely, refresh `ANALYZE`, create indexes, or checkpoint.
+`netbadb inspect` opens the existing tables declared by deployment manifest v6
+and reports catalog metadata or the physical plan chosen for one SQL
+statement. It does not create databases, execute queries or DML, start a
+server, connect remotely, refresh `ANALYZE`, create indexes, or checkpoint.
 
 ```sh
 netbadb inspect catalog \
@@ -20,18 +20,34 @@ netbadb inspect statement \
 ```
 
 `--format` defaults to `text`; `json` emits
-[Inspection JSON v1](../../docs/inspection-json-v1.md). A statement requires
+[Inspection JSON v7](../../docs/inspection-json-v7.md). A statement requires
 exactly one of `--sql` and `--sql-file`. SQL files must be UTF-8 and are read
 before the manifest or database is opened. Success writes only the completed
 inspection to stdout. Usage failures exit 2, operational failures exit 1, and
 all failures write diagnostics only to stderr.
 
+`netbadb operator` does not open a Database. It parses the same manifest v6,
+uses only its configured Unix socket, and exchanges one NBOP v1 request:
+
+```sh
+netbadb operator status --manifest server.json
+netbadb operator rotate-evidence --manifest server.json \
+  --expected-window-epoch 7
+netbadb operator reset-faulted-scheduler --manifest server.json
+```
+
+The rotation precondition is required and is never inferred by a hidden status
+request. The human output is not a stable machine-readable contract; NBOP v1
+is the versioned contract.
+
 ## Ownership, recovery, and authorization
 
-This is an offline local tool. Stop `netbadbd` and any embedded process using
-the same files first. NetbaDB has no cross-process database-file lock, so
-concurrent multi-process access is unsupported and the CLI does not attempt to
-infer ownership from a listening port.
+Inspection is an offline local operation. Before using `netbadb inspect`, stop
+`netbadbd` and any embedded process using the same files. NetbaDB has no
+cross-process database-file lock, so concurrent multi-process file access is
+unsupported and the CLI does not attempt to infer ownership from a listening
+port. Operator commands instead require the live daemon and access only the
+manifest-configured Unix socket.
 
 The CLI uses normal `Database::open_tables` startup recovery. Opening after a
 crash may redo or undo WAL state before inspection; this is not a forensic

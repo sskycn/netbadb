@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 use netbadb_core::{
     AdaptiveEvidencePoolHealth, AdaptiveEvidenceProgressToken, AdaptiveEvidenceRecordError,
     AdaptiveEvidenceRecordOutcome, AdaptiveEvidenceRotationError, AdaptiveEvidenceRotationReport,
-    AutomaticAdmissionScope, AutomaticCrossLaneServicePolicy, AutomaticMultiSafeModePolicy,
-    AutomaticOrchestrationEnvelope, AutomaticOrchestrationInput, AutomaticOrchestrationStopReason,
-    AutomaticScheduler, AutomaticSchedulerGate, AutomaticSchedulerPolicy, AutomaticSchedulerState,
-    AutomaticSchedulerTick, AutomaticSchedulerTickOutcome, Database,
-    MAX_AUTOMATIC_ORCHESTRATION_STEPS, PlannerCalibrationClass,
+    AdaptiveEvidenceWindowEpoch, AutomaticAdmissionScope, AutomaticCrossLaneServicePolicy,
+    AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope, AutomaticOrchestrationInput,
+    AutomaticOrchestrationStopReason, AutomaticScheduler, AutomaticSchedulerGate,
+    AutomaticSchedulerPolicy, AutomaticSchedulerState, AutomaticSchedulerTick,
+    AutomaticSchedulerTickOutcome, Database, MAX_AUTOMATIC_ORCHESTRATION_STEPS,
+    PlannerCalibrationClass,
 };
 use netbadb_types::TableId;
 
@@ -275,6 +276,10 @@ pub enum ServerAdaptiveControlError {
     AdaptiveNotEnabled,
     DriverNotEnabled,
     SchedulerNotFaulted,
+    EvidenceWindowChanged {
+        expected: AdaptiveEvidenceWindowEpoch,
+        actual: AdaptiveEvidenceWindowEpoch,
+    },
     EvidenceRotation(AdaptiveEvidenceRotationError),
     ServerStopped,
 }
@@ -285,6 +290,11 @@ impl fmt::Display for ServerAdaptiveControlError {
             Self::AdaptiveNotEnabled => formatter.write_str("adaptive feedback is not enabled"),
             Self::DriverNotEnabled => formatter.write_str("adaptive driver is not enabled"),
             Self::SchedulerNotFaulted => formatter.write_str("adaptive scheduler is not faulted"),
+            Self::EvidenceWindowChanged { expected, actual } => write!(
+                formatter,
+                "adaptive evidence window changed from expected {} to {}",
+                expected.0, actual.0
+            ),
             Self::EvidenceRotation(error) => error.fmt(formatter),
             Self::ServerStopped => formatter.write_str("server adaptive control is stopped"),
         }
@@ -332,6 +342,22 @@ impl ServerAdaptiveControlHandle {
             .map_err(|_| ServerAdaptiveControlError::ServerStopped)?
     }
 
+    /// Rotates the caller-owned evidence pool only when its current window
+    /// still equals `expected`. Comparison and mutation execute as one command
+    /// in the sole Database worker.
+    pub fn rotate_evidence_if_window(
+        &self,
+        expected: AdaptiveEvidenceWindowEpoch,
+    ) -> Result<AdaptiveEvidenceRotationReport, ServerAdaptiveControlError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.requests
+            .send(ServerAdaptiveControlRequest::RotateEvidenceIfWindow { expected, reply })
+            .map_err(|_| ServerAdaptiveControlError::ServerStopped)?;
+        response
+            .recv()
+            .map_err(|_| ServerAdaptiveControlError::ServerStopped)?
+    }
+
     pub fn reset_faulted_scheduler(&self) -> Result<(), ServerAdaptiveControlError> {
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
@@ -350,6 +376,10 @@ pub(crate) enum ServerAdaptiveControlRequest {
     RotateEvidence {
         reply: SyncSender<Result<AdaptiveEvidenceRotationReport, ServerAdaptiveControlError>>,
     },
+    RotateEvidenceIfWindow {
+        expected: AdaptiveEvidenceWindowEpoch,
+        reply: SyncSender<Result<AdaptiveEvidenceRotationReport, ServerAdaptiveControlError>>,
+    },
     ResetFaultedScheduler {
         reply: SyncSender<Result<(), ServerAdaptiveControlError>>,
     },
@@ -365,6 +395,7 @@ pub(crate) enum ServerAdaptiveStartupMode {
 pub(crate) struct ServerAdaptiveHostConfig {
     pub(crate) tick_interval: Option<Duration>,
     pub(crate) controls: Receiver<ServerAdaptiveControlRequest>,
+    pub(crate) operator_failures: Receiver<()>,
 }
 
 impl ServerAdaptiveStartupMode {
@@ -394,6 +425,10 @@ pub(crate) enum ServerAdaptiveWorkerCommand {
         reply: SyncSender<Result<ServerAdaptiveStatus, ServerAdaptiveControlError>>,
     },
     RotateEvidence {
+        reply: SyncSender<Result<AdaptiveEvidenceRotationReport, ServerAdaptiveControlError>>,
+    },
+    RotateEvidenceIfWindow {
+        expected: AdaptiveEvidenceWindowEpoch,
         reply: SyncSender<Result<AdaptiveEvidenceRotationReport, ServerAdaptiveControlError>>,
     },
     ResetFaultedScheduler {
@@ -512,6 +547,17 @@ impl ServerAdaptiveWorkerRuntime {
                     .feedback
                     .rotate_window()
                     .map_err(ServerAdaptiveControlError::EvidenceRotation);
+                let _ = reply.send(result);
+            }
+            ServerAdaptiveWorkerCommand::RotateEvidenceIfWindow { expected, reply } => {
+                let actual = self.feedback.pool().progress_token().window_epoch;
+                let result = if actual == expected {
+                    self.feedback
+                        .rotate_window()
+                        .map_err(ServerAdaptiveControlError::EvidenceRotation)
+                } else {
+                    Err(ServerAdaptiveControlError::EvidenceWindowChanged { expected, actual })
+                };
                 let _ = reply.send(result);
             }
             ServerAdaptiveWorkerCommand::ResetFaultedScheduler { reply } => {
@@ -738,6 +784,14 @@ pub(crate) fn forward_control_requests<F>(
                     let _ = fallback.send(Err(ServerAdaptiveControlError::ServerStopped));
                 }
             }
+            ServerAdaptiveControlRequest::RotateEvidenceIfWindow { expected, reply } => {
+                let fallback = reply.clone();
+                if submit(ServerAdaptiveWorkerCommand::RotateEvidenceIfWindow { expected, reply })
+                    .is_err()
+                {
+                    let _ = fallback.send(Err(ServerAdaptiveControlError::ServerStopped));
+                }
+            }
             ServerAdaptiveControlRequest::ResetFaultedScheduler { reply } => {
                 let fallback = reply.clone();
                 if submit(ServerAdaptiveWorkerCommand::ResetFaultedScheduler { reply }).is_err() {
@@ -757,6 +811,9 @@ pub(crate) fn handle_disabled_worker_command(command: ServerAdaptiveWorkerComman
             let _ = reply.send(Ok(disabled_status()));
         }
         ServerAdaptiveWorkerCommand::RotateEvidence { reply } => {
+            let _ = reply.send(Err(ServerAdaptiveControlError::AdaptiveNotEnabled));
+        }
+        ServerAdaptiveWorkerCommand::RotateEvidenceIfWindow { reply, .. } => {
             let _ = reply.send(Err(ServerAdaptiveControlError::AdaptiveNotEnabled));
         }
         ServerAdaptiveWorkerCommand::ResetFaultedScheduler { reply } => {
@@ -1007,6 +1064,48 @@ mod tests {
                 .window_epoch
                 .0,
             1
+        );
+
+        let (reply, response) = mpsc::sync_channel(1);
+        runtime.handle(
+            &mut database,
+            ServerAdaptiveWorkerCommand::RotateEvidenceIfWindow {
+                expected: AdaptiveEvidenceWindowEpoch(0),
+                reply,
+            },
+        );
+        assert_eq!(
+            response.recv().expect("conditional rotation response"),
+            Err(ServerAdaptiveControlError::EvidenceWindowChanged {
+                expected: AdaptiveEvidenceWindowEpoch(0),
+                actual: AdaptiveEvidenceWindowEpoch(1),
+            })
+        );
+        assert_eq!(
+            runtime
+                .status(None)
+                .feedback
+                .expect("feedback status")
+                .evidence_progress
+                .window_epoch,
+            AdaptiveEvidenceWindowEpoch(1)
+        );
+
+        let (reply, response) = mpsc::sync_channel(1);
+        runtime.handle(
+            &mut database,
+            ServerAdaptiveWorkerCommand::RotateEvidenceIfWindow {
+                expected: AdaptiveEvidenceWindowEpoch(1),
+                reply,
+            },
+        );
+        assert_eq!(
+            response
+                .recv()
+                .expect("conditional rotation response")
+                .expect("matching conditional rotation succeeds")
+                .new_window_epoch,
+            AdaptiveEvidenceWindowEpoch(2)
         );
 
         database.close().expect("close driver fixture");

@@ -6,6 +6,7 @@ mod authorization;
 mod limits;
 mod manifest;
 mod metrics;
+mod operator;
 mod postgres;
 mod runtime;
 mod tls;
@@ -13,6 +14,7 @@ mod tls;
 use std::error::Error;
 use std::fmt;
 
+pub use netbadb_core::AdaptiveEvidenceWindowEpoch;
 use netbadb_core::{
     Database, DatabaseError, DatabaseTransaction, DdlOutcome, ExecutionResult, ParameterTypeHint,
     PreparedDdlStatement, PreparedSqlStatement, QueryResult, TransactionState,
@@ -35,8 +37,17 @@ pub use limits::{
     MAX_CONFIGURED_CONNECTIONS, MAX_CONFIGURED_RESULT_ROWS, MAX_SOCKET_TIMEOUT, ServerLimits,
     ServerLimitsError, SessionPolicy,
 };
-pub use manifest::{ManifestError, ServerConfig, TableBootstrap};
+pub use manifest::{DEPLOYMENT_MANIFEST_VERSION, ManifestError, ServerConfig, TableBootstrap};
 pub use metrics::{ServerMetricsHandle, ServerMetricsSnapshot};
+pub use operator::{
+    MAX_OPERATOR_PAYLOAD_BYTES, OPERATOR_PROTOCOL_VERSION, OperatorAdaptiveModeV1,
+    OperatorClientError, OperatorDriverStatusV1, OperatorErrorCodeV1, OperatorEvidencePoolHealthV1,
+    OperatorEvidenceRecordErrorV1, OperatorEvidenceRecordOutcomeV1,
+    OperatorEvidenceRenewalReasonV1, OperatorEvidenceRotationV1, OperatorFeedbackStatusV1,
+    OperatorOrchestrationStopReasonV1, OperatorRemoteErrorV1, OperatorSchedulerDelayClassV1,
+    OperatorSchedulerFaultV1, OperatorSchedulerGateV1, OperatorStatusV1, ServerOperatorClient,
+    ServerOperatorConfig, ServerOperatorConfigError, ServerOperatorError,
+};
 pub use postgres::{PostgresServerHandle, PostgresTcpServer, PostgresTcpServerError};
 pub use runtime::{ServerHandle, SessionId, TcpServer, TcpServerError, WorkerFatalError};
 pub use tls::{AuthenticatedClientIdentity, ClientIdentity, TlsConfigError, TransportKind};

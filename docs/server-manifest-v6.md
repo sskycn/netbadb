@@ -1,41 +1,38 @@
-# NetbaDB deployment manifest v5
+# NetbaDB deployment manifest v6
 
-> Historical format. Current `netbadbd` requires deployment manifest v6.
-> V5 is rejected explicitly.
-
-Deployment manifest v5 was the current `netbadbd` startup configuration in
-Phase 17.
-Versions 1 through 4 and future versions are rejected explicitly; there is no
-dual v4/v5 decoder. The manifest is a deployment contract, not a database file
+Deployment manifest v6 is the only current `netbadbd` startup configuration.
+Versions 1 through 5 and future versions are rejected explicitly; there is no
+dual v5/v6 decoder. The manifest is a deployment contract, not a database file
 format, canonical schema, wire protocol, or runtime-status document.
 
-V5 retains v4's `listen`, `limits`, `tls`, `authorization`, and `tables`
-semantics exactly and adds the optional top-level `adaptive` object. All
+V6 retains v5's `listen`, `limits`, `tls`, `authorization`, `tables`, and
+`adaptive` semantics exactly and adds the optional top-level `operator`
+object. All
 objects are strict: unknown fields, modes, calibration classes, or cross-lane
 tags fail JSON decoding. Configuration is loaded once at startup and is never
 rewritten or watched.
 
-## Migration from v4
+## Migration from v5
 
 The non-adaptive migration is deliberately mechanical:
 
 ```text
-change "version": 4 to "version": 5
+change "version": 5 to "version": 6
 leave every other field unchanged
-omit "adaptive"
+omit "operator"
 ```
 
-The resulting server has the same runtime behavior and Adaptive is Disabled.
-Enabling Adaptive is a separate, explicit deployment change.
+The resulting server has identical Server and Adaptive runtime behavior and no
+operator socket. Enabling the operator plane is a separate deployment change.
 
 ## Complete driven example
 
-The following example shows every v5 Adaptive field. Numeric values are
+The following example shows every v6 Adaptive field. Numeric values are
 examples, not defaults.
 
 ```json
 {
-  "version": 5,
+  "version": 6,
   "listen": "127.0.0.1:7878",
   "limits": {
     "max_connections": 128,
@@ -183,6 +180,10 @@ examples, not defaults.
       "max_calibration_classes": 4,
       "max_fairness_entries": 64
     }
+  },
+  "operator": {
+    "unix_socket": "run/netbadb-operator.sock",
+    "io_timeout_ms": 5000
   }
 }
 ```
@@ -296,6 +297,39 @@ The cross-lane service is one of these exact tagged objects:
 Variant-specific fields are strict. A zero bounded burst is invalid, and a
 burst-count field on either other mode is an unknown field.
 
+## Local operator plane
+
+Omitting `operator` is the sole disabled representation. `"operator": null`,
+missing fields, unknown fields, a zero `io_timeout_ms`, or an operator object
+without an enabled `adaptive` section are rejected. Feedback-only and driven
+Adaptive modes may both configure the plane; fault reset in feedback-only mode
+returns the stable `driver_not_enabled` operator error.
+
+`unix_socket` is resolved relative to the directory containing the manifest.
+The parent directory must already exist and is canonicalized while the final
+socket filename need not exist. Parsing validates and resolves this path but
+does not bind, connect, create a thread, or require a running daemon. The
+`io_timeout_ms` value applies only to reading one request frame and writing one
+response frame. After a complete request is forwarded, the listener waits for
+the definitive worker result and never cancels a mutation on timeout or client
+disconnect.
+
+At server startup the local Unix-domain socket must not already exist as any
+filesystem object. The server never removes an existing socket, file,
+directory, or symlink. After bind it sets mode `0600` before accepting. Normal
+shutdown removes the path only when `lstat` still reports the exact socket
+device and inode created by this server. If the path was replaced, the
+replacement is preserved and shutdown reports a bounded diagnostic. A crash
+may leave a stale socket; verify that the old daemon stopped, remove the stale
+path explicitly, and restart.
+
+On non-Unix platforms manifest parsing remains available, but starting a
+configured plane returns a typed unsupported-platform error. The plane has no
+TCP, HTTP, TLS, database-principal, Native, PostgreSQL, or SQL surface. Local
+filesystem access to the `0600` socket is the v1 authentication boundary.
+
+See [NetbaDB Operator Protocol v1](server-operator-protocol-v1.md).
+
 ## Runtime and operator behavior
 
 `ServerConfig` stores the runtime-ready selected mode. `TcpServer::new` and
@@ -321,19 +355,17 @@ There is no hot reload, filesystem watcher, dynamic scope, periodic status
 logger, automatic evidence rotation, or automatic fault reset.
 
 The embedded `ServerHandle` control API retains `status`, `rotate_evidence`,
-and `reset_faulted_scheduler`. `netbadbd` has no live admin transport in v5.
-An operator currently recovers a daemon stuck awaiting explicit renewal, or a
-faulted scheduler, by restarting the process when schema-driven renewal does
-not apply. Phase 17 intentionally adds no HTTP, Unix socket, Native/PG admin
-frame, SQL command, function, or signal protocol.
+and `reset_faulted_scheduler`, and adds conditional
+`rotate_evidence_if_window`. When configured, `netbadbd` exposes those bounded
+operations through NBOP v1 without adding any other mutation authority.
 
-`netbadb inspect` uses the same v5 parser and validates the complete Adaptive
+`netbadb inspect` uses the same v6 parser and validates the complete Adaptive
 section, including constructors and structural rules, before offline
 inspection. It never creates an evidence pool, host cadence, scheduler, or
 maintenance run and does not gain Adaptive-specific database mutations beyond
 the existing normal open/recovery semantics.
 
-V5 changes only the Server Deployment Manifest version. Native Protocol v2,
+V6 changes only the Server Deployment Manifest version. Native Protocol v2,
 PostgreSQL wire, SQL, authorization, SessionPolicy, Server metrics, Inspection
 JSON v7, Canonical Schema, Heap, BTree, LSM, Columnar, Change Stream,
 Coordinator, SDK Schema Spec, and all persistent database formats are

@@ -33,9 +33,10 @@ use crate::adaptive_feedback::{
     ServerAdaptiveFeedbackRuntime, execute_prepared_with_optional_server_feedback,
 };
 use crate::authorization::{AuthorizationPolicy, PrincipalAuthorization};
+use crate::operator::ServerOperatorPlane;
 use crate::{
     ClientIdentity, DatabaseSession, ServerAdaptiveFeedbackConfig, ServerConfig, ServerLimits,
-    SessionPolicy, TableBootstrap, TransportKind,
+    ServerOperatorError, SessionPolicy, TableBootstrap, TransportKind,
 };
 
 const MAX_PREPARED_STATEMENTS: usize = 1_024;
@@ -77,8 +78,15 @@ impl PostgresTcpServer {
     }
 
     pub fn start(self) -> Result<PostgresServerHandle, PostgresTcpServerError> {
-        let (listen, tables, limits, security, authorization, manifest_adaptive_mode) =
-            self.config.into_parts();
+        let (
+            listen,
+            tables,
+            limits,
+            security,
+            authorization,
+            manifest_adaptive_mode,
+            operator_config,
+        ) = self.config.into_parts();
         let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
         if security.kind() != TransportKind::PlaintextLoopback {
             return Err(PostgresTcpServerError::TlsManifestUnsupported);
@@ -93,29 +101,40 @@ impl PostgresTcpServer {
         let listener = match TcpListener::bind(listen) {
             Ok(listener) => listener,
             Err(source) => {
-                let _ = worker.shutdown();
-                return Err(PostgresTcpServerError::Bind {
-                    address: listen,
-                    source,
-                });
+                return Err(finish_pg_startup_failure(
+                    worker,
+                    PostgresTcpServerError::Bind {
+                        address: listen,
+                        source,
+                    },
+                ));
             }
         };
         if let Err(error) = listener.set_nonblocking(true) {
-            let _ = worker.shutdown();
-            return Err(PostgresTcpServerError::ListenerConfiguration(error));
+            return Err(finish_pg_startup_failure(
+                worker,
+                PostgresTcpServerError::ListenerConfiguration(error),
+            ));
         }
         let local_addr = match listener.local_addr() {
             Ok(address) => address,
             Err(error) => {
-                let _ = worker.shutdown();
-                return Err(PostgresTcpServerError::ListenerConfiguration(error));
+                return Err(finish_pg_startup_failure(
+                    worker,
+                    PostgresTcpServerError::ListenerConfiguration(error),
+                ));
             }
         };
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let (adaptive_control_tx, adaptive_control_rx) = mpsc::channel();
-        let join = thread::Builder::new()
+        let (operator_failure_tx, operator_failure_rx) = mpsc::channel();
+        let (worker_tx, worker_rx) = mpsc::sync_channel(0);
+        let join = match thread::Builder::new()
             .name("netbadb-postgres-server".into())
             .spawn(move || {
+                let worker = worker_rx
+                    .recv()
+                    .map_err(|_| PostgresTcpServerError::WorkerStopped)?;
                 run_pg_accept_loop(
                     listener,
                     shutdown_rx,
@@ -124,14 +143,56 @@ impl PostgresTcpServer {
                     ServerAdaptiveHostConfig {
                         tick_interval,
                         controls: adaptive_control_rx,
+                        operator_failures: operator_failure_rx,
                     },
                 )
-            })
-            .map_err(PostgresTcpServerError::ThreadSpawn)?;
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                return Err(finish_pg_startup_failure(
+                    worker,
+                    PostgresTcpServerError::ThreadSpawn(error),
+                ));
+            }
+        };
+        if let Err(error) = worker_tx.send(worker) {
+            let startup = match join.join() {
+                Ok(Ok(())) => PostgresTcpServerError::WorkerStopped,
+                Ok(Err(error)) => error,
+                Err(_) => PostgresTcpServerError::ThreadPanicked,
+            };
+            return Err(finish_pg_startup_failure(error.0, startup));
+        }
+        let adaptive_control = ServerAdaptiveControlHandle::new(adaptive_control_tx);
+        let operator = match operator_config {
+            Some(config) => match ServerOperatorPlane::start(
+                config,
+                adaptive_control.clone(),
+                operator_failure_tx,
+            ) {
+                Ok(operator) => Some(operator),
+                Err(error) => {
+                    let _ = shutdown_tx.send(());
+                    let cleanup = join
+                        .join()
+                        .map_err(|_| PostgresTcpServerError::ThreadPanicked)
+                        .and_then(|result| result);
+                    return Err(match cleanup {
+                        Ok(()) => PostgresTcpServerError::Operator(error),
+                        Err(server) => PostgresTcpServerError::OperatorAndServerCleanup {
+                            operator: Box::new(error),
+                            server: Box::new(server),
+                        },
+                    });
+                }
+            },
+            None => None,
+        };
         Ok(PostgresServerHandle {
             local_addr,
             shutdown_tx,
-            adaptive_control: ServerAdaptiveControlHandle::new(adaptive_control_tx),
+            adaptive_control,
+            operator,
             join: Some(join),
         })
     }
@@ -145,6 +206,7 @@ pub struct PostgresServerHandle {
     local_addr: SocketAddr,
     shutdown_tx: Sender<()>,
     adaptive_control: ServerAdaptiveControlHandle,
+    operator: Option<ServerOperatorPlane>,
     join: Option<JoinHandle<Result<(), PostgresTcpServerError>>>,
 }
 
@@ -160,12 +222,15 @@ impl PostgresServerHandle {
     }
 
     pub fn shutdown(mut self) -> Result<(), PostgresTcpServerError> {
+        let operator = self.operator.take().map(ServerOperatorPlane::shutdown);
         let _ = self.shutdown_tx.send(());
-        self.join_server()
+        combine_operator_and_server(operator, self.join_server())
     }
 
     pub fn wait(mut self) -> Result<(), PostgresTcpServerError> {
-        self.join_server()
+        let server = self.join_server();
+        let operator = self.operator.take().map(ServerOperatorPlane::shutdown);
+        combine_operator_and_server(operator, server)
     }
 
     fn join_server(&mut self) -> Result<(), PostgresTcpServerError> {
@@ -175,6 +240,21 @@ impl PostgresServerHandle {
             .ok_or(PostgresTcpServerError::WorkerStopped)?;
         join.join()
             .map_err(|_| PostgresTcpServerError::ThreadPanicked)?
+    }
+}
+
+fn combine_operator_and_server(
+    operator: Option<Result<(), ServerOperatorError>>,
+    server: Result<(), PostgresTcpServerError>,
+) -> Result<(), PostgresTcpServerError> {
+    match (operator.transpose(), server) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Ok(_), Err(server)) => Err(server),
+        (Err(operator), Ok(())) => Err(PostgresTcpServerError::Operator(operator)),
+        (Err(operator), Err(server)) => Err(PostgresTcpServerError::OperatorAndServerCleanup {
+            operator: Box::new(operator),
+            server: Box::new(server),
+        }),
     }
 }
 
@@ -190,6 +270,15 @@ pub enum PostgresTcpServerError {
     ThreadSpawn(io::Error),
     Database(DatabaseError),
     AdaptiveConfig(ServerAdaptiveDriverConfigError),
+    Operator(ServerOperatorError),
+    OperatorAndServerCleanup {
+        operator: Box<ServerOperatorError>,
+        server: Box<PostgresTcpServerError>,
+    },
+    StartupCleanup {
+        startup: Box<PostgresTcpServerError>,
+        cleanup: Box<PostgresTcpServerError>,
+    },
     WorkerStopped,
     WorkerClose(String),
     ThreadPanicked,
@@ -221,6 +310,15 @@ impl fmt::Display for PostgresTcpServerError {
             Self::AdaptiveConfig(error) => {
                 write!(formatter, "adaptive driver startup failed: {error}")
             }
+            Self::Operator(error) => error.fmt(formatter),
+            Self::OperatorAndServerCleanup { operator, server } => write!(
+                formatter,
+                "operator shutdown failed: {operator}; PostgreSQL server cleanup also failed: {server}"
+            ),
+            Self::StartupCleanup { startup, cleanup } => write!(
+                formatter,
+                "PostgreSQL server startup failed: {startup}; worker cleanup also failed: {cleanup}"
+            ),
             Self::WorkerStopped => {
                 formatter.write_str("PostgreSQL database worker stopped unexpectedly")
             }
@@ -243,8 +341,24 @@ impl Error for PostgresTcpServerError {
             | Self::ThreadSpawn(source) => Some(source),
             Self::Database(error) => Some(error),
             Self::AdaptiveConfig(error) => Some(error),
+            Self::Operator(error) => Some(error),
+            Self::OperatorAndServerCleanup { server, .. } => Some(server.as_ref()),
+            Self::StartupCleanup { cleanup, .. } => Some(cleanup.as_ref()),
             _ => None,
         }
+    }
+}
+
+fn finish_pg_startup_failure(
+    worker: PgDatabaseWorker,
+    startup: PostgresTcpServerError,
+) -> PostgresTcpServerError {
+    match worker.shutdown() {
+        Ok(()) => startup,
+        Err(cleanup) => PostgresTcpServerError::StartupCleanup {
+            startup: Box::new(startup),
+            cleanup: Box::new(cleanup),
+        },
     }
 }
 
@@ -269,6 +383,9 @@ fn run_pg_accept_loop(
         match shutdown.try_recv() {
             Ok(()) | Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {}
+        }
+        if adaptive_host_config.operator_failures.try_recv().is_ok() {
+            break;
         }
         reap_pg_connections(&mut connections);
         if let Some(host) = adaptive_host.as_mut() {

@@ -14,9 +14,9 @@ use netbadb_protocol::{
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
-    AuthorizationConfigError, ManifestError, ServerAdaptiveControlError,
+    AuthorizationConfigError, ManifestError, OperatorAdaptiveModeV1, ServerAdaptiveControlError,
     ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig, ServerAdaptiveMode, ServerConfig,
-    ServerHandle, TcpServer, TcpServerError, TransportKind,
+    ServerHandle, ServerOperatorClient, TcpServer, TcpServerError, TransportKind,
 };
 use netbadb_storage::{wal_alternate_path, wal_path};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
@@ -118,7 +118,7 @@ fn manifest_json_with_transport(
     let tls = tls.map_or_else(String::new, |tls| format!("\"tls\": {tls},"));
     format!(
         r#"{{
-            "version": 5,
+            "version": 6,
             "listen": "127.0.0.1:0",
             {limits}
             {tls}
@@ -216,7 +216,7 @@ fn create_two_table_server(name: &str, authorization: &str) -> (PathBuf, ServerH
         &manifest,
         format!(
             r#"{{
-                "version":5,
+                "version":6,
                 "listen":"127.0.0.1:0",
                 "authorization":{authorization},
                 "tables":[
@@ -321,6 +321,88 @@ fn native_adaptive_driver_reaches_worker_and_control_stays_host_mediated() {
         control.status(),
         Err(ServerAdaptiveControlError::ServerStopped)
     );
+    cleanup(&directory);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_query_continues_across_live_operator_status_and_rotation() {
+    let directory = test_directory("operator-plane");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    Database::create(directory.join("users.ndb"), users_table("UserId"))
+        .unwrap()
+        .close()
+        .unwrap();
+    let socket = PathBuf::from(format!(
+        "/tmp/netbadb-native-op-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let manifest = directory.join("server.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&manifest_json("users.ndb", "UserId")).unwrap();
+    value["adaptive"] = serde_json::json!({
+        "mode": "feedback_only",
+        "feedback": {"limits": {
+            "max_target_windows": 4,
+            "workload": {"max_query_shapes":4,"max_plan_variants_per_shape":4},
+            "max_calibration_epochs": 4,
+            "max_calibration_query_shapes": 4,
+            "max_calibration_plan_variants_per_shape": 4
+        }}
+    });
+    value["operator"] = serde_json::json!({
+        "unix_socket": socket,
+        "io_timeout_ms": 1000
+    });
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    let operator_config = config.operator_config().unwrap().clone();
+    let server = TcpServer::new(config).start().unwrap();
+    let operator = ServerOperatorClient::new(&operator_config);
+    assert_eq!(
+        operator.status().unwrap().mode,
+        OperatorAdaptiveModeV1::FeedbackOnly
+    );
+
+    let mut client = Client::connect(server.local_addr());
+    assert!(matches!(
+        client.hello().as_slice(),
+        [ServerMessage::HelloAck { .. }]
+    ));
+    assert!(matches!(
+        client
+            .request(
+                2,
+                ClientMessage::Execute {
+                    sql: "SELECT id FROM users".into()
+                }
+            )
+            .as_slice(),
+        [
+            ServerMessage::QueryStart { .. },
+            ServerMessage::QueryEnd { .. }
+        ]
+    ));
+    assert_eq!(operator.rotate_evidence(0).unwrap().new_window_epoch, 1);
+    assert!(matches!(
+        client
+            .request(
+                3,
+                ClientMessage::Execute {
+                    sql: "SELECT id FROM users".into()
+                }
+            )
+            .as_slice(),
+        [
+            ServerMessage::QueryStart { .. },
+            ServerMessage::QueryEnd { .. }
+        ]
+    ));
+    client.close_clean();
+    server.shutdown().unwrap();
+    assert!(!socket.exists());
     cleanup(&directory);
 }
 
@@ -1080,7 +1162,7 @@ fn assert_tls_handshake_rejected(address: SocketAddr, config: Arc<ClientConfig>)
 }
 
 #[test]
-fn manifest_v5_validates_tls_material_and_allows_secure_remote_configuration() {
+fn manifest_v6_validates_tls_material_and_allows_secure_remote_configuration() {
     let directory = test_directory("tls-manifest");
     cleanup(&directory);
     std::fs::create_dir_all(&directory).unwrap();
