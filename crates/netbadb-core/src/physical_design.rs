@@ -350,6 +350,14 @@ impl PhysicalDesignEvidenceWindow {
         collect_columnar_support(&report.plan_variant, &binding_counts, &mut columnar_support);
         deduplicate_columnar_support(&mut columnar_support);
         for candidate in columnar_support {
+            let Some(table_column_count) =
+                logical_table_column_count(&report.query_shape, candidate.table_id)
+            else {
+                continue;
+            };
+            if u64_len(candidate.columns.len()) >= table_column_count {
+                continue;
+            }
             let Some(work) = scan_work
                 .iter()
                 .find(|work| work.table_id == candidate.table_id)
@@ -1154,6 +1162,33 @@ fn deduplicate_columnar_support(support: &mut Vec<PhysicalColumnarCandidate>) {
 
 fn same_column_set(left: &[ColumnId], right: &[ColumnId]) -> bool {
     left.len() == right.len() && left.iter().all(|column| right.contains(column))
+}
+
+fn logical_table_column_count(shape: &LogicalQueryShape, table_id: TableId) -> Option<u64> {
+    match shape {
+        LogicalQueryShape::Scan {
+            table_id: scanned,
+            columns,
+            ..
+        } => (*scanned == table_id).then(|| {
+            let mut unique = Vec::new();
+            for column in columns {
+                if !unique.contains(&column.column_id) {
+                    unique.push(column.column_id);
+                }
+            }
+            u64_len(unique.len())
+        }),
+        LogicalQueryShape::Join { left, right, .. } => logical_table_column_count(left, table_id)
+            .or_else(|| logical_table_column_count(right, table_id)),
+        LogicalQueryShape::Filter { input, .. }
+        | LogicalQueryShape::Sort { input, .. }
+        | LogicalQueryShape::Project { input, .. }
+        | LogicalQueryShape::ScalarProject { input, .. }
+        | LogicalQueryShape::Aggregate { input, .. }
+        | LogicalQueryShape::Limit { input, .. } => logical_table_column_count(input, table_id),
+        LogicalQueryShape::OneRow => None,
+    }
 }
 
 fn record_candidate_work(

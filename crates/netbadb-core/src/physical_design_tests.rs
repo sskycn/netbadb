@@ -528,13 +528,7 @@ fn empty_stale_and_full_row_evidence_are_fail_closed() {
         .database
         .advise_physical_design(&full_row_window, policy(1, 1, 0, 8))
         .expect("inspect full-row scan");
-    assert_eq!(advice.columnar_candidates.len(), 1);
-    assert_eq!(
-        advice.columnar_candidates[0].decision,
-        PhysicalDesignCandidateDecision::NoAction(
-            PhysicalDesignNoActionReason::UnsupportedCurrentLayout,
-        )
-    );
+    assert!(advice.columnar_candidates.is_empty());
     fixture.close();
 }
 
