@@ -1,5 +1,8 @@
 # NetbaDB deployment manifest v6
 
+> Historical deployment contract. Current `netbadbd` requires Manifest v7.
+> Manifest v6 is explicitly rejected.
+
 Deployment manifest v6 is the only current `netbadbd` startup configuration.
 Versions 1 through 5 and future versions are rejected explicitly; there is no
 dual v5/v6 decoder. The manifest is a deployment contract, not a database file

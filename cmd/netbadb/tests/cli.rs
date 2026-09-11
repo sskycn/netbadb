@@ -84,7 +84,7 @@ impl Fixture {
         database.close().unwrap();
 
         let manifest = directory.join("server.json");
-        write_manifest(&manifest, 6, "users");
+        write_manifest(&manifest, 7, "users");
         Self {
             directory,
             manifest,
@@ -291,7 +291,7 @@ fn catalog_text_and_json_are_complete_deterministic_and_ignore_network_acl_filte
 }
 
 #[test]
-fn inspect_accepts_and_validates_v6_adaptive_without_rewriting_the_manifest() {
+fn inspect_accepts_and_validates_v7_adaptive_without_rewriting_the_manifest() {
     let fixture = Fixture::new("adaptive-manifest");
     let mut manifest: Value =
         serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
@@ -310,6 +310,28 @@ fn inspect_accepts_and_validates_v6_adaptive_without_rewriting_the_manifest() {
             }
         }
     });
+    manifest["physical_design"] = json!({
+        "evidence_limits": {
+            "max_index_candidates": 4,
+            "max_columnar_candidates": 4,
+            "max_query_shapes_per_candidate": 4,
+            "max_columnar_columns_per_candidate": 4
+        },
+        "advisor_policy": {
+            "index": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 4
+            },
+            "columnar": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 4
+            }
+        }
+    });
     let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
     std::fs::write(&fixture.manifest, &bytes).unwrap();
 
@@ -317,13 +339,13 @@ fn inspect_accepts_and_validates_v6_adaptive_without_rewriting_the_manifest() {
     assert!(inspected.status.success(), "{}", stderr(&inspected));
     assert_eq!(std::fs::read(&fixture.manifest).unwrap(), bytes);
 
-    let document = include_str!("../../../docs/server-manifest-v6.md");
+    let document = include_str!("../../../docs/server-manifest-v7.md");
     let documented: Value = serde_json::from_str(
         document
             .split_once("```json\n")
             .and_then(|(_, remainder)| remainder.split_once("\n```"))
             .map(|(example, _)| example)
-            .expect("v6 documentation contains a JSON example"),
+            .expect("v7 documentation contains a JSON example"),
     )
     .unwrap();
     manifest["adaptive"] = documented["adaptive"].clone();
@@ -497,7 +519,7 @@ fn manifest_and_input_failures_precede_output_and_schema_mismatch_is_rejected() 
     assert!(stderr(&old_manifest).contains("unsupported deployment manifest version 5"));
 
     let mismatch = fixture.directory.join("mismatch.json");
-    write_manifest(&mismatch, 6, "other_users");
+    write_manifest(&mismatch, 7, "other_users");
     let mismatch = netbadb()
         .args(["inspect", "catalog", "--manifest"])
         .arg(&mismatch)
@@ -546,6 +568,28 @@ fn operator_cli_uses_live_nbop_and_never_infers_rotation_epoch() {
             }
         }
     });
+    manifest["physical_design"] = json!({
+        "evidence_limits": {
+            "max_index_candidates": 4,
+            "max_columnar_candidates": 4,
+            "max_query_shapes_per_candidate": 4,
+            "max_columnar_columns_per_candidate": 4
+        },
+        "advisor_policy": {
+            "index": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 4
+            },
+            "columnar": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 4
+            }
+        }
+    });
     let socket = PathBuf::from(format!("/tmp/netbadb-cli-op-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
     manifest["operator"] = json!({
@@ -567,8 +611,10 @@ fn operator_cli_uses_live_nbop_and_never_infers_rotation_epoch() {
         .output()
         .unwrap();
     assert!(status.status.success(), "{}", stderr(&status));
-    assert!(stdout(&status).contains("adaptive mode: feedback_only"));
-    assert!(stdout(&status).contains("evidence window epoch: 0"));
+    assert!(stdout(&status).contains("Adaptive: feedback-only"));
+    assert!(stdout(&status).contains("adaptive evidence window epoch: 0"));
+    assert!(stdout(&status).contains("Physical Design: enabled"));
+    assert!(stdout(&status).contains("design evidence epoch: 0"));
 
     let missing_epoch = netbadb()
         .args(["operator", "rotate-evidence", "--manifest"])
@@ -604,6 +650,50 @@ fn operator_cli_uses_live_nbop_and_never_infers_rotation_epoch() {
     assert_eq!(reset.status.code(), Some(1));
     assert!(stderr(&reset).contains("adaptive driver is not enabled"));
 
+    let no_evidence = netbadb()
+        .args([
+            "operator",
+            "physical-design",
+            "recommendations",
+            "--manifest",
+        ])
+        .arg(&fixture.manifest)
+        .output()
+        .unwrap();
+    assert_eq!(no_evidence.status.code(), Some(1));
+    assert!(stderr(&no_evidence).contains("physical-design evidence window is empty"));
+
+    let missing_design_epoch = netbadb()
+        .args([
+            "operator",
+            "physical-design",
+            "rotate-evidence",
+            "--manifest",
+        ])
+        .arg(&fixture.manifest)
+        .output()
+        .unwrap();
+    assert_eq!(missing_design_epoch.status.code(), Some(2));
+    assert!(stderr(&missing_design_epoch).contains("--expected-evidence-epoch is required"));
+
+    let design_rotated = netbadb()
+        .args([
+            "operator",
+            "physical-design",
+            "rotate-evidence",
+            "--manifest",
+        ])
+        .arg(&fixture.manifest)
+        .args(["--expected-evidence-epoch", "0"])
+        .output()
+        .unwrap();
+    assert!(
+        design_rotated.status.success(),
+        "{}",
+        stderr(&design_rotated)
+    );
+    assert!(stdout(&design_rotated).contains("previous epoch 0, new epoch 1"));
+
     server.shutdown().unwrap();
     assert!(!socket.exists());
 }
@@ -633,6 +723,28 @@ fn operator_cli_reports_unconfigured_and_offline_planes_without_opening_database
                 "max_calibration_epochs": 1,
                 "max_calibration_query_shapes": 1,
                 "max_calibration_plan_variants_per_shape": 1
+            }
+        }
+    });
+    manifest["physical_design"] = json!({
+        "evidence_limits": {
+            "max_index_candidates": 1,
+            "max_columnar_candidates": 1,
+            "max_query_shapes_per_candidate": 1,
+            "max_columnar_columns_per_candidate": 1
+        },
+        "advisor_policy": {
+            "index": {
+                "minimum_reports": 0,
+                "minimum_distinct_query_shapes": 0,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 0
+            },
+            "columnar": {
+                "minimum_reports": 0,
+                "minimum_distinct_query_shapes": 0,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 0
             }
         }
     });

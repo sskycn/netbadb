@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 use netbadb_core::{
     AdaptiveEvidencePoolLimits, AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope,
     AutomaticSchedulerPolicy, Database, DatabaseCoordinatorConfig, MaintenanceBudget,
-    PhysicalDesignAdvisorPolicy, PhysicalDesignCandidateDecision, PhysicalDesignEvidenceLimits,
-    PhysicalDesignNoActionReason, PhysicalDesignRecommendationPolicy, TableStorageCreateSpec,
+    TableStorageCreateSpec,
 };
 use netbadb_protocol::{
     ClientMessage, Frame, ProtocolErrorCode, ServerMessage, WireTransactionState,
@@ -16,9 +15,10 @@ use netbadb_protocol::{
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
-    AuthorizationConfigError, ManifestError, OperatorAdaptiveModeV1, ServerAdaptiveControlError,
-    ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig, ServerAdaptiveMode, ServerConfig,
-    ServerHandle, ServerOperatorClient, ServerPhysicalDesignAdvisorConfig,
+    AuthorizationConfigError, ManifestError, OperatorAdaptiveModeV2, OperatorClientError,
+    OperatorErrorCodeV2, OperatorPhysicalDesignDecisionV2, OperatorPhysicalDesignNoActionReasonV2,
+    ServerAdaptiveControlError, ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig,
+    ServerAdaptiveMode, ServerConfig, ServerHandle, ServerOperatorClient,
     ServerPhysicalDesignControlError, TcpServer, TcpServerError, TransportKind,
 };
 use netbadb_storage::{wal_alternate_path, wal_path};
@@ -55,22 +55,6 @@ fn adaptive_driver_config(table_id: TableId) -> ServerAdaptiveDriverConfig {
         Vec::new(),
     )
     .unwrap()
-}
-
-fn physical_design_config() -> ServerPhysicalDesignAdvisorConfig {
-    let recommendation = PhysicalDesignRecommendationPolicy {
-        minimum_reports: 1,
-        minimum_distinct_query_shapes: 1,
-        minimum_actual_scan_work_units: 0,
-        max_recommendations: 8,
-    };
-    ServerPhysicalDesignAdvisorConfig::new(
-        PhysicalDesignEvidenceLimits::default(),
-        PhysicalDesignAdvisorPolicy {
-            index: recommendation,
-            columnar: recommendation,
-        },
-    )
 }
 
 fn users_table(semantic_name: &str) -> TableDef {
@@ -137,7 +121,7 @@ fn manifest_json_with_transport(
     let tls = tls.map_or_else(String::new, |tls| format!("\"tls\": {tls},"));
     format!(
         r#"{{
-            "version": 6,
+            "version": 7,
             "listen": "127.0.0.1:0",
             {limits}
             {tls}
@@ -235,7 +219,7 @@ fn create_two_table_server(name: &str, authorization: &str) -> (PathBuf, ServerH
         &manifest,
         format!(
             r#"{{
-                "version":6,
+                "version":7,
                 "listen":"127.0.0.1:0",
                 "authorization":{authorization},
                 "tables":[
@@ -285,20 +269,72 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     database.close().unwrap();
 
     let manifest = directory.join("server.json");
+    let socket = PathBuf::from(format!(
+        "/tmp/netbadb-native-design-op-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
     let mut manifest_value: serde_json::Value =
         serde_json::from_str(&manifest_json("users.ndb", "UserId")).unwrap();
     manifest_value["authorization"]["local_plaintext"]["schema_admin"] = true.into();
+    manifest_value["physical_design"] = serde_json::json!({
+        "evidence_limits": {
+            "max_index_candidates": 64,
+            "max_columnar_candidates": 64,
+            "max_query_shapes_per_candidate": 32,
+            "max_columnar_columns_per_candidate": 64
+        },
+        "advisor_policy": {
+            "index": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            },
+            "columnar": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            }
+        }
+    });
+    manifest_value["operator"] = serde_json::json!({
+        "unix_socket": socket,
+        "io_timeout_ms": 1000
+    });
     std::fs::write(&manifest, serde_json::to_vec(&manifest_value).unwrap()).unwrap();
-    let server = TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
-        .with_physical_design_advisor(physical_design_config())
-        .start()
-        .unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    let operator_config = config.operator_config().unwrap().clone();
+    let server = TcpServer::new(config).start().unwrap();
+    let operator = ServerOperatorClient::new(&operator_config);
     let design = server.physical_design_control();
     assert_eq!(design.status().unwrap().evidence.recorded_reports, 0);
     assert_eq!(
         server.adaptive_control().status().unwrap().mode,
         ServerAdaptiveMode::Disabled
     );
+    let operator_status = operator.status().unwrap();
+    assert!(operator_status.adaptive.is_none());
+    assert_eq!(
+        operator_status
+            .physical_design
+            .as_ref()
+            .unwrap()
+            .evidence
+            .recorded_reports,
+        0
+    );
+    assert!(matches!(
+        operator.rotate_evidence(0),
+        Err(OperatorClientError::Remote(error))
+            if error.code == OperatorErrorCodeV2::AdaptiveNotEnabled
+    ));
+    assert!(matches!(
+        operator.physical_design_recommendations(),
+        Err(OperatorClientError::Remote(error))
+            if error.code == OperatorErrorCodeV2::PhysicalDesignNoEvidence
+    ));
 
     let mut client = Client::connect(server.local_addr());
     client.hello();
@@ -320,17 +356,19 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     assert_eq!(status.diagnostics.record_success_count, 1);
     assert_eq!(design.status().unwrap(), status);
 
-    let first = design.recommendations().unwrap();
-    let repeated = design.recommendations().unwrap();
+    let status_before_advice = operator.status().unwrap();
+    let first = operator.physical_design_recommendations().unwrap();
+    let repeated = operator.physical_design_recommendations().unwrap();
     assert_eq!(first, repeated);
+    assert_eq!(operator.status().unwrap(), status_before_advice);
     let name_candidate = first
         .index_candidates
         .iter()
-        .find(|entry| entry.candidate.column_id == ColumnId(2))
+        .find(|entry| entry.column_id == 2)
         .unwrap();
     assert_eq!(
         name_candidate.decision,
-        PhysicalDesignCandidateDecision::Recommend
+        OperatorPhysicalDesignDecisionV2::Recommend {}
     );
 
     client.request(
@@ -345,19 +383,21 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
             sql: "SELECT id, name FROM users".into(),
         },
     );
-    let columnar = design.recommendations().unwrap();
+    let columnar = operator.physical_design_recommendations().unwrap();
     assert!(columnar.columnar_candidates.iter().any(|entry| {
-        entry.candidate.columns == vec![ColumnId(1)]
-            && entry.decision == PhysicalDesignCandidateDecision::Recommend
+        entry.columns == vec![1] && entry.decision == OperatorPhysicalDesignDecisionV2::Recommend {}
     }));
     assert!(
         columnar
             .columnar_candidates
             .iter()
-            .all(|entry| entry.candidate.columns.len() < 2),
+            .all(|entry| entry.columns.len() < 2),
         "a full-row Server scan must not become positive design evidence"
     );
-    assert_eq!(design.recommendations().unwrap(), columnar);
+    assert_eq!(
+        operator.physical_design_recommendations().unwrap(),
+        columnar
+    );
 
     assert_eq!(
         client.request(
@@ -368,34 +408,34 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         ),
         vec![ServerMessage::AffectedRows { count: 0 }]
     );
-    let revalidated = design.recommendations().unwrap();
+    let revalidated = operator.physical_design_recommendations().unwrap();
     assert_eq!(
         revalidated
             .index_candidates
             .iter()
-            .find(|entry| entry.candidate.column_id == ColumnId(2))
+            .find(|entry| entry.column_id == 2)
             .unwrap()
             .decision,
-        PhysicalDesignCandidateDecision::NoAction(
-            PhysicalDesignNoActionReason::ExistingDesignCovers
-        )
+        OperatorPhysicalDesignDecisionV2::NoAction {
+            reason: OperatorPhysicalDesignNoActionReasonV2::ExistingDesignCovers
+        }
     );
 
     let epoch = status.evidence.epoch;
-    let rotated = design.rotate_evidence_if_epoch(epoch).unwrap();
-    assert_eq!(rotated.previous_epoch, epoch);
-    assert_eq!(rotated.new_epoch.0, epoch.0 + 1);
+    let rotated = operator.rotate_physical_design_evidence(epoch.0).unwrap();
+    assert_eq!(rotated.previous_epoch, epoch.0);
+    assert_eq!(rotated.new_epoch, epoch.0 + 1);
     assert_eq!(design.status().unwrap().evidence.recorded_reports, 0);
     assert!(matches!(
-        design.rotate_evidence_if_epoch(epoch),
-        Err(ServerPhysicalDesignControlError::EvidenceEpochChanged {
-            expected,
-            actual,
-        }) if expected == epoch && actual == rotated.new_epoch
+        operator.rotate_physical_design_evidence(epoch.0),
+        Err(OperatorClientError::Remote(error))
+            if error.code == OperatorErrorCodeV2::PhysicalDesignEvidenceEpochChanged
     ));
+    assert_eq!(design.status().unwrap().evidence.epoch.0, rotated.new_epoch);
 
     drop(client);
     server.shutdown().unwrap();
+    assert!(!socket.exists());
     assert!(matches!(
         design.status(),
         Err(ServerPhysicalDesignControlError::ServerStopped)
@@ -422,16 +462,51 @@ fn native_adaptive_and_physical_design_share_one_successful_query_report() {
     .close()
     .unwrap();
     let manifest = directory.join("server.json");
-    std::fs::write(&manifest, manifest_json("users.ndb", "UserId")).unwrap();
-    let server = TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
-        .with_physical_design_advisor(physical_design_config())
-        .with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(
-            AdaptiveEvidencePoolLimits::default(),
-        ))
-        .start()
-        .unwrap();
+    let socket = PathBuf::from(format!(
+        "/tmp/netbadb-native-both-op-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&manifest_json("users.ndb", "UserId")).unwrap();
+    value["adaptive"] = serde_json::json!({
+        "mode": "feedback_only",
+        "feedback": {"limits": {
+            "max_target_windows": 8,
+            "workload": {"max_query_shapes":8,"max_plan_variants_per_shape":8},
+            "max_calibration_epochs": 8,
+            "max_calibration_query_shapes": 8,
+            "max_calibration_plan_variants_per_shape": 8
+        }}
+    });
+    value["physical_design"] = serde_json::json!({
+        "evidence_limits": {
+            "max_index_candidates": 8,
+            "max_columnar_candidates": 8,
+            "max_query_shapes_per_candidate": 8,
+            "max_columnar_columns_per_candidate": 8
+        },
+        "advisor_policy": {
+            "index": {"minimum_reports":1,"minimum_distinct_query_shapes":1,
+                "minimum_actual_scan_work_units":0,"max_recommendations":8},
+            "columnar": {"minimum_reports":1,"minimum_distinct_query_shapes":1,
+                "minimum_actual_scan_work_units":0,"max_recommendations":8}
+        }
+    });
+    value["operator"] = serde_json::json!({
+        "unix_socket": socket,
+        "io_timeout_ms": 1000
+    });
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    let operator_config = config.operator_config().unwrap().clone();
+    let server = TcpServer::new(config).start().unwrap();
+    let operator = ServerOperatorClient::new(&operator_config);
     let adaptive = server.adaptive_control();
     let design = server.physical_design_control();
+    let status = operator.status().unwrap();
+    assert!(status.adaptive.is_some());
+    assert!(status.physical_design.is_some());
     let mut client = Client::connect(server.local_addr());
     client.hello();
     client.request(
@@ -451,8 +526,42 @@ fn native_adaptive_and_physical_design_share_one_successful_query_report() {
     );
     assert_eq!(design.status().unwrap().diagnostics.eligible_query_count, 1);
 
+    let adaptive_epoch = adaptive
+        .status()
+        .unwrap()
+        .feedback
+        .unwrap()
+        .evidence_progress
+        .window_epoch
+        .0;
+    let design_epoch = design.status().unwrap().evidence.epoch.0;
+    assert_eq!(
+        operator
+            .rotate_evidence(adaptive_epoch)
+            .unwrap()
+            .new_window_epoch,
+        adaptive_epoch + 1
+    );
+    assert_eq!(design.status().unwrap().evidence.epoch.0, design_epoch);
+    let design_rotation = operator
+        .rotate_physical_design_evidence(design_epoch)
+        .unwrap();
+    assert_eq!(design_rotation.new_epoch, design_epoch + 1);
+    assert_eq!(
+        adaptive
+            .status()
+            .unwrap()
+            .feedback
+            .unwrap()
+            .evidence_progress
+            .window_epoch
+            .0,
+        adaptive_epoch + 1
+    );
+
     drop(client);
     server.shutdown().unwrap();
+    assert!(!socket.exists());
     cleanup(&directory);
 }
 
@@ -572,10 +681,17 @@ fn native_query_continues_across_live_operator_status_and_rotation() {
     let operator_config = config.operator_config().unwrap().clone();
     let server = TcpServer::new(config).start().unwrap();
     let operator = ServerOperatorClient::new(&operator_config);
+    let status = operator.status().unwrap();
     assert_eq!(
-        operator.status().unwrap().mode,
-        OperatorAdaptiveModeV1::FeedbackOnly
+        status.adaptive.unwrap().mode,
+        OperatorAdaptiveModeV2::FeedbackOnly
     );
+    assert!(status.physical_design.is_none());
+    assert!(matches!(
+        operator.physical_design_recommendations(),
+        Err(OperatorClientError::Remote(error))
+            if error.code == OperatorErrorCodeV2::PhysicalDesignNotEnabled
+    ));
 
     let mut client = Client::connect(server.local_addr());
     assert!(matches!(
@@ -1374,7 +1490,7 @@ fn assert_tls_handshake_rejected(address: SocketAddr, config: Arc<ClientConfig>)
 }
 
 #[test]
-fn manifest_v6_validates_tls_material_and_allows_secure_remote_configuration() {
+fn manifest_v7_validates_tls_material_and_allows_secure_remote_configuration() {
     let directory = test_directory("tls-manifest");
     cleanup(&directory);
     std::fs::create_dir_all(&directory).unwrap();

@@ -1,5 +1,8 @@
 # NetbaDB Operator Protocol v1
 
+> Historical protocol contract. The current operator plane requires NBOP v2;
+> version 1 is explicitly rejected.
+
 NBOP v1 is the local live-control contract for one manifest-configured
 Adaptive runtime. It is available only through an AF_UNIX stream socket. It is
 not Native Protocol traffic, PostgreSQL wire traffic, SQL, HTTP, WebSocket, or

@@ -6,15 +6,15 @@ use std::time::{Duration, Instant};
 use netbadb_core::{
     AdaptiveEvidencePoolLimits, AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope,
     AutomaticSchedulerPolicy, Database, DatabaseCoordinatorConfig, MaintenanceBudget,
-    PhysicalDesignAdvisorError, PhysicalDesignAdvisorPolicy, PhysicalDesignEvidenceLimits,
-    PhysicalDesignEvidenceRecordError, PhysicalDesignRecommendationPolicy, TableStorageCreateSpec,
+    PhysicalDesignAdvisorError, PhysicalDesignEvidenceRecordError, TableStorageCreateSpec,
 };
 use netbadb_pgwire::{CANCEL_REQUEST_CODE, PROTOCOL_VERSION_3, SSL_REQUEST_CODE};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
-    OperatorAdaptiveModeV1, PostgresTcpServer, ServerAdaptiveControlError,
-    ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig, ServerAdaptiveMode, ServerConfig,
-    ServerOperatorClient, ServerPhysicalDesignAdvisorConfig, ServerPhysicalDesignControlError,
+    OperatorAdaptiveModeV2, OperatorClientError, OperatorErrorCodeV2,
+    OperatorPhysicalDesignDecisionV2, OperatorPhysicalDesignRecordErrorV2, PostgresTcpServer,
+    ServerAdaptiveControlError, ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig,
+    ServerAdaptiveMode, ServerConfig, ServerOperatorClient, ServerPhysicalDesignControlError,
 };
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 
@@ -42,22 +42,6 @@ fn adaptive_driver_config(table_id: TableId) -> ServerAdaptiveDriverConfig {
         Vec::new(),
     )
     .unwrap()
-}
-
-fn physical_design_config() -> ServerPhysicalDesignAdvisorConfig {
-    let recommendation = PhysicalDesignRecommendationPolicy {
-        minimum_reports: 1,
-        minimum_distinct_query_shapes: 1,
-        minimum_actual_scan_work_units: 0,
-        max_recommendations: 8,
-    };
-    ServerPhysicalDesignAdvisorConfig::new(
-        PhysicalDesignEvidenceLimits::default(),
-        PhysicalDesignAdvisorPolicy {
-            index: recommendation,
-            columnar: recommendation,
-        },
-    )
 }
 
 fn users_table() -> TableDef {
@@ -90,7 +74,7 @@ fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
     std::fs::write(
         &manifest,
         r#"{
-            "version": 6,
+            "version": 7,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -123,6 +107,7 @@ fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
     (directory, server)
 }
 
+#[cfg(unix)]
 #[test]
 fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonfatal() {
     let directory = test_directory("physical-design-legacy-local");
@@ -136,7 +121,7 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
     std::fs::write(
         &manifest,
         r#"{
-            "version": 6,
+            "version": 7,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -155,10 +140,44 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
         }"#,
     )
     .unwrap();
-    let server = PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
-        .with_physical_design_advisor(physical_design_config())
-        .start()
-        .unwrap();
+    let socket = PathBuf::from(format!(
+        "/tmp/netbadb-pg-legacy-op-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    value["physical_design"] = serde_json::json!({
+        "evidence_limits": {
+            "max_index_candidates": 64,
+            "max_columnar_candidates": 64,
+            "max_query_shapes_per_candidate": 32,
+            "max_columnar_columns_per_candidate": 64
+        },
+        "advisor_policy": {
+            "index": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            },
+            "columnar": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            }
+        }
+    });
+    value["operator"] = serde_json::json!({
+        "unix_socket": socket,
+        "io_timeout_ms": 1000
+    });
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    let operator_config = config.operator_config().unwrap().clone();
+    let server = PostgresTcpServer::new(config).start().unwrap();
+    let operator = ServerOperatorClient::new(&operator_config);
     let design = server.physical_design_control();
     assert!(matches!(
         design.recommendations(),
@@ -170,6 +189,14 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
         server.adaptive_control().status().unwrap().mode,
         ServerAdaptiveMode::Disabled
     );
+    let status = operator.status().unwrap();
+    assert!(status.adaptive.is_none());
+    assert!(status.physical_design.is_some());
+    assert!(matches!(
+        operator.physical_design_recommendations(),
+        Err(OperatorClientError::Remote(error))
+            if error.code == OperatorErrorCodeV2::PhysicalDesignNoEvidence
+    ));
 
     let mut stream = TcpStream::connect(server.local_addr()).unwrap();
     startup(&mut stream);
@@ -184,10 +211,21 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
         status.diagnostics.last_record_error,
         Some(PhysicalDesignEvidenceRecordError::GlobalVisibilityRequired)
     );
+    assert_eq!(
+        operator
+            .status()
+            .unwrap()
+            .physical_design
+            .unwrap()
+            .diagnostics
+            .last_record_error,
+        Some(OperatorPhysicalDesignRecordErrorV2::GlobalVisibilityRequired)
+    );
 
     stream.write_all(&frontend(b'X', &[])).unwrap();
     drop(stream);
     server.shutdown().unwrap();
+    assert!(!socket.exists());
     assert!(matches!(
         design.status(),
         Err(ServerPhysicalDesignControlError::ServerStopped)
@@ -195,6 +233,7 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
     cleanup(&directory);
 }
 
+#[cfg(unix)]
 #[test]
 fn postgres_extended_physical_design_capture_records_only_initial_portal_execution() {
     let directory = test_directory("physical-design-extended");
@@ -219,10 +258,14 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
         .unwrap();
     database.close().unwrap();
     let manifest = directory.join("server.json");
-    std::fs::write(
-        &manifest,
+    let socket = PathBuf::from(format!(
+        "/tmp/netbadb-pg-extended-op-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let mut value: serde_json::Value = serde_json::from_str(
         r#"{
-            "version": 6,
+            "version": 7,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": false,
@@ -241,10 +284,37 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
         }"#,
     )
     .unwrap();
-    let server = PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
-        .with_physical_design_advisor(physical_design_config())
-        .start()
-        .unwrap();
+    value["physical_design"] = serde_json::json!({
+        "evidence_limits": {
+            "max_index_candidates": 8,
+            "max_columnar_candidates": 8,
+            "max_query_shapes_per_candidate": 8,
+            "max_columnar_columns_per_candidate": 8
+        },
+        "advisor_policy": {
+            "index": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            },
+            "columnar": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            }
+        }
+    });
+    value["operator"] = serde_json::json!({
+        "unix_socket": socket,
+        "io_timeout_ms": 1000
+    });
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    let operator_config = config.operator_config().unwrap().clone();
+    let server = PostgresTcpServer::new(config).start().unwrap();
+    let operator = ServerOperatorClient::new(&operator_config);
     let design = server.physical_design_control();
     let mut stream = TcpStream::connect(server.local_addr()).unwrap();
     startup(&mut stream);
@@ -269,6 +339,12 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
         [b'1', b'2', b'D', b's', b'Z']
     );
     assert_eq!(design.status().unwrap().evidence.recorded_reports, 1);
+    let report = operator.physical_design_recommendations().unwrap();
+    assert_eq!(report.recorded_reports, 1);
+    assert!(report.index_candidates.iter().any(|candidate| {
+        candidate.column_id == 3
+            && candidate.decision == OperatorPhysicalDesignDecisionV2::Recommend {}
+    }));
 
     stream.write_all(&frontend(b'E', &execute)).unwrap();
     stream.write_all(&frontend(b'S', &[])).unwrap();
@@ -282,6 +358,7 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
     stream.write_all(&frontend(b'X', &[])).unwrap();
     drop(stream);
     server.shutdown().unwrap();
+    assert!(!socket.exists());
     cleanup(&directory);
 }
 
@@ -298,7 +375,7 @@ fn postgres_adaptive_driver_reaches_worker_without_changing_wire_state() {
     std::fs::write(
         &manifest,
         r#"{
-            "version": 6,
+            "version": 7,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -383,7 +460,7 @@ fn postgres_query_and_transaction_status_are_isolated_from_live_operator_request
     let manifest = directory.join("server.json");
     let source = format!(
         r#"{{
-            "version": 6,
+            "version": 7,
             "listen": "127.0.0.1:0",
             "authorization": {{
                 "local_plaintext": {{"schema_admin": true,
@@ -422,8 +499,8 @@ fn postgres_query_and_transaction_status_are_isolated_from_live_operator_request
     let server = PostgresTcpServer::new(config).start().unwrap();
     let operator = ServerOperatorClient::new(&operator_config);
     assert_eq!(
-        operator.status().unwrap().mode,
-        OperatorAdaptiveModeV1::FeedbackOnly
+        operator.status().unwrap().adaptive.unwrap().mode,
+        OperatorAdaptiveModeV2::FeedbackOnly
     );
 
     let mut stream = TcpStream::connect(server.local_addr()).unwrap();
@@ -431,7 +508,7 @@ fn postgres_query_and_transaction_status_are_isolated_from_live_operator_request
     let begin = query(&mut stream, "BEGIN");
     assert_eq!(begin.last().unwrap().1, [b'T']);
     let status = operator.status().unwrap();
-    assert_eq!(status.feedback.window_epoch, 0);
+    assert_eq!(status.adaptive.unwrap().feedback.window_epoch, 0);
     let rotation = operator.rotate_evidence(0).unwrap();
     assert_eq!(rotation.new_window_epoch, 1);
     let select = query(&mut stream, "SELECT id FROM users");

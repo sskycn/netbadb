@@ -174,7 +174,7 @@ impl From<ManifestError> for TcpServerError {
 pub struct TcpServer {
     config: ServerConfig,
     adaptive_override: Option<ServerAdaptiveStartupMode>,
-    physical_design: Option<ServerPhysicalDesignAdvisorConfig>,
+    physical_design_override: Option<ServerPhysicalDesignAdvisorConfig>,
 }
 
 impl TcpServer {
@@ -183,7 +183,7 @@ impl TcpServer {
         Self {
             config,
             adaptive_override: None,
-            physical_design: None,
+            physical_design_override: None,
         }
     }
 
@@ -210,7 +210,7 @@ impl TcpServer {
         mut self,
         config: ServerPhysicalDesignAdvisorConfig,
     ) -> Self {
-        self.physical_design = Some(config);
+        self.physical_design_override = Some(config);
         self
     }
 
@@ -222,10 +222,11 @@ impl TcpServer {
             security,
             authorization,
             manifest_adaptive_mode,
+            manifest_physical_design,
             operator_config,
         ) = self.config.into_parts();
         let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
-        let physical_design = self.physical_design;
+        let physical_design = self.physical_design_override.or(manifest_physical_design);
         validate_listener_security(listen, security.kind() == TransportKind::MutualTls)?;
         let table_count = tables.len();
         let transport_kind = security.kind();
@@ -317,6 +318,7 @@ impl TcpServer {
             Some(config) => match ServerOperatorPlane::start(
                 config,
                 adaptive_control.clone(),
+                physical_design_control.clone(),
                 operator_failure_tx,
             ) {
                 Ok(operator) => Some(operator),

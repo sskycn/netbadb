@@ -71,6 +71,12 @@
   current Database inventory. They MUST remain explicit worker commands and
   MUST NOT invoke DDL, scheduling, maintenance, identity reservation, or
   automatic evidence rotation.
+- Deployment and operator exposure of physical-design advice MUST remain a
+  projection of the worker-owned runtime. Operator recommendations are
+  observation only: they MUST NOT reserve identity, generate DDL, build
+  physical state, or create another scheduling or mutation authority. When one
+  operator response exposes multiple observation domains, each domain MUST
+  remain semantically independent.
 - Adaptive evidence admission failure is telemetry-only. It MUST NOT change an
   otherwise successful client result, protocol transaction state, or worker
   lifetime, and the Server MUST NOT retry, clear, rotate, schedule, or run

@@ -9,16 +9,21 @@ use netbadb_core::{
     AdaptiveEvidencePoolHealth, AdaptiveEvidenceRecordError, AdaptiveEvidenceRecordOutcome,
     AdaptiveEvidenceRotationError, AdaptiveEvidenceRotationReport, AdaptiveEvidenceWindowEpoch,
     AutomaticEvidenceRenewalReason, AutomaticOrchestrationStopReason, AutomaticSchedulerDelayClass,
-    AutomaticSchedulerFault, AutomaticSchedulerGate,
+    AutomaticSchedulerFault, AutomaticSchedulerGate, PhysicalColumnarRecommendationInspection,
+    PhysicalDesignAdvisorError, PhysicalDesignAdvisorReport, PhysicalDesignCandidateDecision,
+    PhysicalDesignEvidenceRecordError, PhysicalDesignEvidenceRecordOutcome,
+    PhysicalDesignEvidenceSummary, PhysicalDesignNoActionReason,
+    PhysicalIndexRecommendationInspection,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
     ServerAdaptiveControlError, ServerAdaptiveControlHandle, ServerAdaptiveMode,
-    ServerAdaptiveStatus,
+    ServerAdaptiveStatus, ServerPhysicalDesignControlError, ServerPhysicalDesignControlHandle,
+    ServerPhysicalDesignRotationReport, ServerPhysicalDesignStatus,
 };
 
-pub const OPERATOR_PROTOCOL_VERSION: u16 = 1;
+pub const OPERATOR_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_OPERATOR_PAYLOAD_BYTES: u32 = 64 * 1024;
 
 const OPERATOR_MAGIC: [u8; 4] = *b"NBOP";
@@ -74,21 +79,21 @@ impl Error for ServerOperatorConfigError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorAdaptiveModeV1 {
+pub enum OperatorAdaptiveModeV2 {
     FeedbackOnly,
     Driven,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorEvidencePoolHealthV1 {
+pub enum OperatorEvidencePoolHealthV2 {
     Healthy,
     RotationRecommended,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorEvidenceRecordOutcomeV1 {
+pub enum OperatorEvidenceRecordOutcomeV2 {
     Recorded,
     SchemaRotated,
     RecordedWithCapacityRejection,
@@ -97,7 +102,7 @@ pub enum OperatorEvidenceRecordOutcomeV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorEvidenceRecordErrorV1 {
+pub enum OperatorEvidenceRecordErrorV2 {
     GlobalVisibilityRequired,
     StaleSchemaEvidence,
     OutOfOrderVisibility,
@@ -110,7 +115,7 @@ pub enum OperatorEvidenceRecordErrorV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorSchedulerDelayClassV1 {
+pub enum OperatorSchedulerDelayClassV2 {
     Normal,
     Idle,
     NoProgress,
@@ -118,7 +123,7 @@ pub enum OperatorSchedulerDelayClassV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorEvidenceRenewalReasonV1 {
+pub enum OperatorEvidenceRenewalReasonV2 {
     ColumnarPhysicalStateChanged,
     ColumnarEligibilityChanged,
     AuthoritativeLsmLayoutChanged,
@@ -126,7 +131,7 @@ pub enum OperatorEvidenceRenewalReasonV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorSchedulerFaultV1 {
+pub enum OperatorSchedulerFaultV2 {
     MaintenanceEnvelopeExceeded,
     StepFailed,
     ConsumptionOverflow,
@@ -134,9 +139,9 @@ pub enum OperatorSchedulerFaultV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OperatorSchedulerGateV1 {
+pub enum OperatorSchedulerGateV2 {
     Open {
-        delay_class: OperatorSchedulerDelayClassV1,
+        delay_class: OperatorSchedulerDelayClassV2,
     },
     AwaitingTrialProgress {
         window_epoch: u64,
@@ -145,16 +150,16 @@ pub enum OperatorSchedulerGateV1 {
     },
     AwaitingEvidenceRenewal {
         blocked_window_epoch: u64,
-        renewal_reason: OperatorEvidenceRenewalReasonV1,
+        renewal_reason: OperatorEvidenceRenewalReasonV2,
     },
     Faulted {
-        fault: OperatorSchedulerFaultV1,
+        fault: OperatorSchedulerFaultV2,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorOrchestrationStopReasonV1 {
+pub enum OperatorOrchestrationStopReasonV2 {
     NoReadyWork,
     StepLimitReached,
     ActiveTrial,
@@ -166,7 +171,7 @@ pub enum OperatorOrchestrationStopReasonV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorFeedbackStatusV1 {
+pub struct OperatorFeedbackStatusV2 {
     pub eligible_query_count: u64,
     pub record_success_count: u64,
     pub record_error_count: u64,
@@ -174,20 +179,20 @@ pub struct OperatorFeedbackStatusV1 {
     pub schema_rotation_count: u64,
     pub incomplete_report_count: u64,
     pub counter_overflowed: bool,
-    pub last_record_outcome: Option<OperatorEvidenceRecordOutcomeV1>,
-    pub last_record_error: Option<OperatorEvidenceRecordErrorV1>,
+    pub last_record_outcome: Option<OperatorEvidenceRecordOutcomeV2>,
+    pub last_record_error: Option<OperatorEvidenceRecordErrorV2>,
     pub window_epoch: u64,
     pub schema_generation: Option<u64>,
     pub recorded_reports: u64,
-    pub pool_health: OperatorEvidencePoolHealthV1,
+    pub pool_health: OperatorEvidencePoolHealthV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorDriverStatusV1 {
+pub struct OperatorDriverStatusV2 {
     pub scheduler_last_observed_tick: Option<u64>,
     pub scheduler_last_run_tick: Option<u64>,
-    pub scheduler_gate: OperatorSchedulerGateV1,
+    pub scheduler_gate: OperatorSchedulerGateV2,
     pub last_submitted_logical_tick: Option<u64>,
     pub tick_pending: bool,
     pub driver_tick_count: u64,
@@ -195,22 +200,172 @@ pub struct OperatorDriverStatusV1 {
     pub scheduler_ran_count: u64,
     pub scheduler_held_count: u64,
     pub scheduler_error_count: u64,
-    pub last_orchestration_stop_reason: Option<OperatorOrchestrationStopReasonV1>,
+    pub last_orchestration_stop_reason: Option<OperatorOrchestrationStopReasonV2>,
     pub host_clock_exhausted: bool,
     pub counter_overflowed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorStatusV1 {
-    pub mode: OperatorAdaptiveModeV1,
-    pub feedback: OperatorFeedbackStatusV1,
-    pub driver: Option<OperatorDriverStatusV1>,
+pub struct OperatorAdaptiveStatusV2 {
+    pub mode: OperatorAdaptiveModeV2,
+    pub feedback: OperatorFeedbackStatusV2,
+    pub driver: Option<OperatorDriverStatusV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorEvidenceRotationV1 {
+pub struct OperatorStatusV2 {
+    pub adaptive: Option<OperatorAdaptiveStatusV2>,
+    pub physical_design: Option<OperatorPhysicalDesignStatusV2>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorPhysicalDesignRecordOutcomeV2 {
+    Recorded,
+    SchemaRotated,
+    RecordedWithCapacityRejection,
+    SchemaRotatedWithCapacityRejection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorPhysicalDesignRecordErrorV2 {
+    GlobalVisibilityRequired,
+    StaleSchemaEvidence,
+    OutOfOrderVisibility,
+    EvidenceWindowEpochExhausted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalDesignDiagnosticsV2 {
+    pub eligible_query_count: u64,
+    pub record_success_count: u64,
+    pub record_error_count: u64,
+    pub schema_rotation_count: u64,
+    pub capacity_rejection_count: u64,
+    pub incomplete_report_count: u64,
+    pub counter_overflowed: bool,
+    pub last_record_outcome: Option<OperatorPhysicalDesignRecordOutcomeV2>,
+    pub last_record_error: Option<OperatorPhysicalDesignRecordErrorV2>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalDesignEvidenceLimitsV2 {
+    pub max_index_candidates: u64,
+    pub max_columnar_candidates: u64,
+    pub max_query_shapes_per_candidate: u64,
+    pub max_columnar_columns_per_candidate: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalDesignEvidenceStatusV2 {
+    pub limits: OperatorPhysicalDesignEvidenceLimitsV2,
+    pub epoch: u64,
+    pub schema_generation: Option<u64>,
+    pub first_global_commit_seq: Option<u64>,
+    pub last_global_commit_seq: Option<u64>,
+    pub ordering_high_water: Option<u64>,
+    pub recorded_reports: u64,
+    pub index_candidate_count: u64,
+    pub columnar_candidate_count: u64,
+    pub capacity_rejections: u64,
+    pub discarded_incomplete_reports: u64,
+    pub overflowed: bool,
+    pub incomplete: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalDesignStatusV2 {
+    pub diagnostics: OperatorPhysicalDesignDiagnosticsV2,
+    pub evidence: OperatorPhysicalDesignEvidenceStatusV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalDesignEvidenceSummaryV2 {
+    pub report_count: u64,
+    pub distinct_query_shapes: u64,
+    pub total_actual_scan_work_units: u64,
+    pub total_rows_examined: u64,
+    pub overflowed: bool,
+    pub incomplete: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorPhysicalDesignNoActionReasonV2 {
+    BelowMinimumReports,
+    BelowMinimumShapeDiversity,
+    BelowMinimumActualWork,
+    ExistingDesignCovers,
+    UnsupportedCurrentLayout,
+    IncompleteEvidence,
+    CurrentProjectionUnavailable,
+    RecommendationLimitReached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorPhysicalDesignDecisionV2 {
+    Recommend {},
+    NoAction {
+        reason: OperatorPhysicalDesignNoActionReasonV2,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalIndexCandidateV2 {
+    pub table_id: u64,
+    pub column_id: u32,
+    pub point_report_count: u64,
+    pub range_report_count: u64,
+    pub evidence: OperatorPhysicalDesignEvidenceSummaryV2,
+    pub decision: OperatorPhysicalDesignDecisionV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalColumnarCandidateV2 {
+    pub table_id: u64,
+    pub columns: Vec<u32>,
+    pub evidence: OperatorPhysicalDesignEvidenceSummaryV2,
+    pub decision: OperatorPhysicalDesignDecisionV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalDesignAdvisorReportV2 {
+    pub evidence_epoch: u64,
+    pub schema_generation: u64,
+    pub first_global_commit_seq: u64,
+    pub last_global_commit_seq: u64,
+    pub recorded_reports: u64,
+    pub discarded_incomplete_reports: u64,
+    pub overflowed: bool,
+    pub incomplete: bool,
+    pub index_candidates: Vec<OperatorPhysicalIndexCandidateV2>,
+    pub columnar_candidates: Vec<OperatorPhysicalColumnarCandidateV2>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalDesignRotationV2 {
+    pub previous_epoch: u64,
+    pub new_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorEvidenceRotationV2 {
     pub previous_window_epoch: u64,
     pub new_window_epoch: u64,
     pub schema_generation: Option<u64>,
@@ -224,12 +379,19 @@ pub struct OperatorEvidenceRotationV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorErrorCodeV1 {
+pub enum OperatorErrorCodeV2 {
     AdaptiveNotEnabled,
     DriverNotEnabled,
     SchedulerNotFaulted,
     EvidenceWindowChanged,
     EvidenceWindowEpochExhausted,
+    PhysicalDesignNotEnabled,
+    PhysicalDesignEvidenceEpochChanged,
+    PhysicalDesignEvidenceEpochExhausted,
+    PhysicalDesignNoEvidence,
+    PhysicalDesignStaleSchema,
+    PhysicalDesignInconclusiveCapacity,
+    ResponseTooLarge,
     ServerStopped,
     MalformedRequest,
     UnsupportedProtocolVersion,
@@ -239,49 +401,65 @@ pub enum OperatorErrorCodeV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorRemoteErrorV1 {
-    pub code: OperatorErrorCodeV1,
+pub struct OperatorRemoteErrorV2 {
+    pub code: OperatorErrorCodeV2,
     pub message: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OperatorRequestV1 {
+struct OperatorRequestV2 {
     request_id: u64,
-    operation: OperatorOperationV1,
+    operation: OperatorOperationV2,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum OperatorOperationV1 {
+enum OperatorOperationV2 {
     Status {},
     RotateEvidence { expected_window_epoch: u64 },
     ResetFaultedScheduler {},
+    PhysicalDesignRecommendations {},
+    RotatePhysicalDesignEvidence { expected_evidence_epoch: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
-enum OperatorResponseV1 {
+enum OperatorResponseV2 {
     Ok {
         request_id: u64,
-        result: OperatorResultV1,
+        result: OperatorResultV2,
     },
     Error {
         request_id: u64,
-        error: OperatorRemoteErrorV1,
+        error: OperatorRemoteErrorV2,
     },
+}
+
+impl OperatorResponseV2 {
+    const fn request_id(&self) -> u64 {
+        match self {
+            Self::Ok { request_id, .. } | Self::Error { request_id, .. } => *request_id,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum OperatorResultV1 {
+enum OperatorResultV2 {
     Status {
-        status: OperatorStatusV1,
+        status: Box<OperatorStatusV2>,
     },
     EvidenceRotated {
-        rotation: OperatorEvidenceRotationV1,
+        rotation: OperatorEvidenceRotationV2,
     },
     SchedulerReset {},
+    PhysicalDesignRecommendations {
+        report: OperatorPhysicalDesignAdvisorReportV2,
+    },
+    PhysicalDesignEvidenceRotated {
+        rotation: OperatorPhysicalDesignRotationV2,
+    },
 }
 
 #[derive(Debug)]
@@ -408,7 +586,7 @@ pub enum OperatorClientError {
     Protocol(OperatorProtocolError),
     RequestIdMismatch { expected: u64, received: u64 },
     UnexpectedResult,
-    Remote(OperatorRemoteErrorV1),
+    Remote(OperatorRemoteErrorV2),
 }
 
 impl fmt::Display for OperatorClientError {
@@ -459,9 +637,9 @@ impl<'a> ServerOperatorClient<'a> {
         Self { config }
     }
 
-    pub fn status(&self) -> Result<OperatorStatusV1, OperatorClientError> {
-        match self.exchange(OperatorOperationV1::Status {})? {
-            OperatorResultV1::Status { status } => Ok(status),
+    pub fn status(&self) -> Result<OperatorStatusV2, OperatorClientError> {
+        match self.exchange(OperatorOperationV2::Status {})? {
+            OperatorResultV2::Status { status } => Ok(*status),
             _ => Err(OperatorClientError::UnexpectedResult),
         }
     }
@@ -469,18 +647,39 @@ impl<'a> ServerOperatorClient<'a> {
     pub fn rotate_evidence(
         &self,
         expected_window_epoch: u64,
-    ) -> Result<OperatorEvidenceRotationV1, OperatorClientError> {
-        match self.exchange(OperatorOperationV1::RotateEvidence {
+    ) -> Result<OperatorEvidenceRotationV2, OperatorClientError> {
+        match self.exchange(OperatorOperationV2::RotateEvidence {
             expected_window_epoch,
         })? {
-            OperatorResultV1::EvidenceRotated { rotation } => Ok(rotation),
+            OperatorResultV2::EvidenceRotated { rotation } => Ok(rotation),
             _ => Err(OperatorClientError::UnexpectedResult),
         }
     }
 
     pub fn reset_faulted_scheduler(&self) -> Result<(), OperatorClientError> {
-        match self.exchange(OperatorOperationV1::ResetFaultedScheduler {})? {
-            OperatorResultV1::SchedulerReset {} => Ok(()),
+        match self.exchange(OperatorOperationV2::ResetFaultedScheduler {})? {
+            OperatorResultV2::SchedulerReset {} => Ok(()),
+            _ => Err(OperatorClientError::UnexpectedResult),
+        }
+    }
+
+    pub fn physical_design_recommendations(
+        &self,
+    ) -> Result<OperatorPhysicalDesignAdvisorReportV2, OperatorClientError> {
+        match self.exchange(OperatorOperationV2::PhysicalDesignRecommendations {})? {
+            OperatorResultV2::PhysicalDesignRecommendations { report } => Ok(report),
+            _ => Err(OperatorClientError::UnexpectedResult),
+        }
+    }
+
+    pub fn rotate_physical_design_evidence(
+        &self,
+        expected_evidence_epoch: u64,
+    ) -> Result<OperatorPhysicalDesignRotationV2, OperatorClientError> {
+        match self.exchange(OperatorOperationV2::RotatePhysicalDesignEvidence {
+            expected_evidence_epoch,
+        })? {
+            OperatorResultV2::PhysicalDesignEvidenceRotated { rotation } => Ok(rotation),
             _ => Err(OperatorClientError::UnexpectedResult),
         }
     }
@@ -488,8 +687,8 @@ impl<'a> ServerOperatorClient<'a> {
     #[cfg(unix)]
     fn exchange(
         &self,
-        operation: OperatorOperationV1,
-    ) -> Result<OperatorResultV1, OperatorClientError> {
+        operation: OperatorOperationV2,
+    ) -> Result<OperatorResultV2, OperatorClientError> {
         use std::os::unix::net::UnixStream;
 
         let mut stream = UnixStream::connect(self.config.unix_socket()).map_err(|source| {
@@ -505,23 +704,23 @@ impl<'a> ServerOperatorClient<'a> {
         let request_id = 1;
         write_frame(
             &mut stream,
-            &OperatorRequestV1 {
+            &OperatorRequestV2 {
                 request_id,
                 operation,
             },
         )
         .map_err(OperatorClientError::Protocol)?;
-        let response: OperatorResponseV1 =
+        let response: OperatorResponseV2 =
             read_frame(&mut stream).map_err(OperatorClientError::Protocol)?;
         match response {
-            OperatorResponseV1::Ok {
+            OperatorResponseV2::Ok {
                 request_id: received,
                 result,
             } => {
                 verify_request_id(request_id, received)?;
                 Ok(result)
             }
-            OperatorResponseV1::Error {
+            OperatorResponseV2::Error {
                 request_id: received,
                 error,
             } => {
@@ -536,8 +735,8 @@ impl<'a> ServerOperatorClient<'a> {
     #[cfg(not(unix))]
     fn exchange(
         &self,
-        _operation: OperatorOperationV1,
-    ) -> Result<OperatorResultV1, OperatorClientError> {
+        _operation: OperatorOperationV2,
+    ) -> Result<OperatorResultV2, OperatorClientError> {
         Err(OperatorClientError::UnsupportedPlatform)
     }
 }
@@ -625,7 +824,8 @@ impl ServerOperatorPlane {
     #[cfg(unix)]
     pub(crate) fn start(
         config: ServerOperatorConfig,
-        control: ServerAdaptiveControlHandle,
+        adaptive_control: ServerAdaptiveControlHandle,
+        physical_design_control: ServerPhysicalDesignControlHandle,
         failure_notification: Sender<()>,
     ) -> Result<Self, ServerOperatorError> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -678,8 +878,13 @@ impl ServerOperatorPlane {
             .name("netbadb-operator-listener".into())
             .spawn(move || {
                 let mut failure = OperatorFailureNotification::new(failure_notification);
-                let run =
-                    run_operator_listener(&listener, &shutdown_rx, config.io_timeout(), &control);
+                let run = run_operator_listener(
+                    &listener,
+                    &shutdown_rx,
+                    config.io_timeout(),
+                    &adaptive_control,
+                    &physical_design_control,
+                );
                 let result = run.and(owned.cleanup());
                 if result.is_ok() {
                     failure.disarm();
@@ -696,7 +901,8 @@ impl ServerOperatorPlane {
     #[cfg(not(unix))]
     pub(crate) fn start(
         _config: ServerOperatorConfig,
-        _control: ServerAdaptiveControlHandle,
+        _adaptive_control: ServerAdaptiveControlHandle,
+        _physical_design_control: ServerPhysicalDesignControlHandle,
         _failure_notification: Sender<()>,
     ) -> Result<Self, ServerOperatorError> {
         Err(ServerOperatorError::UnsupportedPlatform)
@@ -816,7 +1022,8 @@ fn run_operator_listener(
     listener: &std::os::unix::net::UnixListener,
     shutdown: &std::sync::mpsc::Receiver<()>,
     io_timeout: Duration,
-    control: &ServerAdaptiveControlHandle,
+    adaptive_control: &ServerAdaptiveControlHandle,
+    physical_design_control: &ServerPhysicalDesignControlHandle,
 ) -> Result<(), ServerOperatorError> {
     use std::sync::mpsc::TryRecvError;
 
@@ -833,7 +1040,11 @@ fn run_operator_listener(
                     .and_then(|()| stream.set_write_timeout(Some(io_timeout)))
                     .is_ok()
                 {
-                    let _ = serve_operator_connection(&mut stream, control);
+                    let _ = serve_operator_connection(
+                        &mut stream,
+                        adaptive_control,
+                        physical_design_control,
+                    );
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -847,12 +1058,13 @@ fn run_operator_listener(
 #[cfg(unix)]
 fn serve_operator_connection(
     stream: &mut std::os::unix::net::UnixStream,
-    control: &ServerAdaptiveControlHandle,
+    adaptive_control: &ServerAdaptiveControlHandle,
+    physical_design_control: &ServerPhysicalDesignControlHandle,
 ) -> Result<(), OperatorProtocolError> {
-    let request = match read_frame::<OperatorRequestV1>(stream) {
+    let request = match read_frame::<OperatorRequestV2>(stream) {
         Ok(request) => request,
         Err(error) => {
-            let response = OperatorResponseV1::Error {
+            let response = OperatorResponseV2::Error {
                 request_id: 0,
                 error: protocol_remote_error(&error),
             };
@@ -860,54 +1072,118 @@ fn serve_operator_connection(
             return Err(error);
         }
     };
-    let response = execute_operator_request(request, control);
-    write_frame(stream, &response)
+    let response = execute_operator_request(request, adaptive_control, physical_design_control);
+    write_operator_response(stream, &response)
+}
+
+fn write_operator_response(
+    writer: &mut impl Write,
+    response: &OperatorResponseV2,
+) -> Result<(), OperatorProtocolError> {
+    let request_id = response.request_id();
+    match write_frame(writer, response) {
+        Err(OperatorProtocolError::PayloadTooLarge(_)) => write_frame(
+            writer,
+            &OperatorResponseV2::Error {
+                request_id,
+                error: response_too_large_error(),
+            },
+        ),
+        result => result,
+    }
 }
 
 fn execute_operator_request(
-    request: OperatorRequestV1,
-    control: &ServerAdaptiveControlHandle,
-) -> OperatorResponseV1 {
+    request: OperatorRequestV2,
+    adaptive_control: &ServerAdaptiveControlHandle,
+    physical_design_control: &ServerPhysicalDesignControlHandle,
+) -> OperatorResponseV2 {
     let result = match request.operation {
-        OperatorOperationV1::Status {} => control
-            .status()
-            .and_then(operator_status)
-            .map(|status| OperatorResultV1::Status { status }),
-        OperatorOperationV1::RotateEvidence {
+        OperatorOperationV2::Status {} => {
+            operator_status(adaptive_control, physical_design_control).map(|status| {
+                OperatorResultV2::Status {
+                    status: Box::new(status),
+                }
+            })
+        }
+        OperatorOperationV2::RotateEvidence {
             expected_window_epoch,
-        } => control
+        } => adaptive_control
             .rotate_evidence_if_window(AdaptiveEvidenceWindowEpoch(expected_window_epoch))
             .map(operator_rotation)
-            .map(|rotation| OperatorResultV1::EvidenceRotated { rotation }),
-        OperatorOperationV1::ResetFaultedScheduler {} => control
+            .map(|rotation| OperatorResultV2::EvidenceRotated { rotation })
+            .map_err(control_remote_error),
+        OperatorOperationV2::ResetFaultedScheduler {} => adaptive_control
             .reset_faulted_scheduler()
-            .map(|()| OperatorResultV1::SchedulerReset {}),
+            .map(|()| OperatorResultV2::SchedulerReset {})
+            .map_err(control_remote_error),
+        OperatorOperationV2::PhysicalDesignRecommendations {} => physical_design_control
+            .recommendations()
+            .map(operator_physical_design_report)
+            .map(|report| OperatorResultV2::PhysicalDesignRecommendations { report })
+            .map_err(physical_design_remote_error),
+        OperatorOperationV2::RotatePhysicalDesignEvidence {
+            expected_evidence_epoch,
+        } => physical_design_control
+            .rotate_evidence_if_epoch(netbadb_core::PhysicalDesignEvidenceEpoch(
+                expected_evidence_epoch,
+            ))
+            .map(operator_physical_design_rotation)
+            .map(|rotation| OperatorResultV2::PhysicalDesignEvidenceRotated { rotation })
+            .map_err(physical_design_remote_error),
     };
     match result {
-        Ok(result) => OperatorResponseV1::Ok {
+        Ok(result) => OperatorResponseV2::Ok {
             request_id: request.request_id,
             result,
         },
-        Err(error) => OperatorResponseV1::Error {
+        Err(error) => OperatorResponseV2::Error {
             request_id: request.request_id,
-            error: control_remote_error(error),
+            error,
         },
     }
 }
 
 fn operator_status(
+    adaptive_control: &ServerAdaptiveControlHandle,
+    physical_design_control: &ServerPhysicalDesignControlHandle,
+) -> Result<OperatorStatusV2, OperatorRemoteErrorV2> {
+    let adaptive = match adaptive_control.status() {
+        Ok(status) if status.mode == ServerAdaptiveMode::Disabled => None,
+        Ok(status) => Some(operator_adaptive_status(status).map_err(control_remote_error)?),
+        Err(ServerAdaptiveControlError::AdaptiveNotEnabled) => None,
+        Err(error) => return Err(control_remote_error(error)),
+    };
+    let physical_design = match physical_design_control.status() {
+        Ok(status) => Some(operator_physical_design_status(status)),
+        Err(ServerPhysicalDesignControlError::PhysicalDesignNotEnabled) => None,
+        Err(error) => return Err(physical_design_remote_error(error)),
+    };
+    if adaptive.is_none() && physical_design.is_none() {
+        return Err(OperatorRemoteErrorV2 {
+            code: OperatorErrorCodeV2::Internal,
+            message: "operator plane has no managed runtime".into(),
+        });
+    }
+    Ok(OperatorStatusV2 {
+        adaptive,
+        physical_design,
+    })
+}
+
+fn operator_adaptive_status(
     status: ServerAdaptiveStatus,
-) -> Result<OperatorStatusV1, ServerAdaptiveControlError> {
+) -> Result<OperatorAdaptiveStatusV2, ServerAdaptiveControlError> {
     let mode = match status.mode {
-        ServerAdaptiveMode::FeedbackOnly => OperatorAdaptiveModeV1::FeedbackOnly,
-        ServerAdaptiveMode::Driven => OperatorAdaptiveModeV1::Driven,
+        ServerAdaptiveMode::FeedbackOnly => OperatorAdaptiveModeV2::FeedbackOnly,
+        ServerAdaptiveMode::Driven => OperatorAdaptiveModeV2::Driven,
         ServerAdaptiveMode::Disabled => return Err(ServerAdaptiveControlError::AdaptiveNotEnabled),
     };
     let feedback = status
         .feedback
         .ok_or(ServerAdaptiveControlError::AdaptiveNotEnabled)?;
     let progress = feedback.evidence_progress;
-    let feedback = OperatorFeedbackStatusV1 {
+    let feedback = OperatorFeedbackStatusV2 {
         eligible_query_count: feedback.eligible_query_count,
         record_success_count: feedback.record_success_count,
         record_error_count: feedback.record_error_count,
@@ -921,13 +1197,13 @@ fn operator_status(
         schema_generation: progress.schema_generation.map(|generation| generation.0),
         recorded_reports: progress.recorded_reports,
         pool_health: match feedback.pool_health {
-            AdaptiveEvidencePoolHealth::Healthy => OperatorEvidencePoolHealthV1::Healthy,
+            AdaptiveEvidencePoolHealth::Healthy => OperatorEvidencePoolHealthV2::Healthy,
             AdaptiveEvidencePoolHealth::RotationRecommended => {
-                OperatorEvidencePoolHealthV1::RotationRecommended
+                OperatorEvidencePoolHealthV2::RotationRecommended
             }
         },
     };
-    let driver = status.driver.map(|driver| OperatorDriverStatusV1 {
+    let driver = status.driver.map(|driver| OperatorDriverStatusV2 {
         scheduler_last_observed_tick: driver.scheduler_state.last_observed_tick.map(|tick| tick.0),
         scheduler_last_run_tick: driver.scheduler_state.last_run_tick.map(|tick| tick.0),
         scheduler_gate: scheduler_gate(driver.scheduler_state.gate),
@@ -944,70 +1220,70 @@ fn operator_status(
         host_clock_exhausted: driver.host_clock_exhausted,
         counter_overflowed: driver.counter_overflowed,
     });
-    Ok(OperatorStatusV1 {
+    Ok(OperatorAdaptiveStatusV2 {
         mode,
         feedback,
         driver,
     })
 }
 
-fn record_outcome(outcome: AdaptiveEvidenceRecordOutcome) -> OperatorEvidenceRecordOutcomeV1 {
+fn record_outcome(outcome: AdaptiveEvidenceRecordOutcome) -> OperatorEvidenceRecordOutcomeV2 {
     match outcome {
-        AdaptiveEvidenceRecordOutcome::Recorded => OperatorEvidenceRecordOutcomeV1::Recorded,
+        AdaptiveEvidenceRecordOutcome::Recorded => OperatorEvidenceRecordOutcomeV2::Recorded,
         AdaptiveEvidenceRecordOutcome::SchemaRotated => {
-            OperatorEvidenceRecordOutcomeV1::SchemaRotated
+            OperatorEvidenceRecordOutcomeV2::SchemaRotated
         }
         AdaptiveEvidenceRecordOutcome::RecordedWithCapacityRejection => {
-            OperatorEvidenceRecordOutcomeV1::RecordedWithCapacityRejection
+            OperatorEvidenceRecordOutcomeV2::RecordedWithCapacityRejection
         }
         AdaptiveEvidenceRecordOutcome::SchemaRotatedWithCapacityRejection => {
-            OperatorEvidenceRecordOutcomeV1::SchemaRotatedWithCapacityRejection
+            OperatorEvidenceRecordOutcomeV2::SchemaRotatedWithCapacityRejection
         }
     }
 }
 
-fn record_error(error: AdaptiveEvidenceRecordError) -> OperatorEvidenceRecordErrorV1 {
+fn record_error(error: AdaptiveEvidenceRecordError) -> OperatorEvidenceRecordErrorV2 {
     match error {
         AdaptiveEvidenceRecordError::GlobalVisibilityRequired => {
-            OperatorEvidenceRecordErrorV1::GlobalVisibilityRequired
+            OperatorEvidenceRecordErrorV2::GlobalVisibilityRequired
         }
         AdaptiveEvidenceRecordError::StaleSchemaEvidence { .. } => {
-            OperatorEvidenceRecordErrorV1::StaleSchemaEvidence
+            OperatorEvidenceRecordErrorV2::StaleSchemaEvidence
         }
         AdaptiveEvidenceRecordError::OutOfOrderVisibility { .. } => {
-            OperatorEvidenceRecordErrorV1::OutOfOrderVisibility
+            OperatorEvidenceRecordErrorV2::OutOfOrderVisibility
         }
         AdaptiveEvidenceRecordError::StaleTargetGenerationEvidence { .. } => {
-            OperatorEvidenceRecordErrorV1::StaleTargetGenerationEvidence
+            OperatorEvidenceRecordErrorV2::StaleTargetGenerationEvidence
         }
         AdaptiveEvidenceRecordError::StaleTargetIdentityEvidence { .. } => {
-            OperatorEvidenceRecordErrorV1::StaleTargetIdentityEvidence
+            OperatorEvidenceRecordErrorV2::StaleTargetIdentityEvidence
         }
         AdaptiveEvidenceRecordError::RetiredTargetEvidence { .. } => {
-            OperatorEvidenceRecordErrorV1::RetiredTargetEvidence
+            OperatorEvidenceRecordErrorV2::RetiredTargetEvidence
         }
         AdaptiveEvidenceRecordError::StaleCalibrationEpochEvidence { .. } => {
-            OperatorEvidenceRecordErrorV1::StaleCalibrationEpochEvidence
+            OperatorEvidenceRecordErrorV2::StaleCalibrationEpochEvidence
         }
         AdaptiveEvidenceRecordError::EvidenceWindowEpochExhausted => {
-            OperatorEvidenceRecordErrorV1::EvidenceWindowEpochExhausted
+            OperatorEvidenceRecordErrorV2::EvidenceWindowEpochExhausted
         }
     }
 }
 
-fn scheduler_gate(gate: AutomaticSchedulerGate) -> OperatorSchedulerGateV1 {
+fn scheduler_gate(gate: AutomaticSchedulerGate) -> OperatorSchedulerGateV2 {
     match gate {
-        AutomaticSchedulerGate::Open { delay } => OperatorSchedulerGateV1::Open {
+        AutomaticSchedulerGate::Open { delay } => OperatorSchedulerGateV2::Open {
             delay_class: match delay {
-                AutomaticSchedulerDelayClass::Normal => OperatorSchedulerDelayClassV1::Normal,
-                AutomaticSchedulerDelayClass::Idle => OperatorSchedulerDelayClassV1::Idle,
+                AutomaticSchedulerDelayClass::Normal => OperatorSchedulerDelayClassV2::Normal,
+                AutomaticSchedulerDelayClass::Idle => OperatorSchedulerDelayClassV2::Idle,
                 AutomaticSchedulerDelayClass::NoProgress => {
-                    OperatorSchedulerDelayClassV1::NoProgress
+                    OperatorSchedulerDelayClassV2::NoProgress
                 }
             },
         },
         AutomaticSchedulerGate::AwaitingTrialProgress { evidence } => {
-            OperatorSchedulerGateV1::AwaitingTrialProgress {
+            OperatorSchedulerGateV2::AwaitingTrialProgress {
                 window_epoch: evidence.window_epoch.0,
                 schema_generation: evidence.schema_generation.map(|generation| generation.0),
                 recorded_reports: evidence.recorded_reports,
@@ -1016,28 +1292,28 @@ fn scheduler_gate(gate: AutomaticSchedulerGate) -> OperatorSchedulerGateV1 {
         AutomaticSchedulerGate::AwaitingEvidenceRenewal {
             blocked_window_epoch,
             recommendation,
-        } => OperatorSchedulerGateV1::AwaitingEvidenceRenewal {
+        } => OperatorSchedulerGateV2::AwaitingEvidenceRenewal {
             blocked_window_epoch: blocked_window_epoch.0,
             renewal_reason: match recommendation.reason {
                 AutomaticEvidenceRenewalReason::ColumnarPhysicalStateChanged => {
-                    OperatorEvidenceRenewalReasonV1::ColumnarPhysicalStateChanged
+                    OperatorEvidenceRenewalReasonV2::ColumnarPhysicalStateChanged
                 }
                 AutomaticEvidenceRenewalReason::ColumnarEligibilityChanged => {
-                    OperatorEvidenceRenewalReasonV1::ColumnarEligibilityChanged
+                    OperatorEvidenceRenewalReasonV2::ColumnarEligibilityChanged
                 }
                 AutomaticEvidenceRenewalReason::AuthoritativeLsmLayoutChanged => {
-                    OperatorEvidenceRenewalReasonV1::AuthoritativeLsmLayoutChanged
+                    OperatorEvidenceRenewalReasonV2::AuthoritativeLsmLayoutChanged
                 }
             },
         },
-        AutomaticSchedulerGate::Faulted(fault) => OperatorSchedulerGateV1::Faulted {
+        AutomaticSchedulerGate::Faulted(fault) => OperatorSchedulerGateV2::Faulted {
             fault: match fault {
                 AutomaticSchedulerFault::MaintenanceEnvelopeExceeded => {
-                    OperatorSchedulerFaultV1::MaintenanceEnvelopeExceeded
+                    OperatorSchedulerFaultV2::MaintenanceEnvelopeExceeded
                 }
-                AutomaticSchedulerFault::StepFailed => OperatorSchedulerFaultV1::StepFailed,
+                AutomaticSchedulerFault::StepFailed => OperatorSchedulerFaultV2::StepFailed,
                 AutomaticSchedulerFault::ConsumptionOverflow => {
-                    OperatorSchedulerFaultV1::ConsumptionOverflow
+                    OperatorSchedulerFaultV2::ConsumptionOverflow
                 }
             },
         },
@@ -1046,34 +1322,34 @@ fn scheduler_gate(gate: AutomaticSchedulerGate) -> OperatorSchedulerGateV1 {
 
 fn orchestration_stop_reason(
     reason: AutomaticOrchestrationStopReason,
-) -> OperatorOrchestrationStopReasonV1 {
+) -> OperatorOrchestrationStopReasonV2 {
     match reason {
         AutomaticOrchestrationStopReason::NoReadyWork => {
-            OperatorOrchestrationStopReasonV1::NoReadyWork
+            OperatorOrchestrationStopReasonV2::NoReadyWork
         }
         AutomaticOrchestrationStopReason::StepLimitReached => {
-            OperatorOrchestrationStopReasonV1::StepLimitReached
+            OperatorOrchestrationStopReasonV2::StepLimitReached
         }
         AutomaticOrchestrationStopReason::ActiveTrial(_) => {
-            OperatorOrchestrationStopReasonV1::ActiveTrial
+            OperatorOrchestrationStopReasonV2::ActiveTrial
         }
         AutomaticOrchestrationStopReason::TrialBoundaryResolved => {
-            OperatorOrchestrationStopReasonV1::TrialBoundaryResolved
+            OperatorOrchestrationStopReasonV2::TrialBoundaryResolved
         }
         AutomaticOrchestrationStopReason::EvidenceRenewalRecommended(_) => {
-            OperatorOrchestrationStopReasonV1::EvidenceRenewalRecommended
+            OperatorOrchestrationStopReasonV2::EvidenceRenewalRecommended
         }
         AutomaticOrchestrationStopReason::SelectedCandidateDidNotProgress => {
-            OperatorOrchestrationStopReasonV1::SelectedCandidateDidNotProgress
+            OperatorOrchestrationStopReasonV2::SelectedCandidateDidNotProgress
         }
         AutomaticOrchestrationStopReason::MaintenanceEnvelopeExceeded { .. } => {
-            OperatorOrchestrationStopReasonV1::MaintenanceEnvelopeExceeded
+            OperatorOrchestrationStopReasonV2::MaintenanceEnvelopeExceeded
         }
     }
 }
 
-fn operator_rotation(report: AdaptiveEvidenceRotationReport) -> OperatorEvidenceRotationV1 {
-    OperatorEvidenceRotationV1 {
+fn operator_rotation(report: AdaptiveEvidenceRotationReport) -> OperatorEvidenceRotationV2 {
+    OperatorEvidenceRotationV2 {
         previous_window_epoch: report.previous_window_epoch.0,
         new_window_epoch: report.new_window_epoch.0,
         schema_generation: report.schema_generation.map(|generation| generation.0),
@@ -1086,68 +1362,333 @@ fn operator_rotation(report: AdaptiveEvidenceRotationReport) -> OperatorEvidence
     }
 }
 
-fn control_remote_error(error: ServerAdaptiveControlError) -> OperatorRemoteErrorV1 {
+fn operator_physical_design_status(
+    status: ServerPhysicalDesignStatus,
+) -> OperatorPhysicalDesignStatusV2 {
+    let diagnostics = status.diagnostics;
+    let evidence = status.evidence;
+    OperatorPhysicalDesignStatusV2 {
+        diagnostics: OperatorPhysicalDesignDiagnosticsV2 {
+            eligible_query_count: diagnostics.eligible_query_count,
+            record_success_count: diagnostics.record_success_count,
+            record_error_count: diagnostics.record_error_count,
+            schema_rotation_count: diagnostics.schema_rotation_count,
+            capacity_rejection_count: diagnostics.capacity_rejection_count,
+            incomplete_report_count: diagnostics.incomplete_report_count,
+            counter_overflowed: diagnostics.counter_overflowed,
+            last_record_outcome: diagnostics
+                .last_record_outcome
+                .map(physical_design_record_outcome),
+            last_record_error: diagnostics
+                .last_record_error
+                .map(physical_design_record_error),
+        },
+        evidence: OperatorPhysicalDesignEvidenceStatusV2 {
+            limits: OperatorPhysicalDesignEvidenceLimitsV2 {
+                max_index_candidates: evidence.limits.max_index_candidates,
+                max_columnar_candidates: evidence.limits.max_columnar_candidates,
+                max_query_shapes_per_candidate: evidence.limits.max_query_shapes_per_candidate,
+                max_columnar_columns_per_candidate: evidence
+                    .limits
+                    .max_columnar_columns_per_candidate,
+            },
+            epoch: evidence.epoch.0,
+            schema_generation: evidence.schema_generation.map(|generation| generation.0),
+            first_global_commit_seq: evidence.first_global_commit_seq.map(|sequence| sequence.0),
+            last_global_commit_seq: evidence.last_global_commit_seq.map(|sequence| sequence.0),
+            ordering_high_water: evidence.ordering_high_water.map(|sequence| sequence.0),
+            recorded_reports: evidence.recorded_reports,
+            index_candidate_count: evidence.index_candidate_count,
+            columnar_candidate_count: evidence.columnar_candidate_count,
+            capacity_rejections: evidence.capacity_rejections,
+            discarded_incomplete_reports: evidence.discarded_incomplete_reports,
+            overflowed: evidence.overflowed,
+            incomplete: evidence.incomplete,
+            truncated: evidence.truncated,
+        },
+    }
+}
+
+const fn physical_design_record_outcome(
+    outcome: PhysicalDesignEvidenceRecordOutcome,
+) -> OperatorPhysicalDesignRecordOutcomeV2 {
+    match outcome {
+        PhysicalDesignEvidenceRecordOutcome::Recorded => {
+            OperatorPhysicalDesignRecordOutcomeV2::Recorded
+        }
+        PhysicalDesignEvidenceRecordOutcome::SchemaRotated => {
+            OperatorPhysicalDesignRecordOutcomeV2::SchemaRotated
+        }
+        PhysicalDesignEvidenceRecordOutcome::RecordedWithCapacityRejection => {
+            OperatorPhysicalDesignRecordOutcomeV2::RecordedWithCapacityRejection
+        }
+        PhysicalDesignEvidenceRecordOutcome::SchemaRotatedWithCapacityRejection => {
+            OperatorPhysicalDesignRecordOutcomeV2::SchemaRotatedWithCapacityRejection
+        }
+    }
+}
+
+const fn physical_design_record_error(
+    error: PhysicalDesignEvidenceRecordError,
+) -> OperatorPhysicalDesignRecordErrorV2 {
+    match error {
+        PhysicalDesignEvidenceRecordError::GlobalVisibilityRequired => {
+            OperatorPhysicalDesignRecordErrorV2::GlobalVisibilityRequired
+        }
+        PhysicalDesignEvidenceRecordError::StaleSchemaEvidence { .. } => {
+            OperatorPhysicalDesignRecordErrorV2::StaleSchemaEvidence
+        }
+        PhysicalDesignEvidenceRecordError::OutOfOrderVisibility { .. } => {
+            OperatorPhysicalDesignRecordErrorV2::OutOfOrderVisibility
+        }
+        PhysicalDesignEvidenceRecordError::EvidenceWindowEpochExhausted => {
+            OperatorPhysicalDesignRecordErrorV2::EvidenceWindowEpochExhausted
+        }
+    }
+}
+
+fn operator_physical_design_report(
+    report: PhysicalDesignAdvisorReport,
+) -> OperatorPhysicalDesignAdvisorReportV2 {
+    OperatorPhysicalDesignAdvisorReportV2 {
+        evidence_epoch: report.evidence_epoch.0,
+        schema_generation: report.schema_generation.0,
+        first_global_commit_seq: report.first_global_commit_seq.0,
+        last_global_commit_seq: report.last_global_commit_seq.0,
+        recorded_reports: report.recorded_reports,
+        discarded_incomplete_reports: report.discarded_incomplete_reports,
+        overflowed: report.overflowed,
+        incomplete: report.incomplete,
+        index_candidates: report
+            .index_candidates
+            .into_iter()
+            .map(operator_index_candidate)
+            .collect(),
+        columnar_candidates: report
+            .columnar_candidates
+            .into_iter()
+            .map(operator_columnar_candidate)
+            .collect(),
+    }
+}
+
+fn operator_index_candidate(
+    inspection: PhysicalIndexRecommendationInspection,
+) -> OperatorPhysicalIndexCandidateV2 {
+    OperatorPhysicalIndexCandidateV2 {
+        table_id: inspection.candidate.table_id.0,
+        column_id: inspection.candidate.column_id.0,
+        point_report_count: inspection.point_report_count,
+        range_report_count: inspection.range_report_count,
+        evidence: operator_evidence_summary(inspection.evidence),
+        decision: operator_design_decision(inspection.decision),
+    }
+}
+
+fn operator_columnar_candidate(
+    inspection: PhysicalColumnarRecommendationInspection,
+) -> OperatorPhysicalColumnarCandidateV2 {
+    OperatorPhysicalColumnarCandidateV2 {
+        table_id: inspection.candidate.table_id.0,
+        columns: inspection
+            .candidate
+            .columns
+            .into_iter()
+            .map(|column| column.0)
+            .collect(),
+        evidence: operator_evidence_summary(inspection.evidence),
+        decision: operator_design_decision(inspection.decision),
+    }
+}
+
+const fn operator_evidence_summary(
+    evidence: PhysicalDesignEvidenceSummary,
+) -> OperatorPhysicalDesignEvidenceSummaryV2 {
+    OperatorPhysicalDesignEvidenceSummaryV2 {
+        report_count: evidence.report_count,
+        distinct_query_shapes: evidence.distinct_query_shapes,
+        total_actual_scan_work_units: evidence.total_actual_scan_work_units,
+        total_rows_examined: evidence.total_rows_examined,
+        overflowed: evidence.overflowed,
+        incomplete: evidence.incomplete,
+        truncated: evidence.truncated,
+    }
+}
+
+const fn operator_design_decision(
+    decision: PhysicalDesignCandidateDecision,
+) -> OperatorPhysicalDesignDecisionV2 {
+    match decision {
+        PhysicalDesignCandidateDecision::Recommend => {
+            OperatorPhysicalDesignDecisionV2::Recommend {}
+        }
+        PhysicalDesignCandidateDecision::NoAction(reason) => {
+            OperatorPhysicalDesignDecisionV2::NoAction {
+                reason: operator_no_action_reason(reason),
+            }
+        }
+    }
+}
+
+const fn operator_no_action_reason(
+    reason: PhysicalDesignNoActionReason,
+) -> OperatorPhysicalDesignNoActionReasonV2 {
+    match reason {
+        PhysicalDesignNoActionReason::BelowMinimumReports => {
+            OperatorPhysicalDesignNoActionReasonV2::BelowMinimumReports
+        }
+        PhysicalDesignNoActionReason::BelowMinimumShapeDiversity => {
+            OperatorPhysicalDesignNoActionReasonV2::BelowMinimumShapeDiversity
+        }
+        PhysicalDesignNoActionReason::BelowMinimumActualWork => {
+            OperatorPhysicalDesignNoActionReasonV2::BelowMinimumActualWork
+        }
+        PhysicalDesignNoActionReason::ExistingDesignCovers => {
+            OperatorPhysicalDesignNoActionReasonV2::ExistingDesignCovers
+        }
+        PhysicalDesignNoActionReason::UnsupportedCurrentLayout => {
+            OperatorPhysicalDesignNoActionReasonV2::UnsupportedCurrentLayout
+        }
+        PhysicalDesignNoActionReason::IncompleteEvidence => {
+            OperatorPhysicalDesignNoActionReasonV2::IncompleteEvidence
+        }
+        PhysicalDesignNoActionReason::CurrentProjectionUnavailable => {
+            OperatorPhysicalDesignNoActionReasonV2::CurrentProjectionUnavailable
+        }
+        PhysicalDesignNoActionReason::RecommendationLimitReached => {
+            OperatorPhysicalDesignNoActionReasonV2::RecommendationLimitReached
+        }
+    }
+}
+
+const fn operator_physical_design_rotation(
+    report: ServerPhysicalDesignRotationReport,
+) -> OperatorPhysicalDesignRotationV2 {
+    OperatorPhysicalDesignRotationV2 {
+        previous_epoch: report.previous_epoch.0,
+        new_epoch: report.new_epoch.0,
+    }
+}
+
+fn control_remote_error(error: ServerAdaptiveControlError) -> OperatorRemoteErrorV2 {
     let code = match error {
-        ServerAdaptiveControlError::AdaptiveNotEnabled => OperatorErrorCodeV1::AdaptiveNotEnabled,
-        ServerAdaptiveControlError::DriverNotEnabled => OperatorErrorCodeV1::DriverNotEnabled,
-        ServerAdaptiveControlError::SchedulerNotFaulted => OperatorErrorCodeV1::SchedulerNotFaulted,
+        ServerAdaptiveControlError::AdaptiveNotEnabled => OperatorErrorCodeV2::AdaptiveNotEnabled,
+        ServerAdaptiveControlError::DriverNotEnabled => OperatorErrorCodeV2::DriverNotEnabled,
+        ServerAdaptiveControlError::SchedulerNotFaulted => OperatorErrorCodeV2::SchedulerNotFaulted,
         ServerAdaptiveControlError::EvidenceWindowChanged { .. } => {
-            OperatorErrorCodeV1::EvidenceWindowChanged
+            OperatorErrorCodeV2::EvidenceWindowChanged
         }
         ServerAdaptiveControlError::EvidenceRotation(
             AdaptiveEvidenceRotationError::EvidenceWindowEpochExhausted,
-        ) => OperatorErrorCodeV1::EvidenceWindowEpochExhausted,
-        ServerAdaptiveControlError::ServerStopped => OperatorErrorCodeV1::ServerStopped,
+        ) => OperatorErrorCodeV2::EvidenceWindowEpochExhausted,
+        ServerAdaptiveControlError::ServerStopped => OperatorErrorCodeV2::ServerStopped,
     };
     let message = match code {
-        OperatorErrorCodeV1::AdaptiveNotEnabled => "adaptive runtime is not enabled",
-        OperatorErrorCodeV1::DriverNotEnabled => "adaptive driver is not enabled",
-        OperatorErrorCodeV1::SchedulerNotFaulted => "adaptive scheduler is not faulted",
-        OperatorErrorCodeV1::EvidenceWindowChanged => "adaptive evidence window changed",
-        OperatorErrorCodeV1::EvidenceWindowEpochExhausted => {
+        OperatorErrorCodeV2::AdaptiveNotEnabled => "adaptive runtime is not enabled",
+        OperatorErrorCodeV2::DriverNotEnabled => "adaptive driver is not enabled",
+        OperatorErrorCodeV2::SchedulerNotFaulted => "adaptive scheduler is not faulted",
+        OperatorErrorCodeV2::EvidenceWindowChanged => "adaptive evidence window changed",
+        OperatorErrorCodeV2::EvidenceWindowEpochExhausted => {
             "adaptive evidence window epoch is exhausted"
         }
-        OperatorErrorCodeV1::ServerStopped => "server adaptive control is stopped",
+        OperatorErrorCodeV2::ServerStopped => "server adaptive control is stopped",
         _ => "operator request failed",
     };
-    OperatorRemoteErrorV1 {
+    OperatorRemoteErrorV2 {
         code,
         message: message.into(),
     }
 }
 
-fn protocol_remote_error(error: &OperatorProtocolError) -> OperatorRemoteErrorV1 {
+fn physical_design_remote_error(error: ServerPhysicalDesignControlError) -> OperatorRemoteErrorV2 {
+    let code = match error {
+        ServerPhysicalDesignControlError::PhysicalDesignNotEnabled => {
+            OperatorErrorCodeV2::PhysicalDesignNotEnabled
+        }
+        ServerPhysicalDesignControlError::EvidenceEpochChanged { .. } => {
+            OperatorErrorCodeV2::PhysicalDesignEvidenceEpochChanged
+        }
+        ServerPhysicalDesignControlError::EvidenceRotation(
+            PhysicalDesignEvidenceRecordError::EvidenceWindowEpochExhausted,
+        ) => OperatorErrorCodeV2::PhysicalDesignEvidenceEpochExhausted,
+        ServerPhysicalDesignControlError::EvidenceRotation(_) => OperatorErrorCodeV2::Internal,
+        ServerPhysicalDesignControlError::Advisor(PhysicalDesignAdvisorError::NoEvidence) => {
+            OperatorErrorCodeV2::PhysicalDesignNoEvidence
+        }
+        ServerPhysicalDesignControlError::Advisor(PhysicalDesignAdvisorError::StaleSchema {
+            ..
+        }) => OperatorErrorCodeV2::PhysicalDesignStaleSchema,
+        ServerPhysicalDesignControlError::Advisor(
+            PhysicalDesignAdvisorError::InconclusiveCapacity { .. },
+        ) => OperatorErrorCodeV2::PhysicalDesignInconclusiveCapacity,
+        ServerPhysicalDesignControlError::Advisor(PhysicalDesignAdvisorError::Database(_)) => {
+            OperatorErrorCodeV2::Internal
+        }
+        ServerPhysicalDesignControlError::ServerStopped => OperatorErrorCodeV2::ServerStopped,
+    };
+    let message = match code {
+        OperatorErrorCodeV2::PhysicalDesignNotEnabled => "physical-design advisor is not enabled",
+        OperatorErrorCodeV2::PhysicalDesignEvidenceEpochChanged => {
+            "physical-design evidence epoch changed"
+        }
+        OperatorErrorCodeV2::PhysicalDesignEvidenceEpochExhausted => {
+            "physical-design evidence epoch is exhausted"
+        }
+        OperatorErrorCodeV2::PhysicalDesignNoEvidence => "physical-design evidence window is empty",
+        OperatorErrorCodeV2::PhysicalDesignStaleSchema => {
+            "physical-design evidence schema is stale"
+        }
+        OperatorErrorCodeV2::PhysicalDesignInconclusiveCapacity => {
+            "physical-design evidence is capacity-truncated"
+        }
+        OperatorErrorCodeV2::ServerStopped => "server physical-design control is stopped",
+        _ => "operator request failed",
+    };
+    OperatorRemoteErrorV2 {
+        code,
+        message: message.into(),
+    }
+}
+
+fn response_too_large_error() -> OperatorRemoteErrorV2 {
+    OperatorRemoteErrorV2 {
+        code: OperatorErrorCodeV2::ResponseTooLarge,
+        message: "operator response exceeds the NBOP payload limit".into(),
+    }
+}
+
+fn protocol_remote_error(error: &OperatorProtocolError) -> OperatorRemoteErrorV2 {
     let (code, message) = match error {
         OperatorProtocolError::UnsupportedVersion(_) => (
-            OperatorErrorCodeV1::UnsupportedProtocolVersion,
+            OperatorErrorCodeV2::UnsupportedProtocolVersion,
             "unsupported operator protocol version",
         ),
         OperatorProtocolError::RequestTooLarge(_) | OperatorProtocolError::PayloadTooLarge(_) => (
-            OperatorErrorCodeV1::RequestTooLarge,
+            OperatorErrorCodeV2::RequestTooLarge,
             "operator request is too large",
         ),
         OperatorProtocolError::TruncatedHeader | OperatorProtocolError::TruncatedPayload => (
-            OperatorErrorCodeV1::MalformedRequest,
+            OperatorErrorCodeV2::MalformedRequest,
             "truncated operator request",
         ),
         OperatorProtocolError::WrongMagic => (
-            OperatorErrorCodeV1::MalformedRequest,
+            OperatorErrorCodeV2::MalformedRequest,
             "invalid operator request magic",
         ),
         OperatorProtocolError::NonzeroReserved(_) => (
-            OperatorErrorCodeV1::MalformedRequest,
+            OperatorErrorCodeV2::MalformedRequest,
             "operator reserved field is nonzero",
         ),
         OperatorProtocolError::InvalidJson(_) => (
-            OperatorErrorCodeV1::MalformedRequest,
+            OperatorErrorCodeV2::MalformedRequest,
             "invalid operator request JSON",
         ),
         OperatorProtocolError::Io(_) => (
-            OperatorErrorCodeV1::MalformedRequest,
+            OperatorErrorCodeV2::MalformedRequest,
             "operator request I/O failed",
         ),
     };
-    OperatorRemoteErrorV1 {
+    OperatorRemoteErrorV2 {
         code,
         message: message.into(),
     }
@@ -1181,53 +1722,203 @@ mod tests {
         config: ServerOperatorConfig,
     ) -> Result<ServerOperatorPlane, ServerOperatorError> {
         let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let (design_tx, _design_rx) = std::sync::mpsc::channel();
         let (server_shutdown, _server_shutdown_rx) = std::sync::mpsc::channel();
         ServerOperatorPlane::start(
             config,
             ServerAdaptiveControlHandle::new(control_tx),
+            ServerPhysicalDesignControlHandle::new(design_tx),
             server_shutdown,
         )
     }
 
     #[test]
-    fn frame_header_is_exact_big_endian_nbop_v1() {
-        let request = OperatorRequestV1 {
+    fn frame_header_is_exact_big_endian_nbop_v2() {
+        let request = OperatorRequestV2 {
             request_id: 42,
-            operation: OperatorOperationV1::Status {},
+            operation: OperatorOperationV2::Status {},
         };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &request).unwrap();
         assert_eq!(&bytes[..4], b"NBOP");
-        assert_eq!(&bytes[4..6], &[0, 1]);
+        assert_eq!(&bytes[4..6], &[0, 2]);
         assert_eq!(&bytes[6..8], &[0, 0]);
         assert_eq!(
             u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize,
             bytes.len() - OPERATOR_HEADER_BYTES
         );
-        let decoded: OperatorRequestV1 = read_frame(&mut bytes.as_slice()).unwrap();
+        let decoded: OperatorRequestV2 = read_frame(&mut bytes.as_slice()).unwrap();
         assert_eq!(decoded.request_id, 42);
-        assert!(matches!(decoded.operation, OperatorOperationV1::Status {}));
+        assert!(matches!(decoded.operation, OperatorOperationV2::Status {}));
     }
 
     #[test]
     fn response_frame_and_request_id_echo_are_stable() {
-        let response = OperatorResponseV1::Ok {
+        let response = OperatorResponseV2::Ok {
             request_id: 42,
-            result: OperatorResultV1::SchedulerReset {},
+            result: OperatorResultV2::SchedulerReset {},
         };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &response).unwrap();
         let payload = br#"{"outcome":"ok","request_id":42,"result":{"type":"scheduler_reset"}}"#;
         assert_eq!(&bytes[..4], b"NBOP");
-        assert_eq!(&bytes[4..8], &[0, 1, 0, 0]);
+        assert_eq!(&bytes[4..8], &[0, 2, 0, 0]);
         assert_eq!(&bytes[8..12], &(payload.len() as u32).to_be_bytes());
         assert_eq!(&bytes[12..], payload);
+    }
+
+    #[test]
+    fn physical_design_status_and_report_use_explicit_stable_dtos() {
+        let status = operator_physical_design_status(ServerPhysicalDesignStatus {
+            diagnostics: crate::ServerPhysicalDesignDiagnostics {
+                eligible_query_count: 1,
+                record_success_count: 2,
+                record_error_count: 3,
+                schema_rotation_count: 4,
+                capacity_rejection_count: 5,
+                incomplete_report_count: 6,
+                counter_overflowed: true,
+                last_record_outcome: Some(
+                    PhysicalDesignEvidenceRecordOutcome::SchemaRotatedWithCapacityRejection,
+                ),
+                last_record_error: Some(PhysicalDesignEvidenceRecordError::OutOfOrderVisibility {
+                    previous: netbadb_types::DatabaseCommitSeq(9),
+                    received: netbadb_types::DatabaseCommitSeq(8),
+                }),
+            },
+            evidence: netbadb_core::PhysicalDesignEvidenceWindowInspection {
+                limits: netbadb_core::PhysicalDesignEvidenceLimits {
+                    max_index_candidates: 10,
+                    max_columnar_candidates: 11,
+                    max_query_shapes_per_candidate: 12,
+                    max_columnar_columns_per_candidate: 13,
+                },
+                epoch: netbadb_core::PhysicalDesignEvidenceEpoch(14),
+                schema_generation: Some(netbadb_types::SchemaGeneration(15)),
+                first_global_commit_seq: Some(netbadb_types::DatabaseCommitSeq(16)),
+                last_global_commit_seq: Some(netbadb_types::DatabaseCommitSeq(17)),
+                ordering_high_water: Some(netbadb_types::DatabaseCommitSeq(18)),
+                recorded_reports: 19,
+                index_candidate_count: 20,
+                columnar_candidate_count: 21,
+                capacity_rejections: 22,
+                discarded_incomplete_reports: 23,
+                overflowed: true,
+                incomplete: true,
+                truncated: true,
+            },
+        });
+        assert_eq!(status.diagnostics.eligible_query_count, 1);
+        assert_eq!(
+            status.diagnostics.last_record_outcome,
+            Some(OperatorPhysicalDesignRecordOutcomeV2::SchemaRotatedWithCapacityRejection)
+        );
+        assert_eq!(
+            status.diagnostics.last_record_error,
+            Some(OperatorPhysicalDesignRecordErrorV2::OutOfOrderVisibility)
+        );
+        assert_eq!(
+            status.evidence.limits.max_columnar_columns_per_candidate,
+            13
+        );
+        assert_eq!(status.evidence.epoch, 14);
+        assert_eq!(status.evidence.ordering_high_water, Some(18));
+        assert_eq!(status.evidence.discarded_incomplete_reports, 23);
+
+        for (reason, expected) in [
+            (
+                PhysicalDesignNoActionReason::BelowMinimumReports,
+                OperatorPhysicalDesignNoActionReasonV2::BelowMinimumReports,
+            ),
+            (
+                PhysicalDesignNoActionReason::BelowMinimumShapeDiversity,
+                OperatorPhysicalDesignNoActionReasonV2::BelowMinimumShapeDiversity,
+            ),
+            (
+                PhysicalDesignNoActionReason::BelowMinimumActualWork,
+                OperatorPhysicalDesignNoActionReasonV2::BelowMinimumActualWork,
+            ),
+            (
+                PhysicalDesignNoActionReason::ExistingDesignCovers,
+                OperatorPhysicalDesignNoActionReasonV2::ExistingDesignCovers,
+            ),
+            (
+                PhysicalDesignNoActionReason::UnsupportedCurrentLayout,
+                OperatorPhysicalDesignNoActionReasonV2::UnsupportedCurrentLayout,
+            ),
+            (
+                PhysicalDesignNoActionReason::IncompleteEvidence,
+                OperatorPhysicalDesignNoActionReasonV2::IncompleteEvidence,
+            ),
+            (
+                PhysicalDesignNoActionReason::CurrentProjectionUnavailable,
+                OperatorPhysicalDesignNoActionReasonV2::CurrentProjectionUnavailable,
+            ),
+            (
+                PhysicalDesignNoActionReason::RecommendationLimitReached,
+                OperatorPhysicalDesignNoActionReasonV2::RecommendationLimitReached,
+            ),
+        ] {
+            assert_eq!(operator_no_action_reason(reason), expected);
+        }
+    }
+
+    #[test]
+    fn oversized_success_becomes_bounded_response_too_large_error() {
+        let candidate = OperatorPhysicalIndexCandidateV2 {
+            table_id: 1,
+            column_id: 2,
+            point_report_count: 3,
+            range_report_count: 4,
+            evidence: OperatorPhysicalDesignEvidenceSummaryV2 {
+                report_count: 5,
+                distinct_query_shapes: 6,
+                total_actual_scan_work_units: 7,
+                total_rows_examined: 8,
+                overflowed: false,
+                incomplete: false,
+                truncated: false,
+            },
+            decision: OperatorPhysicalDesignDecisionV2::Recommend {},
+        };
+        let response = OperatorResponseV2::Ok {
+            request_id: 77,
+            result: OperatorResultV2::PhysicalDesignRecommendations {
+                report: OperatorPhysicalDesignAdvisorReportV2 {
+                    evidence_epoch: 1,
+                    schema_generation: 2,
+                    first_global_commit_seq: 3,
+                    last_global_commit_seq: 4,
+                    recorded_reports: 5,
+                    discarded_incomplete_reports: 0,
+                    overflowed: false,
+                    incomplete: false,
+                    index_candidates: vec![candidate; 1_000],
+                    columnar_candidates: Vec::new(),
+                },
+            },
+        };
+        let mut bytes = Vec::new();
+        write_operator_response(&mut bytes, &response).unwrap();
+        assert!(bytes.len() <= OPERATOR_HEADER_BYTES + MAX_OPERATOR_PAYLOAD_BYTES as usize);
+        assert!(matches!(
+            read_frame::<OperatorResponseV2>(&mut bytes.as_slice()).unwrap(),
+            OperatorResponseV2::Error {
+                request_id: 77,
+                error: OperatorRemoteErrorV2 {
+                    code: OperatorErrorCodeV2::ResponseTooLarge,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]
     fn reset_and_conditional_rotation_forward_typed_worker_results() {
         let (requests, controls) = std::sync::mpsc::channel();
         let control = ServerAdaptiveControlHandle::new(requests);
+        let (design_requests, _design_controls) = std::sync::mpsc::channel();
+        let design_control = ServerPhysicalDesignControlHandle::new(design_requests);
         let worker = std::thread::spawn(move || {
             match controls.recv().unwrap() {
                 ServerAdaptiveControlRequest::ResetFaultedScheduler { reply } => {
@@ -1250,35 +1941,37 @@ mod tests {
         });
 
         let reset = execute_operator_request(
-            OperatorRequestV1 {
+            OperatorRequestV2 {
                 request_id: 11,
-                operation: OperatorOperationV1::ResetFaultedScheduler {},
+                operation: OperatorOperationV2::ResetFaultedScheduler {},
             },
             &control,
+            &design_control,
         );
         assert!(matches!(
             reset,
-            OperatorResponseV1::Ok {
+            OperatorResponseV2::Ok {
                 request_id: 11,
-                result: OperatorResultV1::SchedulerReset {}
+                result: OperatorResultV2::SchedulerReset {}
             }
         ));
 
         let stale = execute_operator_request(
-            OperatorRequestV1 {
+            OperatorRequestV2 {
                 request_id: 12,
-                operation: OperatorOperationV1::RotateEvidence {
+                operation: OperatorOperationV2::RotateEvidence {
                     expected_window_epoch: 7,
                 },
             },
             &control,
+            &design_control,
         );
         assert!(matches!(
             stale,
-            OperatorResponseV1::Error {
+            OperatorResponseV2::Error {
                 request_id: 12,
-                error: OperatorRemoteErrorV1 {
-                    code: OperatorErrorCodeV1::EvidenceWindowChanged,
+                error: OperatorRemoteErrorV2 {
+                    code: OperatorErrorCodeV2::EvidenceWindowChanged,
                     ..
                 }
             }
@@ -1290,53 +1983,88 @@ mod tests {
     fn codec_rejects_header_and_payload_violations() {
         let mut wrong_magic = [0_u8; OPERATOR_HEADER_BYTES];
         wrong_magic[..4].copy_from_slice(b"NOPE");
-        wrong_magic[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        wrong_magic[4..6].copy_from_slice(&2_u16.to_be_bytes());
         assert!(matches!(
-            read_frame::<OperatorRequestV1>(&mut wrong_magic.as_slice()),
+            read_frame::<OperatorRequestV2>(&mut wrong_magic.as_slice()),
             Err(OperatorProtocolError::WrongMagic)
         ));
 
         let mut wrong_version = [0_u8; OPERATOR_HEADER_BYTES];
         wrong_version[..4].copy_from_slice(b"NBOP");
-        wrong_version[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        wrong_version[4..6].copy_from_slice(&1_u16.to_be_bytes());
         assert!(matches!(
-            read_frame::<OperatorRequestV1>(&mut wrong_version.as_slice()),
-            Err(OperatorProtocolError::UnsupportedVersion(2))
+            read_frame::<OperatorRequestV2>(&mut wrong_version.as_slice()),
+            Err(OperatorProtocolError::UnsupportedVersion(1))
         ));
 
         let mut reserved = [0_u8; OPERATOR_HEADER_BYTES];
         reserved[..4].copy_from_slice(b"NBOP");
-        reserved[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        reserved[4..6].copy_from_slice(&2_u16.to_be_bytes());
         reserved[6..8].copy_from_slice(&1_u16.to_be_bytes());
         assert!(matches!(
-            read_frame::<OperatorRequestV1>(&mut reserved.as_slice()),
+            read_frame::<OperatorRequestV2>(&mut reserved.as_slice()),
             Err(OperatorProtocolError::NonzeroReserved(1))
         ));
 
         let mut oversized = [0_u8; OPERATOR_HEADER_BYTES];
         oversized[..4].copy_from_slice(b"NBOP");
-        oversized[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        oversized[4..6].copy_from_slice(&2_u16.to_be_bytes());
         oversized[8..12].copy_from_slice(&(MAX_OPERATOR_PAYLOAD_BYTES + 1).to_be_bytes());
         assert!(matches!(
-            read_frame::<OperatorRequestV1>(&mut oversized.as_slice()),
+            read_frame::<OperatorRequestV2>(&mut oversized.as_slice()),
             Err(OperatorProtocolError::RequestTooLarge(_))
         ));
         assert!(matches!(
-            read_frame::<OperatorRequestV1>(&mut b"NB".as_slice()),
+            read_frame::<OperatorRequestV2>(&mut b"NB".as_slice()),
             Err(OperatorProtocolError::TruncatedHeader)
         ));
 
-        let truncated_payload = b"NBOP\0\x01\0\0\0\0\0\x02{".to_vec();
+        let truncated_payload = b"NBOP\0\x02\0\0\0\0\0\x02{".to_vec();
         assert!(matches!(
-            read_frame::<OperatorRequestV1>(&mut truncated_payload.as_slice()),
+            read_frame::<OperatorRequestV2>(&mut truncated_payload.as_slice()),
             Err(OperatorProtocolError::TruncatedPayload)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v1_client_receives_explicit_unsupported_protocol_version() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let (adaptive_tx, _adaptive_rx) = std::sync::mpsc::channel();
+        let (design_tx, _design_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert!(matches!(
+                serve_operator_connection(
+                    &mut server,
+                    &ServerAdaptiveControlHandle::new(adaptive_tx),
+                    &ServerPhysicalDesignControlHandle::new(design_tx),
+                ),
+                Err(OperatorProtocolError::UnsupportedVersion(1))
+            ));
+        });
+        let mut v1_header = [0_u8; OPERATOR_HEADER_BYTES];
+        v1_header[..4].copy_from_slice(b"NBOP");
+        v1_header[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        client.write_all(&v1_header).unwrap();
+        assert!(matches!(
+            read_frame::<OperatorResponseV2>(&mut client).unwrap(),
+            OperatorResponseV2::Error {
+                request_id: 0,
+                error: OperatorRemoteErrorV2 {
+                    code: OperatorErrorCodeV2::UnsupportedProtocolVersion,
+                    ..
+                }
+            }
+        ));
+        worker.join().unwrap();
     }
 
     #[test]
     fn strict_request_json_rejects_unknown_fields_and_operations() {
         fn framed(payload: &[u8]) -> Vec<u8> {
-            let mut bytes = Vec::from(b"NBOP\0\x01\0\0".as_slice());
+            let mut bytes = Vec::from(b"NBOP\0\x02\0\0".as_slice());
             bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
             bytes.extend_from_slice(payload);
             bytes
@@ -1347,7 +2075,7 @@ mod tests {
             &[0xff][..],
         ] {
             assert!(matches!(
-                read_frame::<OperatorRequestV1>(&mut framed(payload).as_slice()),
+                read_frame::<OperatorRequestV2>(&mut framed(payload).as_slice()),
                 Err(OperatorProtocolError::InvalidJson(_))
             ));
         }
@@ -1376,9 +2104,9 @@ mod tests {
             let mut bytes = Vec::new();
             write_frame(
                 &mut bytes,
-                &OperatorRequestV1 {
+                &OperatorRequestV2 {
                     request_id,
-                    operation: OperatorOperationV1::ResetFaultedScheduler {},
+                    operation: OperatorOperationV2::ResetFaultedScheduler {},
                 },
             )
             .unwrap();
@@ -1389,10 +2117,12 @@ mod tests {
         config.io_timeout = Duration::from_secs(1);
         let path = config.unix_socket().to_path_buf();
         let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let (design_tx, _design_rx) = std::sync::mpsc::channel();
         let (failure_tx, _failure_rx) = std::sync::mpsc::channel();
         let plane = ServerOperatorPlane::start(
             config,
             ServerAdaptiveControlHandle::new(control_tx),
+            ServerPhysicalDesignControlHandle::new(design_tx),
             failure_tx,
         )
         .unwrap();
@@ -1409,8 +2139,8 @@ mod tests {
         assert!(matches!(control_rx.try_recv(), Err(TryRecvError::Empty)));
         first_reply.send(Ok(())).unwrap();
         assert!(matches!(
-            read_frame::<OperatorResponseV1>(&mut first).unwrap(),
-            OperatorResponseV1::Ok { request_id: 1, .. }
+            read_frame::<OperatorResponseV2>(&mut first).unwrap(),
+            OperatorResponseV2::Ok { request_id: 1, .. }
         ));
 
         let second_reply = match control_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
@@ -1421,11 +2151,11 @@ mod tests {
             .send(Err(ServerAdaptiveControlError::SchedulerNotFaulted))
             .unwrap();
         assert!(matches!(
-            read_frame::<OperatorResponseV1>(&mut second).unwrap(),
-            OperatorResponseV1::Error {
+            read_frame::<OperatorResponseV2>(&mut second).unwrap(),
+            OperatorResponseV2::Error {
                 request_id: 2,
-                error: OperatorRemoteErrorV1 {
-                    code: OperatorErrorCodeV1::SchedulerNotFaulted,
+                error: OperatorRemoteErrorV2 {
+                    code: OperatorErrorCodeV2::SchedulerNotFaulted,
                     ..
                 }
             }

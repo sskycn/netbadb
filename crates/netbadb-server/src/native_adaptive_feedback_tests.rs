@@ -293,7 +293,7 @@ fn native_server_builder_is_default_disabled_and_explicitly_enabled() {
     let manifest = root.join("server.json");
     let source = format!(
         r#"{{
-            "version": 6,
+            "version": 7,
             "listen": "127.0.0.1:0",
             "authorization": {{
                 "local_plaintext": {{
@@ -321,7 +321,7 @@ fn native_server_builder_is_default_disabled_and_explicitly_enabled() {
 
     let disabled = TcpServer::new(config.clone());
     assert!(disabled.adaptive_override.is_none());
-    assert!(disabled.physical_design.is_none());
+    assert!(disabled.physical_design_override.is_none());
     let limits = AdaptiveEvidencePoolLimits::default();
     let design = design_config();
     let enabled = disabled
@@ -332,7 +332,7 @@ fn native_server_builder_is_default_disabled_and_explicitly_enabled() {
         Some(crate::adaptive_driver::ServerAdaptiveStartupMode::FeedbackOnly(config))
             if config.limits() == limits
     ));
-    assert_eq!(enabled.physical_design, Some(design));
+    assert_eq!(enabled.physical_design_override, Some(design));
     let reverse = TcpServer::new(config)
         .with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits))
         .with_physical_design_advisor(design);
@@ -341,7 +341,7 @@ fn native_server_builder_is_default_disabled_and_explicitly_enabled() {
         Some(crate::adaptive_driver::ServerAdaptiveStartupMode::FeedbackOnly(config))
             if config.limits() == limits
     ));
-    assert_eq!(reverse.physical_design, Some(design));
+    assert_eq!(reverse.physical_design_override, Some(design));
 
     fs::remove_dir_all(root).expect("remove config root");
 }

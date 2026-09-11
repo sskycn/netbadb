@@ -1,6 +1,6 @@
 # `netbadb` inspection and local operator CLI
 
-`netbadb inspect` opens the existing tables declared by deployment manifest v6
+`netbadb inspect` opens the existing tables declared by deployment manifest v7
 and reports catalog metadata or the physical plan chosen for one SQL
 statement. It does not create databases, execute queries or DML, start a
 server, connect remotely, refresh `ANALYZE`, create indexes, or checkpoint.
@@ -26,18 +26,21 @@ before the manifest or database is opened. Success writes only the completed
 inspection to stdout. Usage failures exit 2, operational failures exit 1, and
 all failures write diagnostics only to stderr.
 
-`netbadb operator` does not open a Database. It parses the same manifest v6,
-uses only its configured Unix socket, and exchanges one NBOP v1 request:
+`netbadb operator` does not open a Database. It parses the same manifest v7,
+uses only its configured Unix socket, and exchanges one NBOP v2 request:
 
 ```sh
 netbadb operator status --manifest server.json
 netbadb operator rotate-evidence --manifest server.json \
   --expected-window-epoch 7
 netbadb operator reset-faulted-scheduler --manifest server.json
+netbadb operator physical-design recommendations --manifest server.json
+netbadb operator physical-design rotate-evidence --manifest server.json \
+  --expected-evidence-epoch 7
 ```
 
 The rotation precondition is required and is never inferred by a hidden status
-request. The human output is not a stable machine-readable contract; NBOP v1
+request. The human output is not a stable machine-readable contract; NBOP v2
 is the versioned contract.
 
 ## Ownership, recovery, and authorization

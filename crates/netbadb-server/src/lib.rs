@@ -41,13 +41,20 @@ pub use limits::{
 pub use manifest::{DEPLOYMENT_MANIFEST_VERSION, ManifestError, ServerConfig, TableBootstrap};
 pub use metrics::{ServerMetricsHandle, ServerMetricsSnapshot};
 pub use operator::{
-    MAX_OPERATOR_PAYLOAD_BYTES, OPERATOR_PROTOCOL_VERSION, OperatorAdaptiveModeV1,
-    OperatorClientError, OperatorDriverStatusV1, OperatorErrorCodeV1, OperatorEvidencePoolHealthV1,
-    OperatorEvidenceRecordErrorV1, OperatorEvidenceRecordOutcomeV1,
-    OperatorEvidenceRenewalReasonV1, OperatorEvidenceRotationV1, OperatorFeedbackStatusV1,
-    OperatorOrchestrationStopReasonV1, OperatorRemoteErrorV1, OperatorSchedulerDelayClassV1,
-    OperatorSchedulerFaultV1, OperatorSchedulerGateV1, OperatorStatusV1, ServerOperatorClient,
-    ServerOperatorConfig, ServerOperatorConfigError, ServerOperatorError,
+    MAX_OPERATOR_PAYLOAD_BYTES, OPERATOR_PROTOCOL_VERSION, OperatorAdaptiveModeV2,
+    OperatorAdaptiveStatusV2, OperatorClientError, OperatorDriverStatusV2, OperatorErrorCodeV2,
+    OperatorEvidencePoolHealthV2, OperatorEvidenceRecordErrorV2, OperatorEvidenceRecordOutcomeV2,
+    OperatorEvidenceRenewalReasonV2, OperatorEvidenceRotationV2, OperatorFeedbackStatusV2,
+    OperatorOrchestrationStopReasonV2, OperatorPhysicalColumnarCandidateV2,
+    OperatorPhysicalDesignAdvisorReportV2, OperatorPhysicalDesignDecisionV2,
+    OperatorPhysicalDesignDiagnosticsV2, OperatorPhysicalDesignEvidenceLimitsV2,
+    OperatorPhysicalDesignEvidenceStatusV2, OperatorPhysicalDesignEvidenceSummaryV2,
+    OperatorPhysicalDesignNoActionReasonV2, OperatorPhysicalDesignRecordErrorV2,
+    OperatorPhysicalDesignRecordOutcomeV2, OperatorPhysicalDesignRotationV2,
+    OperatorPhysicalDesignStatusV2, OperatorPhysicalIndexCandidateV2, OperatorRemoteErrorV2,
+    OperatorSchedulerDelayClassV2, OperatorSchedulerFaultV2, OperatorSchedulerGateV2,
+    OperatorStatusV2, ServerOperatorClient, ServerOperatorConfig, ServerOperatorConfigError,
+    ServerOperatorError,
 };
 pub use physical_design::{
     ServerPhysicalDesignAdvisorConfig, ServerPhysicalDesignControlError,

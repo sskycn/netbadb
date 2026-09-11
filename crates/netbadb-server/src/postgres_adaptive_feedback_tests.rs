@@ -264,7 +264,7 @@ fn postgres_server_builder_is_default_disabled_and_explicitly_enabled() {
     fs::write(
         &manifest,
         r#"{
-            "version": 6,
+            "version": 7,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {
@@ -291,7 +291,7 @@ fn postgres_server_builder_is_default_disabled_and_explicitly_enabled() {
 
     let disabled = PostgresTcpServer::new(config.clone());
     assert!(disabled.adaptive_override.is_none());
-    assert!(disabled.physical_design.is_none());
+    assert!(disabled.physical_design_override.is_none());
     let limits = AdaptiveEvidencePoolLimits::default();
     let design = design_runtime().status().evidence.limits;
     let recommendation = PhysicalDesignRecommendationPolicy {
@@ -315,7 +315,7 @@ fn postgres_server_builder_is_default_disabled_and_explicitly_enabled() {
         Some(crate::adaptive_driver::ServerAdaptiveStartupMode::FeedbackOnly(config))
             if config.limits() == limits
     ));
-    assert_eq!(enabled.physical_design, Some(design));
+    assert_eq!(enabled.physical_design_override, Some(design));
     let reverse = PostgresTcpServer::new(config)
         .with_physical_design_advisor(design)
         .with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits));
@@ -324,7 +324,7 @@ fn postgres_server_builder_is_default_disabled_and_explicitly_enabled() {
         Some(crate::adaptive_driver::ServerAdaptiveStartupMode::FeedbackOnly(config))
             if config.limits() == limits
     ));
-    assert_eq!(reverse.physical_design, Some(design));
+    assert_eq!(reverse.physical_design_override, Some(design));
     fs::remove_dir_all(root).expect("remove PostgreSQL config root");
 }
 

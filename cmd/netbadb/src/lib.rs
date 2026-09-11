@@ -10,19 +10,24 @@ use std::path::PathBuf;
 use netbadb_sdk::inspection::{render_catalog, render_statement};
 use netbadb_sdk::{Database, DatabaseError};
 use netbadb_server::{
-    ManifestError, OperatorAdaptiveModeV1, OperatorClientError, OperatorSchedulerDelayClassV1,
-    OperatorSchedulerFaultV1, OperatorSchedulerGateV1, OperatorStatusV1, ServerConfig,
+    ManifestError, OperatorAdaptiveModeV2, OperatorClientError, OperatorErrorCodeV2,
+    OperatorPhysicalDesignAdvisorReportV2, OperatorPhysicalDesignDecisionV2,
+    OperatorPhysicalDesignNoActionReasonV2, OperatorRemoteErrorV2, OperatorSchedulerDelayClassV2,
+    OperatorSchedulerFaultV2, OperatorSchedulerGateV2, OperatorStatusV2, ServerConfig,
     ServerOperatorClient,
 };
 
-const ROOT_HELP: &str = "Usage:\n  netbadb inspect <catalog|statement> [options]\n  netbadb operator <status|rotate-evidence|reset-faulted-scheduler> [options]\n\nUse `netbadb inspect --help` or `netbadb operator --help` for commands.\n";
+const ROOT_HELP: &str = "Usage:\n  netbadb inspect <catalog|statement> [options]\n  netbadb operator <status|rotate-evidence|reset-faulted-scheduler|physical-design> [options]\n\nUse `netbadb inspect --help` or `netbadb operator --help` for commands.\n";
 const INSPECT_HELP: &str = "Usage:\n  netbadb inspect catalog --manifest <server.json> [--format text|json]\n  netbadb inspect statement --manifest <server.json> (--sql <SQL>|--sql-file <path>) [--format text|json]\n";
 const CATALOG_HELP: &str = "Usage: netbadb inspect catalog --manifest <server.json> [--format text|json]\n\nInspects the complete offline local catalog.\n";
 const STATEMENT_HELP: &str = "Usage: netbadb inspect statement --manifest <server.json> (--sql <SQL>|--sql-file <path>) [--format text|json]\n\nCompiles and inspects one statement without executing it.\n";
-const OPERATOR_HELP: &str = "Usage:\n  netbadb operator status --manifest <server.json>\n  netbadb operator rotate-evidence --manifest <server.json> --expected-window-epoch <epoch>\n  netbadb operator reset-faulted-scheduler --manifest <server.json>\n";
-const OPERATOR_STATUS_HELP: &str = "Usage: netbadb operator status --manifest <server.json>\n\nReads bounded live Adaptive status over NBOP v1.\n";
+const OPERATOR_HELP: &str = "Usage:\n  netbadb operator status --manifest <server.json>\n  netbadb operator rotate-evidence --manifest <server.json> --expected-window-epoch <epoch>\n  netbadb operator reset-faulted-scheduler --manifest <server.json>\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n";
+const OPERATOR_STATUS_HELP: &str = "Usage: netbadb operator status --manifest <server.json>\n\nReads bounded live Adaptive and Physical Design status over NBOP v2.\n";
 const OPERATOR_ROTATE_HELP: &str = "Usage: netbadb operator rotate-evidence --manifest <server.json> --expected-window-epoch <epoch>\n\nConditionally rotates the live evidence window. The expected epoch is required and is never inferred.\n";
 const OPERATOR_RESET_HELP: &str = "Usage: netbadb operator reset-faulted-scheduler --manifest <server.json>\n\nAcknowledges and resets only a genuinely faulted scheduler.\n";
+const OPERATOR_PHYSICAL_DESIGN_HELP: &str = "Usage:\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n";
+const OPERATOR_PHYSICAL_DESIGN_RECOMMENDATIONS_HELP: &str = "Usage: netbadb operator physical-design recommendations --manifest <server.json>\n\nReads current-inventory physical-design advice without applying it.\n";
+const OPERATOR_PHYSICAL_DESIGN_ROTATE_HELP: &str = "Usage: netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n\nConditionally rotates design evidence. The expected epoch is required and is never inferred.\n";
 
 /// Parses and runs one CLI invocation and returns its complete stdout after
 /// the requested operation reaches a definitive outcome.
@@ -80,6 +85,22 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<String, 
             run_operator(manifest, |client| client.reset_faulted_scheduler())?;
             Ok("adaptive scheduler reset\n".into())
         }
+        Action::OperatorPhysicalDesignRecommendations { manifest } => {
+            let report = run_operator(manifest, |client| client.physical_design_recommendations())?;
+            Ok(render_physical_design_recommendations(&report))
+        }
+        Action::OperatorPhysicalDesignRotate {
+            manifest,
+            expected_evidence_epoch,
+        } => {
+            let rotation = run_operator(manifest, |client| {
+                client.rotate_physical_design_evidence(expected_evidence_epoch)
+            })?;
+            Ok(format!(
+                "physical-design evidence rotated: previous epoch {}, new epoch {}\n",
+                rotation.previous_epoch, rotation.new_epoch
+            ))
+        }
     }
 }
 
@@ -96,59 +117,158 @@ fn run_operator<T>(
         .map_err(Into::into)
 }
 
-fn render_operator_status(status: &OperatorStatusV1) -> String {
-    let mode = match status.mode {
-        OperatorAdaptiveModeV1::FeedbackOnly => "feedback_only",
-        OperatorAdaptiveModeV1::Driven => "driven",
-    };
-    let feedback = &status.feedback;
+fn render_operator_status(status: &OperatorStatusV2) -> String {
+    let mut output = String::new();
+    match &status.adaptive {
+        None => output.push_str("Adaptive: disabled\n"),
+        Some(adaptive) => {
+            let mode = match adaptive.mode {
+                OperatorAdaptiveModeV2::FeedbackOnly => "feedback-only",
+                OperatorAdaptiveModeV2::Driven => "driven",
+            };
+            let feedback = &adaptive.feedback;
+            output.push_str(&format!(
+                "Adaptive: {mode}\nadaptive evidence window epoch: {}\nadaptive schema generation: {}\nadaptive recorded reports: {}\nadaptive eligible queries: {}\nadaptive record successes: {}\nadaptive record errors: {}\n",
+                feedback.window_epoch,
+                feedback
+                    .schema_generation
+                    .map_or_else(|| "none".into(), |generation| generation.to_string()),
+                feedback.recorded_reports,
+                feedback.eligible_query_count,
+                feedback.record_success_count,
+                feedback.record_error_count,
+            ));
+            if let Some(driver) = &adaptive.driver {
+                output.push_str("scheduler gate: ");
+                output.push_str(render_scheduler_gate(driver.scheduler_gate));
+                output.push('\n');
+                output.push_str(&format!(
+                    "scheduler ticks: {}\nscheduler runs: {}\nscheduler errors: {}\ntick pending: {}\n",
+                    driver.scheduler_tick_count,
+                    driver.scheduler_ran_count,
+                    driver.scheduler_error_count,
+                    driver.tick_pending,
+                ));
+            }
+        }
+    }
+    match &status.physical_design {
+        None => output.push_str("Physical Design: disabled\n"),
+        Some(design) => output.push_str(&format!(
+            "Physical Design: enabled\ndesign evidence epoch: {}\ndesign recorded reports: {}\nindex candidate count: {}\ncolumnar candidate count: {}\ndesign evidence truncated: {}\ndesign evidence incomplete: {}\n",
+            design.evidence.epoch,
+            design.evidence.recorded_reports,
+            design.evidence.index_candidate_count,
+            design.evidence.columnar_candidate_count,
+            design.evidence.truncated,
+            design.evidence.incomplete,
+        )),
+    }
+    output
+}
+
+fn render_physical_design_recommendations(
+    report: &OperatorPhysicalDesignAdvisorReportV2,
+) -> String {
     let mut output = format!(
-        "adaptive mode: {mode}\nevidence window epoch: {}\nschema generation: {}\nrecorded reports: {}\neligible queries: {}\nrecord successes: {}\nrecord errors: {}\n",
-        feedback.window_epoch,
-        feedback
-            .schema_generation
-            .map_or_else(|| "none".into(), |generation| generation.to_string()),
-        feedback.recorded_reports,
-        feedback.eligible_query_count,
-        feedback.record_success_count,
-        feedback.record_error_count,
+        "physical-design evidence epoch: {}\nschema generation: {}\nG range: {}..={}\nrecorded reports: {}\ndiscarded incomplete reports: {}\noverflowed: {}\nincomplete: {}\n",
+        report.evidence_epoch,
+        report.schema_generation,
+        report.first_global_commit_seq,
+        report.last_global_commit_seq,
+        report.recorded_reports,
+        report.discarded_incomplete_reports,
+        report.overflowed,
+        report.incomplete,
     );
-    if let Some(driver) = &status.driver {
-        output.push_str("scheduler gate: ");
-        output.push_str(render_scheduler_gate(driver.scheduler_gate));
-        output.push('\n');
+    for candidate in &report.index_candidates {
         output.push_str(&format!(
-            "scheduler ticks: {}\nscheduler runs: {}\nscheduler errors: {}\ntick pending: {}\n",
-            driver.scheduler_tick_count,
-            driver.scheduler_ran_count,
-            driver.scheduler_error_count,
-            driver.tick_pending,
+            "Index candidate: TableId({}), ColumnId({})\n  observed reports: {}\n  distinct shapes: {}\n  observed actual scan work: {}\n  rows examined: {}\n  point reports: {}\n  range reports: {}\n  decision: {}\n",
+            candidate.table_id,
+            candidate.column_id,
+            candidate.evidence.report_count,
+            candidate.evidence.distinct_query_shapes,
+            candidate.evidence.total_actual_scan_work_units,
+            candidate.evidence.total_rows_examined,
+            candidate.point_report_count,
+            candidate.range_report_count,
+            render_design_decision(candidate.decision),
+        ));
+    }
+    for candidate in &report.columnar_candidates {
+        let columns = candidate
+            .columns
+            .iter()
+            .map(|column| format!("ColumnId({column})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(
+            "Columnar candidate: TableId({}), columns [{}]\n  observed reports: {}\n  distinct shapes: {}\n  observed actual scan work: {}\n  rows examined: {}\n  decision: {}\n",
+            candidate.table_id,
+            columns,
+            candidate.evidence.report_count,
+            candidate.evidence.distinct_query_shapes,
+            candidate.evidence.total_actual_scan_work_units,
+            candidate.evidence.total_rows_examined,
+            render_design_decision(candidate.decision),
         ));
     }
     output
 }
 
-const fn render_scheduler_gate(gate: OperatorSchedulerGateV1) -> &'static str {
+const fn render_design_decision(decision: OperatorPhysicalDesignDecisionV2) -> &'static str {
+    match decision {
+        OperatorPhysicalDesignDecisionV2::Recommend {} => "recommend",
+        OperatorPhysicalDesignDecisionV2::NoAction { reason } => match reason {
+            OperatorPhysicalDesignNoActionReasonV2::BelowMinimumReports => {
+                "no_action: below_minimum_reports"
+            }
+            OperatorPhysicalDesignNoActionReasonV2::BelowMinimumShapeDiversity => {
+                "no_action: below_minimum_shape_diversity"
+            }
+            OperatorPhysicalDesignNoActionReasonV2::BelowMinimumActualWork => {
+                "no_action: below_minimum_actual_work"
+            }
+            OperatorPhysicalDesignNoActionReasonV2::ExistingDesignCovers => {
+                "no_action: existing_design_covers"
+            }
+            OperatorPhysicalDesignNoActionReasonV2::UnsupportedCurrentLayout => {
+                "no_action: unsupported_current_layout"
+            }
+            OperatorPhysicalDesignNoActionReasonV2::IncompleteEvidence => {
+                "no_action: incomplete_evidence"
+            }
+            OperatorPhysicalDesignNoActionReasonV2::CurrentProjectionUnavailable => {
+                "no_action: current_projection_unavailable"
+            }
+            OperatorPhysicalDesignNoActionReasonV2::RecommendationLimitReached => {
+                "no_action: recommendation_limit_reached"
+            }
+        },
+    }
+}
+
+const fn render_scheduler_gate(gate: OperatorSchedulerGateV2) -> &'static str {
     match gate {
-        OperatorSchedulerGateV1::Open {
-            delay_class: OperatorSchedulerDelayClassV1::Normal,
+        OperatorSchedulerGateV2::Open {
+            delay_class: OperatorSchedulerDelayClassV2::Normal,
         } => "open (normal)",
-        OperatorSchedulerGateV1::Open {
-            delay_class: OperatorSchedulerDelayClassV1::Idle,
+        OperatorSchedulerGateV2::Open {
+            delay_class: OperatorSchedulerDelayClassV2::Idle,
         } => "open (idle)",
-        OperatorSchedulerGateV1::Open {
-            delay_class: OperatorSchedulerDelayClassV1::NoProgress,
+        OperatorSchedulerGateV2::Open {
+            delay_class: OperatorSchedulerDelayClassV2::NoProgress,
         } => "open (no_progress)",
-        OperatorSchedulerGateV1::AwaitingTrialProgress { .. } => "awaiting_trial_progress",
-        OperatorSchedulerGateV1::AwaitingEvidenceRenewal { .. } => "awaiting_evidence_renewal",
-        OperatorSchedulerGateV1::Faulted {
-            fault: OperatorSchedulerFaultV1::MaintenanceEnvelopeExceeded,
+        OperatorSchedulerGateV2::AwaitingTrialProgress { .. } => "awaiting_trial_progress",
+        OperatorSchedulerGateV2::AwaitingEvidenceRenewal { .. } => "awaiting_evidence_renewal",
+        OperatorSchedulerGateV2::Faulted {
+            fault: OperatorSchedulerFaultV2::MaintenanceEnvelopeExceeded,
         } => "faulted (maintenance_envelope_exceeded)",
-        OperatorSchedulerGateV1::Faulted {
-            fault: OperatorSchedulerFaultV1::StepFailed,
+        OperatorSchedulerGateV2::Faulted {
+            fault: OperatorSchedulerFaultV2::StepFailed,
         } => "faulted (step_failed)",
-        OperatorSchedulerGateV1::Faulted {
-            fault: OperatorSchedulerFaultV1::ConsumptionOverflow,
+        OperatorSchedulerGateV2::Faulted {
+            fault: OperatorSchedulerFaultV2::ConsumptionOverflow,
         } => "faulted (consumption_overflow)",
     }
 }
@@ -199,6 +319,13 @@ enum Action {
     OperatorReset {
         manifest: PathBuf,
     },
+    OperatorPhysicalDesignRecommendations {
+        manifest: PathBuf,
+    },
+    OperatorPhysicalDesignRotate {
+        manifest: PathBuf,
+        expected_evidence_epoch: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +338,9 @@ enum HelpTopic {
     OperatorStatus,
     OperatorRotate,
     OperatorReset,
+    OperatorPhysicalDesign,
+    OperatorPhysicalDesignRecommendations,
+    OperatorPhysicalDesignRotate,
 }
 
 impl HelpTopic {
@@ -224,6 +354,11 @@ impl HelpTopic {
             Self::OperatorStatus => OPERATOR_STATUS_HELP,
             Self::OperatorRotate => OPERATOR_ROTATE_HELP,
             Self::OperatorReset => OPERATOR_RESET_HELP,
+            Self::OperatorPhysicalDesign => OPERATOR_PHYSICAL_DESIGN_HELP,
+            Self::OperatorPhysicalDesignRecommendations => {
+                OPERATOR_PHYSICAL_DESIGN_RECOMMENDATIONS_HELP
+            }
+            Self::OperatorPhysicalDesignRotate => OPERATOR_PHYSICAL_DESIGN_ROTATE_HELP,
         }
     }
 }
@@ -296,8 +431,67 @@ fn parse_operator(mut arguments: impl Iterator<Item = OsString>) -> Result<Actio
                 Action::OperatorReset { manifest }
             })
         }
+        Some("physical-design") => parse_operator_physical_design(arguments),
         _ => Err(UsageError::UnknownOperatorCommand(subcommand)),
     }
+}
+
+fn parse_operator_physical_design(
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<Action, UsageError> {
+    let subcommand = arguments
+        .next()
+        .ok_or(UsageError::PhysicalDesignCommandRequired)?;
+    if subcommand == "--help" || subcommand == "-h" {
+        return no_extra(arguments, Action::Help(HelpTopic::OperatorPhysicalDesign));
+    }
+    match subcommand.to_str() {
+        Some("recommendations") => parse_operator_simple(
+            arguments,
+            HelpTopic::OperatorPhysicalDesignRecommendations,
+            |manifest| Action::OperatorPhysicalDesignRecommendations { manifest },
+        ),
+        Some("rotate-evidence") => parse_operator_physical_design_rotate(arguments),
+        _ => Err(UsageError::UnknownPhysicalDesignCommand(subcommand)),
+    }
+}
+
+fn parse_operator_physical_design_rotate(
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<Action, UsageError> {
+    let mut manifest = None;
+    let mut expected = None;
+    while let Some(argument) = arguments.next() {
+        if argument == "--help" || argument == "-h" {
+            if manifest.is_none() && expected.is_none() {
+                return no_extra(
+                    arguments,
+                    Action::Help(HelpTopic::OperatorPhysicalDesignRotate),
+                );
+            }
+            return Err(UsageError::UnexpectedArgument(argument));
+        }
+        match argument.to_str() {
+            Some("--manifest") => set_once(
+                &mut manifest,
+                PathBuf::from(required_value(&mut arguments, "--manifest")?),
+                "--manifest",
+            )?,
+            Some("--expected-evidence-epoch") => {
+                let raw = required_value(&mut arguments, "--expected-evidence-epoch")?;
+                let parsed = raw
+                    .to_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .ok_or(UsageError::InvalidEvidenceEpoch(raw))?;
+                set_once(&mut expected, parsed, "--expected-evidence-epoch")?;
+            }
+            _ => return Err(UsageError::UnknownArgument(argument)),
+        }
+    }
+    Ok(Action::OperatorPhysicalDesignRotate {
+        manifest: manifest.ok_or(UsageError::ManifestRequired)?,
+        expected_evidence_epoch: expected.ok_or(UsageError::ExpectedEvidenceEpochRequired)?,
+    })
 }
 
 fn parse_operator_simple(
@@ -511,6 +705,12 @@ impl fmt::Display for OperationalError {
                 formatter,
                 "inspection failed: {primary}; additionally failed to close database: {close}"
             ),
+            Self::Operator(OperatorClientError::Remote(OperatorRemoteErrorV2 {
+                code: OperatorErrorCodeV2::ResponseTooLarge,
+                ..
+            })) => formatter.write_str(
+                "operator recommendation response exceeds NBOP v2 payload limit; reduce physical-design evidence/recommendation cardinality in Manifest and restart",
+            ),
             Self::Operator(error) => error.fmt(formatter),
         }
     }
@@ -525,6 +725,8 @@ enum UsageError {
     UnknownInspectCommand(OsString),
     OperatorCommandRequired,
     UnknownOperatorCommand(OsString),
+    PhysicalDesignCommandRequired,
+    UnknownPhysicalDesignCommand(OsString),
     ManifestRequired,
     SqlSourceRequired,
     SqlSourceConflict,
@@ -536,6 +738,8 @@ enum UsageError {
     UnexpectedArgument(OsString),
     ExpectedWindowEpochRequired,
     InvalidWindowEpoch(OsString),
+    ExpectedEvidenceEpochRequired,
+    InvalidEvidenceEpoch(OsString),
 }
 
 impl fmt::Display for UsageError {
@@ -551,11 +755,19 @@ impl fmt::Display for UsageError {
                 command.to_string_lossy()
             ),
             Self::OperatorCommandRequired => formatter.write_str(
-                "operator requires `status`, `rotate-evidence`, or `reset-faulted-scheduler`",
+                "operator requires `status`, `rotate-evidence`, `reset-faulted-scheduler`, or `physical-design`",
             ),
             Self::UnknownOperatorCommand(command) => write!(
                 formatter,
                 "unknown operator command `{}`",
+                command.to_string_lossy()
+            ),
+            Self::PhysicalDesignCommandRequired => formatter.write_str(
+                "physical-design requires `recommendations` or `rotate-evidence`",
+            ),
+            Self::UnknownPhysicalDesignCommand(command) => write!(
+                formatter,
+                "unknown physical-design command `{}`",
                 command.to_string_lossy()
             ),
             Self::ManifestRequired => formatter.write_str("--manifest is required"),
@@ -591,6 +803,14 @@ impl fmt::Display for UsageError {
             Self::InvalidWindowEpoch(value) => write!(
                 formatter,
                 "invalid window epoch `{}`; expected an unsigned integer",
+                value.to_string_lossy()
+            ),
+            Self::ExpectedEvidenceEpochRequired => {
+                formatter.write_str("--expected-evidence-epoch is required")
+            }
+            Self::InvalidEvidenceEpoch(value) => write!(
+                formatter,
+                "invalid evidence epoch `{}`; expected an unsigned integer",
                 value.to_string_lossy()
             ),
         }
@@ -646,6 +866,9 @@ impl From<OperationalError> for CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netbadb_server::{
+        OperatorPhysicalDesignEvidenceSummaryV2, OperatorPhysicalIndexCandidateV2,
+    };
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -798,5 +1021,84 @@ mod tests {
             ])),
             Err(UsageError::ExpectedWindowEpochRequired)
         ));
+        assert_eq!(
+            parse_args(args(&[
+                "operator",
+                "physical-design",
+                "recommendations",
+                "--manifest",
+                "server.json"
+            ]))
+            .unwrap(),
+            Action::OperatorPhysicalDesignRecommendations {
+                manifest: PathBuf::from("server.json")
+            }
+        );
+        assert_eq!(
+            parse_args(args(&[
+                "operator",
+                "physical-design",
+                "rotate-evidence",
+                "--expected-evidence-epoch",
+                "9",
+                "--manifest",
+                "server.json"
+            ]))
+            .unwrap(),
+            Action::OperatorPhysicalDesignRotate {
+                manifest: PathBuf::from("server.json"),
+                expected_evidence_epoch: 9,
+            }
+        );
+        assert!(matches!(
+            parse_args(args(&[
+                "operator",
+                "physical-design",
+                "rotate-evidence",
+                "--manifest",
+                "server.json"
+            ])),
+            Err(UsageError::ExpectedEvidenceEpochRequired)
+        ));
+    }
+
+    #[test]
+    fn recommendation_output_uses_canonical_ids_and_observed_work_only() {
+        let output =
+            render_physical_design_recommendations(&OperatorPhysicalDesignAdvisorReportV2 {
+                evidence_epoch: 7,
+                schema_generation: 8,
+                first_global_commit_seq: 9,
+                last_global_commit_seq: 10,
+                recorded_reports: 11,
+                discarded_incomplete_reports: 0,
+                overflowed: false,
+                incomplete: false,
+                index_candidates: vec![OperatorPhysicalIndexCandidateV2 {
+                    table_id: 12,
+                    column_id: 13,
+                    point_report_count: 14,
+                    range_report_count: 15,
+                    evidence: OperatorPhysicalDesignEvidenceSummaryV2 {
+                        report_count: 16,
+                        distinct_query_shapes: 17,
+                        total_actual_scan_work_units: 18,
+                        total_rows_examined: 19,
+                        overflowed: false,
+                        incomplete: false,
+                        truncated: false,
+                    },
+                    decision: OperatorPhysicalDesignDecisionV2::NoAction {
+                        reason: OperatorPhysicalDesignNoActionReasonV2::ExistingDesignCovers,
+                    },
+                }],
+                columnar_candidates: Vec::new(),
+            });
+        assert!(output.contains("TableId(12), ColumnId(13)"));
+        assert!(output.contains("observed actual scan work: 18"));
+        assert!(output.contains("no_action: existing_design_covers"));
+        for forbidden in ["CREATE INDEX", "estimated_savings", "speedup", "roi"] {
+            assert!(!output.contains(forbidden));
+        }
     }
 }

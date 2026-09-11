@@ -51,10 +51,15 @@ fn users_table() -> TableDef {
     )
 }
 
-fn manifest_fixture(transport: &str, driven: bool, with_operator: bool) -> Fixture {
+fn manifest_fixture(
+    transport: &str,
+    driven: bool,
+    with_physical_design: bool,
+    with_operator: bool,
+) -> Fixture {
     let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
-        "netbadbd-v6-{transport}-{}-{sequence}",
+        "netbadbd-v7-{transport}-{}-{sequence}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&directory);
@@ -71,18 +76,21 @@ fn manifest_fixture(transport: &str, driven: bool, with_operator: bool) -> Fixtu
         std::process::id()
     ));
     let _ = std::fs::remove_file(&socket);
-    let document = include_str!("../../../docs/server-manifest-v6.md");
+    let document = include_str!("../../../docs/server-manifest-v7.md");
     let example = document
         .split_once("```json\n")
         .and_then(|(_, remainder)| remainder.split_once("\n```"))
         .map(|(example, _)| example)
-        .expect("v6 documentation contains a JSON example");
+        .expect("v7 documentation contains a JSON example");
     let mut source: serde_json::Value = serde_json::from_str(example).unwrap();
     source["listen"] = "127.0.0.1:0".into();
     source["operator"]["unix_socket"] = socket.to_string_lossy().into_owned().into();
     let object = source.as_object_mut().unwrap();
     if !driven {
         object.remove("adaptive");
+    }
+    if !with_physical_design {
+        object.remove("physical_design");
     }
     if !with_operator {
         object.remove("operator");
@@ -204,16 +212,21 @@ fn assert_driven_operator(fixture: &Fixture) {
     let config = ServerConfig::from_manifest_path(&fixture.manifest).unwrap();
     let operator = config.operator_config().unwrap();
     let status = ServerOperatorClient::new(operator).status().unwrap();
-    assert!(status.driver.is_some());
+    assert!(status.adaptive.unwrap().driver.is_some());
+    assert!(status.physical_design.is_some());
 }
 
 #[test]
 fn native_sigterm_gracefully_closes_driven_daemon_and_removes_operator_socket() {
-    let fixture = manifest_fixture("native-sigterm", true, true);
+    let fixture = manifest_fixture("native-sigterm", true, true, true);
     let mut daemon = DaemonProcess::spawn(&fixture.manifest, false);
     let ready = daemon.wait_for_readiness();
     assert!(ready.contains("native listener"), "readiness line: {ready}");
     assert!(ready.contains("adaptive driven"), "readiness line: {ready}");
+    assert!(
+        ready.contains("physical-design enabled"),
+        "readiness line: {ready}"
+    );
     assert!(!ready.contains(fixture.socket.as_ref().unwrap().to_string_lossy().as_ref()));
     assert_driven_operator(&fixture);
 
@@ -231,11 +244,15 @@ fn native_sigterm_gracefully_closes_driven_daemon_and_removes_operator_socket() 
 
 #[test]
 fn native_sigint_gracefully_closes_disabled_daemon_without_operator() {
-    let fixture = manifest_fixture("native-sigint", false, false);
+    let fixture = manifest_fixture("native-sigint", false, false, false);
     let mut daemon = DaemonProcess::spawn(&fixture.manifest, false);
     let ready = daemon.wait_for_readiness();
     assert!(
         ready.contains("adaptive disabled"),
+        "readiness line: {ready}"
+    );
+    assert!(
+        ready.contains("physical-design disabled"),
         "readiness line: {ready}"
     );
 
@@ -247,7 +264,7 @@ fn native_sigint_gracefully_closes_disabled_daemon_without_operator() {
 
 #[test]
 fn postgres_sigterm_gracefully_closes_driven_daemon() {
-    let fixture = manifest_fixture("postgres-sigterm", true, true);
+    let fixture = manifest_fixture("postgres-sigterm", true, true, true);
     let mut daemon = DaemonProcess::spawn(&fixture.manifest, true);
     let ready = daemon.wait_for_readiness();
     assert!(
@@ -255,6 +272,10 @@ fn postgres_sigterm_gracefully_closes_driven_daemon() {
         "readiness line: {ready}"
     );
     assert!(ready.contains("adaptive driven"), "readiness line: {ready}");
+    assert!(
+        ready.contains("physical-design enabled"),
+        "readiness line: {ready}"
+    );
     assert_driven_operator(&fixture);
 
     daemon.send_signal("SIGTERM");
@@ -266,7 +287,7 @@ fn postgres_sigterm_gracefully_closes_driven_daemon() {
 
 #[test]
 fn operator_startup_failure_never_publishes_readiness() {
-    let fixture = manifest_fixture("operator-conflict", true, true);
+    let fixture = manifest_fixture("operator-conflict", true, true, true);
     let socket = fixture.socket.as_ref().unwrap();
     std::fs::write(socket, b"owned elsewhere").unwrap();
 
@@ -280,5 +301,61 @@ fn operator_startup_failure_never_publishes_readiness() {
         "startup failure output: {lines:?}"
     );
     assert_eq!(std::fs::read(socket).unwrap(), b"owned elsewhere");
+    fixture.cleanup();
+}
+
+#[test]
+fn native_design_only_daemon_exposes_status_and_conditional_rotation() {
+    let fixture = manifest_fixture("native-design-only", false, true, true);
+    let mut daemon = DaemonProcess::spawn(&fixture.manifest, false);
+    let ready = daemon.wait_for_readiness();
+    assert!(
+        ready.contains("adaptive disabled"),
+        "readiness line: {ready}"
+    );
+    assert!(
+        ready.contains("physical-design enabled"),
+        "readiness line: {ready}"
+    );
+
+    let config = ServerConfig::from_manifest_path(&fixture.manifest).unwrap();
+    let operator = ServerOperatorClient::new(config.operator_config().unwrap());
+    let status = operator.status().unwrap();
+    assert!(status.adaptive.is_none());
+    assert_eq!(status.physical_design.unwrap().evidence.epoch, 0);
+    let rotation = operator.rotate_physical_design_evidence(0).unwrap();
+    assert_eq!(rotation.previous_epoch, 0);
+    assert_eq!(rotation.new_epoch, 1);
+
+    daemon.send_signal("SIGTERM");
+    let (status, _) = daemon.wait();
+    assert!(status.success());
+    assert!(!fixture.socket.as_ref().unwrap().exists());
+    fixture.cleanup();
+}
+
+#[test]
+fn postgres_design_only_daemon_exposes_nbop_v2_status() {
+    let fixture = manifest_fixture("postgres-design-only", false, true, true);
+    let mut daemon = DaemonProcess::spawn(&fixture.manifest, true);
+    let ready = daemon.wait_for_readiness();
+    assert!(
+        ready.contains("adaptive disabled"),
+        "readiness line: {ready}"
+    );
+    assert!(
+        ready.contains("physical-design enabled"),
+        "readiness line: {ready}"
+    );
+    let config = ServerConfig::from_manifest_path(&fixture.manifest).unwrap();
+    let status = ServerOperatorClient::new(config.operator_config().unwrap())
+        .status()
+        .unwrap();
+    assert!(status.adaptive.is_none());
+    assert!(status.physical_design.is_some());
+
+    daemon.send_signal("SIGTERM");
+    let (status, _) = daemon.wait();
+    assert!(status.success());
     fixture.cleanup();
 }

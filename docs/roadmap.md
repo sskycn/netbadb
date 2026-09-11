@@ -1,5 +1,23 @@
 # NetbaDB roadmap
 
+## Physical Design deployment/operator presentation (Adaptive Operations Phase 22 complete)
+
+- upgraded the sole current deployment contract to strict Manifest v7 with an
+  optional complete Physical Design limits/policy snapshot and no defaults;
+- made operator deployment legal for Adaptive, Physical Design, or both while
+  preserving their independent worker-owned evidence domains;
+- upgraded the local plane to NBOP v2 with multi-domain status, explicit
+  physical-design DTOs, current-inventory recommendations, conditional design
+  rotation, stable errors, and bounded `response_too_large` fallback;
+- added official CLI status, recommendations, and conditional design rotation,
+  plus Native/PostgreSQL manifest startup and daemon readiness presentation;
+- retained observation-only advice: no design apply, DDL generation, identity
+  reservation, projection build, background advisor, or scheduler authority.
+
+See [`adaptive-operations-phase22.md`](adaptive-operations-phase22.md),
+[`server-manifest-v7.md`](server-manifest-v7.md), and
+[`server-operator-protocol-v2.md`](server-operator-protocol-v2.md).
+
 ## Server Physical Design evidence bridge (Adaptive Operations Phase 21 complete)
 
 - added explicit programmatic Native and PostgreSQL opt-in with independent

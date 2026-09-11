@@ -56,7 +56,7 @@ const MAX_CATALOG_PATTERN_ATOMS: usize = 1_024;
 pub struct PostgresTcpServer {
     config: ServerConfig,
     adaptive_override: Option<ServerAdaptiveStartupMode>,
-    physical_design: Option<ServerPhysicalDesignAdvisorConfig>,
+    physical_design_override: Option<ServerPhysicalDesignAdvisorConfig>,
 }
 
 impl PostgresTcpServer {
@@ -65,7 +65,7 @@ impl PostgresTcpServer {
         Self {
             config,
             adaptive_override: None,
-            physical_design: None,
+            physical_design_override: None,
         }
     }
 
@@ -92,7 +92,7 @@ impl PostgresTcpServer {
         mut self,
         config: ServerPhysicalDesignAdvisorConfig,
     ) -> Self {
-        self.physical_design = Some(config);
+        self.physical_design_override = Some(config);
         self
     }
 
@@ -104,10 +104,11 @@ impl PostgresTcpServer {
             security,
             authorization,
             manifest_adaptive_mode,
+            manifest_physical_design,
             operator_config,
         ) = self.config.into_parts();
         let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
-        let physical_design = self.physical_design;
+        let physical_design = self.physical_design_override.or(manifest_physical_design);
         if security.kind() != TransportKind::PlaintextLoopback {
             return Err(PostgresTcpServerError::TlsManifestUnsupported);
         }
@@ -195,6 +196,7 @@ impl PostgresTcpServer {
             Some(config) => match ServerOperatorPlane::start(
                 config,
                 adaptive_control.clone(),
+                physical_design_control.clone(),
                 operator_failure_tx,
             ) {
                 Ok(operator) => Some(operator),

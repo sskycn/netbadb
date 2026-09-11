@@ -11,12 +11,15 @@ use netbadb_core::{
     AdaptiveWorkloadPolicy, AutomaticCalibrationTrialPolicy, AutomaticCrossLaneServicePolicy,
     AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope, AutomaticSafeModePolicy,
     AutomaticSchedulerPolicy, AutomaticSchedulerPolicyError, CalibrationRatio,
-    CalibrationRatioError, MaintenanceBudget, PlannerCalibrationClass, PlannerCalibrationPolicy,
+    CalibrationRatioError, MaintenanceBudget, PhysicalDesignAdvisorPolicy,
+    PhysicalDesignEvidenceLimits, PhysicalDesignRecommendationPolicy, PlannerCalibrationClass,
+    PlannerCalibrationPolicy,
 };
 use netbadb_schema::{ColumnDef, Schema, SchemaError, TableDef, TypeSpec};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 use serde::{Deserialize, Deserializer};
 
+use crate::ServerPhysicalDesignAdvisorConfig;
 use crate::adaptive_driver::ServerAdaptiveStartupMode;
 use crate::authorization::{AuthorizationPolicy, TablePermissions, parse_certificate_sha256};
 use crate::tls::{MutualTlsConfig, TlsMaterialPaths, TransportSecurity};
@@ -31,7 +34,7 @@ use crate::{
 use crate::{ServerOperatorConfig, ServerOperatorConfigError};
 use crate::{TlsConfigError, TransportKind};
 
-pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 6;
+pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 7;
 pub const DEFAULT_LISTEN_ADDRESS: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878);
 
@@ -51,8 +54,20 @@ pub struct ServerConfig {
     tls: Option<MutualTlsConfig>,
     authorization: AuthorizationPolicy,
     adaptive_mode: ServerAdaptiveStartupMode,
+    physical_design: Option<ServerPhysicalDesignAdvisorConfig>,
     operator: Option<ServerOperatorConfig>,
 }
+
+pub(crate) type ServerConfigParts = (
+    SocketAddr,
+    Vec<TableBootstrap>,
+    ServerLimits,
+    TransportSecurity,
+    AuthorizationPolicy,
+    ServerAdaptiveStartupMode,
+    Option<ServerPhysicalDesignAdvisorConfig>,
+    Option<ServerOperatorConfig>,
+);
 
 impl ServerConfig {
     pub fn from_manifest_path(path: impl AsRef<Path>) -> Result<Self, ManifestError> {
@@ -77,8 +92,14 @@ impl ServerConfig {
             .map_or(Ok(ServerAdaptiveStartupMode::Disabled), |adaptive| {
                 adaptive.into_runtime()
             })?;
-        if operator.is_some() && matches!(adaptive_mode, ServerAdaptiveStartupMode::Disabled) {
-            return Err(ManifestError::OperatorRequiresAdaptive);
+        let physical_design = manifest
+            .physical_design
+            .map(ManifestPhysicalDesign::into_config);
+        if operator.is_some()
+            && matches!(adaptive_mode, ServerAdaptiveStartupMode::Disabled)
+            && physical_design.is_none()
+        {
+            return Err(ManifestError::OperatorRequiresManagedRuntime);
         }
 
         let listen = match manifest.listen {
@@ -175,6 +196,7 @@ impl ServerConfig {
             tls,
             authorization,
             adaptive_mode,
+            physical_design,
             operator,
         })
     }
@@ -210,6 +232,18 @@ impl ServerConfig {
         self.adaptive_mode.mode()
     }
 
+    /// Returns whether manifest-derived physical-design observation is enabled.
+    #[must_use]
+    pub const fn physical_design_enabled(&self) -> bool {
+        self.physical_design.is_some()
+    }
+
+    /// Returns the complete manifest-derived physical-design configuration.
+    #[must_use]
+    pub const fn physical_design_config(&self) -> Option<&ServerPhysicalDesignAdvisorConfig> {
+        self.physical_design.as_ref()
+    }
+
     /// Returns the resolved local operator configuration without binding or
     /// connecting to its socket.
     #[must_use]
@@ -217,17 +251,7 @@ impl ServerConfig {
         self.operator.as_ref()
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        SocketAddr,
-        Vec<TableBootstrap>,
-        ServerLimits,
-        TransportSecurity,
-        AuthorizationPolicy,
-        ServerAdaptiveStartupMode,
-        Option<ServerOperatorConfig>,
-    ) {
+    pub(crate) fn into_parts(self) -> ServerConfigParts {
         let security = self
             .tls
             .map_or(TransportSecurity::PlaintextLoopback, |tls| {
@@ -240,6 +264,7 @@ impl ServerConfig {
             security,
             self.authorization,
             self.adaptive_mode,
+            self.physical_design,
             self.operator,
         )
     }
@@ -298,7 +323,7 @@ pub enum ManifestError {
         source: CalibrationRatioError,
     },
     AdaptiveDriverConfig(ServerAdaptiveDriverConfigError),
-    OperatorRequiresAdaptive,
+    OperatorRequiresManagedRuntime,
     OperatorSocketPath(PathBuf),
     OperatorSocketParent {
         path: PathBuf,
@@ -381,9 +406,8 @@ impl fmt::Display for ManifestError {
             Self::AdaptiveDriverConfig(error) => {
                 write!(formatter, "invalid adaptive driver configuration: {error}")
             }
-            Self::OperatorRequiresAdaptive => {
-                formatter.write_str("operator plane requires Adaptive to be enabled")
-            }
+            Self::OperatorRequiresManagedRuntime => formatter
+                .write_str("operator plane requires Adaptive or Physical Design to be enabled"),
             Self::OperatorSocketPath(path) => write!(
                 formatter,
                 "operator Unix socket path `{}` must name a file",
@@ -431,7 +455,7 @@ impl Error for ManifestError {
             | Self::TablePathIsNotFile(_)
             | Self::DuplicateStoragePath(_)
             | Self::TlsPathIsNotFile { .. }
-            | Self::OperatorRequiresAdaptive
+            | Self::OperatorRequiresManagedRuntime
             | Self::OperatorSocketPath(_)
             | Self::OperatorSocketParentNotDirectory(_) => None,
         }
@@ -455,8 +479,91 @@ struct DeploymentManifest {
     tables: Vec<ManifestTable>,
     #[serde(default, deserialize_with = "deserialize_optional_adaptive")]
     adaptive: Option<ManifestAdaptive>,
+    #[serde(default, deserialize_with = "deserialize_optional_physical_design")]
+    physical_design: Option<ManifestPhysicalDesign>,
     #[serde(default, deserialize_with = "deserialize_optional_operator")]
     operator: Option<ManifestOperator>,
+}
+
+fn deserialize_optional_physical_design<'de, D>(
+    deserializer: D,
+) -> Result<Option<ManifestPhysicalDesign>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    ManifestPhysicalDesign::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestPhysicalDesign {
+    evidence_limits: ManifestPhysicalDesignEvidenceLimits,
+    advisor_policy: ManifestPhysicalDesignAdvisorPolicy,
+}
+
+impl ManifestPhysicalDesign {
+    const fn into_config(self) -> ServerPhysicalDesignAdvisorConfig {
+        ServerPhysicalDesignAdvisorConfig::new(
+            self.evidence_limits.into_limits(),
+            self.advisor_policy.into_policy(),
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestPhysicalDesignEvidenceLimits {
+    max_index_candidates: u64,
+    max_columnar_candidates: u64,
+    max_query_shapes_per_candidate: u64,
+    max_columnar_columns_per_candidate: u64,
+}
+
+impl ManifestPhysicalDesignEvidenceLimits {
+    const fn into_limits(self) -> PhysicalDesignEvidenceLimits {
+        PhysicalDesignEvidenceLimits {
+            max_index_candidates: self.max_index_candidates,
+            max_columnar_candidates: self.max_columnar_candidates,
+            max_query_shapes_per_candidate: self.max_query_shapes_per_candidate,
+            max_columnar_columns_per_candidate: self.max_columnar_columns_per_candidate,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestPhysicalDesignAdvisorPolicy {
+    index: ManifestPhysicalDesignRecommendationPolicy,
+    columnar: ManifestPhysicalDesignRecommendationPolicy,
+}
+
+impl ManifestPhysicalDesignAdvisorPolicy {
+    const fn into_policy(self) -> PhysicalDesignAdvisorPolicy {
+        PhysicalDesignAdvisorPolicy {
+            index: self.index.into_policy(),
+            columnar: self.columnar.into_policy(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestPhysicalDesignRecommendationPolicy {
+    minimum_reports: u64,
+    minimum_distinct_query_shapes: u64,
+    minimum_actual_scan_work_units: u64,
+    max_recommendations: u32,
+}
+
+impl ManifestPhysicalDesignRecommendationPolicy {
+    const fn into_policy(self) -> PhysicalDesignRecommendationPolicy {
+        PhysicalDesignRecommendationPolicy {
+            minimum_reports: self.minimum_reports,
+            minimum_distinct_query_shapes: self.minimum_distinct_query_shapes,
+            minimum_actual_scan_work_units: self.minimum_actual_scan_work_units,
+            max_recommendations: self.max_recommendations,
+        }
+    }
 }
 
 fn deserialize_optional_operator<'de, D>(
@@ -1210,7 +1317,7 @@ mod tests {
         let listen = listen.map_or_else(String::new, |listen| format!("\"listen\": \"{listen}\","));
         format!(
             r#"{{
-                "version": 6,
+                "version": 7,
                 {listen}
                 "authorization": {{
                     "local_plaintext": {{
@@ -1262,6 +1369,31 @@ mod tests {
                 "max_calibration_epochs": 4,
                 "max_calibration_query_shapes": 64,
                 "max_calibration_plan_variants_per_shape": 8
+            }
+        })
+    }
+
+    fn physical_design_json() -> serde_json::Value {
+        json!({
+            "evidence_limits": {
+                "max_index_candidates": 11,
+                "max_columnar_candidates": 12,
+                "max_query_shapes_per_candidate": 13,
+                "max_columnar_columns_per_candidate": 14
+            },
+            "advisor_policy": {
+                "index": {
+                    "minimum_reports": 21,
+                    "minimum_distinct_query_shapes": 22,
+                    "minimum_actual_scan_work_units": 23,
+                    "max_recommendations": 24
+                },
+                "columnar": {
+                    "minimum_reports": 31,
+                    "minimum_distinct_query_shapes": 32,
+                    "minimum_actual_scan_work_units": 33,
+                    "max_recommendations": 34
+                }
             }
         })
     }
@@ -1408,30 +1540,37 @@ mod tests {
     }
 
     #[test]
-    fn changing_only_v5_version_to_v6_preserves_non_operator_runtime_behavior() {
-        let directory = test_directory("v5-v6-migration");
+    fn changing_only_v6_version_to_v7_preserves_runtime_behavior() {
+        let directory = test_directory("v6-v7-migration");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         create_heap(&directory.join("users.ndb"));
         let manifest = directory.join("server.json");
-        let v6 = manifest_json(Some("127.0.0.1:0"), "users.ndb", "UserId");
-        let v5 = v6.replacen("\"version\": 6", "\"version\": 5", 1);
-        std::fs::write(&manifest, &v5).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&manifest_json(Some("127.0.0.1:0"), "users.ndb", "UserId"))
+                .unwrap();
+        value["adaptive"] = json!({"mode": "feedback_only", "feedback": feedback_json()});
+        value["operator"] = json!({
+            "unix_socket": "operator.sock",
+            "io_timeout_ms": 1000
+        });
+        let v7 = serde_json::to_string(&value).unwrap();
+        let mut v6_value = value.clone();
+        v6_value["version"] = json!(6);
+        let v6 = serde_json::to_string(&v6_value).unwrap();
+        std::fs::write(&manifest, &v6).unwrap();
         assert!(matches!(
             ServerConfig::from_manifest_path(&manifest),
-            Err(ManifestError::UnsupportedVersion(5))
+            Err(ManifestError::UnsupportedVersion(6))
         ));
 
-        std::fs::write(
-            &manifest,
-            v5.replacen("\"version\": 5", "\"version\": 6", 1),
-        )
-        .unwrap();
+        std::fs::write(&manifest, v7).unwrap();
         let config = ServerConfig::from_manifest_path(&manifest).unwrap();
         assert_eq!(config.listen(), "127.0.0.1:0".parse().unwrap());
         assert_eq!(config.limits(), ServerLimits::default());
-        assert_eq!(config.adaptive_mode(), ServerAdaptiveMode::Disabled);
-        assert!(config.operator_config().is_none());
+        assert_eq!(config.adaptive_mode(), ServerAdaptiveMode::FeedbackOnly);
+        assert!(!config.physical_design_enabled());
+        assert!(config.operator_config().is_some());
         assert_eq!(config.tables()[0].table, users_table("UserId"));
 
         std::fs::remove_dir_all(directory).unwrap();
@@ -1508,7 +1647,130 @@ mod tests {
     }
 
     #[test]
-    fn operator_is_optional_requires_adaptive_and_resolves_from_manifest_directory() {
+    fn physical_design_maps_exactly_and_preserves_zero_semantics() {
+        let directory = test_directory("physical-design-mapping");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        create_heap(&directory.join("users.ndb"));
+        let manifest = directory.join("server.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&manifest_json(None, "users.ndb", "UserId")).unwrap();
+        assert!(
+            !ServerConfig::from_manifest_path({
+                std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+                &manifest
+            })
+            .unwrap()
+            .physical_design_enabled()
+        );
+
+        value["physical_design"] = physical_design_json();
+        std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        let design = *config.physical_design_config().unwrap();
+        assert_eq!(
+            design.evidence_limits(),
+            PhysicalDesignEvidenceLimits {
+                max_index_candidates: 11,
+                max_columnar_candidates: 12,
+                max_query_shapes_per_candidate: 13,
+                max_columnar_columns_per_candidate: 14,
+            }
+        );
+        assert_eq!(
+            design.advisor_policy(),
+            PhysicalDesignAdvisorPolicy {
+                index: PhysicalDesignRecommendationPolicy {
+                    minimum_reports: 21,
+                    minimum_distinct_query_shapes: 22,
+                    minimum_actual_scan_work_units: 23,
+                    max_recommendations: 24,
+                },
+                columnar: PhysicalDesignRecommendationPolicy {
+                    minimum_reports: 31,
+                    minimum_distinct_query_shapes: 32,
+                    minimum_actual_scan_work_units: 33,
+                    max_recommendations: 34,
+                },
+            }
+        );
+
+        value["physical_design"] = json!({
+            "evidence_limits": {
+                "max_index_candidates": 0,
+                "max_columnar_candidates": 0,
+                "max_query_shapes_per_candidate": 0,
+                "max_columnar_columns_per_candidate": 0
+            },
+            "advisor_policy": {
+                "index": {
+                    "minimum_reports": 0,
+                    "minimum_distinct_query_shapes": 0,
+                    "minimum_actual_scan_work_units": 0,
+                    "max_recommendations": 0
+                },
+                "columnar": {
+                    "minimum_reports": 0,
+                    "minimum_distinct_query_shapes": 0,
+                    "minimum_actual_scan_work_units": 0,
+                    "max_recommendations": 0
+                }
+            }
+        });
+        std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        let zero = *ServerConfig::from_manifest_path(&manifest)
+            .unwrap()
+            .physical_design_config()
+            .unwrap();
+        assert_eq!(zero.evidence_limits().max_index_candidates, 0);
+        assert_eq!(zero.advisor_policy().index.minimum_reports, 0);
+        assert_eq!(zero.advisor_policy().columnar.max_recommendations, 0);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn physical_design_json_is_strict_complete_and_non_null() {
+        let directory = test_directory("physical-design-strict");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        create_heap(&directory.join("users.ndb"));
+        let manifest = directory.join("server.json");
+        let base: serde_json::Value =
+            serde_json::from_str(&manifest_json(None, "users.ndb", "UserId")).unwrap();
+        for physical_design in [
+            json!(null),
+            json!({}),
+            json!({"evidence_limits": {}, "advisor_policy": {}}),
+            {
+                let mut value = physical_design_json();
+                value["unknown"] = json!(true);
+                value
+            },
+            {
+                let mut value = physical_design_json();
+                value["evidence_limits"]["unknown"] = json!(true);
+                value
+            },
+            {
+                let mut value = physical_design_json();
+                value["advisor_policy"]["index"]["unknown"] = json!(true);
+                value
+            },
+        ] {
+            let mut value = base.clone();
+            value["physical_design"] = physical_design;
+            std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(matches!(
+                ServerConfig::from_manifest_path(&manifest),
+                Err(ManifestError::Json(_))
+            ));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn operator_is_optional_requires_a_managed_runtime_and_resolves_from_manifest_directory() {
         let directory = test_directory("operator-config");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(directory.join("run")).unwrap();
@@ -1530,7 +1792,7 @@ mod tests {
         std::fs::write(&manifest, serde_json::to_vec(&invalid).unwrap()).unwrap();
         assert!(matches!(
             ServerConfig::from_manifest_path(&manifest),
-            Err(ManifestError::OperatorRequiresAdaptive)
+            Err(ManifestError::OperatorRequiresManagedRuntime)
         ));
 
         for adaptive in [
@@ -1553,6 +1815,26 @@ mod tests {
             assert_eq!(operator.io_timeout(), Duration::from_millis(5000));
             assert!(!operator.unix_socket().exists());
         }
+
+        let mut design_only = disabled.clone();
+        design_only["physical_design"] = physical_design_json();
+        design_only["operator"] = json!({
+            "unix_socket": "run/operator.sock",
+            "io_timeout_ms": 5000
+        });
+        std::fs::write(&manifest, serde_json::to_vec(&design_only).unwrap()).unwrap();
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        assert_eq!(config.adaptive_mode(), ServerAdaptiveMode::Disabled);
+        assert!(config.physical_design_enabled());
+        assert!(config.operator_config().is_some());
+
+        let mut both = design_only;
+        both["adaptive"] = json!({"mode": "feedback_only", "feedback": feedback_json()});
+        std::fs::write(&manifest, serde_json::to_vec(&both).unwrap()).unwrap();
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        assert_eq!(config.adaptive_mode(), ServerAdaptiveMode::FeedbackOnly);
+        assert!(config.physical_design_enabled());
+        assert!(config.operator_config().is_some());
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1645,9 +1927,11 @@ mod tests {
         let server = crate::TcpServer::new(config).start().unwrap();
         let client = crate::ServerOperatorClient::new(&operator_config);
         let before = client.status().unwrap();
-        assert_eq!(before.mode, crate::OperatorAdaptiveModeV1::FeedbackOnly);
-        assert_eq!(before.feedback.window_epoch, 0);
-        assert!(before.driver.is_none());
+        let adaptive = before.adaptive.as_ref().unwrap();
+        assert_eq!(adaptive.mode, crate::OperatorAdaptiveModeV2::FeedbackOnly);
+        assert_eq!(adaptive.feedback.window_epoch, 0);
+        assert!(adaptive.driver.is_none());
+        assert!(before.physical_design.is_none());
         for _ in 0..100 {
             assert_eq!(client.status().unwrap(), before);
         }
@@ -1660,34 +1944,60 @@ mod tests {
             }
         }))
         .unwrap();
-        let mut frame = b"NBOP\0\x01\0\0".to_vec();
+        let mut frame = b"NBOP\0\x02\0\0".to_vec();
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&payload);
         let mut lost_response = UnixStream::connect(operator_config.unix_socket()).unwrap();
         lost_response.write_all(&frame).unwrap();
         lost_response.shutdown(Shutdown::Both).unwrap();
         for _ in 0..100 {
-            if client.status().unwrap().feedback.window_epoch == 1 {
+            if client
+                .status()
+                .unwrap()
+                .adaptive
+                .unwrap()
+                .feedback
+                .window_epoch
+                == 1
+            {
                 break;
             }
             std::thread::yield_now();
         }
-        assert_eq!(client.status().unwrap().feedback.window_epoch, 1);
+        assert_eq!(
+            client
+                .status()
+                .unwrap()
+                .adaptive
+                .unwrap()
+                .feedback
+                .window_epoch,
+            1
+        );
         assert!(matches!(
             client.rotate_evidence(0),
             Err(crate::OperatorClientError::Remote(
-                crate::OperatorRemoteErrorV1 {
-                    code: crate::OperatorErrorCodeV1::EvidenceWindowChanged,
+                crate::OperatorRemoteErrorV2 {
+                    code: crate::OperatorErrorCodeV2::EvidenceWindowChanged,
                     ..
                 }
             ))
         ));
-        assert_eq!(client.status().unwrap().feedback.window_epoch, 1);
+        assert_eq!(
+            client
+                .status()
+                .unwrap()
+                .adaptive
+                .unwrap()
+                .feedback
+                .window_epoch,
+            1
+        );
         assert!(matches!(
             client.reset_faulted_scheduler(),
             Err(crate::OperatorClientError::Remote(
-                crate::OperatorRemoteErrorV1 {
-                    code: crate::OperatorErrorCodeV1::DriverNotEnabled,
+                crate::OperatorRemoteErrorV2 {
+                    code: crate::OperatorErrorCodeV2::DriverNotEnabled,
                     ..
                 }
             ))
@@ -1757,18 +2067,18 @@ mod tests {
     }
 
     #[test]
-    fn documented_v6_driven_example_is_a_golden_manifest() {
-        let directory = test_directory("documented-v6-example");
+    fn documented_v7_driven_example_is_a_golden_manifest() {
+        let directory = test_directory("documented-v7-example");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(directory.join("run")).unwrap();
         create_heap(&directory.join("users.ndb"));
         let manifest = directory.join("server.json");
-        let document = include_str!("../../../docs/server-manifest-v6.md");
+        let document = include_str!("../../../docs/server-manifest-v7.md");
         let example = document
             .split_once("```json\n")
             .and_then(|(_, remainder)| remainder.split_once("\n```"))
             .map(|(example, _)| example)
-            .expect("v6 documentation contains a JSON example")
+            .expect("v7 documentation contains a JSON example")
             .replace("127.0.0.1:7878", "127.0.0.1:0")
             .replace("data/users.ndb", "users.ndb");
         std::fs::write(&manifest, example).unwrap();
@@ -2096,6 +2406,126 @@ mod tests {
     }
 
     #[test]
+    fn manifest_physical_design_starts_both_transports_and_builder_override_is_independent() {
+        let directory = test_directory("physical-design-startup");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        create_heap(&directory.join("users.ndb"));
+        let manifest = directory.join("server.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&manifest_json(Some("127.0.0.1:0"), "users.ndb", "UserId"))
+                .unwrap();
+        value["physical_design"] = physical_design_json();
+        value["adaptive"] = json!({"mode": "feedback_only", "feedback": feedback_json()});
+        std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+
+        let native = crate::TcpServer::new(config.clone()).start().unwrap();
+        assert_eq!(
+            native
+                .physical_design_control()
+                .status()
+                .unwrap()
+                .evidence
+                .limits
+                .max_index_candidates,
+            11
+        );
+        assert_eq!(
+            native.adaptive_control().status().unwrap().mode,
+            ServerAdaptiveMode::FeedbackOnly
+        );
+        native.shutdown().unwrap();
+
+        let postgres = crate::PostgresTcpServer::new(config.clone())
+            .start()
+            .unwrap();
+        assert_eq!(
+            postgres
+                .physical_design_control()
+                .status()
+                .unwrap()
+                .evidence
+                .limits
+                .max_columnar_candidates,
+            12
+        );
+        postgres.shutdown().unwrap();
+
+        let replacement = ServerPhysicalDesignAdvisorConfig::new(
+            PhysicalDesignEvidenceLimits {
+                max_index_candidates: 91,
+                max_columnar_candidates: 92,
+                max_query_shapes_per_candidate: 93,
+                max_columnar_columns_per_candidate: 94,
+            },
+            PhysicalDesignAdvisorPolicy {
+                index: PhysicalDesignRecommendationPolicy {
+                    minimum_reports: 1,
+                    minimum_distinct_query_shapes: 1,
+                    minimum_actual_scan_work_units: 1,
+                    max_recommendations: 1,
+                },
+                columnar: PhysicalDesignRecommendationPolicy {
+                    minimum_reports: 2,
+                    minimum_distinct_query_shapes: 2,
+                    minimum_actual_scan_work_units: 2,
+                    max_recommendations: 2,
+                },
+            },
+        );
+        let mut driven_value = value;
+        driven_value["adaptive"] = driven_adaptive_json();
+        std::fs::write(&manifest, serde_json::to_vec(&driven_value).unwrap()).unwrap();
+        let driven_config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        let ServerAdaptiveStartupMode::Driven(driver) = driven_config.adaptive_mode else {
+            panic!("expected driven manifest mode");
+        };
+        let native = crate::TcpServer::new(config.clone())
+            .with_adaptive_driver(*driver)
+            .with_physical_design_advisor(replacement)
+            .start()
+            .unwrap();
+        assert_eq!(
+            native
+                .physical_design_control()
+                .status()
+                .unwrap()
+                .evidence
+                .limits
+                .max_index_candidates,
+            91
+        );
+        assert_eq!(
+            native.adaptive_control().status().unwrap().mode,
+            ServerAdaptiveMode::Driven
+        );
+        native.shutdown().unwrap();
+
+        let postgres = crate::PostgresTcpServer::new(config)
+            .with_physical_design_advisor(replacement)
+            .start()
+            .unwrap();
+        assert_eq!(
+            postgres
+                .physical_design_control()
+                .status()
+                .unwrap()
+                .evidence
+                .limits
+                .max_index_candidates,
+            91
+        );
+        assert_eq!(
+            postgres.adaptive_control().status().unwrap().mode,
+            ServerAdaptiveMode::FeedbackOnly
+        );
+        postgres.shutdown().unwrap();
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn unknown_adaptive_table_fails_before_worker_readiness() {
         let directory = test_directory("adaptive-unknown-table");
         let _ = std::fs::remove_dir_all(&directory);
@@ -2198,7 +2628,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let manifest = directory.join("server.json");
 
-        for version in [1, 2, 3, 4, 5, 7] {
+        for version in [1, 2, 3, 4, 5, 6, 8] {
             std::fs::write(&manifest, format!(r#"{{"version":{version},"tables":[]}}"#)).unwrap();
             assert!(matches!(
                 ServerConfig::from_manifest_path(&manifest),
@@ -2208,7 +2638,7 @@ mod tests {
 
         std::fs::write(
             &manifest,
-            r#"{"version":6,"unexpected":true,"authorization":{"local_plaintext":{"tables":[{"table_id":1,"read":true}]}},"tables":[]}"#,
+            r#"{"version":7,"unexpected":true,"authorization":{"local_plaintext":{"tables":[{"table_id":1,"read":true}]}},"tables":[]}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -2283,7 +2713,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_v6_authorization_is_required_strict_and_schema_bound() {
+    fn manifest_v7_authorization_is_required_strict_and_schema_bound() {
         let directory = test_directory("authorization");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();

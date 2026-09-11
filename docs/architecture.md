@@ -328,6 +328,17 @@ status, on-demand read-only current-inventory recommendations, and atomic
 compare-and-rotate by design epoch. There is no automatic advisor, apply path,
 scheduler lane, persistence, Manifest v7, NBOP change, or wire change.
 
+[Adaptive Operations Phase 22](adaptive-operations-phase22.md) upgrades the
+current deployment contract to strict Manifest v7 and the local operator plane
+to [NBOP v2](server-operator-protocol-v2.md). Manifest v7 explicitly maps all
+Physical Design evidence bounds and independent Index/Columnar advisor
+thresholds into the existing Phase 21 runtime. NBOP v2 projects optional
+Adaptive and Physical Design status, current-inventory read-only advice, and
+conditional design-evidence rotation through typed worker controls. Oversized
+advice returns `response_too_large` rather than changing or truncating the
+report. No Database owner, DDL/apply authority, scheduler lane, persistent
+format, Native/PG wire, or Inspection JSON contract changes.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,
@@ -340,7 +351,7 @@ defer retirement until the last reader is gone. See [Columnar Phase
 The `netbadb` CLI is an offline adapter, not a new compiler or planner layer:
 
 ```text
-deployment manifest v6
+deployment manifest v7
           ↓
 netbadb-server ServerConfig bootstrap
           ↓
