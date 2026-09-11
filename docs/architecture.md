@@ -263,6 +263,18 @@ ordinary non-instrumented paths. Admission failure is telemetry-only, and the
 bridge performs no retry, automatic rotation, scheduler tick, orchestration,
 maintenance, visibility-mode change, manifest update, or wire change.
 
+[Adaptive Operations Phase 16](adaptive-operations-phase16.md) adds the
+Server host-time to cooperative-scheduler bridge. Native and PostgreSQL accept
+loops use wall clock only to offer monotonically numbered logical ticks; a
+single pending reply coalesces missed intervals and prevents maintenance debt.
+The typed tick enters the existing Database worker, where the worker-owned
+Phase 15 evidence pool and Phase 13 scheduler invoke Phase 12 at most once.
+Bounded status, explicit evidence rotation, and fault-only scheduler reset are
+programmatic handle operations routed through the same owner. No Database,
+pool, or scheduler moves to a timer or connection thread, and Manifest v4,
+`netbadbd`, Protocol v2, PostgreSQL wire, and Inspection JSON v7 remain
+unchanged.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

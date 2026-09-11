@@ -23,6 +23,12 @@ use netbadb_protocol::WireTransactionState;
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, SemanticType, TableId};
 use sha2::{Digest, Sha256};
 
+use crate::adaptive_driver::{
+    ServerAdaptiveControlHandle, ServerAdaptiveDriverConfig, ServerAdaptiveDriverConfigError,
+    ServerAdaptiveHostConfig, ServerAdaptiveHostDriver, ServerAdaptiveStartupMode,
+    ServerAdaptiveWorkerCommand, ServerAdaptiveWorkerRuntime, forward_control_requests,
+    handle_disabled_worker_command,
+};
 use crate::adaptive_feedback::{
     ServerAdaptiveFeedbackRuntime, execute_prepared_with_optional_server_feedback,
 };
@@ -42,7 +48,7 @@ const MAX_CATALOG_PATTERN_ATOMS: usize = 1_024;
 
 pub struct PostgresTcpServer {
     config: ServerConfig,
-    adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
+    adaptive_mode: ServerAdaptiveStartupMode,
 }
 
 impl PostgresTcpServer {
@@ -50,7 +56,7 @@ impl PostgresTcpServer {
     pub fn new(config: ServerConfig) -> Self {
         Self {
             config,
-            adaptive_feedback: None,
+            adaptive_mode: ServerAdaptiveStartupMode::Disabled,
         }
     }
 
@@ -58,7 +64,15 @@ impl PostgresTcpServer {
     /// PostgreSQL server's database worker. The wire contract is unchanged.
     #[must_use]
     pub fn with_adaptive_feedback(mut self, config: ServerAdaptiveFeedbackConfig) -> Self {
-        self.adaptive_feedback = Some(config);
+        self.adaptive_mode = ServerAdaptiveStartupMode::FeedbackOnly(config);
+        self
+    }
+
+    /// Enables feedback capture plus host-time logical scheduling in the
+    /// existing PostgreSQL database worker. The wire contract is unchanged.
+    #[must_use]
+    pub fn with_adaptive_driver(mut self, config: ServerAdaptiveDriverConfig) -> Self {
+        self.adaptive_mode = ServerAdaptiveStartupMode::Driven(Box::new(config));
         self
     }
 
@@ -67,11 +81,12 @@ impl PostgresTcpServer {
         if security.kind() != TransportKind::PlaintextLoopback {
             return Err(PostgresTcpServerError::TlsManifestUnsupported);
         }
+        let tick_interval = self.adaptive_mode.tick_interval();
         let worker = PgDatabaseWorker::start(
             tables,
             limits.session_policy(),
             authorization,
-            self.adaptive_feedback,
+            self.adaptive_mode,
         )?;
         let listener = match TcpListener::bind(listen) {
             Ok(listener) => listener,
@@ -95,13 +110,26 @@ impl PostgresTcpServer {
             }
         };
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (adaptive_control_tx, adaptive_control_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("netbadb-postgres-server".into())
-            .spawn(move || run_pg_accept_loop(listener, shutdown_rx, worker, limits))
+            .spawn(move || {
+                run_pg_accept_loop(
+                    listener,
+                    shutdown_rx,
+                    worker,
+                    limits,
+                    ServerAdaptiveHostConfig {
+                        tick_interval,
+                        controls: adaptive_control_rx,
+                    },
+                )
+            })
             .map_err(PostgresTcpServerError::ThreadSpawn)?;
         Ok(PostgresServerHandle {
             local_addr,
             shutdown_tx,
+            adaptive_control: ServerAdaptiveControlHandle::new(adaptive_control_tx),
             join: Some(join),
         })
     }
@@ -114,6 +142,7 @@ impl PostgresTcpServer {
 pub struct PostgresServerHandle {
     local_addr: SocketAddr,
     shutdown_tx: Sender<()>,
+    adaptive_control: ServerAdaptiveControlHandle,
     join: Option<JoinHandle<Result<(), PostgresTcpServerError>>>,
 }
 
@@ -121,6 +150,11 @@ impl PostgresServerHandle {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    #[must_use]
+    pub fn adaptive_control(&self) -> ServerAdaptiveControlHandle {
+        self.adaptive_control.clone()
     }
 
     pub fn shutdown(mut self) -> Result<(), PostgresTcpServerError> {
@@ -153,6 +187,7 @@ pub enum PostgresTcpServerError {
     Accept(io::Error),
     ThreadSpawn(io::Error),
     Database(DatabaseError),
+    AdaptiveConfig(ServerAdaptiveDriverConfigError),
     WorkerStopped,
     WorkerClose(String),
     ThreadPanicked,
@@ -181,6 +216,9 @@ impl fmt::Display for PostgresTcpServerError {
                 formatter,
                 "PostgreSQL database worker startup failed: {error}"
             ),
+            Self::AdaptiveConfig(error) => {
+                write!(formatter, "adaptive driver startup failed: {error}")
+            }
             Self::WorkerStopped => {
                 formatter.write_str("PostgreSQL database worker stopped unexpectedly")
             }
@@ -202,6 +240,7 @@ impl Error for PostgresTcpServerError {
             | Self::Accept(source)
             | Self::ThreadSpawn(source) => Some(source),
             Self::Database(error) => Some(error),
+            Self::AdaptiveConfig(error) => Some(error),
             _ => None,
         }
     }
@@ -217,15 +256,38 @@ fn run_pg_accept_loop(
     shutdown: Receiver<()>,
     worker: PgDatabaseWorker,
     limits: ServerLimits,
+    adaptive_host_config: ServerAdaptiveHostConfig,
 ) -> Result<(), PostgresTcpServerError> {
     let mut connections = Vec::new();
     let mut next_session_id = 1_u64;
+    let mut adaptive_host = adaptive_host_config
+        .tick_interval
+        .map(ServerAdaptiveHostDriver::new);
     loop {
         match shutdown.try_recv() {
             Ok(()) | Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {}
         }
         reap_pg_connections(&mut connections);
+        if let Some(host) = adaptive_host.as_mut() {
+            host.poll(|command| {
+                worker
+                    .client
+                    .commands
+                    .send(PgWorkerCommand::Adaptive(command))
+                    .map_err(|_| ())
+            });
+        }
+        let host_snapshot = adaptive_host
+            .as_ref()
+            .map(ServerAdaptiveHostDriver::snapshot);
+        forward_control_requests(&adaptive_host_config.controls, host_snapshot, |command| {
+            worker
+                .client
+                .commands
+                .send(PgWorkerCommand::Adaptive(command))
+                .map_err(|_| ())
+        });
         match listener.accept() {
             Ok((stream, _)) => {
                 if connections.len() >= limits.max_connections() {
@@ -430,7 +492,7 @@ impl PgDatabaseWorker {
         tables: Vec<TableBootstrap>,
         policy: SessionPolicy,
         authorization: AuthorizationPolicy,
-        adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
+        adaptive_mode: ServerAdaptiveStartupMode,
     ) -> Result<Self, PostgresTcpServerError> {
         let (commands, receiver) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -444,14 +506,21 @@ impl PgDatabaseWorker {
                 let database = match Database::open_tables(entries) {
                     Ok(database) => database,
                     Err(error) => {
-                        let _ = ready_tx.send(Err(error));
+                        let _ = ready_tx.send(Err(PgWorkerStartupError::Database(error)));
                         return Ok(());
+                    }
+                };
+                let adaptive = match ServerAdaptiveWorkerRuntime::new(adaptive_mode, &database) {
+                    Ok(adaptive) => adaptive,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(PgWorkerStartupError::Adaptive(error)));
+                        return database.close().map_err(|error| error.to_string());
                     }
                 };
                 if ready_tx.send(Ok(())).is_err() {
                     return database.close().map_err(|error| error.to_string());
                 }
-                run_pg_worker(database, policy, authorization, adaptive_feedback, receiver)
+                run_pg_worker(database, policy, authorization, adaptive, receiver)
             })
             .map_err(PostgresTcpServerError::ThreadSpawn)?;
         match ready_rx
@@ -462,9 +531,13 @@ impl PgDatabaseWorker {
                 client: PgWorkerClient { commands },
                 join,
             }),
-            Err(error) => {
+            Err(PgWorkerStartupError::Database(error)) => {
                 let _ = join.join();
                 Err(PostgresTcpServerError::Database(error))
+            }
+            Err(PgWorkerStartupError::Adaptive(error)) => {
+                let _ = join.join();
+                Err(PostgresTcpServerError::AdaptiveConfig(error))
             }
         }
     }
@@ -502,20 +575,25 @@ enum PgWorkerCommand {
         session_id: u64,
         reply: SyncSender<Result<(), PgConnectionError>>,
     },
+    Adaptive(ServerAdaptiveWorkerCommand),
     Shutdown {
         reply: SyncSender<()>,
     },
+}
+
+enum PgWorkerStartupError {
+    Database(DatabaseError),
+    Adaptive(ServerAdaptiveDriverConfigError),
 }
 
 fn run_pg_worker(
     mut database: Database,
     policy: SessionPolicy,
     authorization: AuthorizationPolicy,
-    adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
+    mut adaptive: Option<ServerAdaptiveWorkerRuntime>,
     commands: Receiver<PgWorkerCommand>,
 ) -> Result<(), String> {
     let mut sessions: HashMap<u64, PgWorkerSession> = HashMap::new();
-    let mut adaptive_feedback = adaptive_feedback.map(ServerAdaptiveFeedbackRuntime::new);
     while let Ok(command) = commands.recv() {
         match command {
             PgWorkerCommand::Open {
@@ -561,7 +639,9 @@ fn run_pg_worker(
                 };
                 let messages = session.handle_with_adaptive_feedback(
                     &mut database,
-                    adaptive_feedback.as_mut(),
+                    adaptive
+                        .as_mut()
+                        .map(ServerAdaptiveWorkerRuntime::feedback_mut),
                     message,
                 );
                 let _ = reply.send(Ok(messages));
@@ -579,6 +659,10 @@ fn run_pg_worker(
                 }
                 let _ = reply.send(result);
             }
+            PgWorkerCommand::Adaptive(command) => match adaptive.as_mut() {
+                Some(adaptive) => adaptive.handle(&mut database, command),
+                None => handle_disabled_worker_command(command),
+            },
             PgWorkerCommand::Shutdown { reply } => {
                 for session in sessions.values_mut() {
                     session

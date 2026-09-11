@@ -4,15 +4,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use netbadb_core::Database;
+use netbadb_core::{
+    AdaptiveEvidencePoolLimits, AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope,
+    AutomaticSchedulerPolicy, Database, MaintenanceBudget,
+};
 use netbadb_protocol::{
     ClientMessage, Frame, ProtocolErrorCode, ServerMessage, WireTransactionState,
     encode_client_frame, read_server_frame, write_client_frame,
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
-    AuthorizationConfigError, ManifestError, ServerConfig, ServerHandle, TcpServer, TcpServerError,
-    TransportKind,
+    AuthorizationConfigError, ManifestError, ServerAdaptiveControlError,
+    ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig, ServerAdaptiveMode, ServerConfig,
+    ServerHandle, TcpServer, TcpServerError, TransportKind,
 };
 use netbadb_storage::{wal_alternate_path, wal_path};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
@@ -30,6 +34,24 @@ fn test_directory(name: &str) -> PathBuf {
 
 fn cleanup(directory: &Path) {
     let _ = std::fs::remove_dir_all(directory);
+}
+
+fn adaptive_driver_config(table_id: TableId) -> ServerAdaptiveDriverConfig {
+    let budget = MaintenanceBudget::new(u64::MAX, u64::MAX, u64::MAX, 4);
+    ServerAdaptiveDriverConfig::new(
+        ServerAdaptiveFeedbackConfig::new(AdaptiveEvidencePoolLimits::default()),
+        Duration::from_millis(10),
+        AutomaticSchedulerPolicy::new(1, 2, 2, 3).unwrap(),
+        AutomaticOrchestrationEnvelope {
+            max_steps: 4,
+            per_step_maintenance_budget: budget,
+            run_maintenance_budget: budget,
+        },
+        AutomaticMultiSafeModePolicy::default(),
+        vec![table_id],
+        Vec::new(),
+    )
+    .unwrap()
 }
 
 fn users_table(semantic_name: &str) -> TableDef {
@@ -221,6 +243,85 @@ fn create_two_table_server(name: &str, authorization: &str) -> (PathBuf, ServerH
         .start()
         .unwrap();
     (directory, server)
+}
+
+#[test]
+fn native_adaptive_driver_reaches_worker_and_control_stays_host_mediated() {
+    let directory = test_directory("adaptive-driver");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    Database::create(directory.join("users.ndb"), users_table("UserId"))
+        .unwrap()
+        .close()
+        .unwrap();
+    let manifest = directory.join("server.json");
+    std::fs::write(&manifest, manifest_json("users.ndb", "UserId")).unwrap();
+    let server = TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .with_adaptive_driver(adaptive_driver_config(TableId(1)))
+        .start()
+        .unwrap();
+    let control = server.adaptive_control();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        let status = control.status().unwrap();
+        if status
+            .driver
+            .is_some_and(|driver| driver.scheduler_tick_count >= 1)
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "adaptive tick did not reach worker"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(status.mode, ServerAdaptiveMode::Driven);
+    assert!(status.feedback.is_some());
+    let driver = status.driver.unwrap();
+    assert!(driver.driver_tick_count >= 1);
+    assert_eq!(
+        driver.scheduler_tick_count,
+        driver.scheduler_ran_count + driver.scheduler_held_count + driver.scheduler_error_count
+    );
+    let mut client = Client::connect(server.local_addr());
+    assert!(matches!(
+        client.hello().as_slice(),
+        [ServerMessage::HelloAck { .. }]
+    ));
+    let query = client.request(
+        2,
+        ClientMessage::Execute {
+            sql: "SELECT id FROM users".into(),
+        },
+    );
+    assert!(matches!(
+        query.as_slice(),
+        [
+            ServerMessage::QueryStart { .. },
+            ServerMessage::QueryEnd { row_count: 0 }
+        ]
+    ));
+    client.close_clean();
+    let captured = control.status().unwrap().feedback.unwrap();
+    assert_eq!(captured.eligible_query_count, 1);
+    assert_eq!(
+        captured.record_success_count + captured.record_error_count,
+        1
+    );
+    let before = status.feedback.unwrap().evidence_progress.window_epoch.0;
+    let rotation = control.rotate_evidence().unwrap();
+    assert_eq!(rotation.new_window_epoch.0, before + 1);
+    assert_eq!(
+        control.reset_faulted_scheduler(),
+        Err(ServerAdaptiveControlError::SchedulerNotFaulted)
+    );
+    server.shutdown().unwrap();
+    assert_eq!(
+        control.status(),
+        Err(ServerAdaptiveControlError::ServerStopped)
+    );
+    cleanup(&directory);
 }
 
 struct TestIdentity {

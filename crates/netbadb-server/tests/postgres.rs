@@ -1,11 +1,18 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use netbadb_core::Database;
+use netbadb_core::{
+    AdaptiveEvidencePoolLimits, AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope,
+    AutomaticSchedulerPolicy, Database, MaintenanceBudget,
+};
 use netbadb_pgwire::{CANCEL_REQUEST_CODE, PROTOCOL_VERSION_3, SSL_REQUEST_CODE};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
-use netbadb_server::{PostgresTcpServer, ServerConfig};
+use netbadb_server::{
+    PostgresTcpServer, ServerAdaptiveControlError, ServerAdaptiveDriverConfig,
+    ServerAdaptiveFeedbackConfig, ServerAdaptiveMode, ServerConfig,
+};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 
 fn test_directory(name: &str) -> PathBuf {
@@ -14,6 +21,24 @@ fn test_directory(name: &str) -> PathBuf {
 
 fn cleanup(path: &Path) {
     let _ = std::fs::remove_dir_all(path);
+}
+
+fn adaptive_driver_config(table_id: TableId) -> ServerAdaptiveDriverConfig {
+    let budget = MaintenanceBudget::new(u64::MAX, u64::MAX, u64::MAX, 4);
+    ServerAdaptiveDriverConfig::new(
+        ServerAdaptiveFeedbackConfig::new(AdaptiveEvidencePoolLimits::default()),
+        Duration::from_millis(10),
+        AutomaticSchedulerPolicy::new(1, 2, 2, 3).unwrap(),
+        AutomaticOrchestrationEnvelope {
+            max_steps: 4,
+            per_step_maintenance_budget: budget,
+            run_maintenance_budget: budget,
+        },
+        AutomaticMultiSafeModePolicy::default(),
+        vec![table_id],
+        Vec::new(),
+    )
+    .unwrap()
 }
 
 fn users_table() -> TableDef {
@@ -77,6 +102,88 @@ fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
         .start()
         .unwrap();
     (directory, server)
+}
+
+#[test]
+fn postgres_adaptive_driver_reaches_worker_without_changing_wire_state() {
+    let directory = test_directory("adaptive-driver");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    Database::create(directory.join("users.ndb"), users_table())
+        .unwrap()
+        .close()
+        .unwrap();
+    let manifest = directory.join("server.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+            "version": 4,
+            "listen": "127.0.0.1:0",
+            "authorization": {
+                "local_plaintext": {"schema_admin": true,
+                    "tables": [{"table_id":1,"read":true,"write":true,"transaction":true,"analyze":false}]
+                },
+                "clients": []
+            },
+            "tables": [{
+                "path":"users.ndb","id":1,"name":"users",
+                "columns":[
+                    {"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false,"primary_key":true},
+                    {"id":2,"name":"name","physical_type":"text","semantic_type":null,"nullable":true,"primary_key":false},
+                    {"id":3,"name":"active","physical_type":"bool","semantic_type":null,"nullable":false,"primary_key":false}
+                ]
+            }]
+        }"#,
+    )
+    .unwrap();
+    let server = PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .with_adaptive_driver(adaptive_driver_config(TableId(1)))
+        .start()
+        .unwrap();
+    let control = server.adaptive_control();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        let status = control.status().unwrap();
+        if status
+            .driver
+            .is_some_and(|driver| driver.scheduler_tick_count >= 1)
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "adaptive tick did not reach worker"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(status.mode, ServerAdaptiveMode::Driven);
+    assert!(status.feedback.is_some());
+
+    let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+    startup(&mut stream);
+    let messages = query(&mut stream, "SELECT id FROM users");
+    assert_eq!(messages.last().map(|message| message.0), Some(b'Z'));
+    assert_eq!(messages.last().unwrap().1, [b'I']);
+    stream.write_all(&frontend(b'X', &[])).unwrap();
+    drop(stream);
+    let captured = control.status().unwrap().feedback.unwrap();
+    assert_eq!(captured.eligible_query_count, 1);
+    assert_eq!(
+        captured.record_success_count + captured.record_error_count,
+        1
+    );
+    let rotation = control.rotate_evidence().unwrap();
+    assert_eq!(rotation.new_window_epoch.0, 1);
+    assert_eq!(
+        control.reset_faulted_scheduler(),
+        Err(ServerAdaptiveControlError::SchedulerNotFaulted)
+    );
+    server.shutdown().unwrap();
+    assert_eq!(
+        control.status(),
+        Err(ServerAdaptiveControlError::ServerStopped)
+    );
+    cleanup(&directory);
 }
 
 fn startup(stream: &mut TcpStream) {

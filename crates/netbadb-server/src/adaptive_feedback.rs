@@ -2,7 +2,6 @@ use netbadb_core::{
     AdaptiveEvidencePool, AdaptiveEvidencePoolLimits, AdaptiveEvidenceRecordError,
     AdaptiveEvidenceRecordOutcome, Database, DatabaseError, ExecutionResult, PreparedStatement,
 };
-#[cfg(test)]
 use netbadb_core::{
     AdaptiveEvidencePoolHealth, AdaptiveEvidencePoolInspection, AdaptiveEvidenceProgressToken,
 };
@@ -45,7 +44,6 @@ pub(crate) struct ServerAdaptiveFeedbackDiagnostics {
     pub(crate) last_record_error: Option<AdaptiveEvidenceRecordError>,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServerAdaptiveFeedbackInspection {
     pub(crate) diagnostics: ServerAdaptiveFeedbackDiagnostics,
@@ -78,7 +76,6 @@ impl ServerAdaptiveFeedbackRuntime {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn inspection(&self) -> ServerAdaptiveFeedbackInspection {
         let pool = self.pool.inspection();
         ServerAdaptiveFeedbackInspection {
@@ -87,6 +84,19 @@ impl ServerAdaptiveFeedbackRuntime {
             health: pool.health,
             pool,
         }
+    }
+
+    pub(crate) const fn pool(&self) -> &AdaptiveEvidencePool {
+        &self.pool
+    }
+
+    pub(crate) fn rotate_window(
+        &mut self,
+    ) -> Result<
+        netbadb_core::AdaptiveEvidenceRotationReport,
+        netbadb_core::AdaptiveEvidenceRotationError,
+    > {
+        self.pool.rotate_window()
     }
 
     fn increment(&mut self, counter: fn(&mut ServerAdaptiveFeedbackDiagnostics) -> &mut u64) {

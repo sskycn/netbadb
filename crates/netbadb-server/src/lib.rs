@@ -1,5 +1,6 @@
 //! Transport-neutral synchronous NetbaDB protocol sessions.
 
+mod adaptive_driver;
 mod adaptive_feedback;
 mod authorization;
 mod limits;
@@ -22,6 +23,11 @@ use netbadb_protocol::{
     WireTransactionState, validate_server_message,
 };
 
+pub use adaptive_driver::{
+    ServerAdaptiveControlError, ServerAdaptiveControlHandle, ServerAdaptiveDriverConfig,
+    ServerAdaptiveDriverConfigError, ServerAdaptiveDriverStatus, ServerAdaptiveFeedbackStatus,
+    ServerAdaptiveMode, ServerAdaptiveStatus,
+};
 pub use adaptive_feedback::ServerAdaptiveFeedbackConfig;
 pub use authorization::AuthorizationConfigError;
 pub use limits::{

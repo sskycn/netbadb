@@ -13,6 +13,12 @@ use netbadb_protocol::{
     write_server_frame,
 };
 
+use crate::adaptive_driver::{
+    ServerAdaptiveControlHandle, ServerAdaptiveDriverConfig, ServerAdaptiveDriverConfigError,
+    ServerAdaptiveHostConfig, ServerAdaptiveHostDriver, ServerAdaptiveStartupMode,
+    ServerAdaptiveWorkerCommand, ServerAdaptiveWorkerRuntime, forward_control_requests,
+    handle_disabled_worker_command,
+};
 use crate::adaptive_feedback::ServerAdaptiveFeedbackRuntime;
 use crate::authorization::{
     AuthorizationAction, AuthorizationDenied, AuthorizationPolicy, PrincipalAuthorization,
@@ -70,6 +76,7 @@ impl Error for WorkerFatalError {}
 pub enum TcpServerError {
     Manifest(ManifestError),
     Database(DatabaseError),
+    AdaptiveConfig(ServerAdaptiveDriverConfigError),
     Bind {
         address: SocketAddr,
         source: io::Error,
@@ -93,6 +100,9 @@ impl fmt::Display for TcpServerError {
         match self {
             Self::Manifest(error) => error.fmt(formatter),
             Self::Database(error) => write!(formatter, "database worker startup failed: {error}"),
+            Self::AdaptiveConfig(error) => {
+                write!(formatter, "adaptive driver startup failed: {error}")
+            }
             Self::Bind { address, source } => {
                 write!(
                     formatter,
@@ -122,6 +132,7 @@ impl Error for TcpServerError {
         match self {
             Self::Manifest(error) => Some(error),
             Self::Database(error) => Some(error),
+            Self::AdaptiveConfig(error) => Some(error),
             Self::Bind { source, .. }
             | Self::ListenerConfiguration(source)
             | Self::Accept(source)
@@ -144,7 +155,7 @@ impl From<ManifestError> for TcpServerError {
 
 pub struct TcpServer {
     config: ServerConfig,
-    adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
+    adaptive_mode: ServerAdaptiveStartupMode,
 }
 
 impl TcpServer {
@@ -152,7 +163,7 @@ impl TcpServer {
     pub fn new(config: ServerConfig) -> Self {
         Self {
             config,
-            adaptive_feedback: None,
+            adaptive_mode: ServerAdaptiveStartupMode::Disabled,
         }
     }
 
@@ -160,7 +171,15 @@ impl TcpServer {
     /// server's database worker. Deployment manifest v4 remains unchanged.
     #[must_use]
     pub fn with_adaptive_feedback(mut self, config: ServerAdaptiveFeedbackConfig) -> Self {
-        self.adaptive_feedback = Some(config);
+        self.adaptive_mode = ServerAdaptiveStartupMode::FeedbackOnly(config);
+        self
+    }
+
+    /// Enables feedback capture plus host-time logical scheduling in the
+    /// existing database worker. Deployment manifest v4 remains unchanged.
+    #[must_use]
+    pub fn with_adaptive_driver(mut self, config: ServerAdaptiveDriverConfig) -> Self {
+        self.adaptive_mode = ServerAdaptiveStartupMode::Driven(Box::new(config));
         self
     }
 
@@ -169,11 +188,12 @@ impl TcpServer {
         validate_listener_security(listen, security.kind() == TransportKind::MutualTls)?;
         let table_count = tables.len();
         let transport_kind = security.kind();
+        let tick_interval = self.adaptive_mode.tick_interval();
         let worker = DatabaseWorker::start(
             tables,
             limits.session_policy(),
             authorization,
-            self.adaptive_feedback,
+            self.adaptive_mode,
         )?;
         let metrics = ServerMetricsHandle::new();
         let listener = match TcpListener::bind(listen) {
@@ -204,6 +224,7 @@ impl TcpServer {
             }
         };
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (adaptive_control_tx, adaptive_control_rx) = mpsc::channel();
         let (worker_tx, worker_rx) = mpsc::sync_channel(0);
         let server_metrics = metrics.clone();
         let join = match thread::Builder::new()
@@ -219,6 +240,10 @@ impl TcpServer {
                     limits,
                     security,
                     server_metrics,
+                    ServerAdaptiveHostConfig {
+                        tick_interval,
+                        controls: adaptive_control_rx,
+                    },
                 )
             }) {
             Ok(join) => join,
@@ -243,6 +268,7 @@ impl TcpServer {
             transport_kind,
             metrics,
             shutdown_tx,
+            adaptive_control: ServerAdaptiveControlHandle::new(adaptive_control_tx),
             join: Some(join),
         })
     }
@@ -258,6 +284,7 @@ pub struct ServerHandle {
     transport_kind: TransportKind,
     metrics: ServerMetricsHandle,
     shutdown_tx: Sender<()>,
+    adaptive_control: ServerAdaptiveControlHandle,
     join: Option<JoinHandle<Result<(), TcpServerError>>>,
 }
 
@@ -285,6 +312,11 @@ impl ServerHandle {
     #[must_use]
     pub fn metrics_handle(&self) -> ServerMetricsHandle {
         self.metrics.clone()
+    }
+
+    #[must_use]
+    pub fn adaptive_control(&self) -> ServerAdaptiveControlHandle {
+        self.adaptive_control.clone()
     }
 
     pub fn shutdown(mut self) -> Result<(), TcpServerError> {
@@ -366,7 +398,7 @@ impl DatabaseWorker {
         tables: Vec<TableBootstrap>,
         session_policy: SessionPolicy,
         authorization: AuthorizationPolicy,
-        adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
+        adaptive_mode: ServerAdaptiveStartupMode,
     ) -> Result<Self, TcpServerError> {
         let (commands, command_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
@@ -381,8 +413,19 @@ impl DatabaseWorker {
                 let database = match Database::open_tables_with_expectation(entries) {
                     Ok(database) => database,
                     Err(error) => {
-                        let _ = ready_tx.send(Err(error));
+                        let _ = ready_tx.send(Err(WorkerStartupError::Database(error)));
                         return Ok(());
+                    }
+                };
+                let adaptive = match ServerAdaptiveWorkerRuntime::new(adaptive_mode, &database) {
+                    Ok(adaptive) => adaptive,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(WorkerStartupError::Adaptive(error)));
+                        return database.close().map_err(|error| {
+                            WorkerFatalError::DatabaseCloseFailed {
+                                message: error.to_string(),
+                            }
+                        });
                     }
                 };
                 if ready_tx.send(Ok(())).is_err() {
@@ -396,7 +439,7 @@ impl DatabaseWorker {
                     database,
                     session_policy,
                     authorization,
-                    adaptive_feedback,
+                    adaptive,
                     command_rx,
                     events_tx,
                 )
@@ -408,9 +451,13 @@ impl DatabaseWorker {
                 events,
                 join: Some(join),
             }),
-            Ok(Err(error)) => {
+            Ok(Err(WorkerStartupError::Database(error))) => {
                 let _ = join.join();
                 Err(TcpServerError::Database(error))
+            }
+            Ok(Err(WorkerStartupError::Adaptive(error))) => {
+                let _ = join.join();
+                Err(TcpServerError::AdaptiveConfig(error))
             }
             Err(_) => match join.join() {
                 Ok(Err(error)) => Err(TcpServerError::WorkerFatal(error)),
@@ -502,9 +549,15 @@ enum WorkerCommand {
         session_id: SessionId,
         reply: SyncSender<Result<(), WorkerRequestError>>,
     },
+    Adaptive(ServerAdaptiveWorkerCommand),
     Shutdown {
         reply: SyncSender<Result<(), WorkerFatalError>>,
     },
+}
+
+enum WorkerStartupError {
+    Database(DatabaseError),
+    Adaptive(ServerAdaptiveDriverConfigError),
 }
 
 #[derive(Debug, Clone)]
@@ -538,7 +591,7 @@ impl fmt::Display for WorkerRequestError {
 
 struct DatabaseWorkerState {
     database: Option<Database>,
-    adaptive_feedback: Option<ServerAdaptiveFeedbackRuntime>,
+    adaptive: Option<ServerAdaptiveWorkerRuntime>,
     sessions: HashMap<SessionId, WorkerSession>,
     session_policy: SessionPolicy,
     authorization: AuthorizationPolicy,
@@ -690,11 +743,11 @@ impl DatabaseWorkerState {
         database: Database,
         session_policy: SessionPolicy,
         authorization: AuthorizationPolicy,
-        adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
+        adaptive: Option<ServerAdaptiveWorkerRuntime>,
     ) -> Self {
         Self {
             database: Some(database),
-            adaptive_feedback: adaptive_feedback.map(ServerAdaptiveFeedbackRuntime::new),
+            adaptive,
             sessions: HashMap::new(),
             session_policy,
             authorization,
@@ -742,12 +795,11 @@ fn run_database_worker(
     database: Database,
     session_policy: SessionPolicy,
     authorization: AuthorizationPolicy,
-    adaptive_feedback: Option<ServerAdaptiveFeedbackConfig>,
+    adaptive: Option<ServerAdaptiveWorkerRuntime>,
     commands: Receiver<WorkerCommand>,
     events: Sender<WorkerFatalError>,
 ) -> Result<(), WorkerFatalError> {
-    let mut state =
-        DatabaseWorkerState::new(database, session_policy, authorization, adaptive_feedback);
+    let mut state = DatabaseWorkerState::new(database, session_policy, authorization, adaptive);
     while let Ok(command) = commands.recv() {
         match command {
             WorkerCommand::OpenSession {
@@ -795,7 +847,10 @@ fn run_database_worker(
                 };
                 let response = session.handle_with_adaptive_feedback(
                     database,
-                    state.adaptive_feedback.as_mut(),
+                    state
+                        .adaptive
+                        .as_mut()
+                        .map(ServerAdaptiveWorkerRuntime::feedback_mut),
                     frame.request_id,
                     frame.message,
                 );
@@ -815,6 +870,16 @@ fn run_database_worker(
                         let _ = events.send(error.clone());
                         return Err(error);
                     }
+                }
+            }
+            WorkerCommand::Adaptive(command) => {
+                let Some(database) = state.database.as_mut() else {
+                    handle_disabled_worker_command(command);
+                    continue;
+                };
+                match state.adaptive.as_mut() {
+                    Some(adaptive) => adaptive.handle(database, command),
+                    None => handle_disabled_worker_command(command),
                 }
             }
             WorkerCommand::Shutdown { reply } => {
@@ -847,11 +912,15 @@ fn run_accept_loop(
     limits: ServerLimits,
     security: TransportSecurity,
     metrics: ServerMetricsHandle,
+    adaptive_host_config: ServerAdaptiveHostConfig,
 ) -> Result<(), TcpServerError> {
     let client = worker.client();
     let mut connections = Vec::new();
     let mut next_session_id = 1_u64;
     let mut fatal = None;
+    let mut adaptive_host = adaptive_host_config
+        .tick_interval
+        .map(ServerAdaptiveHostDriver::new);
 
     loop {
         match shutdown.try_recv() {
@@ -869,6 +938,23 @@ fn run_accept_loop(
             }
         }
         reap_connections(&mut connections, &client, &metrics);
+        if let Some(host) = adaptive_host.as_mut() {
+            host.poll(|command| {
+                client
+                    .commands
+                    .send(WorkerCommand::Adaptive(command))
+                    .map_err(|_| ())
+            });
+        }
+        let host_snapshot = adaptive_host
+            .as_ref()
+            .map(ServerAdaptiveHostDriver::snapshot);
+        forward_control_requests(&adaptive_host_config.controls, host_snapshot, |command| {
+            client
+                .commands
+                .send(WorkerCommand::Adaptive(command))
+                .map_err(|_| ())
+        });
 
         match listener.accept() {
             Ok((stream, _peer)) => {
