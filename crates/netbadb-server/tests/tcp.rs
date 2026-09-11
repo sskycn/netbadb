@@ -704,6 +704,7 @@ fn assert_error(messages: &[ServerMessage], code: ProtocolErrorCode, state: Wire
 #[test]
 fn manifest_bootstrap_serves_handshake_query_dml_and_disconnect_rollback() {
     let (directory, _heap, table, server) = create_manifest_server("vertical");
+    assert!(!server.is_finished());
     let address = server.local_addr();
     let mut client = Client::connect(address);
     assert!(matches!(

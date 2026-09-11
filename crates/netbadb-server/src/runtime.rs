@@ -370,6 +370,17 @@ impl ServerHandle {
         self.adaptive_control.clone()
     }
 
+    /// Returns whether the main server thread or configured operator listener
+    /// has terminated. This is a lifecycle observation, not a health check.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.join.as_ref().is_none_or(JoinHandle::is_finished)
+            || self
+                .operator
+                .as_ref()
+                .is_some_and(ServerOperatorPlane::is_finished)
+    }
+
     pub fn shutdown(mut self) -> Result<(), TcpServerError> {
         let operator = self.operator.take().map(ServerOperatorPlane::shutdown);
         let _ = self.shutdown_tx.send(());
@@ -1327,6 +1338,7 @@ fn is_timeout(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use super::*;
@@ -1348,6 +1360,29 @@ mod tests {
             Some(limits.write_timeout())
         );
         drop(client);
+    }
+
+    #[test]
+    fn server_handle_is_finished_observes_main_thread_completion() {
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel();
+        let (adaptive_tx, _adaptive_rx) = mpsc::channel();
+        let join = thread::spawn(|| Ok(()));
+        while !join.is_finished() {
+            thread::yield_now();
+        }
+        let server = ServerHandle {
+            local_addr: "127.0.0.1:1".parse().unwrap(),
+            table_count: 0,
+            transport_kind: TransportKind::PlaintextLoopback,
+            metrics: ServerMetricsHandle::new(),
+            shutdown_tx,
+            adaptive_control: ServerAdaptiveControlHandle::new(adaptive_tx),
+            operator: None,
+            join: Some(join),
+        };
+
+        assert!(server.is_finished());
+        server.shutdown().unwrap();
     }
 }
 

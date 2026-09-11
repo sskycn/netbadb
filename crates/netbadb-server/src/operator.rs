@@ -711,6 +711,12 @@ impl ServerOperatorPlane {
         join.join()
             .map_err(|_| ServerOperatorError::ThreadPanicked)?
     }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
 }
 
 struct OperatorFailureNotification {
@@ -1453,6 +1459,7 @@ mod tests {
         let (directory, config) = socket_fixture("lifecycle");
         let path = config.unix_socket().to_path_buf();
         let plane = idle_plane(config.clone()).unwrap();
+        assert!(!plane.is_finished());
         let mode = std::fs::symlink_metadata(&path)
             .unwrap()
             .permissions()

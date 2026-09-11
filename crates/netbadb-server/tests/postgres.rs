@@ -141,6 +141,7 @@ fn postgres_adaptive_driver_reaches_worker_without_changing_wire_state() {
         .with_adaptive_driver(adaptive_driver_config(TableId(1)))
         .start()
         .unwrap();
+    assert!(!server.is_finished());
     let control = server.adaptive_control();
     let deadline = Instant::now() + Duration::from_secs(2);
     let status = loop {
