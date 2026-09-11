@@ -40,6 +40,10 @@ not change semantics. The daemon has no second-signal force exit, internal
 timeout, SIGHUP reload, PID/ready file, systemd notification, daemonizing fork,
 HTTP health endpoint, or NBOP shutdown command.
 
+Successful graceful cleanup leaves the database closed and the owned operator
+socket absent, permitting a supervisor to restart the same manifest. A crash
+may leave a stale path; Phase 18's fail-closed no-auto-unlink rule still applies.
+
 Manifest v6 is still the strict current deployment contract. NBOP v1, Native
 Protocol v2, PostgreSQL wire behavior, Inspection JSON v7, Server metrics, SDK
 schema, and persistent formats are byte-for-byte and semantically unchanged.

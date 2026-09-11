@@ -75,6 +75,13 @@ succeeds. Cleanup, join, database-close, operator, or server errors produce a
 failure exit. There is deliberately no internal forced-shutdown deadline;
 external supervisors retain escalation authority.
 
+After a successful graceful exit, the database is closed and the daemon's
+captured operator socket has been removed, so an external supervisor may start
+the same manifest again. An abrupt process termination can leave that socket
+behind. The next startup deliberately rejects the existing path instead of
+guessing ownership or auto-unlinking it; an operator must resolve the stale
+path using deployment-specific evidence.
+
 ## Compatibility
 
 This lifecycle adds no manifest field. Deployment Manifest v6, NBOP v1, Native
