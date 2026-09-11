@@ -272,13 +272,17 @@ fn postgres_server_builder_is_default_disabled_and_explicitly_enabled() {
     let config = ServerConfig::from_manifest_path(&manifest).expect("parse PostgreSQL manifest");
 
     let disabled = PostgresTcpServer::new(config);
-    assert!(disabled.adaptive_feedback.is_none());
+    assert!(matches!(
+        disabled.adaptive_mode,
+        crate::adaptive_driver::ServerAdaptiveStartupMode::Disabled
+    ));
     let limits = AdaptiveEvidencePoolLimits::default();
     let enabled = disabled.with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits));
-    assert_eq!(
-        enabled.adaptive_feedback.map(|config| config.limits()),
-        Some(limits)
-    );
+    assert!(matches!(
+        enabled.adaptive_mode,
+        crate::adaptive_driver::ServerAdaptiveStartupMode::FeedbackOnly(config)
+            if config.limits() == limits
+    ));
     fs::remove_dir_all(root).expect("remove PostgreSQL config root");
 }
 

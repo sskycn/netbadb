@@ -66,5 +66,15 @@
   otherwise successful client result, protocol transaction state, or worker
   lifetime, and the Server MUST NOT retry, clear, rotate, schedule, or run
   maintenance in response.
+- A Server host driver MAY use wall-clock time only to offer logical adaptive
+  scheduling opportunities. Each opportunity MUST enter the existing Database
+  execution owner as a typed command; only that owner may call
+  `AutomaticScheduler` and the Phase 12 runner.
+- At most one adaptive tick may be pending per worker. Missed host intervals
+  MUST coalesce and MUST NOT become a maintenance backlog or catch-up burst.
+- Adaptive scheduler failure MUST NOT corrupt Native or PostgreSQL protocol
+  state, fail an unrelated foreground request, kill the worker, or create a
+  second Database owner. Evidence-window renewal and faulted-scheduler reset
+  remain explicit operator-controlled runtime actions.
 - Wire responses MUST expose stable protocol domain values and errors, never
   internal Rust layouts, discriminants, debug strings, pages, or row locators.
