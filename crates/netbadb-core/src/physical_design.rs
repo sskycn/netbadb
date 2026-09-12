@@ -854,6 +854,15 @@ pub enum PhysicalIndexDesignApplyOutcome {
     AlreadyCovered,
 }
 
+/// Read-only classification of an explicit physical-index name against the
+/// current active index inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalIndexDesignNameState {
+    Available,
+    AlreadyApplied { index_id: IndexId },
+    Conflict,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalIndexDesignApplyReport {
     pub candidate: PhysicalIndexCandidate,
@@ -1056,18 +1065,21 @@ impl Database {
             ));
         }
 
-        if let Some(index_id) = self.active_index_named_for(proposal.candidate, &index_name) {
-            return Ok(self.index_design_report(
-                evidence,
-                proposal,
-                index_name,
-                current_before,
-                current_before,
-                PhysicalIndexDesignApplyOutcome::AlreadyApplied { index_id },
-            ));
-        }
-        if self.active_index_has_name(&index_name) {
-            return Err(PhysicalIndexDesignApplyError::IndexNameConflict(index_name));
+        match self.inspect_physical_index_design_name(proposal.candidate, &index_name) {
+            PhysicalIndexDesignNameState::Available => {}
+            PhysicalIndexDesignNameState::AlreadyApplied { index_id } => {
+                return Ok(self.index_design_report(
+                    evidence,
+                    proposal,
+                    index_name,
+                    current_before,
+                    current_before,
+                    PhysicalIndexDesignApplyOutcome::AlreadyApplied { index_id },
+                ));
+            }
+            PhysicalIndexDesignNameState::Conflict => {
+                return Err(PhysicalIndexDesignApplyError::IndexNameConflict(index_name));
+            }
         }
 
         self.revalidate_index_proposal(proposal)?;
@@ -1186,36 +1198,31 @@ impl Database {
         Ok((table_schema_version, table_fingerprint, storage_id))
     }
 
-    fn active_index_named_for(
+    /// Classifies one typed name using only the current active index inventory.
+    /// This method does not reserve identity or mutate catalog, visibility, or
+    /// storage state.
+    #[must_use]
+    pub fn inspect_physical_index_design_name(
         &self,
         candidate: PhysicalIndexCandidate,
         name: &IndexName,
-    ) -> Option<IndexId> {
-        self.registry.iter().find_map(|entry| {
-            (entry.storage.table().id == candidate.table_id)
-                .then(|| {
-                    entry
-                        .storage
-                        .indexes()
-                        .iter()
-                        .find(|definition| {
-                            definition.name.as_ref() == Some(name)
-                                && definition.column_id == candidate.column_id
-                        })
-                        .map(|definition| definition.id)
-                })
-                .flatten()
-        })
-    }
-
-    fn active_index_has_name(&self, name: &IndexName) -> bool {
-        self.registry.iter().any(|entry| {
-            entry
-                .storage
-                .indexes()
-                .iter()
-                .any(|definition| definition.name.as_ref() == Some(name))
-        })
+    ) -> PhysicalIndexDesignNameState {
+        for entry in self.registry.iter() {
+            for definition in entry.storage.indexes() {
+                if definition.name.as_ref() != Some(name) {
+                    continue;
+                }
+                if entry.storage.table().id == candidate.table_id
+                    && definition.column_id == candidate.column_id
+                {
+                    return PhysicalIndexDesignNameState::AlreadyApplied {
+                        index_id: definition.id,
+                    };
+                }
+                return PhysicalIndexDesignNameState::Conflict;
+            }
+        }
+        PhysicalIndexDesignNameState::Available
     }
 
     fn revalidate_index_proposal(

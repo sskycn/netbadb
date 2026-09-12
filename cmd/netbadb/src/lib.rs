@@ -10,24 +10,25 @@ use std::path::PathBuf;
 use netbadb_sdk::inspection::{render_catalog, render_statement};
 use netbadb_sdk::{Database, DatabaseError};
 use netbadb_server::{
-    ManifestError, OperatorAdaptiveModeV2, OperatorClientError, OperatorErrorCodeV2,
-    OperatorPhysicalDesignAdvisorReportV2, OperatorPhysicalDesignDecisionV2,
-    OperatorPhysicalDesignNoActionReasonV2, OperatorRemoteErrorV2, OperatorSchedulerDelayClassV2,
-    OperatorSchedulerFaultV2, OperatorSchedulerGateV2, OperatorStatusV2, ServerConfig,
-    ServerOperatorClient,
+    ManifestError, OperatorAdaptiveModeV3, OperatorClientError, OperatorErrorCodeV3,
+    OperatorPhysicalDesignDecisionV3, OperatorPhysicalDesignNoActionReasonV3,
+    OperatorPhysicalDesignRecommendationsV3, OperatorPhysicalIndexApplyOutcomeV3,
+    OperatorRemoteErrorV3, OperatorSchedulerDelayClassV3, OperatorSchedulerFaultV3,
+    OperatorSchedulerGateV3, OperatorStatusV3, ServerConfig, ServerOperatorClient,
 };
 
 const ROOT_HELP: &str = "Usage:\n  netbadb inspect <catalog|statement> [options]\n  netbadb operator <status|rotate-evidence|reset-faulted-scheduler|physical-design> [options]\n\nUse `netbadb inspect --help` or `netbadb operator --help` for commands.\n";
 const INSPECT_HELP: &str = "Usage:\n  netbadb inspect catalog --manifest <server.json> [--format text|json]\n  netbadb inspect statement --manifest <server.json> (--sql <SQL>|--sql-file <path>) [--format text|json]\n";
 const CATALOG_HELP: &str = "Usage: netbadb inspect catalog --manifest <server.json> [--format text|json]\n\nInspects the complete offline local catalog.\n";
 const STATEMENT_HELP: &str = "Usage: netbadb inspect statement --manifest <server.json> (--sql <SQL>|--sql-file <path>) [--format text|json]\n\nCompiles and inspects one statement without executing it.\n";
-const OPERATOR_HELP: &str = "Usage:\n  netbadb operator status --manifest <server.json>\n  netbadb operator rotate-evidence --manifest <server.json> --expected-window-epoch <epoch>\n  netbadb operator reset-faulted-scheduler --manifest <server.json>\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n";
-const OPERATOR_STATUS_HELP: &str = "Usage: netbadb operator status --manifest <server.json>\n\nReads bounded live Adaptive and Physical Design status over NBOP v2.\n";
+const OPERATOR_HELP: &str = "Usage:\n  netbadb operator status --manifest <server.json>\n  netbadb operator rotate-evidence --manifest <server.json> --expected-window-epoch <epoch>\n  netbadb operator reset-faulted-scheduler --manifest <server.json>\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n  netbadb operator physical-design apply-index --manifest <server.json> --expected-runtime-token <token> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id> --index-name <name>\n";
+const OPERATOR_STATUS_HELP: &str = "Usage: netbadb operator status --manifest <server.json>\n\nReads bounded live Adaptive and Physical Design status over NBOP v3.\n";
 const OPERATOR_ROTATE_HELP: &str = "Usage: netbadb operator rotate-evidence --manifest <server.json> --expected-window-epoch <epoch>\n\nConditionally rotates the live evidence window. The expected epoch is required and is never inferred.\n";
 const OPERATOR_RESET_HELP: &str = "Usage: netbadb operator reset-faulted-scheduler --manifest <server.json>\n\nAcknowledges and resets only a genuinely faulted scheduler.\n";
-const OPERATOR_PHYSICAL_DESIGN_HELP: &str = "Usage:\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n";
+const OPERATOR_PHYSICAL_DESIGN_HELP: &str = "Usage:\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n  netbadb operator physical-design apply-index --manifest <server.json> --expected-runtime-token <token> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id> --index-name <name>\n";
 const OPERATOR_PHYSICAL_DESIGN_RECOMMENDATIONS_HELP: &str = "Usage: netbadb operator physical-design recommendations --manifest <server.json>\n\nReads current-inventory physical-design advice without applying it.\n";
 const OPERATOR_PHYSICAL_DESIGN_ROTATE_HELP: &str = "Usage: netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n\nConditionally rotates design evidence. The expected epoch is required and is never inferred.\n";
+const OPERATOR_PHYSICAL_DESIGN_APPLY_HELP: &str = "Usage: netbadb operator physical-design apply-index --manifest <server.json> --expected-runtime-token <32-lowercase-hex> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id> --index-name <name>\n\nExplicitly approves one exact current physical-index candidate. No value is inferred or refreshed and the mutation is never retried automatically.\n";
 
 /// Parses and runs one CLI invocation and returns its complete stdout after
 /// the requested operation reaches a definitive outcome.
@@ -86,8 +87,9 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<String, 
             Ok("adaptive scheduler reset\n".into())
         }
         Action::OperatorPhysicalDesignRecommendations { manifest } => {
-            let report = run_operator(manifest, |client| client.physical_design_recommendations())?;
-            Ok(render_physical_design_recommendations(&report))
+            let recommendations =
+                run_operator(manifest, |client| client.physical_design_recommendations())?;
+            Ok(render_physical_design_recommendations(&recommendations))
         }
         Action::OperatorPhysicalDesignRotate {
             manifest,
@@ -101,7 +103,44 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<String, 
                 rotation.previous_epoch, rotation.new_epoch
             ))
         }
+        Action::OperatorPhysicalDesignApply {
+            manifest,
+            expected_runtime_token,
+            expected_evidence_epoch,
+            table_id,
+            column_id,
+            index_name,
+        } => {
+            let apply = run_operator_apply(manifest, |client| {
+                client.apply_physical_index(
+                    expected_runtime_token,
+                    expected_evidence_epoch,
+                    table_id,
+                    column_id,
+                    index_name,
+                )
+            })?;
+            Ok(render_physical_index_apply(&apply))
+        }
     }
+}
+
+fn run_operator_apply<T>(
+    manifest: PathBuf,
+    operation: impl FnOnce(&ServerOperatorClient<'_>) -> Result<T, OperatorClientError>,
+) -> Result<T, CliError> {
+    let config = ServerConfig::from_manifest_path(manifest).map_err(OperationalError::Manifest)?;
+    let operator = config.operator_config().ok_or(OperationalError::Operator(
+        OperatorClientError::OperatorNotConfigured,
+    ))?;
+    operation(&ServerOperatorClient::new(operator))
+        .map_err(|error| match error {
+            OperatorClientError::Protocol(_) => {
+                OperationalError::OperatorApplyOutcomeUncertain(error)
+            }
+            _ => OperationalError::Operator(error),
+        })
+        .map_err(Into::into)
 }
 
 fn run_operator<T>(
@@ -117,14 +156,14 @@ fn run_operator<T>(
         .map_err(Into::into)
 }
 
-fn render_operator_status(status: &OperatorStatusV2) -> String {
+fn render_operator_status(status: &OperatorStatusV3) -> String {
     let mut output = String::new();
     match &status.adaptive {
         None => output.push_str("Adaptive: disabled\n"),
         Some(adaptive) => {
             let mode = match adaptive.mode {
-                OperatorAdaptiveModeV2::FeedbackOnly => "feedback-only",
-                OperatorAdaptiveModeV2::Driven => "driven",
+                OperatorAdaptiveModeV3::FeedbackOnly => "feedback-only",
+                OperatorAdaptiveModeV3::Driven => "driven",
             };
             let feedback = &adaptive.feedback;
             output.push_str(&format!(
@@ -155,7 +194,9 @@ fn render_operator_status(status: &OperatorStatusV2) -> String {
     match &status.physical_design {
         None => output.push_str("Physical Design: disabled\n"),
         Some(design) => output.push_str(&format!(
-            "Physical Design: enabled\ndesign evidence epoch: {}\ndesign recorded reports: {}\nindex candidate count: {}\ncolumnar candidate count: {}\ndesign evidence truncated: {}\ndesign evidence incomplete: {}\n",
+            "Physical Design: enabled\nPhysical index apply: {}\nRuntime token: {}\nRuntime token purpose: stale-request guard, not a credential\ndesign evidence epoch: {}\ndesign recorded reports: {}\nindex candidate count: {}\ncolumnar candidate count: {}\ndesign evidence truncated: {}\ndesign evidence incomplete: {}\n",
+            if design.physical_index_apply.enabled { "enabled" } else { "disabled" },
+            design.physical_index_apply.runtime_token.as_deref().unwrap_or("none"),
             design.evidence.epoch,
             design.evidence.recorded_reports,
             design.evidence.index_candidate_count,
@@ -168,10 +209,18 @@ fn render_operator_status(status: &OperatorStatusV2) -> String {
 }
 
 fn render_physical_design_recommendations(
-    report: &OperatorPhysicalDesignAdvisorReportV2,
+    recommendations: &OperatorPhysicalDesignRecommendationsV3,
 ) -> String {
+    let report = &recommendations.report;
     let mut output = format!(
-        "physical-design evidence epoch: {}\nschema generation: {}\nG range: {}..={}\nrecorded reports: {}\ndiscarded incomplete reports: {}\noverflowed: {}\nincomplete: {}\n",
+        "Physical index apply: {}\nRuntime token: {}\nEvidence epoch: {}\nphysical-design evidence epoch: {}\nschema generation: {}\nG range: {}..={}\nrecorded reports: {}\ndiscarded incomplete reports: {}\noverflowed: {}\nincomplete: {}\n",
+        if recommendations.runtime_token.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        recommendations.runtime_token.as_deref().unwrap_or("none"),
+        report.evidence_epoch,
         report.evidence_epoch,
         report.schema_generation,
         report.first_global_commit_seq,
@@ -216,59 +265,78 @@ fn render_physical_design_recommendations(
     output
 }
 
-const fn render_design_decision(decision: OperatorPhysicalDesignDecisionV2) -> &'static str {
+fn render_physical_index_apply(
+    apply: &netbadb_server::OperatorPhysicalIndexApplyResultV3,
+) -> String {
+    match apply.outcome {
+        OperatorPhysicalIndexApplyOutcomeV3::Created { index_id } => format!(
+            "physical index created: IndexId({index_id}), TableId({}), ColumnId({}), name {}\n",
+            apply.table_id, apply.column_id, apply.index_name
+        ),
+        OperatorPhysicalIndexApplyOutcomeV3::AlreadyApplied { index_id } => format!(
+            "physical index already applied: IndexId({index_id}), TableId({}), ColumnId({}), name {}\n",
+            apply.table_id, apply.column_id, apply.index_name
+        ),
+        OperatorPhysicalIndexApplyOutcomeV3::AlreadyCovered => format!(
+            "physical index already covered: TableId({}), ColumnId({}), name {}; no new index was created because current physical state already covers the candidate.\n",
+            apply.table_id, apply.column_id, apply.index_name
+        ),
+    }
+}
+
+const fn render_design_decision(decision: OperatorPhysicalDesignDecisionV3) -> &'static str {
     match decision {
-        OperatorPhysicalDesignDecisionV2::Recommend {} => "recommend",
-        OperatorPhysicalDesignDecisionV2::NoAction { reason } => match reason {
-            OperatorPhysicalDesignNoActionReasonV2::BelowMinimumReports => {
+        OperatorPhysicalDesignDecisionV3::Recommend {} => "recommend",
+        OperatorPhysicalDesignDecisionV3::NoAction { reason } => match reason {
+            OperatorPhysicalDesignNoActionReasonV3::BelowMinimumReports => {
                 "no_action: below_minimum_reports"
             }
-            OperatorPhysicalDesignNoActionReasonV2::BelowMinimumShapeDiversity => {
+            OperatorPhysicalDesignNoActionReasonV3::BelowMinimumShapeDiversity => {
                 "no_action: below_minimum_shape_diversity"
             }
-            OperatorPhysicalDesignNoActionReasonV2::BelowMinimumActualWork => {
+            OperatorPhysicalDesignNoActionReasonV3::BelowMinimumActualWork => {
                 "no_action: below_minimum_actual_work"
             }
-            OperatorPhysicalDesignNoActionReasonV2::ExistingDesignCovers => {
+            OperatorPhysicalDesignNoActionReasonV3::ExistingDesignCovers => {
                 "no_action: existing_design_covers"
             }
-            OperatorPhysicalDesignNoActionReasonV2::UnsupportedCurrentLayout => {
+            OperatorPhysicalDesignNoActionReasonV3::UnsupportedCurrentLayout => {
                 "no_action: unsupported_current_layout"
             }
-            OperatorPhysicalDesignNoActionReasonV2::IncompleteEvidence => {
+            OperatorPhysicalDesignNoActionReasonV3::IncompleteEvidence => {
                 "no_action: incomplete_evidence"
             }
-            OperatorPhysicalDesignNoActionReasonV2::CurrentProjectionUnavailable => {
+            OperatorPhysicalDesignNoActionReasonV3::CurrentProjectionUnavailable => {
                 "no_action: current_projection_unavailable"
             }
-            OperatorPhysicalDesignNoActionReasonV2::RecommendationLimitReached => {
+            OperatorPhysicalDesignNoActionReasonV3::RecommendationLimitReached => {
                 "no_action: recommendation_limit_reached"
             }
         },
     }
 }
 
-const fn render_scheduler_gate(gate: OperatorSchedulerGateV2) -> &'static str {
+const fn render_scheduler_gate(gate: OperatorSchedulerGateV3) -> &'static str {
     match gate {
-        OperatorSchedulerGateV2::Open {
-            delay_class: OperatorSchedulerDelayClassV2::Normal,
+        OperatorSchedulerGateV3::Open {
+            delay_class: OperatorSchedulerDelayClassV3::Normal,
         } => "open (normal)",
-        OperatorSchedulerGateV2::Open {
-            delay_class: OperatorSchedulerDelayClassV2::Idle,
+        OperatorSchedulerGateV3::Open {
+            delay_class: OperatorSchedulerDelayClassV3::Idle,
         } => "open (idle)",
-        OperatorSchedulerGateV2::Open {
-            delay_class: OperatorSchedulerDelayClassV2::NoProgress,
+        OperatorSchedulerGateV3::Open {
+            delay_class: OperatorSchedulerDelayClassV3::NoProgress,
         } => "open (no_progress)",
-        OperatorSchedulerGateV2::AwaitingTrialProgress { .. } => "awaiting_trial_progress",
-        OperatorSchedulerGateV2::AwaitingEvidenceRenewal { .. } => "awaiting_evidence_renewal",
-        OperatorSchedulerGateV2::Faulted {
-            fault: OperatorSchedulerFaultV2::MaintenanceEnvelopeExceeded,
+        OperatorSchedulerGateV3::AwaitingTrialProgress { .. } => "awaiting_trial_progress",
+        OperatorSchedulerGateV3::AwaitingEvidenceRenewal { .. } => "awaiting_evidence_renewal",
+        OperatorSchedulerGateV3::Faulted {
+            fault: OperatorSchedulerFaultV3::MaintenanceEnvelopeExceeded,
         } => "faulted (maintenance_envelope_exceeded)",
-        OperatorSchedulerGateV2::Faulted {
-            fault: OperatorSchedulerFaultV2::StepFailed,
+        OperatorSchedulerGateV3::Faulted {
+            fault: OperatorSchedulerFaultV3::StepFailed,
         } => "faulted (step_failed)",
-        OperatorSchedulerGateV2::Faulted {
-            fault: OperatorSchedulerFaultV2::ConsumptionOverflow,
+        OperatorSchedulerGateV3::Faulted {
+            fault: OperatorSchedulerFaultV3::ConsumptionOverflow,
         } => "faulted (consumption_overflow)",
     }
 }
@@ -326,6 +394,14 @@ enum Action {
         manifest: PathBuf,
         expected_evidence_epoch: u64,
     },
+    OperatorPhysicalDesignApply {
+        manifest: PathBuf,
+        expected_runtime_token: String,
+        expected_evidence_epoch: u64,
+        table_id: u64,
+        column_id: u32,
+        index_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +417,7 @@ enum HelpTopic {
     OperatorPhysicalDesign,
     OperatorPhysicalDesignRecommendations,
     OperatorPhysicalDesignRotate,
+    OperatorPhysicalDesignApply,
 }
 
 impl HelpTopic {
@@ -359,6 +436,7 @@ impl HelpTopic {
                 OPERATOR_PHYSICAL_DESIGN_RECOMMENDATIONS_HELP
             }
             Self::OperatorPhysicalDesignRotate => OPERATOR_PHYSICAL_DESIGN_ROTATE_HELP,
+            Self::OperatorPhysicalDesignApply => OPERATOR_PHYSICAL_DESIGN_APPLY_HELP,
         }
     }
 }
@@ -452,8 +530,94 @@ fn parse_operator_physical_design(
             |manifest| Action::OperatorPhysicalDesignRecommendations { manifest },
         ),
         Some("rotate-evidence") => parse_operator_physical_design_rotate(arguments),
+        Some("apply-index") => parse_operator_physical_design_apply(arguments),
         _ => Err(UsageError::UnknownPhysicalDesignCommand(subcommand)),
     }
+}
+
+fn parse_operator_physical_design_apply(
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<Action, UsageError> {
+    let mut manifest = None;
+    let mut runtime_token = None;
+    let mut evidence_epoch = None;
+    let mut table_id = None;
+    let mut column_id = None;
+    let mut index_name = None;
+    while let Some(argument) = arguments.next() {
+        if argument == "--help" || argument == "-h" {
+            if manifest.is_none()
+                && runtime_token.is_none()
+                && evidence_epoch.is_none()
+                && table_id.is_none()
+                && column_id.is_none()
+                && index_name.is_none()
+            {
+                return no_extra(
+                    arguments,
+                    Action::Help(HelpTopic::OperatorPhysicalDesignApply),
+                );
+            }
+            return Err(UsageError::UnexpectedArgument(argument));
+        }
+        match argument.to_str() {
+            Some("--manifest") => set_once(
+                &mut manifest,
+                PathBuf::from(required_value(&mut arguments, "--manifest")?),
+                "--manifest",
+            )?,
+            Some("--expected-runtime-token") => {
+                let value = required_utf8(&mut arguments, "--expected-runtime-token")?;
+                set_once(&mut runtime_token, value, "--expected-runtime-token")?;
+            }
+            Some("--expected-evidence-epoch") => {
+                let raw = required_value(&mut arguments, "--expected-evidence-epoch")?;
+                let value = parse_u64(raw, UsageError::InvalidEvidenceEpoch)?;
+                set_once(&mut evidence_epoch, value, "--expected-evidence-epoch")?;
+            }
+            Some("--table-id") => {
+                let raw = required_value(&mut arguments, "--table-id")?;
+                let value = parse_u64(raw, UsageError::InvalidTableId)?;
+                set_once(&mut table_id, value, "--table-id")?;
+            }
+            Some("--column-id") => {
+                let raw = required_value(&mut arguments, "--column-id")?;
+                let value = raw
+                    .to_str()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .ok_or(UsageError::InvalidColumnId(raw))?;
+                set_once(&mut column_id, value, "--column-id")?;
+            }
+            Some("--index-name") => {
+                let value = required_utf8(&mut arguments, "--index-name")?;
+                set_once(&mut index_name, value, "--index-name")?;
+            }
+            _ => return Err(UsageError::UnknownArgument(argument)),
+        }
+    }
+    Ok(Action::OperatorPhysicalDesignApply {
+        manifest: manifest.ok_or(UsageError::ManifestRequired)?,
+        expected_runtime_token: runtime_token.ok_or(UsageError::ExpectedRuntimeTokenRequired)?,
+        expected_evidence_epoch: evidence_epoch.ok_or(UsageError::ExpectedEvidenceEpochRequired)?,
+        table_id: table_id.ok_or(UsageError::TableIdRequired)?,
+        column_id: column_id.ok_or(UsageError::ColumnIdRequired)?,
+        index_name: index_name.ok_or(UsageError::IndexNameRequired)?,
+    })
+}
+
+fn required_utf8(
+    arguments: &mut impl Iterator<Item = OsString>,
+    option: &'static str,
+) -> Result<String, UsageError> {
+    required_value(arguments, option)?
+        .into_string()
+        .map_err(|_| UsageError::ValueMustBeUtf8(option))
+}
+
+fn parse_u64(raw: OsString, invalid: fn(OsString) -> UsageError) -> Result<u64, UsageError> {
+    raw.to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| invalid(raw))
 }
 
 fn parse_operator_physical_design_rotate(
@@ -685,6 +849,7 @@ enum OperationalError {
         close: DatabaseError,
     },
     Operator(OperatorClientError),
+    OperatorApplyOutcomeUncertain(OperatorClientError),
 }
 
 impl fmt::Display for OperationalError {
@@ -705,13 +870,23 @@ impl fmt::Display for OperationalError {
                 formatter,
                 "inspection failed: {primary}; additionally failed to close database: {close}"
             ),
-            Self::Operator(OperatorClientError::Remote(OperatorRemoteErrorV2 {
-                code: OperatorErrorCodeV2::ResponseTooLarge,
+            Self::Operator(OperatorClientError::Remote(OperatorRemoteErrorV3 {
+                code: OperatorErrorCodeV3::ResponseTooLarge,
                 ..
             })) => formatter.write_str(
-                "operator recommendation response exceeds NBOP v2 payload limit; reduce physical-design evidence/recommendation cardinality in Manifest and restart",
+                "operator recommendation response exceeds NBOP v3 payload limit; reduce physical-design evidence/recommendation cardinality in Manifest and restart",
+            ),
+            Self::Operator(OperatorClientError::Remote(OperatorRemoteErrorV3 {
+                code: OperatorErrorCodeV3::PhysicalDesignRuntimeChanged,
+                ..
+            })) => formatter.write_str(
+                "recommendation approval belonged to a previous daemon/operator runtime; fetch fresh recommendations before authorizing a new mutation",
             ),
             Self::Operator(error) => error.fmt(formatter),
+            Self::OperatorApplyOutcomeUncertain(error) => write!(
+                formatter,
+                "physical-index apply outcome is uncertain because the NBOP response was not received ({error}); re-run the exact same command; the CLI did not retry automatically"
+            ),
         }
     }
 }
@@ -740,6 +915,13 @@ enum UsageError {
     InvalidWindowEpoch(OsString),
     ExpectedEvidenceEpochRequired,
     InvalidEvidenceEpoch(OsString),
+    ExpectedRuntimeTokenRequired,
+    TableIdRequired,
+    ColumnIdRequired,
+    IndexNameRequired,
+    InvalidTableId(OsString),
+    InvalidColumnId(OsString),
+    ValueMustBeUtf8(&'static str),
 }
 
 impl fmt::Display for UsageError {
@@ -763,7 +945,7 @@ impl fmt::Display for UsageError {
                 command.to_string_lossy()
             ),
             Self::PhysicalDesignCommandRequired => formatter.write_str(
-                "physical-design requires `recommendations` or `rotate-evidence`",
+                "physical-design requires `recommendations`, `rotate-evidence`, or `apply-index`",
             ),
             Self::UnknownPhysicalDesignCommand(command) => write!(
                 formatter,
@@ -813,6 +995,23 @@ impl fmt::Display for UsageError {
                 "invalid evidence epoch `{}`; expected an unsigned integer",
                 value.to_string_lossy()
             ),
+            Self::ExpectedRuntimeTokenRequired => {
+                formatter.write_str("--expected-runtime-token is required")
+            }
+            Self::TableIdRequired => formatter.write_str("--table-id is required"),
+            Self::ColumnIdRequired => formatter.write_str("--column-id is required"),
+            Self::IndexNameRequired => formatter.write_str("--index-name is required"),
+            Self::InvalidTableId(value) => write!(
+                formatter,
+                "invalid table ID `{}`; expected an unsigned integer",
+                value.to_string_lossy()
+            ),
+            Self::InvalidColumnId(value) => write!(
+                formatter,
+                "invalid column ID `{}`; expected an unsigned 32-bit integer",
+                value.to_string_lossy()
+            ),
+            Self::ValueMustBeUtf8(option) => write!(formatter, "{option} must be valid UTF-8"),
         }
     }
 }
@@ -867,7 +1066,8 @@ impl From<OperationalError> for CliError {
 mod tests {
     use super::*;
     use netbadb_server::{
-        OperatorPhysicalDesignEvidenceSummaryV2, OperatorPhysicalIndexCandidateV2,
+        OperatorPhysicalDesignAdvisorReportV3, OperatorPhysicalDesignEvidenceSummaryV3,
+        OperatorPhysicalIndexCandidateV3,
     };
 
     fn args(values: &[&str]) -> Vec<OsString> {
@@ -1060,45 +1260,114 @@ mod tests {
             ])),
             Err(UsageError::ExpectedEvidenceEpochRequired)
         ));
+        assert_eq!(
+            parse_args(args(&[
+                "operator",
+                "physical-design",
+                "apply-index",
+                "--manifest",
+                "server.json",
+                "--expected-runtime-token",
+                "00112233445566778899aabbccddeeff",
+                "--expected-evidence-epoch",
+                "7",
+                "--table-id",
+                "1",
+                "--column-id",
+                "3",
+                "--index-name",
+                "idx_users_email",
+            ]))
+            .unwrap(),
+            Action::OperatorPhysicalDesignApply {
+                manifest: PathBuf::from("server.json"),
+                expected_runtime_token: "00112233445566778899aabbccddeeff".into(),
+                expected_evidence_epoch: 7,
+                table_id: 1,
+                column_id: 3,
+                index_name: "idx_users_email".into(),
+            }
+        );
+        assert!(matches!(
+            parse_args(args(&[
+                "operator",
+                "physical-design",
+                "apply-index",
+                "--manifest",
+                "server.json",
+            ])),
+            Err(UsageError::ExpectedRuntimeTokenRequired)
+        ));
     }
 
     #[test]
     fn recommendation_output_uses_canonical_ids_and_observed_work_only() {
         let output =
-            render_physical_design_recommendations(&OperatorPhysicalDesignAdvisorReportV2 {
-                evidence_epoch: 7,
-                schema_generation: 8,
-                first_global_commit_seq: 9,
-                last_global_commit_seq: 10,
-                recorded_reports: 11,
-                discarded_incomplete_reports: 0,
-                overflowed: false,
-                incomplete: false,
-                index_candidates: vec![OperatorPhysicalIndexCandidateV2 {
-                    table_id: 12,
-                    column_id: 13,
-                    point_report_count: 14,
-                    range_report_count: 15,
-                    evidence: OperatorPhysicalDesignEvidenceSummaryV2 {
-                        report_count: 16,
-                        distinct_query_shapes: 17,
-                        total_actual_scan_work_units: 18,
-                        total_rows_examined: 19,
-                        overflowed: false,
-                        incomplete: false,
-                        truncated: false,
-                    },
-                    decision: OperatorPhysicalDesignDecisionV2::NoAction {
-                        reason: OperatorPhysicalDesignNoActionReasonV2::ExistingDesignCovers,
-                    },
-                }],
-                columnar_candidates: Vec::new(),
+            render_physical_design_recommendations(&OperatorPhysicalDesignRecommendationsV3 {
+                runtime_token: Some("00".repeat(16)),
+                report: OperatorPhysicalDesignAdvisorReportV3 {
+                    evidence_epoch: 7,
+                    schema_generation: 8,
+                    first_global_commit_seq: 9,
+                    last_global_commit_seq: 10,
+                    recorded_reports: 11,
+                    discarded_incomplete_reports: 0,
+                    overflowed: false,
+                    incomplete: false,
+                    index_candidates: vec![OperatorPhysicalIndexCandidateV3 {
+                        table_id: 12,
+                        column_id: 13,
+                        point_report_count: 14,
+                        range_report_count: 15,
+                        evidence: OperatorPhysicalDesignEvidenceSummaryV3 {
+                            report_count: 16,
+                            distinct_query_shapes: 17,
+                            total_actual_scan_work_units: 18,
+                            total_rows_examined: 19,
+                            overflowed: false,
+                            incomplete: false,
+                            truncated: false,
+                        },
+                        decision: OperatorPhysicalDesignDecisionV3::NoAction {
+                            reason: OperatorPhysicalDesignNoActionReasonV3::ExistingDesignCovers,
+                        },
+                    }],
+                    columnar_candidates: Vec::new(),
+                },
             });
         assert!(output.contains("TableId(12), ColumnId(13)"));
         assert!(output.contains("observed actual scan work: 18"));
         assert!(output.contains("no_action: existing_design_covers"));
         for forbidden in ["CREATE INDEX", "estimated_savings", "speedup", "roi"] {
             assert!(!output.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn apply_output_distinguishes_all_stable_success_outcomes() {
+        for (outcome, expected) in [
+            (
+                OperatorPhysicalIndexApplyOutcomeV3::Created { index_id: 7 },
+                "physical index created",
+            ),
+            (
+                OperatorPhysicalIndexApplyOutcomeV3::AlreadyApplied { index_id: 7 },
+                "physical index already applied",
+            ),
+            (
+                OperatorPhysicalIndexApplyOutcomeV3::AlreadyCovered,
+                "no new index was created because current physical state already covers",
+            ),
+        ] {
+            let output =
+                render_physical_index_apply(&netbadb_server::OperatorPhysicalIndexApplyResultV3 {
+                    table_id: 1,
+                    column_id: 3,
+                    index_name: "idx_users_email".into(),
+                    outcome,
+                });
+            assert!(output.contains(expected));
+            assert!(!output.contains("CREATE INDEX"));
         }
     }
 }

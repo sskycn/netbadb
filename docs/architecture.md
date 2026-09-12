@@ -362,6 +362,17 @@ worker ownership remains the serialization boundary. Manifest v7, NBOP v2,
 both database wire protocols, the operator/CLI/daemon surfaces, metrics,
 Inspection JSON v7, and persistent formats remain unchanged.
 
+[Adaptive Operations Phase 25](adaptive-operations-phase25.md) upgrades the
+strict deployment contract to Manifest v8 and the local operator plane to
+[NBOP v3](server-operator-protocol-v3.md). A local filesystem-authenticated
+operator may explicitly approve one current single-column Heap index candidate
+only when the manifest grants physical-index apply. A random ephemeral runtime
+token plus exact design evidence epoch prevents stale cross-restart authority;
+the sole Database worker performs name classification, fresh Core proposal, and
+Phase 23 apply inside one command. Exact durable named truth remains retryable
+across restart. There is no automatic or Columnar apply, proposal serialization,
+audit persistence, scheduler lane, SQL generation, or persistent-format change.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

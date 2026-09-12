@@ -49,7 +49,7 @@ fn table_permissions() -> &'static str {
 fn plaintext_manifest() -> String {
     format!(
         r#"{{
-            "version": 7,
+            "version": 8,
             "listen":"127.0.0.1:0",
             "authorization":{{"local_plaintext":{{"tables":[{}]}},"clients":[]}},
             "tables":[{{
@@ -268,7 +268,7 @@ fn certificate_fingerprint(certificate: &Certificate) -> String {
 fn tls_manifest(pki: &TestPki) -> String {
     format!(
         r#"{{
-            "version": 7,
+            "version": 8,
             "listen":"127.0.0.1:0",
             "tls":{{
                 "server_certificate":"server.pem",

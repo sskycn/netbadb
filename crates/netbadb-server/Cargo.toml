@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+getrandom.workspace = true
 netbadb-core = { path = "../netbadb-core" }
 netbadb-pgwire = { path = "../netbadb-pgwire" }
 netbadb-protocol = { path = "../netbadb-protocol" }

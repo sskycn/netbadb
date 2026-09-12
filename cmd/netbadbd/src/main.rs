@@ -64,6 +64,14 @@ fn run_server(
     } else {
         "disabled"
     };
+    let physical_index_apply = if config
+        .operator_config()
+        .is_some_and(|operator| operator.allow_physical_index_apply())
+    {
+        "enabled"
+    } else {
+        "disabled"
+    };
     let server = if postgres {
         RunningServer::Postgres(PostgresTcpServer::new(config).start()?)
     } else {
@@ -76,9 +84,13 @@ fn run_server(
         LifecycleAction::PublishReady => {}
         LifecycleAction::Continue => unreachable!("a server cannot continue before readiness"),
     }
-    if let Err(readiness_error) =
-        server.publish_readiness(readiness, max_connections, adaptive, physical_design)
-    {
+    if let Err(readiness_error) = server.publish_readiness(
+        readiness,
+        max_connections,
+        adaptive,
+        physical_design,
+        physical_index_apply,
+    ) {
         return match server.shutdown() {
             Ok(()) => Err(Box::new(ReadinessError::Publish(readiness_error))),
             Err(shutdown) => Err(Box::new(ReadinessError::PublishAndShutdown {
@@ -119,11 +131,12 @@ impl RunningServer {
         max_connections: usize,
         adaptive: &str,
         physical_design: &str,
+        physical_index_apply: &str,
     ) -> io::Result<()> {
         match self {
             Self::Native(server) => writeln!(
                 writer,
-                "netbadbd ready: native listener on {}, {} table(s), max {} connections, transport {}, adaptive {adaptive}, physical-design {physical_design}",
+                "netbadbd ready: native listener on {}, {} table(s), max {} connections, transport {}, adaptive {adaptive}, physical-design {physical_design}, physical-index-apply {physical_index_apply}",
                 server.local_addr(),
                 server.table_count(),
                 max_connections,
@@ -131,7 +144,7 @@ impl RunningServer {
             )?,
             Self::Postgres(server) => writeln!(
                 writer,
-                "netbadbd ready: PostgreSQL listener on {}, max {} connections, transport plaintext-loopback, adaptive {adaptive}, physical-design {physical_design}",
+                "netbadbd ready: PostgreSQL listener on {}, max {} connections, transport plaintext-loopback, adaptive {adaptive}, physical-design {physical_design}, physical-index-apply {physical_index_apply}",
                 server.local_addr(),
                 max_connections,
             )?,

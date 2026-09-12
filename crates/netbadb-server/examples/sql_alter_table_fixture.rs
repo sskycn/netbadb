@@ -206,7 +206,7 @@ fn run(root: &Path) -> Result<(), Box<dyn Error>> {
         ])
     };
     let config = serde_json::to_vec_pretty(&json!({
-        "version": 7,
+        "version": 8,
         "listen": "127.0.0.1:0",
         "authorization": {"local_plaintext": {"schema_admin": true, "tables": [
             {"table_id": 2, "read": true, "write": true, "transaction": true, "analyze": false}

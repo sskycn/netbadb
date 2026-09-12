@@ -2,8 +2,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use netbadb_client::{Client, Config as ClientConfig};
 use netbadb_sdk::{
-    ColumnDef, ColumnId, Database, PhysicalType, ScalarValue, TableDef, TableId, TypeSpec,
+    ColumnDef, ColumnId, Database, DatabaseCoordinatorConfig, PhysicalType, ScalarValue, TableDef,
+    TableId, TableStorageCreateSpec, TypeSpec,
 };
 use netbadb_server::{ServerConfig, TcpServer};
 use serde_json::{Value, json};
@@ -84,7 +86,7 @@ impl Fixture {
         database.close().unwrap();
 
         let manifest = directory.join("server.json");
-        write_manifest(&manifest, 7, "users");
+        write_manifest(&manifest, 8, "users");
         Self {
             directory,
             manifest,
@@ -291,7 +293,7 @@ fn catalog_text_and_json_are_complete_deterministic_and_ignore_network_acl_filte
 }
 
 #[test]
-fn inspect_accepts_and_validates_v7_adaptive_without_rewriting_the_manifest() {
+fn inspect_accepts_and_validates_v8_adaptive_without_rewriting_the_manifest() {
     let fixture = Fixture::new("adaptive-manifest");
     let mut manifest: Value =
         serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
@@ -339,13 +341,13 @@ fn inspect_accepts_and_validates_v7_adaptive_without_rewriting_the_manifest() {
     assert!(inspected.status.success(), "{}", stderr(&inspected));
     assert_eq!(std::fs::read(&fixture.manifest).unwrap(), bytes);
 
-    let document = include_str!("../../../docs/server-manifest-v7.md");
+    let document = include_str!("../../../docs/server-manifest-v8.md");
     let documented: Value = serde_json::from_str(
         document
             .split_once("```json\n")
             .and_then(|(_, remainder)| remainder.split_once("\n```"))
             .map(|(example, _)| example)
-            .expect("v7 documentation contains a JSON example"),
+            .expect("v8 documentation contains a JSON example"),
     )
     .unwrap();
     manifest["adaptive"] = documented["adaptive"].clone();
@@ -519,7 +521,7 @@ fn manifest_and_input_failures_precede_output_and_schema_mismatch_is_rejected() 
     assert!(stderr(&old_manifest).contains("unsupported deployment manifest version 5"));
 
     let mismatch = fixture.directory.join("mismatch.json");
-    write_manifest(&mismatch, 7, "other_users");
+    write_manifest(&mismatch, 8, "other_users");
     let mismatch = netbadb()
         .args(["inspect", "catalog", "--manifest"])
         .arg(&mismatch)
@@ -594,7 +596,8 @@ fn operator_cli_uses_live_nbop_and_never_infers_rotation_epoch() {
     let _ = std::fs::remove_file(&socket);
     manifest["operator"] = json!({
         "unix_socket": socket,
-        "io_timeout_ms": 1000
+        "io_timeout_ms": 1000,
+        "allow_physical_index_apply": false
     });
     std::fs::write(
         &fixture.manifest,
@@ -614,6 +617,8 @@ fn operator_cli_uses_live_nbop_and_never_infers_rotation_epoch() {
     assert!(stdout(&status).contains("Adaptive: feedback-only"));
     assert!(stdout(&status).contains("adaptive evidence window epoch: 0"));
     assert!(stdout(&status).contains("Physical Design: enabled"));
+    assert!(stdout(&status).contains("Physical index apply: disabled"));
+    assert!(stdout(&status).contains("Runtime token: none"));
     assert!(stdout(&status).contains("design evidence epoch: 0"));
 
     let missing_epoch = netbadb()
@@ -663,6 +668,26 @@ fn operator_cli_uses_live_nbop_and_never_infers_rotation_epoch() {
     assert_eq!(no_evidence.status.code(), Some(1));
     assert!(stderr(&no_evidence).contains("physical-design evidence window is empty"));
 
+    let apply_disabled = netbadb()
+        .args(["operator", "physical-design", "apply-index", "--manifest"])
+        .arg(&fixture.manifest)
+        .args([
+            "--expected-runtime-token",
+            "00112233445566778899aabbccddeeff",
+            "--expected-evidence-epoch",
+            "0",
+            "--table-id",
+            "1",
+            "--column-id",
+            "3",
+            "--index-name",
+            "idx_users_name",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(apply_disabled.status.code(), Some(1));
+    assert!(stderr(&apply_disabled).contains("not enabled by the manifest"));
+
     let missing_design_epoch = netbadb()
         .args([
             "operator",
@@ -696,6 +721,171 @@ fn operator_cli_uses_live_nbop_and_never_infers_rotation_epoch() {
 
     server.shutdown().unwrap();
     assert!(!socket.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation() {
+    let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "netbadb-cli-operator-apply-{}-{sequence}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let users = TableDef::new(
+        TableId(1),
+        "users",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64))
+                .primary_key(true),
+            ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+        ],
+    );
+    let mut database = Database::create_catalog(
+        directory.join("catalog"),
+        vec![TableStorageCreateSpec::heap(
+            directory.join("users.ndb"),
+            users,
+        )],
+        Some(
+            DatabaseCoordinatorConfig::new(directory.join("coordinator")).with_global_visibility(),
+        ),
+    )
+    .unwrap();
+    database
+        .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+        .unwrap();
+    database.close().unwrap();
+
+    let socket = PathBuf::from(format!(
+        "/tmp/netbadb-cli-apply-{}-{sequence}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let manifest_path = directory.join("server.json");
+    let manifest = json!({
+        "version": 8,
+        "listen": "127.0.0.1:0",
+        "authorization": {
+            "local_plaintext": {
+                "tables": [{
+                    "table_id": 1,
+                    "read": true,
+                    "write": true,
+                    "transaction": true,
+                    "analyze": false
+                }]
+            },
+            "clients": []
+        },
+        "tables": [{
+            "path": "users.ndb",
+            "id": 1,
+            "name": "users",
+            "columns": [
+                {"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false,"primary_key":true},
+                {"id":2,"name":"name","physical_type":"text","semantic_type":null,"nullable":false,"primary_key":false}
+            ]
+        }],
+        "physical_design": {
+            "evidence_limits": {
+                "max_index_candidates": 8,
+                "max_columnar_candidates": 8,
+                "max_query_shapes_per_candidate": 8,
+                "max_columnar_columns_per_candidate": 8
+            },
+            "advisor_policy": {
+                "index": {
+                    "minimum_reports": 1,
+                    "minimum_distinct_query_shapes": 1,
+                    "minimum_actual_scan_work_units": 0,
+                    "max_recommendations": 8
+                },
+                "columnar": {
+                    "minimum_reports": 1,
+                    "minimum_distinct_query_shapes": 1,
+                    "minimum_actual_scan_work_units": 0,
+                    "max_recommendations": 8
+                }
+            }
+        },
+        "operator": {
+            "unix_socket": socket,
+            "io_timeout_ms": 1000,
+            "allow_physical_index_apply": true
+        }
+    });
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let server = TcpServer::new(ServerConfig::from_manifest_path(&manifest_path).unwrap())
+        .start()
+        .unwrap();
+    let mut client = Client::connect(ClientConfig::new(server.local_addr().to_string())).unwrap();
+    client
+        .query("SELECT id FROM users WHERE name = 'Ada'")
+        .unwrap()
+        .close()
+        .unwrap();
+
+    let recommendations = netbadb()
+        .args([
+            "operator",
+            "physical-design",
+            "recommendations",
+            "--manifest",
+        ])
+        .arg(&manifest_path)
+        .output()
+        .unwrap();
+    assert!(
+        recommendations.status.success(),
+        "{}",
+        stderr(&recommendations)
+    );
+    let recommendations = stdout(&recommendations);
+    let token = recommendations
+        .lines()
+        .find_map(|line| line.strip_prefix("Runtime token: "))
+        .unwrap();
+    let epoch = recommendations
+        .lines()
+        .find_map(|line| line.strip_prefix("Evidence epoch: "))
+        .unwrap();
+
+    let apply = |token: &str, epoch: &str| {
+        netbadb()
+            .args(["operator", "physical-design", "apply-index", "--manifest"])
+            .arg(&manifest_path)
+            .args([
+                "--expected-runtime-token",
+                token,
+                "--expected-evidence-epoch",
+                epoch,
+                "--table-id",
+                "1",
+                "--column-id",
+                "2",
+                "--index-name",
+                "users_name_cli_idx",
+            ])
+            .output()
+            .unwrap()
+    };
+    let created = apply(token, epoch);
+    assert!(created.status.success(), "{}", stderr(&created));
+    assert!(stdout(&created).contains("created"));
+    let retried = apply(token, epoch);
+    assert!(retried.status.success(), "{}", stderr(&retried));
+    assert!(stdout(&retried).contains("already applied"));
+
+    client
+        .query("SELECT id FROM users WHERE name = 'Ada'")
+        .unwrap()
+        .close()
+        .unwrap();
+    drop(client);
+    server.shutdown().unwrap();
+    assert!(!socket.exists());
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -750,7 +940,8 @@ fn operator_cli_reports_unconfigured_and_offline_planes_without_opening_database
     });
     manifest["operator"] = json!({
         "unix_socket": "offline.sock",
-        "io_timeout_ms": 50
+        "io_timeout_ms": 50,
+        "allow_physical_index_apply": false
     });
     std::fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let inspected = catalog(&fixture, "text");

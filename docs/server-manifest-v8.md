@@ -1,11 +1,8 @@
-# NetbaDB deployment manifest v7
+# NetbaDB deployment manifest v8
 
-> Historical deployment contract. Current `netbadbd` requires Manifest v8.
-> Manifest v7 is explicitly rejected.
-
-Deployment Manifest v7 is the only current `netbadbd` startup configuration.
-Versions 1 through 6 and future versions are rejected explicitly; there is no
-dual v6/v7 decoder. This version is independent of Native Protocol v2,
+Deployment Manifest v8 is the only current `netbadbd` startup configuration.
+Versions 1 through 7 and future versions are rejected explicitly; there is no
+dual v7/v8 decoder. This version is independent of Native Protocol v2,
 PostgreSQL wire, Inspection JSON v7, SDK Schema Spec, Canonical Schema, and all
 database persistent formats.
 
@@ -21,7 +18,7 @@ by the server test suite.
 
 ```json
 {
-  "version": 7,
+  "version": 8,
   "listen": "127.0.0.1:7878",
   "limits": {
     "max_connections": 128,
@@ -86,26 +83,27 @@ by the server test suite.
       "columnar": {"minimum_reports":3,"minimum_distinct_query_shapes":2,"minimum_actual_scan_work_units":1000,"max_recommendations":8}
     }
   },
-  "operator": {"unix_socket":"run/netbadb-operator.sock","io_timeout_ms":5000}
+  "operator": {"unix_socket":"run/netbadb-operator.sock","io_timeout_ms":5000,"allow_physical_index_apply":true}
 }
 ```
 
-## Migration from v6
+## Migration from v7
 
-The no-design migration is mechanical:
+For a deployment without `operator`, migration is mechanical:
 
 ```text
-change "version": 6 to "version": 7
+change "version": 7 to "version": 8
 leave every other field unchanged
-omit "physical_design"
 ```
 
-That preserves Server, Adaptive, and Operator behavior and leaves Physical
-Design disabled. Version 6 itself is rejected by current binaries.
+For every v7 deployment with `operator`, add
+`"allow_physical_index_apply": false` while changing the version. The explicit
+false preserves v7 status, evidence rotation, scheduler reset, and read-only
+recommendation behavior. Version 7 itself is rejected by current binaries.
 
 ## Existing deployment fields
 
-`listen`, `limits`, `tls`, `authorization`, `tables`, and `adaptive` retain v6
+`listen`, `limits`, `tls`, `authorization`, `tables`, and `adaptive` retain v7
 meaning. Plaintext is loopback-only; non-loopback Native listeners require
 mutual TLS. PostgreSQL mode remains plaintext loopback. Relative table, TLS,
 and operator paths resolve from the manifest directory. Tables are exact subset
@@ -116,16 +114,15 @@ Limits retain their bounded typed validation. Authorization remains transport
 specific and schema-bound. The complete Adaptive object and all its nested
 limits, scheduler policy, orchestration envelope, scope, and automatic policy
 remain explicit; omitting `adaptive` is its sole disabled representation.
-Feedback-only and driven semantics are unchanged from v6.
+Feedback-only and driven semantics are unchanged from v7.
 
 ## Physical Design
 
 Omitting `physical_design` is the sole disabled representation. `null`, an
 `enabled` flag, or a `mode` field is invalid. Presence enables the worker-owned
-evidence/advisor runtime and its embedded-host programmatic controls. It does
-not expose apply through the manifest, operator, daemon, CLI, SQL, Native, or
-PostgreSQL wire protocols. Every nested object is strict and every field is
-required. There are no manifest defaults.
+evidence/advisor runtime and its embedded-host programmatic controls. Every
+nested object is strict and every field is required. There are no manifest
+defaults.
 
 `evidence_limits` maps one-for-one to `PhysicalDesignEvidenceLimits`:
 `max_index_candidates`, `max_columnar_candidates`,
@@ -161,21 +158,39 @@ may use `ServerHandle::physical_design_control()`.
 
 The operator socket remains Unix-only, mode `0600`, one serial listener thread,
 and filesystem-authenticated. Its machine contract is independently versioned
-as [NBOP v2](server-operator-protocol-v2.md). It cannot change policy; threshold
-and limit changes require restart.
+as [NBOP v3](server-operator-protocol-v3.md). Its required
+`allow_physical_index_apply` field is a second, explicit deployment gate for
+durable named single-column Heap B+Tree apply. `false` retains all read-only and
+maintenance-control operations. `true` requires `physical_design` in the same
+manifest and permits only explicit NBOP approval requests; it is not a runtime
+toggle and changing it requires restart. Filesystem access authenticates the
+local operator, while this manifest field authorizes mutation.
+
+This permission controls only the local daemon operator. It does not disable or
+otherwise change the Phase 24 in-process
+`ServerPhysicalDesignControlHandle::{propose_index,apply_index}` host API. It
+does not modify SessionPolicy, database principals, authorization grants,
+Native Protocol, PostgreSQL wire, or SQL `CREATE INDEX` authority.
 
 `netbadbd --manifest server.json` and `netbadbd --manifest server.json
 --postgres` create the configured design runtime before readiness. The bounded
-readiness line reports only `physical-design enabled` or `physical-design
-disabled`, never policy or candidates.
+readiness line reports physical-design and physical-index-apply as enabled or
+disabled, but never prints the runtime token, policy, or candidates.
 
-`netbadb inspect` parses and fully validates Manifest v7 through
+`netbadb inspect` parses and fully validates Manifest v8 through
 `ServerConfig::from_manifest_path`, but starts no server, socket, evidence
 window, query, or advisor. Inspection does not require a daemon online.
 
-Runtime evidence is memory-only and is lost at restart. Manifest v7 adds no
-recommendation persistence, hot reload, background advisor, design automation,
-scheduler invocation, identity reservation, DDL generation, `CREATE INDEX`,
-projection build, apply authority, schema mutation, or publication of global
-visibility. Heap, BTree and Index Catalog, LSM, Columnar and Projection Catalog,
-Change Stream, Coordinator, and every persistent format remain unchanged.
+Runtime evidence and the 128-bit operator runtime token are memory-only and are
+lost at restart. Every apply-enabled operator start generates a new token from
+OS randomness; evidence rotation does not change it. The token is a stale
+cross-restart request guard, not an authentication credential, and is exposed
+only through local NBOP status/recommendations.
+
+Manifest v8 adds no automatic apply, candidate selection, retry, hot reload,
+background advisor, scheduler lane, audit/request history, Columnar projection
+build, or publication of global visibility. Apply delegates to the existing
+Phase 23 named `CREATE INDEX` transaction. LegacyLocal remains a valid
+deployment and gains no implicit Global visibility. Heap, BTree and Index
+Catalog, LSM, Columnar and Projection Catalog, Change Stream, Coordinator, and
+every persistent format remain unchanged.

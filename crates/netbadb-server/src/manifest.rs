@@ -34,7 +34,7 @@ use crate::{
 use crate::{ServerOperatorConfig, ServerOperatorConfigError};
 use crate::{TlsConfigError, TransportKind};
 
-pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 7;
+pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 8;
 pub const DEFAULT_LISTEN_ADDRESS: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878);
 
@@ -95,6 +95,13 @@ impl ServerConfig {
         let physical_design = manifest
             .physical_design
             .map(ManifestPhysicalDesign::into_config);
+        if operator
+            .as_ref()
+            .is_some_and(|operator| operator.allow_physical_index_apply)
+            && physical_design.is_none()
+        {
+            return Err(ManifestError::OperatorPhysicalIndexApplyRequiresPhysicalDesign);
+        }
         if operator.is_some()
             && matches!(adaptive_mode, ServerAdaptiveStartupMode::Disabled)
             && physical_design.is_none()
@@ -324,6 +331,7 @@ pub enum ManifestError {
     },
     AdaptiveDriverConfig(ServerAdaptiveDriverConfigError),
     OperatorRequiresManagedRuntime,
+    OperatorPhysicalIndexApplyRequiresPhysicalDesign,
     OperatorSocketPath(PathBuf),
     OperatorSocketParent {
         path: PathBuf,
@@ -408,6 +416,8 @@ impl fmt::Display for ManifestError {
             }
             Self::OperatorRequiresManagedRuntime => formatter
                 .write_str("operator plane requires Adaptive or Physical Design to be enabled"),
+            Self::OperatorPhysicalIndexApplyRequiresPhysicalDesign => formatter
+                .write_str("operator physical-index apply requires Physical Design to be enabled"),
             Self::OperatorSocketPath(path) => write!(
                 formatter,
                 "operator Unix socket path `{}` must name a file",
@@ -456,6 +466,7 @@ impl Error for ManifestError {
             | Self::DuplicateStoragePath(_)
             | Self::TlsPathIsNotFile { .. }
             | Self::OperatorRequiresManagedRuntime
+            | Self::OperatorPhysicalIndexApplyRequiresPhysicalDesign
             | Self::OperatorSocketPath(_)
             | Self::OperatorSocketParentNotDirectory(_) => None,
         }
@@ -580,6 +591,7 @@ where
 struct ManifestOperator {
     unix_socket: String,
     io_timeout_ms: u64,
+    allow_physical_index_apply: bool,
 }
 
 impl ManifestOperator {
@@ -610,6 +622,7 @@ impl ManifestOperator {
         ServerOperatorConfig::new(
             parent.join(file_name),
             Duration::from_millis(self.io_timeout_ms),
+            self.allow_physical_index_apply,
         )
         .map_err(ManifestError::OperatorConfig)
     }
@@ -1317,7 +1330,7 @@ mod tests {
         let listen = listen.map_or_else(String::new, |listen| format!("\"listen\": \"{listen}\","));
         format!(
             r#"{{
-                "version": 7,
+                "version": 8,
                 {listen}
                 "authorization": {{
                     "local_plaintext": {{
@@ -1540,8 +1553,8 @@ mod tests {
     }
 
     #[test]
-    fn changing_only_v6_version_to_v7_preserves_runtime_behavior() {
-        let directory = test_directory("v6-v7-migration");
+    fn v7_operator_migrates_to_v8_with_explicit_false_permission() {
+        let directory = test_directory("v7-v8-migration");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         create_heap(&directory.join("users.ndb"));
@@ -1552,25 +1565,35 @@ mod tests {
         value["adaptive"] = json!({"mode": "feedback_only", "feedback": feedback_json()});
         value["operator"] = json!({
             "unix_socket": "operator.sock",
-            "io_timeout_ms": 1000
+            "io_timeout_ms": 1000,
+            "allow_physical_index_apply": false
         });
-        let v7 = serde_json::to_string(&value).unwrap();
-        let mut v6_value = value.clone();
-        v6_value["version"] = json!(6);
-        let v6 = serde_json::to_string(&v6_value).unwrap();
-        std::fs::write(&manifest, &v6).unwrap();
+        let v8 = serde_json::to_string(&value).unwrap();
+        let mut v7_value = value.clone();
+        v7_value["version"] = json!(7);
+        v7_value["operator"]
+            .as_object_mut()
+            .unwrap()
+            .remove("allow_physical_index_apply");
+        std::fs::write(&manifest, serde_json::to_vec(&v7_value).unwrap()).unwrap();
         assert!(matches!(
             ServerConfig::from_manifest_path(&manifest),
-            Err(ManifestError::UnsupportedVersion(6))
+            Err(ManifestError::UnsupportedVersion(7))
         ));
 
-        std::fs::write(&manifest, v7).unwrap();
+        std::fs::write(&manifest, v8).unwrap();
         let config = ServerConfig::from_manifest_path(&manifest).unwrap();
         assert_eq!(config.listen(), "127.0.0.1:0".parse().unwrap());
         assert_eq!(config.limits(), ServerLimits::default());
         assert_eq!(config.adaptive_mode(), ServerAdaptiveMode::FeedbackOnly);
         assert!(!config.physical_design_enabled());
         assert!(config.operator_config().is_some());
+        assert!(
+            !config
+                .operator_config()
+                .unwrap()
+                .allow_physical_index_apply()
+        );
         assert_eq!(config.tables()[0].table, users_table("UserId"));
 
         std::fs::remove_dir_all(directory).unwrap();
@@ -1787,7 +1810,8 @@ mod tests {
         let mut invalid = disabled.clone();
         invalid["operator"] = json!({
             "unix_socket": "run/operator.sock",
-            "io_timeout_ms": 5000
+            "io_timeout_ms": 5000,
+            "allow_physical_index_apply": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&invalid).unwrap()).unwrap();
         assert!(matches!(
@@ -1803,7 +1827,8 @@ mod tests {
             value["adaptive"] = adaptive;
             value["operator"] = json!({
                 "unix_socket": "run/operator.sock",
-                "io_timeout_ms": 5000
+                "io_timeout_ms": 5000,
+                "allow_physical_index_apply": false
             });
             std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
             let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -1820,7 +1845,8 @@ mod tests {
         design_only["physical_design"] = physical_design_json();
         design_only["operator"] = json!({
             "unix_socket": "run/operator.sock",
-            "io_timeout_ms": 5000
+            "io_timeout_ms": 5000,
+            "allow_physical_index_apply": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&design_only).unwrap()).unwrap();
         let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -1835,6 +1861,30 @@ mod tests {
         assert_eq!(config.adaptive_mode(), ServerAdaptiveMode::FeedbackOnly);
         assert!(config.physical_design_enabled());
         assert!(config.operator_config().is_some());
+
+        let mut adaptive_apply = disabled.clone();
+        adaptive_apply["adaptive"] = json!({"mode": "feedback_only", "feedback": feedback_json()});
+        adaptive_apply["operator"] = json!({
+            "unix_socket": "run/operator.sock",
+            "io_timeout_ms": 5000,
+            "allow_physical_index_apply": true
+        });
+        std::fs::write(&manifest, serde_json::to_vec(&adaptive_apply).unwrap()).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::OperatorPhysicalIndexApplyRequiresPhysicalDesign)
+        ));
+
+        let mut design_apply = both;
+        design_apply["operator"]["allow_physical_index_apply"] = json!(true);
+        std::fs::write(&manifest, serde_json::to_vec(&design_apply).unwrap()).unwrap();
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        assert!(
+            config
+                .operator_config()
+                .unwrap()
+                .allow_physical_index_apply()
+        );
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1854,10 +1904,12 @@ mod tests {
         for operator in [
             json!(null),
             json!({"unix_socket": "operator.sock"}),
-            json!({"unix_socket": "operator.sock", "io_timeout_ms": 0}),
+            json!({"unix_socket": "operator.sock", "io_timeout_ms": 1}),
+            json!({"unix_socket": "operator.sock", "io_timeout_ms": 0, "allow_physical_index_apply": false}),
             json!({
                 "unix_socket": "operator.sock",
                 "io_timeout_ms": 1,
+                "allow_physical_index_apply": false,
                 "token": "forbidden"
             }),
         ] {
@@ -1873,7 +1925,8 @@ mod tests {
         let mut value = base;
         value["operator"] = json!({
             "unix_socket": "missing/operator.sock",
-            "io_timeout_ms": 1
+            "io_timeout_ms": 1,
+            "allow_physical_index_apply": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(matches!(
@@ -1918,7 +1971,8 @@ mod tests {
         );
         value["operator"] = json!({
             "unix_socket": socket,
-            "io_timeout_ms": 1000
+            "io_timeout_ms": 1000,
+            "allow_physical_index_apply": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
 
@@ -1928,7 +1982,7 @@ mod tests {
         let client = crate::ServerOperatorClient::new(&operator_config);
         let before = client.status().unwrap();
         let adaptive = before.adaptive.as_ref().unwrap();
-        assert_eq!(adaptive.mode, crate::OperatorAdaptiveModeV2::FeedbackOnly);
+        assert_eq!(adaptive.mode, crate::OperatorAdaptiveModeV3::FeedbackOnly);
         assert_eq!(adaptive.feedback.window_epoch, 0);
         assert!(adaptive.driver.is_none());
         assert!(before.physical_design.is_none());
@@ -1944,7 +1998,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let mut frame = b"NBOP\0\x02\0\0".to_vec();
+        let mut frame = b"NBOP\0\x03\0\0".to_vec();
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&payload);
         let mut lost_response = UnixStream::connect(operator_config.unix_socket()).unwrap();
@@ -1977,8 +2031,8 @@ mod tests {
         assert!(matches!(
             client.rotate_evidence(0),
             Err(crate::OperatorClientError::Remote(
-                crate::OperatorRemoteErrorV2 {
-                    code: crate::OperatorErrorCodeV2::EvidenceWindowChanged,
+                crate::OperatorRemoteErrorV3 {
+                    code: crate::OperatorErrorCodeV3::EvidenceWindowChanged,
                     ..
                 }
             ))
@@ -1996,8 +2050,8 @@ mod tests {
         assert!(matches!(
             client.reset_faulted_scheduler(),
             Err(crate::OperatorClientError::Remote(
-                crate::OperatorRemoteErrorV2 {
-                    code: crate::OperatorErrorCodeV2::DriverNotEnabled,
+                crate::OperatorRemoteErrorV3 {
+                    code: crate::OperatorErrorCodeV3::DriverNotEnabled,
                     ..
                 }
             ))
@@ -2029,7 +2083,8 @@ mod tests {
         );
         value["operator"] = json!({
             "unix_socket": socket,
-            "io_timeout_ms": 100
+            "io_timeout_ms": 100,
+            "allow_physical_index_apply": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
 
@@ -2067,18 +2122,18 @@ mod tests {
     }
 
     #[test]
-    fn documented_v7_driven_example_is_a_golden_manifest() {
-        let directory = test_directory("documented-v7-example");
+    fn documented_v8_driven_example_is_a_golden_manifest() {
+        let directory = test_directory("documented-v8-example");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(directory.join("run")).unwrap();
         create_heap(&directory.join("users.ndb"));
         let manifest = directory.join("server.json");
-        let document = include_str!("../../../docs/server-manifest-v7.md");
+        let document = include_str!("../../../docs/server-manifest-v8.md");
         let example = document
             .split_once("```json\n")
             .and_then(|(_, remainder)| remainder.split_once("\n```"))
             .map(|(example, _)| example)
-            .expect("v7 documentation contains a JSON example")
+            .expect("v8 documentation contains a JSON example")
             .replace("127.0.0.1:7878", "127.0.0.1:0")
             .replace("data/users.ndb", "users.ndb");
         std::fs::write(&manifest, example).unwrap();
@@ -2628,7 +2683,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let manifest = directory.join("server.json");
 
-        for version in [1, 2, 3, 4, 5, 6, 8] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 9] {
             std::fs::write(&manifest, format!(r#"{{"version":{version},"tables":[]}}"#)).unwrap();
             assert!(matches!(
                 ServerConfig::from_manifest_path(&manifest),
@@ -2638,7 +2693,7 @@ mod tests {
 
         std::fs::write(
             &manifest,
-            r#"{"version":7,"unexpected":true,"authorization":{"local_plaintext":{"tables":[{"table_id":1,"read":true}]}},"tables":[]}"#,
+            r#"{"version":8,"unexpected":true,"authorization":{"local_plaintext":{"tables":[{"table_id":1,"read":true}]}},"tables":[]}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -2713,7 +2768,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_v7_authorization_is_required_strict_and_schema_bound() {
+    fn manifest_v8_authorization_is_required_strict_and_schema_bound() {
         let directory = test_directory("authorization");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();

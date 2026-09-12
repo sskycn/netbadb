@@ -246,9 +246,9 @@ pub use physical_design::{
     PhysicalDesignEvidenceSummary, PhysicalDesignEvidenceWindow,
     PhysicalDesignEvidenceWindowInspection, PhysicalDesignNoActionReason,
     PhysicalDesignRecommendationPolicy, PhysicalIndexCandidate, PhysicalIndexDesignApplyError,
-    PhysicalIndexDesignApplyOutcome, PhysicalIndexDesignApplyReport, PhysicalIndexDesignProposal,
-    PhysicalIndexDesignProposalError, PhysicalIndexDesignProposalStaleReason,
-    PhysicalIndexRecommendationInspection,
+    PhysicalIndexDesignApplyOutcome, PhysicalIndexDesignApplyReport, PhysicalIndexDesignNameState,
+    PhysicalIndexDesignProposal, PhysicalIndexDesignProposalError,
+    PhysicalIndexDesignProposalStaleReason, PhysicalIndexRecommendationInspection,
 };
 pub use planner_calibration::{
     PlannerCalibrationAdvisorError, PlannerCalibrationDecision, PlannerCalibrationEvidence,

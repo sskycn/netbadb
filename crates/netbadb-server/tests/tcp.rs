@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 use netbadb_core::{
     AdaptiveEvidencePoolLimits, AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope,
     AutomaticSchedulerPolicy, Database, DatabaseCoordinatorConfig, MaintenanceBudget,
-    PhysicalIndexCandidate, PhysicalIndexDesignApplyError, PhysicalIndexDesignApplyOutcome,
-    TableStorageCreateSpec,
+    PhysicalIndexCandidate, PhysicalIndexDesignApplyOutcome, TableStorageCreateSpec,
 };
 use netbadb_protocol::{
     ClientMessage, Frame, ProtocolErrorCode, ServerMessage, WireTransactionState,
@@ -16,8 +15,8 @@ use netbadb_protocol::{
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
-    AuthorizationConfigError, ManifestError, OperatorAdaptiveModeV2, OperatorClientError,
-    OperatorErrorCodeV2, OperatorPhysicalDesignDecisionV2, OperatorPhysicalDesignNoActionReasonV2,
+    AuthorizationConfigError, ManifestError, OperatorAdaptiveModeV3, OperatorClientError,
+    OperatorErrorCodeV3, OperatorPhysicalDesignDecisionV3, OperatorPhysicalDesignNoActionReasonV3,
     ServerAdaptiveControlError, ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig,
     ServerAdaptiveMode, ServerConfig, ServerHandle, ServerOperatorClient,
     ServerPhysicalDesignControlError, TcpServer, TcpServerError, TransportKind,
@@ -122,7 +121,7 @@ fn manifest_json_with_transport(
     let tls = tls.map_or_else(String::new, |tls| format!("\"tls\": {tls},"));
     format!(
         r#"{{
-            "version": 7,
+            "version": 8,
             "listen": "127.0.0.1:0",
             {limits}
             {tls}
@@ -220,7 +219,7 @@ fn create_two_table_server(name: &str, authorization: &str) -> (PathBuf, ServerH
         &manifest,
         format!(
             r#"{{
-                "version":7,
+                "version":8,
                 "listen":"127.0.0.1:0",
                 "authorization":{authorization},
                 "tables":[
@@ -302,7 +301,8 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     });
     manifest_value["operator"] = serde_json::json!({
         "unix_socket": socket,
-        "io_timeout_ms": 1000
+        "io_timeout_ms": 1000,
+        "allow_physical_index_apply": true
     });
     std::fs::write(&manifest, serde_json::to_vec(&manifest_value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -326,15 +326,28 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
             .recorded_reports,
         0
     );
+    let apply_status = &operator_status
+        .physical_design
+        .as_ref()
+        .unwrap()
+        .physical_index_apply;
+    assert!(apply_status.enabled);
+    let runtime_token = apply_status.runtime_token.as_deref().unwrap();
+    assert_eq!(runtime_token.len(), 32);
+    assert!(
+        runtime_token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
     assert!(matches!(
         operator.rotate_evidence(0),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV2::AdaptiveNotEnabled
+            if error.code == OperatorErrorCodeV3::AdaptiveNotEnabled
     ));
     assert!(matches!(
         operator.physical_design_recommendations(),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV2::PhysicalDesignNoEvidence
+            if error.code == OperatorErrorCodeV3::PhysicalDesignNoEvidence
     ));
 
     let mut client = Client::connect(server.local_addr());
@@ -361,6 +374,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     let first = operator.physical_design_recommendations().unwrap();
     let repeated = operator.physical_design_recommendations().unwrap();
     assert_eq!(first, repeated);
+    assert_eq!(first.runtime_token.as_deref(), Some(runtime_token));
     assert_eq!(operator.status().unwrap(), status_before_advice);
     let name_candidate = first
         .index_candidates
@@ -369,7 +383,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         .unwrap();
     assert_eq!(
         name_candidate.decision,
-        OperatorPhysicalDesignDecisionV2::Recommend {}
+        OperatorPhysicalDesignDecisionV3::Recommend {}
     );
 
     client.request(
@@ -386,7 +400,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     );
     let columnar = operator.physical_design_recommendations().unwrap();
     assert!(columnar.columnar_candidates.iter().any(|entry| {
-        entry.columns == vec![1] && entry.decision == OperatorPhysicalDesignDecisionV2::Recommend {}
+        entry.columns == vec![1] && entry.decision == OperatorPhysicalDesignDecisionV3::Recommend {}
     }));
     assert!(
         columnar
@@ -430,19 +444,71 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         },
     );
     assert!(matches!(
-        design.apply_index(&proposal, index_name.clone()),
-        Err(ServerPhysicalDesignControlError::Apply(error))
-            if matches!(
-                error.as_ref(),
-                PhysicalIndexDesignApplyError::Database(_)
-            )
+        operator.apply_physical_index(
+            runtime_token.to_owned(),
+            status_before_proposal.evidence.epoch.0,
+            1,
+            2,
+            index_name.as_str().to_owned(),
+        ),
+        Err(OperatorClientError::Remote(error))
+            if error.code == OperatorErrorCodeV3::PhysicalIndexApplyFailed
     ));
     client.request(7, ClientMessage::Rollback);
 
+    let lost_response_payload = serde_json::to_vec(&serde_json::json!({
+        "request_id": 99,
+        "operation": {
+            "type": "apply_physical_index",
+            "expected_runtime_token": runtime_token,
+            "expected_evidence_epoch": status_before_proposal.evidence.epoch.0,
+            "table_id": 1,
+            "column_id": 2,
+            "index_name": index_name.as_str()
+        }
+    }))
+    .unwrap();
+    let mut lost_response_frame = b"NBOP\0\x03\0\0".to_vec();
+    lost_response_frame.extend_from_slice(&(lost_response_payload.len() as u32).to_be_bytes());
+    lost_response_frame.extend_from_slice(&lost_response_payload);
+    let mut lost_response =
+        std::os::unix::net::UnixStream::connect(operator_config.unix_socket()).unwrap();
+    lost_response.write_all(&lost_response_frame).unwrap();
+    lost_response.shutdown(Shutdown::Write).unwrap();
+    let mut response_prefix = [0_u8; 1];
+    lost_response.read_exact(&mut response_prefix).unwrap();
+    drop(lost_response);
+
+    let operator_retry = operator
+        .apply_physical_index(
+            runtime_token.to_owned(),
+            status_before_proposal.evidence.epoch.0,
+            1,
+            2,
+            index_name.as_str().to_owned(),
+        )
+        .unwrap();
+    assert!(matches!(
+        operator_retry.outcome,
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV3::AlreadyApplied { .. }
+    ));
+    let operator_covered = operator
+        .apply_physical_index(
+            runtime_token,
+            status_before_proposal.evidence.epoch.0,
+            1,
+            2,
+            "users_name_already_covered_idx",
+        )
+        .unwrap();
+    assert_eq!(
+        operator_covered.outcome,
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV3::AlreadyCovered
+    );
     let created = design.apply_index(&proposal, index_name.clone()).unwrap();
     assert!(matches!(
         created.outcome,
-        PhysicalIndexDesignApplyOutcome::Created { .. }
+        PhysicalIndexDesignApplyOutcome::AlreadyApplied { .. }
     ));
     let after_create = design.status().unwrap();
     assert_eq!(after_create, status_before_proposal);
@@ -466,8 +532,8 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
             .find(|entry| entry.column_id == 2)
             .unwrap()
             .decision,
-        OperatorPhysicalDesignDecisionV2::NoAction {
-            reason: OperatorPhysicalDesignNoActionReasonV2::ExistingDesignCovers
+        OperatorPhysicalDesignDecisionV3::NoAction {
+            reason: OperatorPhysicalDesignNoActionReasonV3::ExistingDesignCovers
         }
     );
 
@@ -479,9 +545,20 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     assert!(matches!(
         operator.rotate_physical_design_evidence(epoch.0),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV2::PhysicalDesignEvidenceEpochChanged
+            if error.code == OperatorErrorCodeV3::PhysicalDesignEvidenceEpochChanged
     ));
     assert_eq!(design.status().unwrap().evidence.epoch.0, rotated.new_epoch);
+    assert_eq!(
+        operator
+            .status()
+            .unwrap()
+            .physical_design
+            .unwrap()
+            .physical_index_apply
+            .runtime_token
+            .as_deref(),
+        Some(runtime_token)
+    );
 
     let repeated = design.apply_index(&proposal, index_name).unwrap();
     assert_eq!(
@@ -511,6 +588,126 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         design.status(),
         Err(ServerPhysicalDesignControlError::ServerStopped)
     ));
+    cleanup(&directory);
+}
+
+#[test]
+fn old_operator_approval_only_recognizes_exact_durable_truth_after_restart() {
+    let directory = test_directory("operator-apply-restart");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut database = Database::create_catalog(
+        directory.join("catalog"),
+        vec![TableStorageCreateSpec::heap(
+            directory.join("users.ndb"),
+            users_table("UserId"),
+        )],
+        Some(
+            DatabaseCoordinatorConfig::new(directory.join("coordinator")).with_global_visibility(),
+        ),
+    )
+    .unwrap();
+    database
+        .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+        .unwrap();
+    database.close().unwrap();
+
+    let socket = PathBuf::from(format!(
+        "/tmp/netbadb-native-restart-op-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let manifest = directory.join("server.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&manifest_json("users.ndb", "UserId")).unwrap();
+    value["physical_design"] = serde_json::json!({
+        "evidence_limits": {
+            "max_index_candidates": 8,
+            "max_columnar_candidates": 8,
+            "max_query_shapes_per_candidate": 8,
+            "max_columnar_columns_per_candidate": 8
+        },
+        "advisor_policy": {
+            "index": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            },
+            "columnar": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            }
+        }
+    });
+    value["operator"] = serde_json::json!({
+        "unix_socket": socket,
+        "io_timeout_ms": 1000,
+        "allow_physical_index_apply": true
+    });
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    let operator_config = config.operator_config().unwrap().clone();
+
+    let first_server = TcpServer::new(config.clone()).start().unwrap();
+    let first_operator = ServerOperatorClient::new(&operator_config);
+    let mut first_client = Client::connect(first_server.local_addr());
+    first_client.hello();
+    first_client.request(
+        2,
+        ClientMessage::Execute {
+            sql: "SELECT id FROM users WHERE name = 'Ada'".into(),
+        },
+    );
+    let first_report = first_operator.physical_design_recommendations().unwrap();
+    assert_eq!(first_report.evidence_epoch, 0);
+    let old_token = first_report.runtime_token.unwrap();
+    let created = first_operator
+        .apply_physical_index(&old_token, 0, 1, 2, "users_name_restart_idx")
+        .unwrap();
+    assert!(matches!(
+        created.outcome,
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV3::Created { .. }
+    ));
+    drop(first_client);
+    first_server.shutdown().unwrap();
+
+    let second_server = TcpServer::new(config).start().unwrap();
+    let second_operator = ServerOperatorClient::new(&operator_config);
+    let second_status = second_operator.status().unwrap();
+    assert_eq!(
+        second_status
+            .physical_design
+            .as_ref()
+            .unwrap()
+            .evidence
+            .epoch,
+        0
+    );
+    let current_token = second_status
+        .physical_design
+        .unwrap()
+        .physical_index_apply
+        .runtime_token
+        .unwrap();
+    assert_eq!(current_token.len(), 32);
+    assert!(
+        current_token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+
+    let recovered = second_operator
+        .apply_physical_index(&old_token, 0, 1, 2, "users_name_restart_idx")
+        .unwrap();
+    assert!(matches!(
+        recovered.outcome,
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV3::AlreadyApplied { .. }
+    ));
+    second_server.shutdown().unwrap();
+    assert!(!socket.exists());
     cleanup(&directory);
 }
 
@@ -560,8 +757,24 @@ fn native_physical_design_proposal_is_bound_to_one_worker_runtime() {
             }
         }
     });
+    let socket = PathBuf::from(format!(
+        "/tmp/netbadb-native-programmatic-op-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    manifest_value["operator"] = serde_json::json!({
+        "unix_socket": socket,
+        "io_timeout_ms": 1000,
+        "allow_physical_index_apply": false
+    });
     std::fs::write(&manifest, serde_json::to_vec(&manifest_value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    assert!(
+        !config
+            .operator_config()
+            .unwrap()
+            .allow_physical_index_apply()
+    );
     let candidate = PhysicalIndexCandidate {
         table_id: TableId(1),
         column_id: ColumnId(2),
@@ -653,6 +866,7 @@ fn native_physical_design_proposal_is_bound_to_one_worker_runtime() {
     );
     drop(second_client);
     second_server.shutdown().unwrap();
+    assert!(!socket.exists());
     cleanup(&directory);
 }
 
@@ -708,7 +922,8 @@ fn native_adaptive_and_physical_design_share_one_successful_query_report() {
     });
     value["operator"] = serde_json::json!({
         "unix_socket": socket,
-        "io_timeout_ms": 1000
+        "io_timeout_ms": 1000,
+        "allow_physical_index_apply": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -887,7 +1102,8 @@ fn native_query_continues_across_live_operator_status_and_rotation() {
     });
     value["operator"] = serde_json::json!({
         "unix_socket": socket,
-        "io_timeout_ms": 1000
+        "io_timeout_ms": 1000,
+        "allow_physical_index_apply": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -897,13 +1113,13 @@ fn native_query_continues_across_live_operator_status_and_rotation() {
     let status = operator.status().unwrap();
     assert_eq!(
         status.adaptive.unwrap().mode,
-        OperatorAdaptiveModeV2::FeedbackOnly
+        OperatorAdaptiveModeV3::FeedbackOnly
     );
     assert!(status.physical_design.is_none());
     assert!(matches!(
         operator.physical_design_recommendations(),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV2::PhysicalDesignNotEnabled
+            if error.code == OperatorErrorCodeV3::PhysicalDesignNotEnabled
     ));
 
     let mut client = Client::connect(server.local_addr());
@@ -1703,7 +1919,7 @@ fn assert_tls_handshake_rejected(address: SocketAddr, config: Arc<ClientConfig>)
 }
 
 #[test]
-fn manifest_v7_validates_tls_material_and_allows_secure_remote_configuration() {
+fn manifest_v8_validates_tls_material_and_allows_secure_remote_configuration() {
     let directory = test_directory("tls-manifest");
     cleanup(&directory);
     std::fs::create_dir_all(&directory).unwrap();

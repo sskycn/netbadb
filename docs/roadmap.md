@@ -1,5 +1,25 @@
 # NetbaDB roadmap
 
+## Operator-approved physical index apply (Adaptive Operations Phase 25 complete)
+
+- upgraded the sole current deployment contract to strict Manifest v8 with a
+  required operator `allow_physical_index_apply` field and Physical Design
+  prerequisite for `true`;
+- upgraded the local plane to NBOP v3 with an ephemeral OS-random runtime token,
+  exact evidence-epoch approval, explicit logical IDs/name, and stable outcomes
+  and errors;
+- added one worker-atomic approval command that shares Core name idempotency,
+  derives a fresh proposal from current evidence, and immediately delegates to
+  Phase 23 named `CREATE INDEX`;
+- preserved cross-restart exact-name recovery while preventing an old approval
+  from authorizing new mutation in a new runtime;
+- retained explicit-only behavior: no automatic or Columnar apply, scheduler,
+  SQL generation, token/proposal/request persistence, or durable operator audit.
+
+See [`adaptive-operations-phase25.md`](adaptive-operations-phase25.md),
+[`server-manifest-v8.md`](server-manifest-v8.md), and
+[`server-operator-protocol-v3.md`](server-operator-protocol-v3.md).
+
 ## Server programmatic physical index apply (Adaptive Operations Phase 24 complete)
 
 - extended the existing Native/PostgreSQL physical-design control handle with

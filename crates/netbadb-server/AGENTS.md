@@ -80,7 +80,19 @@
   delegate current-state validation and mutation to Core's typed apply API and
   existing named-index transaction. Server MUST NOT duplicate coverage,
   incarnation, schema, storage, evidence, naming, allocation, WAL, retry, or
-  recovery authority, and MUST NOT add an operator/wire/automatic apply path.
+  recovery authority. It MUST NOT create an automatic apply path; an operator
+  wire path must satisfy the explicit approval rules below.
+- Durable physical-index mutation from the local operator plane MUST require
+  explicit deployment authorization in addition to filesystem access.
+- A wire approval MUST bind both an operator/runtime lifetime and an exact
+  Physical Design evidence epoch. Numeric evidence epochs alone are
+  insufficient across daemon restart.
+- Wire clients MUST NOT construct or serialize Core or Server proposal objects
+  as mutation authority. The Database worker MUST derive the Core proposal and
+  apply it inside one typed worker command.
+- A stale runtime approval MAY recognize an already-created exact named index
+  as an idempotent success, but MUST NOT authorize a new mutation in the new
+  runtime.
 - Deployment and operator exposure of physical-design advice MUST remain a
   projection of the worker-owned runtime. Operator recommendations are
   observation only: they MUST NOT reserve identity, generate DDL, build

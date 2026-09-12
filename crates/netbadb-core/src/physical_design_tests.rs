@@ -9,7 +9,8 @@ use crate::{
     PhysicalDesignEvidenceRecordError, PhysicalDesignEvidenceRecordOutcome,
     PhysicalDesignEvidenceWindow, PhysicalDesignNoActionReason, PhysicalDesignRecommendationPolicy,
     PhysicalIndexCandidate, PhysicalIndexDesignApplyError, PhysicalIndexDesignApplyOutcome,
-    PhysicalIndexDesignProposalError, PlanVariant, QueryExpressionShape, QueryExpressionShapeKind,
+    PhysicalIndexDesignNameState, PhysicalIndexDesignProposalError, PlanVariant,
+    QueryExpressionShape, QueryExpressionShapeKind,
 };
 
 fn policy(
@@ -836,6 +837,79 @@ fn apply_recognizes_coverage_and_name_conflicts_before_mutation() {
         PhysicalIndexDesignApplyOutcome::AlreadyCovered
     );
     assert_eq!(fixture.database.indexes(TABLE_ID).unwrap().len(), 2);
+    fixture.close();
+}
+
+#[test]
+fn current_physical_index_name_classification_is_active_only_and_pure() {
+    let mut fixture = Fixture::create("phase25-name-classification", false);
+    let candidate = index_candidate();
+    let name = netbadb_types::IndexName::new("events_category_name_state").unwrap();
+    let before = fixture
+        .database
+        .current_database_snapshot()
+        .unwrap()
+        .unwrap()
+        .commit_seq();
+    assert_eq!(
+        fixture
+            .database
+            .inspect_physical_index_design_name(candidate, &name),
+        PhysicalIndexDesignNameState::Available
+    );
+    assert_eq!(
+        fixture
+            .database
+            .current_database_snapshot()
+            .unwrap()
+            .unwrap()
+            .commit_seq(),
+        before
+    );
+
+    let definition = fixture
+        .database
+        .create_named_index(name.clone(), TABLE_ID, ColumnId(2))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .database
+            .inspect_physical_index_design_name(candidate, &name),
+        PhysicalIndexDesignNameState::AlreadyApplied {
+            index_id: definition.id
+        }
+    );
+    assert_eq!(
+        fixture.database.inspect_physical_index_design_name(
+            PhysicalIndexCandidate {
+                table_id: TABLE_ID,
+                column_id: ColumnId(1),
+            },
+            &name,
+        ),
+        PhysicalIndexDesignNameState::Conflict
+    );
+    assert_eq!(
+        fixture.database.inspect_physical_index_design_name(
+            PhysicalIndexCandidate {
+                table_id: netbadb_types::TableId(TABLE_ID.0 + 1),
+                column_id: ColumnId(2),
+            },
+            &name,
+        ),
+        PhysicalIndexDesignNameState::Conflict
+    );
+
+    fixture
+        .database
+        .drop_index(TABLE_ID, definition.id)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .database
+            .inspect_physical_index_design_name(candidate, &name),
+        PhysicalIndexDesignNameState::Available
+    );
     fixture.close();
 }
 

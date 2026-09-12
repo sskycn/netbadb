@@ -59,7 +59,7 @@ fn manifest_fixture(
 ) -> Fixture {
     let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
-        "netbadbd-v7-{transport}-{}-{sequence}",
+        "netbadbd-v8-{transport}-{}-{sequence}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&directory);
@@ -76,12 +76,12 @@ fn manifest_fixture(
         std::process::id()
     ));
     let _ = std::fs::remove_file(&socket);
-    let document = include_str!("../../../docs/server-manifest-v7.md");
+    let document = include_str!("../../../docs/server-manifest-v8.md");
     let example = document
         .split_once("```json\n")
         .and_then(|(_, remainder)| remainder.split_once("\n```"))
         .map(|(example, _)| example)
-        .expect("v7 documentation contains a JSON example");
+        .expect("v8 documentation contains a JSON example");
     let mut source: serde_json::Value = serde_json::from_str(example).unwrap();
     source["listen"] = "127.0.0.1:0".into();
     source["operator"]["unix_socket"] = socket.to_string_lossy().into_owned().into();
@@ -91,6 +91,9 @@ fn manifest_fixture(
     }
     if !with_physical_design {
         object.remove("physical_design");
+        if with_operator {
+            object["operator"]["allow_physical_index_apply"] = false.into();
+        }
     }
     if !with_operator {
         object.remove("operator");
@@ -227,6 +230,10 @@ fn native_sigterm_gracefully_closes_driven_daemon_and_removes_operator_socket() 
         ready.contains("physical-design enabled"),
         "readiness line: {ready}"
     );
+    assert!(
+        ready.contains("physical-index-apply enabled"),
+        "readiness line: {ready}"
+    );
     assert!(!ready.contains(fixture.socket.as_ref().unwrap().to_string_lossy().as_ref()));
     assert_driven_operator(&fixture);
 
@@ -255,6 +262,10 @@ fn native_sigint_gracefully_closes_disabled_daemon_without_operator() {
         ready.contains("physical-design disabled"),
         "readiness line: {ready}"
     );
+    assert!(
+        ready.contains("physical-index-apply disabled"),
+        "readiness line: {ready}"
+    );
 
     daemon.send_signal("SIGINT");
     let (status, _) = daemon.wait();
@@ -274,6 +285,10 @@ fn postgres_sigterm_gracefully_closes_driven_daemon() {
     assert!(ready.contains("adaptive driven"), "readiness line: {ready}");
     assert!(
         ready.contains("physical-design enabled"),
+        "readiness line: {ready}"
+    );
+    assert!(
+        ready.contains("physical-index-apply enabled"),
         "readiness line: {ready}"
     );
     assert_driven_operator(&fixture);
@@ -317,12 +332,20 @@ fn native_design_only_daemon_exposes_status_and_conditional_rotation() {
         ready.contains("physical-design enabled"),
         "readiness line: {ready}"
     );
+    assert!(
+        ready.contains("physical-index-apply enabled"),
+        "readiness line: {ready}"
+    );
 
     let config = ServerConfig::from_manifest_path(&fixture.manifest).unwrap();
     let operator = ServerOperatorClient::new(config.operator_config().unwrap());
     let status = operator.status().unwrap();
     assert!(status.adaptive.is_none());
-    assert_eq!(status.physical_design.unwrap().evidence.epoch, 0);
+    let design = status.physical_design.unwrap();
+    assert_eq!(design.evidence.epoch, 0);
+    let runtime_token = design.physical_index_apply.runtime_token.unwrap();
+    assert!(design.physical_index_apply.enabled);
+    assert!(!ready.contains(&runtime_token));
     let rotation = operator.rotate_physical_design_evidence(0).unwrap();
     assert_eq!(rotation.previous_epoch, 0);
     assert_eq!(rotation.new_epoch, 1);
@@ -335,7 +358,7 @@ fn native_design_only_daemon_exposes_status_and_conditional_rotation() {
 }
 
 #[test]
-fn postgres_design_only_daemon_exposes_nbop_v2_status() {
+fn postgres_design_only_daemon_exposes_nbop_v3_status() {
     let fixture = manifest_fixture("postgres-design-only", false, true, true);
     let mut daemon = DaemonProcess::spawn(&fixture.manifest, true);
     let ready = daemon.wait_for_readiness();
@@ -345,6 +368,10 @@ fn postgres_design_only_daemon_exposes_nbop_v2_status() {
     );
     assert!(
         ready.contains("physical-design enabled"),
+        "readiness line: {ready}"
+    );
+    assert!(
+        ready.contains("physical-index-apply enabled"),
         "readiness line: {ready}"
     );
     let config = ServerConfig::from_manifest_path(&fixture.manifest).unwrap();

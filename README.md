@@ -407,7 +407,7 @@ The current code genuinely supports:
   explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
 - a blocking TCP runtime with loopback plaintext or mandatory mutual TLS whose
   dedicated synchronous worker owns the Database and every SessionState, plus
-  strict deployment manifest v7 bootstrap, authenticated certificate identity,
+  strict deployment manifest v8 bootstrap, authenticated certificate identity,
   per-certificate and local-plaintext table/operation authorization, secure
   remote listen, bounded connections/socket inactivity, response-row policy,
   in-process metrics, and the standalone `netbadbd` executable;
@@ -415,18 +415,20 @@ The current code genuinely supports:
 - stable, read-only embedded catalog and chosen-plan inspection DTOs with an
   explicit deterministic text renderer that exposes no planner objects or
   storage internals and never drives execution;
-- an offline `netbadb inspect` CLI that reuses deployment manifest v7 and the
+- an offline `netbadb inspect` CLI that reuses deployment manifest v8 and the
   embedded inspection API, with deterministic human text and explicit
   current versioned Inspection JSON v7 output (with v1-v6 retained
   historically);
-- a local Unix-only NBOP v2 operator plane, configured by manifest v7, whose
+- a local Unix-only NBOP v3 operator plane, configured by manifest v8, whose
   `0600` socket exposes bounded multi-domain status, Adaptive controls,
-  read-only current-inventory physical-design recommendations, and conditional
-  design-evidence rotation through typed Server control paths;
+  current-inventory physical-design recommendations, conditional design-evidence
+  rotation, and manifest-authorized explicit physical-index approval through
+  typed Server control paths;
 - an embedded-host-only Server physical-index proposal/apply control that binds
   proposals to one worker evidence-window lifetime and delegates explicit
   caller-named single-column Heap index creation to the existing Core
-  transaction path, without an NBOP, SQL, or wire apply operation;
+  transaction path; the local operator adds a separate explicit approval path
+  without changing SQL or database wire protocols;
 - a diagnostics-only synchronous `netbadb-lsp` server that loads SDK Schema
   Spec v1 or v2 once, compiles full editor buffers without database access, and maps
   stable UTF-8 byte diagnostics to UTF-16 LSP ranges;
@@ -441,9 +443,9 @@ Current Protocol v2 is specified in
 [`docs/protocol-v2.md`](docs/protocol-v2.md); the frozen v1 byte contract remains
 in [`docs/protocol-v1.md`](docs/protocol-v1.md). Current standalone
 configuration is documented in
-[`docs/server-manifest-v7.md`](docs/server-manifest-v7.md), and the local
+[`docs/server-manifest-v8.md`](docs/server-manifest-v8.md), and the local
 operator contract is specified in
-[`docs/server-operator-protocol-v2.md`](docs/server-operator-protocol-v2.md).
+[`docs/server-operator-protocol-v3.md`](docs/server-operator-protocol-v3.md).
 The generated SDK
 input contract is documented in
 [`docs/sdk-schema-v2.md`](docs/sdk-schema-v2.md), with v1 retained as a readable

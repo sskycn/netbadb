@@ -8,12 +8,13 @@ use netbadb_core::{
     PhysicalDesignAdvisorReport, PhysicalDesignEvidenceEpoch, PhysicalDesignEvidenceLimits,
     PhysicalDesignEvidenceRecordError, PhysicalDesignEvidenceRecordOutcome,
     PhysicalDesignEvidenceSummary, PhysicalDesignEvidenceWindow,
-    PhysicalDesignEvidenceWindowInspection, PhysicalIndexCandidate, PhysicalIndexDesignApplyError,
-    PhysicalIndexDesignApplyReport, PhysicalIndexDesignProposal, PhysicalIndexDesignProposalError,
+    PhysicalDesignEvidenceWindowInspection, PhysicalDesignNoActionReason, PhysicalIndexCandidate,
+    PhysicalIndexDesignApplyError, PhysicalIndexDesignApplyOutcome, PhysicalIndexDesignApplyReport,
+    PhysicalIndexDesignNameState, PhysicalIndexDesignProposal, PhysicalIndexDesignProposalError,
 };
 use netbadb_schema::SchemaFingerprint;
 use netbadb_types::{
-    DatabaseCommitSeq, IndexName, SchemaGeneration, StorageId, TableSchemaVersion,
+    DatabaseCommitSeq, IndexId, IndexName, SchemaGeneration, StorageId, TableSchemaVersion,
 };
 
 use crate::adaptive_driver::ServerAdaptiveHostConfig;
@@ -79,6 +80,20 @@ pub struct ServerPhysicalDesignStatus {
 pub struct ServerPhysicalDesignRotationReport {
     pub previous_epoch: PhysicalDesignEvidenceEpoch,
     pub new_epoch: PhysicalDesignEvidenceEpoch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerApprovedPhysicalIndexApplyOutcome {
+    Created { index_id: IndexId },
+    AlreadyApplied { index_id: IndexId },
+    AlreadyCovered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerApprovedPhysicalIndexApplyReport {
+    pub(crate) candidate: PhysicalIndexCandidate,
+    pub(crate) index_name: IndexName,
+    pub(crate) outcome: ServerApprovedPhysicalIndexApplyOutcome,
 }
 
 struct ServerPhysicalDesignRuntimeIdentity;
@@ -193,6 +208,8 @@ pub enum ServerPhysicalDesignControlError {
     Proposal(Box<PhysicalIndexDesignProposalError>),
     Apply(Box<PhysicalIndexDesignApplyError>),
     ProposalRuntimeChanged,
+    PhysicalDesignRuntimeChanged,
+    PhysicalIndexNameConflict(IndexName),
     ServerStopped,
 }
 
@@ -214,6 +231,11 @@ impl fmt::Display for ServerPhysicalDesignControlError {
             Self::ProposalRuntimeChanged => formatter.write_str(
                 "physical-index proposal belongs to another server physical-design runtime",
             ),
+            Self::PhysicalDesignRuntimeChanged => formatter
+                .write_str("physical-index approval belongs to another operator/design runtime"),
+            Self::PhysicalIndexNameConflict(name) => {
+                write!(formatter, "physical-index name `{name}` is already in use")
+            }
             Self::ServerStopped => formatter.write_str("server physical-design control is stopped"),
         }
     }
@@ -229,6 +251,8 @@ impl Error for ServerPhysicalDesignControlError {
             Self::PhysicalDesignNotEnabled
             | Self::EvidenceEpochChanged { .. }
             | Self::ProposalRuntimeChanged
+            | Self::PhysicalDesignRuntimeChanged
+            | Self::PhysicalIndexNameConflict(_)
             | Self::ServerStopped => None,
         }
     }
@@ -301,6 +325,31 @@ impl ServerPhysicalDesignControlHandle {
             .map_err(|_| ServerPhysicalDesignControlError::ServerStopped)?
     }
 
+    /// Forwards one externally approved logical candidate as one atomic worker
+    /// command. The listener has already checked deployment permission and the
+    /// current opaque runtime token; Core still owns all database decisions.
+    pub(crate) fn apply_approved_index(
+        &self,
+        runtime_token_matches: bool,
+        expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalIndexCandidate,
+        index_name: IndexName,
+    ) -> Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.requests
+            .send(ServerPhysicalDesignControlRequest::ApplyApprovedIndex {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate,
+                index_name,
+                reply,
+            })
+            .map_err(|_| ServerPhysicalDesignControlError::ServerStopped)?;
+        response
+            .recv()
+            .map_err(|_| ServerPhysicalDesignControlError::ServerStopped)?
+    }
+
     /// Compares and rotates as one command in the sole Database worker.
     pub fn rotate_evidence_if_epoch(
         &self,
@@ -333,6 +382,15 @@ pub(crate) enum ServerPhysicalDesignControlRequest {
         index_name: IndexName,
         reply: SyncSender<Result<PhysicalIndexDesignApplyReport, ServerPhysicalDesignControlError>>,
     },
+    ApplyApprovedIndex {
+        runtime_token_matches: bool,
+        expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalIndexCandidate,
+        index_name: IndexName,
+        reply: SyncSender<
+            Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError>,
+        >,
+    },
     RotateEvidenceIfEpoch {
         expected: PhysicalDesignEvidenceEpoch,
         reply: SyncSender<
@@ -357,6 +415,15 @@ pub(crate) enum ServerPhysicalDesignWorkerCommand {
         proposal: Box<ServerPhysicalIndexDesignProposal>,
         index_name: IndexName,
         reply: SyncSender<Result<PhysicalIndexDesignApplyReport, ServerPhysicalDesignControlError>>,
+    },
+    ApplyApprovedIndex {
+        runtime_token_matches: bool,
+        expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalIndexCandidate,
+        index_name: IndexName,
+        reply: SyncSender<
+            Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError>,
+        >,
     },
     RotateEvidenceIfEpoch {
         expected: PhysicalDesignEvidenceEpoch,
@@ -484,6 +551,22 @@ impl ServerPhysicalDesignRuntime {
                 };
                 let _ = reply.send(result);
             }
+            ServerPhysicalDesignWorkerCommand::ApplyApprovedIndex {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate,
+                index_name,
+                reply,
+            } => {
+                let result = self.apply_approved_index(
+                    database,
+                    runtime_token_matches,
+                    expected_evidence_epoch,
+                    candidate,
+                    index_name,
+                );
+                let _ = reply.send(result);
+            }
             ServerPhysicalDesignWorkerCommand::RotateEvidenceIfEpoch { expected, reply } => {
                 let actual = self.evidence.epoch();
                 let result = if actual == expected {
@@ -500,6 +583,78 @@ impl ServerPhysicalDesignRuntime {
                 let _ = reply.send(result);
             }
         }
+    }
+
+    fn apply_approved_index(
+        &mut self,
+        database: &mut Database,
+        runtime_token_matches: bool,
+        expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalIndexCandidate,
+        index_name: IndexName,
+    ) -> Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError> {
+        match database.inspect_physical_index_design_name(candidate, &index_name) {
+            PhysicalIndexDesignNameState::AlreadyApplied { index_id } => {
+                return Ok(ServerApprovedPhysicalIndexApplyReport {
+                    candidate,
+                    index_name,
+                    outcome: ServerApprovedPhysicalIndexApplyOutcome::AlreadyApplied { index_id },
+                });
+            }
+            PhysicalIndexDesignNameState::Conflict => {
+                return Err(ServerPhysicalDesignControlError::PhysicalIndexNameConflict(
+                    index_name,
+                ));
+            }
+            PhysicalIndexDesignNameState::Available => {}
+        }
+        if !runtime_token_matches {
+            return Err(ServerPhysicalDesignControlError::PhysicalDesignRuntimeChanged);
+        }
+        let actual = self.evidence.epoch();
+        if actual != expected_evidence_epoch {
+            return Err(ServerPhysicalDesignControlError::EvidenceEpochChanged {
+                expected: expected_evidence_epoch,
+                actual,
+            });
+        }
+
+        let proposal =
+            match database.propose_physical_index_design(&self.evidence, self.policy, candidate) {
+                Ok(proposal) => proposal,
+                Err(PhysicalIndexDesignProposalError::CandidateNotRecommended {
+                    reason: PhysicalDesignNoActionReason::ExistingDesignCovers,
+                    ..
+                }) => {
+                    return Ok(ServerApprovedPhysicalIndexApplyReport {
+                        candidate,
+                        index_name,
+                        outcome: ServerApprovedPhysicalIndexApplyOutcome::AlreadyCovered,
+                    });
+                }
+                Err(error) => {
+                    return Err(ServerPhysicalDesignControlError::Proposal(Box::new(error)));
+                }
+            };
+        let report = database
+            .apply_physical_index_design(&self.evidence, &proposal, index_name.clone())
+            .map_err(|error| ServerPhysicalDesignControlError::Apply(Box::new(error)))?;
+        let outcome = match report.outcome {
+            PhysicalIndexDesignApplyOutcome::Created { index_id } => {
+                ServerApprovedPhysicalIndexApplyOutcome::Created { index_id }
+            }
+            PhysicalIndexDesignApplyOutcome::AlreadyApplied { index_id } => {
+                ServerApprovedPhysicalIndexApplyOutcome::AlreadyApplied { index_id }
+            }
+            PhysicalIndexDesignApplyOutcome::AlreadyCovered => {
+                ServerApprovedPhysicalIndexApplyOutcome::AlreadyCovered
+            }
+        };
+        Ok(ServerApprovedPhysicalIndexApplyReport {
+            candidate,
+            index_name,
+            outcome,
+        })
     }
 }
 
@@ -551,6 +706,26 @@ pub(crate) fn forward_physical_design_control_requests<F>(
                     let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
                 }
             }
+            ServerPhysicalDesignControlRequest::ApplyApprovedIndex {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate,
+                index_name,
+                reply,
+            } => {
+                let fallback = reply.clone();
+                if submit(ServerPhysicalDesignWorkerCommand::ApplyApprovedIndex {
+                    runtime_token_matches,
+                    expected_evidence_epoch,
+                    candidate,
+                    index_name,
+                    reply,
+                })
+                .is_err()
+                {
+                    let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
+                }
+            }
             ServerPhysicalDesignControlRequest::RotateEvidenceIfEpoch { expected, reply } => {
                 let fallback = reply.clone();
                 if submit(ServerPhysicalDesignWorkerCommand::RotateEvidenceIfEpoch {
@@ -586,6 +761,11 @@ pub(crate) fn handle_disabled_physical_design_worker_command(
             ));
         }
         ServerPhysicalDesignWorkerCommand::ApplyIndex { reply, .. } => {
+            let _ = reply.send(Err(
+                ServerPhysicalDesignControlError::PhysicalDesignNotEnabled,
+            ));
+        }
+        ServerPhysicalDesignWorkerCommand::ApplyApprovedIndex { reply, .. } => {
             let _ = reply.send(Err(
                 ServerPhysicalDesignControlError::PhysicalDesignNotEnabled,
             ));
@@ -733,6 +913,27 @@ mod tests {
             },
         );
         response.recv().expect("apply response")
+    }
+
+    fn apply_approved(
+        database: &mut Database,
+        runtime: &mut ServerPhysicalDesignRuntime,
+        runtime_token_matches: bool,
+        expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
+        name: &str,
+    ) -> Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        runtime.handle(
+            database,
+            ServerPhysicalDesignWorkerCommand::ApplyApprovedIndex {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate: CANDIDATE,
+                index_name: IndexName::new(name).expect("valid index name"),
+                reply,
+            },
+        );
+        response.recv().expect("approved apply response")
     }
 
     fn current_commit_seq(database: &Database) -> DatabaseCommitSeq {
@@ -1021,6 +1222,99 @@ mod tests {
                 )
         ));
         assert_eq!(current_commit_seq(&fixture.database), before);
+        fixture.close();
+    }
+
+    #[test]
+    fn operator_approval_is_one_worker_command_with_retry_precedence() {
+        let mut fixture = Fixture::create("operator-approval");
+        let mut runtime = ServerPhysicalDesignRuntime::new(config());
+        record_candidate(&mut fixture.database, &mut runtime);
+        let epoch = runtime.status().evidence.epoch;
+        let before = current_commit_seq(&fixture.database);
+
+        assert!(matches!(
+            apply_approved(
+                &mut fixture.database,
+                &mut runtime,
+                false,
+                epoch,
+                "stale_runtime_absent"
+            ),
+            Err(ServerPhysicalDesignControlError::PhysicalDesignRuntimeChanged)
+        ));
+        assert_eq!(current_commit_seq(&fixture.database), before);
+        assert!(fixture.database.indexes(TABLE_ID).unwrap().is_empty());
+
+        assert!(matches!(
+            apply_approved(
+                &mut fixture.database,
+                &mut runtime,
+                true,
+                PhysicalDesignEvidenceEpoch(epoch.0 + 1),
+                "stale_epoch_absent"
+            ),
+            Err(ServerPhysicalDesignControlError::EvidenceEpochChanged { .. })
+        ));
+        assert_eq!(current_commit_seq(&fixture.database), before);
+
+        let created = apply_approved(
+            &mut fixture.database,
+            &mut runtime,
+            true,
+            epoch,
+            "approved_category_idx",
+        )
+        .expect("create approved index");
+        let index_id = match created.outcome {
+            ServerApprovedPhysicalIndexApplyOutcome::Created { index_id } => index_id,
+            other => panic!("unexpected approved outcome: {other:?}"),
+        };
+        assert_eq!(
+            index_id,
+            IndexId(1),
+            "rejected approvals must not burn an ID"
+        );
+        let after = current_commit_seq(&fixture.database);
+        assert!(after > before);
+
+        runtime.evidence.rotate_window().expect("rotate evidence");
+        let retry = apply_approved(
+            &mut fixture.database,
+            &mut runtime,
+            false,
+            epoch,
+            "approved_category_idx",
+        )
+        .expect("exact durable name wins over stale runtime and epoch");
+        assert_eq!(
+            retry.outcome,
+            ServerApprovedPhysicalIndexApplyOutcome::AlreadyApplied { index_id }
+        );
+        assert_eq!(current_commit_seq(&fixture.database), after);
+
+        fixture
+            .database
+            .create_named_index(
+                IndexName::new("conflicting_approval_name").unwrap(),
+                TABLE_ID,
+                ColumnId(1),
+            )
+            .unwrap();
+        let before_conflict = current_commit_seq(&fixture.database);
+        assert!(matches!(
+            apply_approved(
+                &mut fixture.database,
+                &mut runtime,
+                false,
+                epoch,
+                "conflicting_approval_name"
+            ),
+            Err(ServerPhysicalDesignControlError::PhysicalIndexNameConflict(
+                _
+            ))
+        ));
+        assert_eq!(current_commit_seq(&fixture.database), before_conflict);
         fixture.close();
     }
 }

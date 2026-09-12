@@ -293,7 +293,7 @@ fn native_server_builder_is_default_disabled_and_explicitly_enabled() {
     let manifest = root.join("server.json");
     let source = format!(
         r#"{{
-            "version": 7,
+            "version": 8,
             "listen": "127.0.0.1:0",
             "authorization": {{
                 "local_plaintext": {{
