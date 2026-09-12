@@ -390,6 +390,20 @@ are never scanned or adopted. NBCM/NBCS/NBCD, schema/coordinator/WAL, Manifest
 v8, NBOP v3, Native Protocol v2, Inspection JSON v7, and Server behavior remain
 unchanged, and Columnar recommendation apply remains deferred.
 
+[Adaptive Operations Phase 27](adaptive-operations-phase27.md) adds a
+Core-only, explicit bridge from one current recommended
+`PhysicalColumnarCandidate` into the existing managed Columnar build APIs. The
+caller chooses Snapshot or Incremental without a default and supplies the exact
+placement directory; a runtime-only proposal freezes those choices with the
+durable database, evidence, schema, table, storage, and optional Change Stream
+generation anchors. Apply recognizes the exact registered target before
+evidence freshness, rejects conflicting occupants, returns `AlreadyCovered`
+for another covering projection, and reruns the advisor before delegating the
+only mutation to Phase 26. Incremental requires a pre-enabled unchanged stream;
+no path, row-group policy, stream enablement, identity allocation, artifact
+publication, refresh, scheduler, Server/operator surface, external contract, or
+persistent format authority is added.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

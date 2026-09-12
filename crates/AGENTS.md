@@ -53,6 +53,12 @@ and `LIMIT` whenever those concepts are involved.
 - Avoid unnecessary per-row allocation and cloning, but optimize only with
   evidence.
 
+Physical Design Columnar apply MUST NOT allocate projection identity, publish
+NBC artifacts, or manipulate NBPC directly. Snapshot versus Incremental mode
+and target placement are explicit caller approvals, and Incremental apply MUST
+NOT enable or replace a Change Stream. Mutation may begin only through an
+existing `Database` Columnar build API.
+
 ## Library quality
 
 - Public types MUST have stable, documented invariants and domain-specific

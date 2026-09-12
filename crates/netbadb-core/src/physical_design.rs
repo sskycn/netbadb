@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use netbadb_executor::ExecutionAccessKind;
 use netbadb_planner::PlanVariant;
@@ -9,12 +10,15 @@ use netbadb_rel::{
 use netbadb_schema::SchemaFingerprint;
 use netbadb_storage::StorageKind;
 use netbadb_types::{
-    ColumnId, DatabaseCommitSeq, IndexId, IndexName, SchemaGeneration, StorageId, TableId,
-    TableSchemaVersion,
+    ChangeStreamGeneration, ColumnId, ColumnarProjectionId, DatabaseCommitSeq, IndexId, IndexName,
+    SchemaGeneration, StorageId, TableId, TableSchemaVersion,
 };
 
 use crate::registry::TablePlacement;
-use crate::{Database, DatabaseError, ExecutionFeedbackReport, PartitionError, SchemaCatalogError};
+use crate::{
+    ColumnarProjectionSpec, Database, DatabaseError, ExecutionFeedbackReport, PartitionError,
+    ProjectionCatalogError, SchemaCatalogError,
+};
 
 /// Fixed-width cardinality limits for one caller-owned in-memory window.
 /// These are memory/evidence bounds, not recommendation thresholds.
@@ -99,6 +103,14 @@ pub struct PhysicalColumnarCandidate {
     pub table_id: TableId,
     /// Canonical schema declaration order in advisor reports.
     pub columns: Vec<ColumnId>,
+}
+
+/// Caller-selected maintenance semantics for one physical Columnar design.
+/// Neither mode is an implicit default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalColumnarDesignMode {
+    Snapshot,
+    Incremental,
 }
 
 /// Work paid by executions structurally relevant to a candidate. Work can
@@ -874,6 +886,359 @@ pub struct PhysicalIndexDesignApplyReport {
     pub outcome: PhysicalIndexDesignApplyOutcome,
 }
 
+/// Runtime-only approval of one exact recommended Columnar shape, maintenance
+/// mode, and placement. Construction is restricted to `Database` so every
+/// proposal carries current durable identity and structural anchors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalColumnarDesignProposal {
+    database_incarnation: [u8; 16],
+    candidate: PhysicalColumnarCandidate,
+    mode: PhysicalColumnarDesignMode,
+    directory: PathBuf,
+    evidence_epoch: PhysicalDesignEvidenceEpoch,
+    evidence_schema_generation: SchemaGeneration,
+    first_global_commit_seq: DatabaseCommitSeq,
+    last_global_commit_seq: DatabaseCommitSeq,
+    proposed_at_global_commit_seq: DatabaseCommitSeq,
+    table_schema_version: TableSchemaVersion,
+    table_fingerprint: SchemaFingerprint,
+    storage_id: StorageId,
+    change_stream_generation: Option<ChangeStreamGeneration>,
+    evidence: PhysicalDesignEvidenceSummary,
+    policy: PhysicalDesignAdvisorPolicy,
+}
+
+impl PhysicalColumnarDesignProposal {
+    #[must_use]
+    pub fn candidate(&self) -> &PhysicalColumnarCandidate {
+        &self.candidate
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> PhysicalColumnarDesignMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    #[must_use]
+    pub const fn evidence_epoch(&self) -> PhysicalDesignEvidenceEpoch {
+        self.evidence_epoch
+    }
+
+    #[must_use]
+    pub const fn evidence_schema_generation(&self) -> SchemaGeneration {
+        self.evidence_schema_generation
+    }
+
+    #[must_use]
+    pub const fn first_global_commit_seq(&self) -> DatabaseCommitSeq {
+        self.first_global_commit_seq
+    }
+
+    #[must_use]
+    pub const fn last_global_commit_seq(&self) -> DatabaseCommitSeq {
+        self.last_global_commit_seq
+    }
+
+    #[must_use]
+    pub const fn proposed_at_global_commit_seq(&self) -> DatabaseCommitSeq {
+        self.proposed_at_global_commit_seq
+    }
+
+    #[must_use]
+    pub const fn table_schema_version(&self) -> TableSchemaVersion {
+        self.table_schema_version
+    }
+
+    #[must_use]
+    pub fn table_fingerprint(&self) -> &SchemaFingerprint {
+        &self.table_fingerprint
+    }
+
+    #[must_use]
+    pub const fn storage_id(&self) -> StorageId {
+        self.storage_id
+    }
+
+    #[must_use]
+    pub const fn change_stream_generation(&self) -> Option<ChangeStreamGeneration> {
+        self.change_stream_generation
+    }
+
+    #[must_use]
+    pub const fn evidence(&self) -> PhysicalDesignEvidenceSummary {
+        self.evidence
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> PhysicalDesignAdvisorPolicy {
+        self.policy
+    }
+}
+
+#[derive(Debug)]
+pub enum PhysicalColumnarDesignProposalError {
+    Advisor(PhysicalDesignAdvisorError),
+    CandidateNotObserved(PhysicalColumnarCandidate),
+    CandidateNotRecommended {
+        candidate: PhysicalColumnarCandidate,
+        reason: PhysicalDesignNoActionReason,
+    },
+    GlobalVisibilityRequired,
+    DurableCatalogRequired,
+    IncrementalChangeStreamNotEnabled {
+        storage_id: StorageId,
+    },
+    IncrementalChangeStreamUnavailable {
+        storage_id: StorageId,
+    },
+    ProjectionLocationConflict {
+        directory: PathBuf,
+    },
+    Database(DatabaseError),
+}
+
+impl fmt::Display for PhysicalColumnarDesignProposalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Advisor(error) => error.fmt(formatter),
+            Self::CandidateNotObserved(candidate) => write!(
+                formatter,
+                "physical-columnar candidate for table {} was not observed",
+                candidate.table_id.0
+            ),
+            Self::CandidateNotRecommended { candidate, reason } => write!(
+                formatter,
+                "physical-columnar candidate for table {} was not recommended: {reason:?}",
+                candidate.table_id.0
+            ),
+            Self::GlobalVisibilityRequired => {
+                formatter.write_str("physical-columnar proposals require global visibility")
+            }
+            Self::DurableCatalogRequired => formatter.write_str(
+                "physical-columnar proposals require durable schema and managed projection catalogs",
+            ),
+            Self::IncrementalChangeStreamNotEnabled { storage_id } => write!(
+                formatter,
+                "incremental physical-columnar design requires an enabled change stream for storage {}",
+                storage_id.0
+            ),
+            Self::IncrementalChangeStreamUnavailable { storage_id } => write!(
+                formatter,
+                "incremental physical-columnar design change stream for storage {} is unavailable",
+                storage_id.0
+            ),
+            Self::ProjectionLocationConflict { directory } => write!(
+                formatter,
+                "physical-columnar location {} is already registered",
+                directory.display()
+            ),
+            Self::Database(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PhysicalColumnarDesignProposalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Advisor(error) => Some(error),
+            Self::Database(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<PhysicalDesignAdvisorError> for PhysicalColumnarDesignProposalError {
+    fn from(error: PhysicalDesignAdvisorError) -> Self {
+        Self::Advisor(error)
+    }
+}
+
+impl From<DatabaseError> for PhysicalColumnarDesignProposalError {
+    fn from(error: DatabaseError) -> Self {
+        Self::Database(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalColumnarDesignProposalStaleReason {
+    SchemaGenerationChanged {
+        expected: SchemaGeneration,
+        actual: SchemaGeneration,
+    },
+    TableVersionChanged {
+        expected: TableSchemaVersion,
+        actual: TableSchemaVersion,
+    },
+    TableFingerprintChanged,
+    StorageChanged {
+        expected: StorageId,
+        actual: StorageId,
+    },
+    ColumnMissing,
+    UnsupportedCurrentLayout,
+    VisibilityMovedBackward {
+        proposed_at: DatabaseCommitSeq,
+        current: DatabaseCommitSeq,
+    },
+    ChangeStreamDisabled,
+    ChangeStreamUnavailable,
+    ChangeStreamGenerationChanged {
+        expected: ChangeStreamGeneration,
+        actual: ChangeStreamGeneration,
+    },
+}
+
+impl fmt::Display for PhysicalColumnarDesignProposalStaleReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SchemaGenerationChanged { expected, actual } => write!(
+                formatter,
+                "schema generation changed from {} to {}",
+                expected.0, actual.0
+            ),
+            Self::TableVersionChanged { expected, actual } => write!(
+                formatter,
+                "table schema version changed from {} to {}",
+                expected.0, actual.0
+            ),
+            Self::TableFingerprintChanged => {
+                formatter.write_str("table schema fingerprint changed")
+            }
+            Self::StorageChanged { expected, actual } => write!(
+                formatter,
+                "table storage changed from {} to {}",
+                expected.0, actual.0
+            ),
+            Self::ColumnMissing => formatter.write_str("proposal column is missing"),
+            Self::UnsupportedCurrentLayout => {
+                formatter.write_str("current table layout cannot build this Columnar projection")
+            }
+            Self::VisibilityMovedBackward {
+                proposed_at,
+                current,
+            } => write!(
+                formatter,
+                "global visibility moved backward from {} to {}",
+                proposed_at.0, current.0
+            ),
+            Self::ChangeStreamDisabled => formatter.write_str("change stream was disabled"),
+            Self::ChangeStreamUnavailable => formatter.write_str("change stream is unavailable"),
+            Self::ChangeStreamGenerationChanged { expected, actual } => write!(
+                formatter,
+                "change stream generation changed from {} to {}",
+                expected.0, actual.0
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum PhysicalColumnarDesignApplyError {
+    DatabaseIdentityChanged,
+    EvidenceEpochChanged {
+        expected: PhysicalDesignEvidenceEpoch,
+        actual: PhysicalDesignEvidenceEpoch,
+    },
+    StaleProposal(PhysicalColumnarDesignProposalStaleReason),
+    CandidateNotObserved(PhysicalColumnarCandidate),
+    RecommendationNoLongerValid(PhysicalDesignNoActionReason),
+    ProjectionLocationConflict {
+        directory: PathBuf,
+        projection_id: ColumnarProjectionId,
+    },
+    Advisor(PhysicalDesignAdvisorError),
+    Database(DatabaseError),
+}
+
+impl fmt::Display for PhysicalColumnarDesignApplyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DatabaseIdentityChanged => {
+                formatter.write_str("physical-columnar proposal belongs to another database")
+            }
+            Self::EvidenceEpochChanged { expected, actual } => write!(
+                formatter,
+                "physical-design evidence epoch changed from {} to {}",
+                expected.0, actual.0
+            ),
+            Self::StaleProposal(reason) => reason.fmt(formatter),
+            Self::CandidateNotObserved(candidate) => write!(
+                formatter,
+                "physical-columnar candidate for table {} is no longer observed",
+                candidate.table_id.0
+            ),
+            Self::RecommendationNoLongerValid(reason) => write!(
+                formatter,
+                "physical-columnar recommendation is no longer valid: {reason:?}"
+            ),
+            Self::ProjectionLocationConflict {
+                directory,
+                projection_id,
+            } => write!(
+                formatter,
+                "physical-columnar location {} conflicts with projection {}",
+                directory.display(),
+                projection_id.0
+            ),
+            Self::Advisor(error) => error.fmt(formatter),
+            Self::Database(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PhysicalColumnarDesignApplyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Advisor(error) => Some(error),
+            Self::Database(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<PhysicalDesignAdvisorError> for PhysicalColumnarDesignApplyError {
+    fn from(error: PhysicalDesignAdvisorError) -> Self {
+        Self::Advisor(error)
+    }
+}
+
+impl From<DatabaseError> for PhysicalColumnarDesignApplyError {
+    fn from(error: DatabaseError) -> Self {
+        Self::Database(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalColumnarDesignApplyOutcome {
+    Created { projection_id: ColumnarProjectionId },
+    AlreadyApplied { projection_id: ColumnarProjectionId },
+    AlreadyCovered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalColumnarDesignLocationState {
+    Available,
+    AlreadyApplied { projection_id: ColumnarProjectionId },
+    Conflict { projection_id: ColumnarProjectionId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalColumnarDesignApplyReport {
+    pub candidate: PhysicalColumnarCandidate,
+    pub mode: PhysicalColumnarDesignMode,
+    pub directory: PathBuf,
+    pub evidence_epoch: PhysicalDesignEvidenceEpoch,
+    pub global_commit_seq_before: DatabaseCommitSeq,
+    pub global_commit_seq_after: DatabaseCommitSeq,
+    pub schema_generation: SchemaGeneration,
+    pub outcome: PhysicalColumnarDesignApplyOutcome,
+}
+
 #[derive(Debug)]
 pub enum PhysicalDesignAdvisorError {
     NoEvidence,
@@ -1042,6 +1407,274 @@ impl Database {
         })
     }
 
+    /// Freezes one exact recommended Columnar candidate, caller-selected mode,
+    /// and caller-selected absolute placement without reserving identity or
+    /// changing catalog, filesystem, visibility, stream, or evidence state.
+    pub fn propose_physical_columnar_design(
+        &self,
+        evidence: &PhysicalDesignEvidenceWindow,
+        policy: PhysicalDesignAdvisorPolicy,
+        candidate: PhysicalColumnarCandidate,
+        mode: PhysicalColumnarDesignMode,
+        directory: impl AsRef<Path>,
+    ) -> Result<PhysicalColumnarDesignProposal, PhysicalColumnarDesignProposalError> {
+        let advice = self.advise_physical_design(evidence, policy)?;
+        if self.visibility_mode() != crate::DatabaseVisibilityMode::Global {
+            return Err(PhysicalColumnarDesignProposalError::GlobalVisibilityRequired);
+        }
+        let Some(catalog_path) = self.catalog_path.as_deref() else {
+            return Err(PhysicalColumnarDesignProposalError::DurableCatalogRequired);
+        };
+        if !self.projections.is_managed() {
+            return Err(PhysicalColumnarDesignProposalError::DurableCatalogRequired);
+        }
+        self.projections
+            .ensure_mutation_available()
+            .map_err(DatabaseError::from)?;
+        let database_incarnation = crate::schema_catalog_file::load(catalog_path)
+            .map_err(DatabaseError::from)?
+            .incarnation;
+        let inspection = advice
+            .columnar_candidates
+            .iter()
+            .find(|inspection| inspection.candidate == candidate)
+            .ok_or_else(|| {
+                PhysicalColumnarDesignProposalError::CandidateNotObserved(candidate.clone())
+            })?;
+        if let PhysicalDesignCandidateDecision::NoAction(reason) = inspection.decision {
+            return Err(
+                PhysicalColumnarDesignProposalError::CandidateNotRecommended { candidate, reason },
+            );
+        }
+
+        let directory = crate::schema_catalog_file::absolute(directory.as_ref())
+            .map_err(DatabaseError::from)?;
+        match self.inspect_physical_columnar_design_location(&candidate, mode, &directory)? {
+            PhysicalColumnarDesignLocationState::Available => {}
+            PhysicalColumnarDesignLocationState::AlreadyApplied { .. }
+            | PhysicalColumnarDesignLocationState::Conflict { .. } => {
+                return Err(
+                    PhysicalColumnarDesignProposalError::ProjectionLocationConflict { directory },
+                );
+            }
+        }
+
+        let (table_schema_version, table_fingerprint, storage_id) =
+            self.current_columnar_table_anchor(&candidate)?;
+        let change_stream_generation =
+            match mode {
+                PhysicalColumnarDesignMode::Snapshot => None,
+                PhysicalColumnarDesignMode::Incremental => {
+                    let stream = self
+                        .registry
+                        .get(storage_id)
+                        .ok_or(crate::StorageRegistryError::UnknownStorageId { storage_id })
+                        .map_err(DatabaseError::from)?
+                        .inspect_change_stream();
+                    match stream.status {
+                        netbadb_storage::ChangeStreamStatus::Disabled => {
+                            return Err(PhysicalColumnarDesignProposalError::
+                            IncrementalChangeStreamNotEnabled { storage_id });
+                        }
+                        netbadb_storage::ChangeStreamStatus::Unavailable => {
+                            return Err(PhysicalColumnarDesignProposalError::
+                            IncrementalChangeStreamUnavailable { storage_id });
+                        }
+                        netbadb_storage::ChangeStreamStatus::Enabled => {}
+                    }
+                    if stream.storage_id != storage_id
+                        || stream.table_id != candidate.table_id
+                        || stream.schema_fingerprint != table_fingerprint
+                    {
+                        return Err(PhysicalColumnarDesignProposalError::
+                        IncrementalChangeStreamUnavailable { storage_id });
+                    }
+                    match stream.generation {
+                        Some(generation) if generation.0 != 0 => Some(generation),
+                        _ => {
+                            return Err(PhysicalColumnarDesignProposalError::
+                            IncrementalChangeStreamUnavailable { storage_id });
+                        }
+                    }
+                }
+            };
+        let proposed_at_global_commit_seq = self.current_global_commit_seq()?;
+
+        Ok(PhysicalColumnarDesignProposal {
+            database_incarnation,
+            candidate,
+            mode,
+            directory,
+            evidence_epoch: advice.evidence_epoch,
+            evidence_schema_generation: advice.schema_generation,
+            first_global_commit_seq: advice.first_global_commit_seq,
+            last_global_commit_seq: advice.last_global_commit_seq,
+            proposed_at_global_commit_seq,
+            table_schema_version,
+            table_fingerprint,
+            storage_id,
+            change_stream_generation,
+            evidence: inspection.evidence,
+            policy,
+        })
+    }
+
+    /// Classifies one normalized placement against registered managed
+    /// projections only. It never scans or adopts filesystem artifacts.
+    pub fn inspect_physical_columnar_design_location(
+        &self,
+        candidate: &PhysicalColumnarCandidate,
+        mode: PhysicalColumnarDesignMode,
+        directory: impl AsRef<Path>,
+    ) -> Result<PhysicalColumnarDesignLocationState, DatabaseError> {
+        if !self.projections.is_managed() {
+            return Err(ProjectionCatalogError::Unavailable(
+                "physical-columnar design requires a managed projection catalog".into(),
+            )
+            .into());
+        }
+        self.projections.ensure_mutation_available()?;
+        let directory = crate::schema_catalog_file::absolute(directory.as_ref())?;
+        for entry in self.projections.iter() {
+            if entry.directory != directory {
+                continue;
+            }
+            let projection_id = entry.identity.id;
+            let Some(projection) = &entry.projection else {
+                return Ok(PhysicalColumnarDesignLocationState::Conflict { projection_id });
+            };
+            let metadata = projection.metadata();
+            let columns = metadata
+                .columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>();
+            let actual_mode = if metadata.incremental.is_some() {
+                PhysicalColumnarDesignMode::Incremental
+            } else {
+                PhysicalColumnarDesignMode::Snapshot
+            };
+            if metadata.table_id == candidate.table_id
+                && columns == candidate.columns
+                && actual_mode == mode
+            {
+                return Ok(PhysicalColumnarDesignLocationState::AlreadyApplied { projection_id });
+            }
+            return Ok(PhysicalColumnarDesignLocationState::Conflict { projection_id });
+        }
+        Ok(PhysicalColumnarDesignLocationState::Available)
+    }
+
+    /// Applies one still-valid placement-bound Columnar proposal. Every no-op
+    /// and rejection completes before entering an existing managed build API.
+    pub fn apply_physical_columnar_design(
+        &mut self,
+        evidence: &PhysicalDesignEvidenceWindow,
+        proposal: &PhysicalColumnarDesignProposal,
+    ) -> Result<PhysicalColumnarDesignApplyReport, PhysicalColumnarDesignApplyError> {
+        let Some(catalog_path) = self.catalog_path.as_deref() else {
+            return Err(PhysicalColumnarDesignApplyError::DatabaseIdentityChanged);
+        };
+        let current_incarnation = crate::schema_catalog_file::load(catalog_path)
+            .map_err(DatabaseError::from)?
+            .incarnation;
+        if current_incarnation != proposal.database_incarnation {
+            return Err(PhysicalColumnarDesignApplyError::DatabaseIdentityChanged);
+        }
+        let current_before = self.current_global_commit_seq()?;
+        if current_before < proposal.proposed_at_global_commit_seq {
+            return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                PhysicalColumnarDesignProposalStaleReason::VisibilityMovedBackward {
+                    proposed_at: proposal.proposed_at_global_commit_seq,
+                    current: current_before,
+                },
+            ));
+        }
+
+        match self.inspect_physical_columnar_design_location(
+            &proposal.candidate,
+            proposal.mode,
+            &proposal.directory,
+        )? {
+            PhysicalColumnarDesignLocationState::Available => {}
+            PhysicalColumnarDesignLocationState::AlreadyApplied { projection_id } => {
+                return Ok(self.columnar_design_report(
+                    proposal,
+                    current_before,
+                    current_before,
+                    PhysicalColumnarDesignApplyOutcome::AlreadyApplied { projection_id },
+                ));
+            }
+            PhysicalColumnarDesignLocationState::Conflict { projection_id } => {
+                return Err(
+                    PhysicalColumnarDesignApplyError::ProjectionLocationConflict {
+                        directory: proposal.directory.clone(),
+                        projection_id,
+                    },
+                );
+            }
+        }
+
+        self.revalidate_columnar_proposal(proposal)?;
+        if self.current_columnar_design_covers(&proposal.candidate)? {
+            return Ok(self.columnar_design_report(
+                proposal,
+                current_before,
+                current_before,
+                PhysicalColumnarDesignApplyOutcome::AlreadyCovered,
+            ));
+        }
+        if evidence.epoch() != proposal.evidence_epoch {
+            return Err(PhysicalColumnarDesignApplyError::EvidenceEpochChanged {
+                expected: proposal.evidence_epoch,
+                actual: evidence.epoch(),
+            });
+        }
+        let advice = self.advise_physical_design(evidence, proposal.policy)?;
+        let inspection = advice
+            .columnar_candidates
+            .iter()
+            .find(|inspection| inspection.candidate == proposal.candidate)
+            .ok_or_else(|| {
+                PhysicalColumnarDesignApplyError::CandidateNotObserved(proposal.candidate.clone())
+            })?;
+        match inspection.decision {
+            PhysicalDesignCandidateDecision::Recommend => {}
+            PhysicalDesignCandidateDecision::NoAction(
+                PhysicalDesignNoActionReason::ExistingDesignCovers,
+            ) => {
+                return Ok(self.columnar_design_report(
+                    proposal,
+                    current_before,
+                    current_before,
+                    PhysicalColumnarDesignApplyOutcome::AlreadyCovered,
+                ));
+            }
+            PhysicalDesignCandidateDecision::NoAction(reason) => {
+                return Err(PhysicalColumnarDesignApplyError::RecommendationNoLongerValid(reason));
+            }
+        }
+
+        let spec = ColumnarProjectionSpec::new(
+            proposal.candidate.table_id,
+            proposal.directory.clone(),
+            proposal.candidate.columns.clone(),
+        );
+        let projection_id = match proposal.mode {
+            PhysicalColumnarDesignMode::Snapshot => self.build_columnar_projection(spec)?,
+            PhysicalColumnarDesignMode::Incremental => {
+                self.build_incremental_columnar_projection(spec)?
+            }
+        };
+        let current_after = self.current_global_commit_seq()?;
+        Ok(self.columnar_design_report(
+            proposal,
+            current_before,
+            current_after,
+            PhysicalColumnarDesignApplyOutcome::Created { projection_id },
+        ))
+    }
+
     /// Explicitly applies one current, still-valid single-column Heap index
     /// recommendation. All preflight failures occur before the existing
     /// `create_named_index` authority can reserve an IndexId.
@@ -1196,6 +1829,222 @@ impl Database {
             }
         };
         Ok((table_schema_version, table_fingerprint, storage_id))
+    }
+
+    fn current_columnar_table_anchor(
+        &self,
+        candidate: &PhysicalColumnarCandidate,
+    ) -> Result<(TableSchemaVersion, SchemaFingerprint, StorageId), DatabaseError> {
+        let table_schema_version = self.table_schema_version(candidate.table_id).ok_or(
+            SchemaCatalogError::ExpectationMissingTable(candidate.table_id),
+        )?;
+        let table = self
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == candidate.table_id)
+            .ok_or(SchemaCatalogError::ExpectationMissingTable(
+                candidate.table_id,
+            ))?;
+        if candidate
+            .columns
+            .iter()
+            .any(|column| table.column_by_id(*column).is_none())
+        {
+            return Err(SchemaCatalogError::ExpectationMissingTable(candidate.table_id).into());
+        }
+        let storage_id = match self.bindings.placement(candidate.table_id)? {
+            TablePlacement::Single { storage_id, .. } => *storage_id,
+            TablePlacement::RangePartitioned { .. } => {
+                return Err(DatabaseError::ColumnarProjectionRequiresSingleStorage(
+                    candidate.table_id,
+                ));
+            }
+        };
+        let storage = self
+            .registry
+            .get(storage_id)
+            .ok_or(crate::StorageRegistryError::UnknownStorageId { storage_id })?;
+        if !matches!(storage.kind(), StorageKind::Heap | StorageKind::Lsm) {
+            return Err(DatabaseError::ColumnarProjectionRequiresSingleStorage(
+                candidate.table_id,
+            ));
+        }
+        Ok((table_schema_version, table.fingerprint()?, storage_id))
+    }
+
+    fn revalidate_columnar_proposal(
+        &self,
+        proposal: &PhysicalColumnarDesignProposal,
+    ) -> Result<(), PhysicalColumnarDesignApplyError> {
+        let current_schema = self.schema_generation();
+        if current_schema != proposal.evidence_schema_generation {
+            return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                PhysicalColumnarDesignProposalStaleReason::SchemaGenerationChanged {
+                    expected: proposal.evidence_schema_generation,
+                    actual: current_schema,
+                },
+            ));
+        }
+        let Some(current_version) = self.table_schema_version(proposal.candidate.table_id) else {
+            return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                PhysicalColumnarDesignProposalStaleReason::ColumnMissing,
+            ));
+        };
+        if current_version != proposal.table_schema_version {
+            return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                PhysicalColumnarDesignProposalStaleReason::TableVersionChanged {
+                    expected: proposal.table_schema_version,
+                    actual: current_version,
+                },
+            ));
+        }
+        let Some(table) = self
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == proposal.candidate.table_id)
+        else {
+            return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                PhysicalColumnarDesignProposalStaleReason::ColumnMissing,
+            ));
+        };
+        if table.fingerprint().map_err(DatabaseError::from)? != proposal.table_fingerprint {
+            return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                PhysicalColumnarDesignProposalStaleReason::TableFingerprintChanged,
+            ));
+        }
+        if proposal
+            .candidate
+            .columns
+            .iter()
+            .any(|column| table.column_by_id(*column).is_none())
+        {
+            return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                PhysicalColumnarDesignProposalStaleReason::ColumnMissing,
+            ));
+        }
+        let current_storage = match self
+            .bindings
+            .placement(proposal.candidate.table_id)
+            .map_err(DatabaseError::from)?
+        {
+            TablePlacement::Single { storage_id, .. } => *storage_id,
+            TablePlacement::RangePartitioned { .. } => {
+                return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                    PhysicalColumnarDesignProposalStaleReason::UnsupportedCurrentLayout,
+                ));
+            }
+        };
+        if current_storage != proposal.storage_id {
+            return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                PhysicalColumnarDesignProposalStaleReason::StorageChanged {
+                    expected: proposal.storage_id,
+                    actual: current_storage,
+                },
+            ));
+        }
+        let Some(storage) = self.registry.get(current_storage) else {
+            return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                PhysicalColumnarDesignProposalStaleReason::UnsupportedCurrentLayout,
+            ));
+        };
+        if !matches!(storage.kind(), StorageKind::Heap | StorageKind::Lsm) {
+            return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                PhysicalColumnarDesignProposalStaleReason::UnsupportedCurrentLayout,
+            ));
+        }
+        if proposal.mode == PhysicalColumnarDesignMode::Incremental {
+            let stream = storage.inspect_change_stream();
+            match stream.status {
+                netbadb_storage::ChangeStreamStatus::Disabled => {
+                    return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                        PhysicalColumnarDesignProposalStaleReason::ChangeStreamDisabled,
+                    ));
+                }
+                netbadb_storage::ChangeStreamStatus::Unavailable => {
+                    return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                        PhysicalColumnarDesignProposalStaleReason::ChangeStreamUnavailable,
+                    ));
+                }
+                netbadb_storage::ChangeStreamStatus::Enabled => {}
+            }
+            if stream.storage_id != current_storage
+                || stream.table_id != proposal.candidate.table_id
+                || stream.schema_fingerprint != proposal.table_fingerprint
+            {
+                return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                    PhysicalColumnarDesignProposalStaleReason::ChangeStreamUnavailable,
+                ));
+            }
+            let Some(expected) = proposal.change_stream_generation else {
+                return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                    PhysicalColumnarDesignProposalStaleReason::ChangeStreamUnavailable,
+                ));
+            };
+            let Some(actual) = stream.generation else {
+                return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                    PhysicalColumnarDesignProposalStaleReason::ChangeStreamUnavailable,
+                ));
+            };
+            if actual != expected {
+                return Err(PhysicalColumnarDesignApplyError::StaleProposal(
+                    PhysicalColumnarDesignProposalStaleReason::ChangeStreamGenerationChanged {
+                        expected,
+                        actual,
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn current_columnar_design_covers(
+        &self,
+        candidate: &PhysicalColumnarCandidate,
+    ) -> Result<bool, DatabaseError> {
+        self.projections.ensure_mutation_available()?;
+        if self.projections.iter().any(|entry| {
+            entry.identity.table_id == candidate.table_id && entry.projection.is_none()
+        }) {
+            return Err(ProjectionCatalogError::Unavailable(
+                "current projection inventory contains an unavailable candidate table entry".into(),
+            )
+            .into());
+        }
+        Ok(self.projections.iter().any(|entry| {
+            entry.projection.as_ref().is_some_and(|projection| {
+                let metadata = projection.metadata();
+                metadata.table_id == candidate.table_id
+                    && candidate.columns.iter().all(|column| {
+                        metadata
+                            .columns
+                            .iter()
+                            .any(|projected| projected.column_id == *column)
+                    })
+            })
+        }))
+    }
+
+    fn columnar_design_report(
+        &self,
+        proposal: &PhysicalColumnarDesignProposal,
+        global_commit_seq_before: DatabaseCommitSeq,
+        global_commit_seq_after: DatabaseCommitSeq,
+        outcome: PhysicalColumnarDesignApplyOutcome,
+    ) -> PhysicalColumnarDesignApplyReport {
+        PhysicalColumnarDesignApplyReport {
+            candidate: proposal.candidate.clone(),
+            mode: proposal.mode,
+            directory: proposal.directory.clone(),
+            evidence_epoch: proposal.evidence_epoch,
+            global_commit_seq_before,
+            global_commit_seq_after,
+            schema_generation: self.schema_generation(),
+            outcome,
+        }
     }
 
     /// Classifies one typed name using only the current active index inventory.

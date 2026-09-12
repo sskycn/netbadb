@@ -1,16 +1,22 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 use netbadb_types::{ColumnId, DatabaseCommitSeq, SchemaGeneration};
 
 use crate::execution_feedback_tests::{Fixture, TABLE_ID};
 use crate::{
-    ColumnarProjectionSpec, PhysicalDesignAdvisorError, PhysicalDesignAdvisorPolicy,
-    PhysicalDesignCandidateDecision, PhysicalDesignEvidenceEpoch, PhysicalDesignEvidenceLimits,
-    PhysicalDesignEvidenceRecordError, PhysicalDesignEvidenceRecordOutcome,
-    PhysicalDesignEvidenceWindow, PhysicalDesignNoActionReason, PhysicalDesignRecommendationPolicy,
-    PhysicalIndexCandidate, PhysicalIndexDesignApplyError, PhysicalIndexDesignApplyOutcome,
-    PhysicalIndexDesignNameState, PhysicalIndexDesignProposalError, PlanVariant,
-    QueryExpressionShape, QueryExpressionShapeKind,
+    ColumnarAdvanceBudget, ColumnarProjectionHealth, ColumnarProjectionSpec, DatabaseError,
+    PhysicalColumnarCandidate, PhysicalColumnarDesignApplyError,
+    PhysicalColumnarDesignApplyOutcome, PhysicalColumnarDesignLocationState,
+    PhysicalColumnarDesignMode, PhysicalColumnarDesignProposalError,
+    PhysicalColumnarDesignProposalStaleReason, PhysicalDesignAdvisorError,
+    PhysicalDesignAdvisorPolicy, PhysicalDesignCandidateDecision, PhysicalDesignEvidenceEpoch,
+    PhysicalDesignEvidenceLimits, PhysicalDesignEvidenceRecordError,
+    PhysicalDesignEvidenceRecordOutcome, PhysicalDesignEvidenceWindow,
+    PhysicalDesignNoActionReason, PhysicalDesignRecommendationPolicy, PhysicalIndexCandidate,
+    PhysicalIndexDesignApplyError, PhysicalIndexDesignApplyOutcome, PhysicalIndexDesignNameState,
+    PhysicalIndexDesignProposalError, PlanVariant, ProjectionCatalogError, QueryExpressionShape,
+    QueryExpressionShapeKind,
 };
 
 fn policy(
@@ -36,6 +42,39 @@ fn index_candidate() -> PhysicalIndexCandidate {
         table_id: TABLE_ID,
         column_id: ColumnId(2),
     }
+}
+
+fn columnar_candidate() -> PhysicalColumnarCandidate {
+    PhysicalColumnarCandidate {
+        table_id: TABLE_ID,
+        columns: vec![ColumnId(1), ColumnId(2)],
+    }
+}
+
+fn columnar_window(fixture: &mut Fixture) -> PhysicalDesignEvidenceWindow {
+    let mut window = PhysicalDesignEvidenceWindow::default();
+    let report = feedback(
+        fixture,
+        "SELECT id, category FROM events WHERE category >= 3",
+    );
+    window
+        .record_execution_feedback(&report)
+        .expect("record columnar evidence");
+    window
+}
+
+fn make_catalog_parent_read_only(database: &mut crate::Database) -> Result<(), DatabaseError> {
+    let catalog = database
+        .catalog_path
+        .as_ref()
+        .expect("managed schema catalog path");
+    let parent = catalog.parent().expect("schema catalog parent");
+    let mut permissions = fs::metadata(parent)
+        .expect("catalog parent metadata")
+        .permissions();
+    permissions.set_mode(0o555);
+    fs::set_permissions(parent, permissions).expect("make catalog parent read-only");
+    Ok(())
 }
 
 fn feedback(fixture: &mut Fixture, sql: &str) -> crate::ExecutionFeedbackReport {
@@ -952,4 +991,552 @@ fn proposal_is_bound_to_durable_database_incarnation() {
     );
     first.close();
     second.close();
+}
+
+#[test]
+fn columnar_proposals_are_pure_exact_and_mode_explicit() {
+    let mut fixture = Fixture::create("phase27-proposal-purity", false);
+    let window = columnar_window(&mut fixture);
+    let candidate = columnar_candidate();
+    let snapshot_directory = fixture.root.join("approved-snapshot");
+    let incremental_directory = fixture.root.join("approved-incremental");
+    let inspection_before = fixture.database.inspect_columnar_projection_catalog();
+    let visibility_before = fixture
+        .database
+        .current_database_snapshot()
+        .unwrap()
+        .unwrap()
+        .commit_seq();
+    let schema_before = fixture.database.schema_generation();
+    let evidence_before = window.clone();
+
+    assert!(matches!(
+        fixture.database.propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            PhysicalColumnarCandidate {
+                table_id: TABLE_ID,
+                columns: vec![ColumnId(2), ColumnId(1)],
+            },
+            PhysicalColumnarDesignMode::Snapshot,
+            &snapshot_directory,
+        ),
+        Err(PhysicalColumnarDesignProposalError::CandidateNotObserved(_))
+    ));
+    assert!(matches!(
+        fixture.database.propose_physical_columnar_design(
+            &window,
+            policy(2, 1, 0, 8),
+            candidate.clone(),
+            PhysicalColumnarDesignMode::Snapshot,
+            &snapshot_directory,
+        ),
+        Err(PhysicalColumnarDesignProposalError::CandidateNotRecommended { .. })
+    ));
+    assert!(matches!(
+        fixture.database.propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            candidate.clone(),
+            PhysicalColumnarDesignMode::Incremental,
+            &incremental_directory,
+        ),
+        Err(PhysicalColumnarDesignProposalError::IncrementalChangeStreamNotEnabled { .. })
+    ));
+
+    let snapshot = fixture
+        .database
+        .propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            candidate.clone(),
+            PhysicalColumnarDesignMode::Snapshot,
+            &snapshot_directory,
+        )
+        .expect("snapshot proposal without stream");
+    assert_eq!(snapshot.candidate(), &candidate);
+    assert_eq!(snapshot.mode(), PhysicalColumnarDesignMode::Snapshot);
+    assert_eq!(
+        snapshot.directory(),
+        crate::schema_catalog_file::absolute(&snapshot_directory)
+            .unwrap()
+            .as_path()
+    );
+    assert!(snapshot.directory().is_absolute());
+    assert_eq!(snapshot.change_stream_generation(), None);
+    assert!(!snapshot_directory.exists());
+
+    let cursor = fixture
+        .database
+        .enable_change_stream(TABLE_ID)
+        .expect("explicitly enable stream");
+    let incremental = fixture
+        .database
+        .propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            candidate,
+            PhysicalColumnarDesignMode::Incremental,
+            &incremental_directory,
+        )
+        .expect("incremental proposal with stream");
+    assert_eq!(
+        incremental.change_stream_generation(),
+        Some(cursor.generation)
+    );
+    assert!(!incremental_directory.exists());
+    assert_eq!(window, evidence_before);
+    assert_eq!(fixture.database.schema_generation(), schema_before);
+    assert_eq!(
+        fixture
+            .database
+            .current_database_snapshot()
+            .unwrap()
+            .unwrap()
+            .commit_seq(),
+        visibility_before
+    );
+    assert_eq!(
+        fixture
+            .database
+            .inspect_columnar_projection_catalog()
+            .next_projection_id,
+        inspection_before.next_projection_id
+    );
+    assert!(fixture.database.inspect_columnar_projections().is_empty());
+    fixture.close();
+}
+
+#[test]
+fn snapshot_columnar_apply_is_exact_idempotent_and_visibility_neutral() {
+    let mut fixture = Fixture::create("phase27-snapshot-apply", false);
+    let mut window = columnar_window(&mut fixture);
+    let candidate = columnar_candidate();
+    let directory = fixture.root.join("snapshot-design");
+    let proposal = fixture
+        .database
+        .propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            candidate.clone(),
+            PhysicalColumnarDesignMode::Snapshot,
+            &directory,
+        )
+        .expect("snapshot proposal");
+    fixture
+        .database
+        .execute("INSERT INTO events VALUES (8999, 2, 'before-apply')")
+        .expect("ordinary DML before apply");
+    let additional = feedback(
+        &mut fixture,
+        "SELECT id, category FROM events WHERE category >= 2",
+    );
+    window
+        .record_execution_feedback(&additional)
+        .expect("same-epoch additional evidence");
+    assert_eq!(window.epoch(), proposal.evidence_epoch());
+    let schema_before = fixture.database.schema_generation();
+    let g_before = fixture
+        .database
+        .current_database_snapshot()
+        .unwrap()
+        .unwrap()
+        .commit_seq();
+    assert!(g_before > proposal.proposed_at_global_commit_seq());
+    let created = fixture
+        .database
+        .apply_physical_columnar_design(&window, &proposal)
+        .expect("apply snapshot proposal");
+    let projection_id = match created.outcome {
+        PhysicalColumnarDesignApplyOutcome::Created { projection_id } => projection_id,
+        other => panic!("unexpected apply outcome: {other:?}"),
+    };
+    assert_eq!(created.global_commit_seq_before, g_before);
+    assert_eq!(created.global_commit_seq_after, g_before);
+    assert_eq!(created.schema_generation, schema_before);
+    assert_eq!(fixture.database.schema_generation(), schema_before);
+    let projection = &fixture.database.inspect_columnar_projections()[0];
+    assert_eq!(projection.columns, candidate.columns);
+    assert_eq!(projection.directory, proposal.directory());
+    assert_eq!(projection.mode, Some("snapshot"));
+    assert_eq!(projection.health, ColumnarProjectionHealth::Fresh);
+    assert_eq!(
+        fixture
+            .database
+            .inspect_physical_columnar_design_location(
+                &candidate,
+                PhysicalColumnarDesignMode::Snapshot,
+                &directory,
+            )
+            .unwrap(),
+        PhysicalColumnarDesignLocationState::AlreadyApplied { projection_id }
+    );
+
+    window.rotate_window().expect("rotate evidence");
+    let retry = fixture
+        .database
+        .apply_physical_columnar_design(&window, &proposal)
+        .expect("retry after evidence rotation");
+    assert_eq!(
+        retry.outcome,
+        PhysicalColumnarDesignApplyOutcome::AlreadyApplied { projection_id }
+    );
+    assert_eq!(
+        fixture
+            .database
+            .inspect_columnar_projection_catalog()
+            .next_projection_id,
+        Some(netbadb_types::ColumnarProjectionId(projection_id.0 + 1))
+    );
+
+    fixture
+        .database
+        .execute("INSERT INTO events VALUES (9000, 3, 'later')")
+        .expect("committed DML");
+    assert_eq!(
+        fixture.database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Stale
+    );
+    assert_eq!(
+        fixture
+            .database
+            .inspect_physical_columnar_design_location(
+                &candidate,
+                PhysicalColumnarDesignMode::Snapshot,
+                &directory,
+            )
+            .unwrap(),
+        PhysicalColumnarDesignLocationState::AlreadyApplied { projection_id }
+    );
+    fixture.close();
+}
+
+#[test]
+fn incremental_columnar_apply_revalidates_stream_lineage_and_uses_existing_advance() {
+    let mut fixture = Fixture::create("phase27-incremental-apply", false);
+    let window = columnar_window(&mut fixture);
+    let candidate = columnar_candidate();
+    let first_cursor = fixture
+        .database
+        .enable_change_stream(TABLE_ID)
+        .expect("enable first stream");
+    let stale_directory = fixture.root.join("stale-incremental-design");
+    let stale = fixture
+        .database
+        .propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            candidate.clone(),
+            PhysicalColumnarDesignMode::Incremental,
+            &stale_directory,
+        )
+        .expect("first incremental proposal");
+    assert_eq!(
+        stale.change_stream_generation(),
+        Some(first_cursor.generation)
+    );
+    fixture
+        .database
+        .disable_change_stream(TABLE_ID)
+        .expect("disable first stream");
+    let next_while_disabled = fixture
+        .database
+        .inspect_columnar_projection_catalog()
+        .next_projection_id;
+    assert!(matches!(
+        fixture
+            .database
+            .apply_physical_columnar_design(&window, &stale),
+        Err(PhysicalColumnarDesignApplyError::StaleProposal(
+            PhysicalColumnarDesignProposalStaleReason::ChangeStreamDisabled
+        ))
+    ));
+    assert_eq!(
+        fixture
+            .database
+            .inspect_columnar_projection_catalog()
+            .next_projection_id,
+        next_while_disabled
+    );
+    let second_cursor = fixture
+        .database
+        .enable_change_stream(TABLE_ID)
+        .expect("enable replacement stream");
+    let next_before_rejection = fixture
+        .database
+        .inspect_columnar_projection_catalog()
+        .next_projection_id;
+    assert!(matches!(
+        fixture
+            .database
+            .apply_physical_columnar_design(&window, &stale),
+        Err(PhysicalColumnarDesignApplyError::StaleProposal(
+            PhysicalColumnarDesignProposalStaleReason::ChangeStreamGenerationChanged {
+                expected,
+                actual,
+            }
+        )) if expected == first_cursor.generation && actual == second_cursor.generation
+    ));
+    assert_eq!(
+        fixture
+            .database
+            .inspect_columnar_projection_catalog()
+            .next_projection_id,
+        next_before_rejection
+    );
+    assert!(!stale_directory.exists());
+
+    let directory = fixture.root.join("incremental-design");
+    let proposal = fixture
+        .database
+        .propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            candidate.clone(),
+            PhysicalColumnarDesignMode::Incremental,
+            &directory,
+        )
+        .expect("replacement-stream proposal");
+    let g_before = fixture
+        .database
+        .current_database_snapshot()
+        .unwrap()
+        .unwrap()
+        .commit_seq();
+    let created = fixture
+        .database
+        .apply_physical_columnar_design(&window, &proposal)
+        .expect("apply incremental proposal");
+    let projection_id = match created.outcome {
+        PhysicalColumnarDesignApplyOutcome::Created { projection_id } => projection_id,
+        other => panic!("unexpected apply outcome: {other:?}"),
+    };
+    assert_eq!(created.global_commit_seq_before, g_before);
+    assert_eq!(created.global_commit_seq_after, g_before);
+    let projection = &fixture.database.inspect_columnar_projections()[0];
+    assert_eq!(projection.mode, Some("incremental"));
+    assert_eq!(projection.columns, candidate.columns);
+    assert_eq!(projection.directory, proposal.directory());
+    assert_eq!(projection.stream_generation, Some(second_cursor.generation));
+    assert_eq!(projection.health, ColumnarProjectionHealth::Fresh);
+
+    fixture
+        .database
+        .execute("INSERT INTO events VALUES (9001, 4, 'incremental-later')")
+        .expect("streamed DML");
+    assert_eq!(
+        fixture.database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Lagging
+    );
+    fixture
+        .database
+        .advance_columnar_projection(projection_id, ColumnarAdvanceBudget::new(8, 1 << 20))
+        .expect("explicitly advance projection");
+    assert_eq!(
+        fixture.database.inspect_columnar_projections()[0].health,
+        ColumnarProjectionHealth::Fresh
+    );
+    fixture.close();
+}
+
+#[test]
+fn columnar_apply_conflicts_by_location_and_noops_for_other_coverage() {
+    let mut fixture = Fixture::create("phase27-location-conflict", false);
+    let window = columnar_window(&mut fixture);
+    let candidate = columnar_candidate();
+    fixture
+        .database
+        .enable_change_stream(TABLE_ID)
+        .expect("enable stream");
+    let directory = fixture.root.join("shared-location");
+    let snapshot = fixture
+        .database
+        .propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            candidate.clone(),
+            PhysicalColumnarDesignMode::Snapshot,
+            &directory,
+        )
+        .expect("snapshot proposal");
+    let incremental = fixture
+        .database
+        .propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            candidate.clone(),
+            PhysicalColumnarDesignMode::Incremental,
+            &directory,
+        )
+        .expect("incremental proposal");
+    let created = fixture
+        .database
+        .apply_physical_columnar_design(&window, &snapshot)
+        .expect("create snapshot");
+    let projection_id = match created.outcome {
+        PhysicalColumnarDesignApplyOutcome::Created { projection_id } => projection_id,
+        other => panic!("unexpected apply outcome: {other:?}"),
+    };
+    assert!(matches!(
+        fixture
+            .database
+            .apply_physical_columnar_design(&window, &incremental),
+        Err(PhysicalColumnarDesignApplyError::ProjectionLocationConflict {
+            projection_id: actual,
+            ..
+        }) if actual == projection_id
+    ));
+    fixture.close();
+
+    let mut covered = Fixture::create("phase27-other-coverage", false);
+    let window = columnar_window(&mut covered);
+    let candidate = columnar_candidate();
+    let proposal = covered
+        .database
+        .propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            candidate.clone(),
+            PhysicalColumnarDesignMode::Snapshot,
+            covered.root.join("approved-but-unused"),
+        )
+        .expect("proposal before coverage");
+    covered
+        .database
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TABLE_ID,
+            covered.root.join("other-covering-projection"),
+            candidate.columns,
+        ))
+        .expect("create other covering projection");
+    let next_before = covered
+        .database
+        .inspect_columnar_projection_catalog()
+        .next_projection_id;
+    let g_before = covered
+        .database
+        .current_database_snapshot()
+        .unwrap()
+        .unwrap()
+        .commit_seq();
+    let report = covered
+        .database
+        .apply_physical_columnar_design(&window, &proposal)
+        .expect("coverage no-op");
+    assert_eq!(
+        report.outcome,
+        PhysicalColumnarDesignApplyOutcome::AlreadyCovered
+    );
+    assert_eq!(report.global_commit_seq_before, g_before);
+    assert_eq!(report.global_commit_seq_after, g_before);
+    assert_eq!(
+        covered
+            .database
+            .inspect_columnar_projection_catalog()
+            .next_projection_id,
+        next_before
+    );
+    assert!(!proposal.directory().exists());
+    covered.close();
+}
+
+#[test]
+fn columnar_apply_propagates_recovery_required_and_reopen_recovers_exact_retry() {
+    let mut fixture = Fixture::create("phase27-recovery-retry", false);
+    let window = columnar_window(&mut fixture);
+    let candidate = columnar_candidate();
+    let directory = fixture.root.join("ambiguous-publication");
+    let proposal = fixture
+        .database
+        .propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            candidate,
+            PhysicalColumnarDesignMode::Snapshot,
+            &directory,
+        )
+        .expect("recovery proposal");
+    fixture.database.columnar_build_after_scan = Some(make_catalog_parent_read_only);
+    let failed = fixture
+        .database
+        .apply_physical_columnar_design(&window, &proposal);
+    assert!(matches!(
+        failed,
+        Err(PhysicalColumnarDesignApplyError::Database(
+            DatabaseError::ProjectionCatalog(ProjectionCatalogError::RecoveryRequired { .. })
+        ))
+    ));
+    assert!(
+        !fixture
+            .database
+            .inspect_columnar_projection_catalog()
+            .available
+    );
+    assert!(fixture.database.inspect_columnar_projections().is_empty());
+
+    let Fixture {
+        root,
+        source,
+        database,
+    } = fixture;
+    let mut permissions = fs::metadata(&root).expect("fixture metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&root, permissions).expect("restore fixture permissions");
+    drop(database);
+
+    let mut reopened = crate::Database::open_catalog(root.join("catalog"))
+        .expect("reopen promotes exact pending artifact");
+    let recovered = &reopened.inspect_columnar_projections()[0];
+    let projection_id = recovered.projection_id.expect("recovered projection id");
+    assert_eq!(recovered.directory, proposal.directory());
+    let retry = reopened
+        .apply_physical_columnar_design(&window, &proposal)
+        .expect("exact retry after recovery");
+    assert_eq!(
+        retry.outcome,
+        PhysicalColumnarDesignApplyOutcome::AlreadyApplied { projection_id }
+    );
+    reopened.close().expect("close recovered database");
+    crate::cleanup_created_table_files(std::slice::from_ref(&source));
+    fs::remove_dir_all(root).expect("remove recovery fixture");
+}
+
+#[test]
+fn columnar_proposal_is_bound_to_durable_database_incarnation() {
+    let mut first = Fixture::create("phase27-identity-a", false);
+    let second = Fixture::create("phase27-identity-b", false);
+    let window = columnar_window(&mut first);
+    let proposal = first
+        .database
+        .propose_physical_columnar_design(
+            &window,
+            policy(1, 1, 0, 8),
+            columnar_candidate(),
+            PhysicalColumnarDesignMode::Snapshot,
+            first.root.join("foreign-design"),
+        )
+        .expect("first database proposal");
+    let Fixture {
+        root,
+        source,
+        mut database,
+    } = second;
+    let next_before = database
+        .inspect_columnar_projection_catalog()
+        .next_projection_id;
+    assert!(matches!(
+        database.apply_physical_columnar_design(&window, &proposal),
+        Err(PhysicalColumnarDesignApplyError::DatabaseIdentityChanged)
+    ));
+    assert_eq!(
+        database
+            .inspect_columnar_projection_catalog()
+            .next_projection_id,
+        next_before
+    );
+    assert!(database.inspect_columnar_projections().is_empty());
+    database.close().expect("close second database");
+    crate::cleanup_created_table_files(std::slice::from_ref(&source));
+    fs::remove_dir_all(root).expect("remove second fixture");
+    first.close();
 }

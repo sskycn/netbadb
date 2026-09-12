@@ -1,5 +1,26 @@
 # NetbaDB roadmap
 
+## Explicit Core Columnar design apply (Adaptive Operations Phase 27 complete)
+
+- added a no-default `PhysicalColumnarDesignMode` and runtime-only proposals
+  that bind an exact recommended ordered column shape to caller-approved
+  Snapshot/Incremental semantics and one normalized placement directory;
+- required Global visibility, durable schema identity, an available managed
+  Projection Catalog, and, for Incremental, an already healthy enabled Change
+  Stream whose exact generation is revalidated at apply;
+- added registered-location classification with exact `AlreadyApplied`
+  precedence, fail-closed conflicts, current covering-design `AlreadyCovered`,
+  structural/evidence/advisor revalidation, and no ID consumption before build;
+- delegated the only creation call to the existing Snapshot or Incremental
+  `Database` build API, preserving Phase 26 NBPC v2 intent, publication,
+  recovery-required, reopen, and ID-burn semantics;
+- kept G and canonical schema generation unchanged and retained Core-only
+  scope: Server/operator exposure, path policy, stream enablement, row-group
+  tuning, automatic apply, refresh/drop/revert, and every external or persistent
+  contract remain deferred.
+
+See [`adaptive-operations-phase27.md`](adaptive-operations-phase27.md).
+
 ## Recoverable managed Columnar publication (Adaptive Operations Phase 26 complete)
 
 - upgraded the independently versioned Projection Catalog and marker from NBPC

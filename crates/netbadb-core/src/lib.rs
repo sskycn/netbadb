@@ -241,7 +241,11 @@ pub use partition_catalog::{
     PartitionCatalogConfig, PartitionError, RangePartitionSpec, TablePlacementSpec,
 };
 pub use physical_design::{
-    PhysicalColumnarCandidate, PhysicalColumnarRecommendationInspection,
+    PhysicalColumnarCandidate, PhysicalColumnarDesignApplyError,
+    PhysicalColumnarDesignApplyOutcome, PhysicalColumnarDesignApplyReport,
+    PhysicalColumnarDesignLocationState, PhysicalColumnarDesignMode,
+    PhysicalColumnarDesignProposal, PhysicalColumnarDesignProposalError,
+    PhysicalColumnarDesignProposalStaleReason, PhysicalColumnarRecommendationInspection,
     PhysicalDesignAdvisorError, PhysicalDesignAdvisorPolicy, PhysicalDesignAdvisorReport,
     PhysicalDesignCandidateDecision, PhysicalDesignEvidenceEpoch, PhysicalDesignEvidenceLimits,
     PhysicalDesignEvidenceRecordError, PhysicalDesignEvidenceRecordOutcome,
@@ -1398,6 +1402,9 @@ struct CapturedIncrementalColumnarSource {
     rows: Vec<(StorageVersionKey, Vec<ScalarValue>)>,
 }
 
+#[cfg(test)]
+type ColumnarBuildAfterScanHook = fn(&mut Database) -> Result<(), DatabaseError>;
+
 pub struct Database {
     committed: schema_catalog::CommittedCatalogState,
     bindings: PhysicalBindings,
@@ -1418,6 +1425,8 @@ pub struct Database {
     group_barrier: Rc<Cell<Option<u64>>>,
     active_group: Option<ActiveGroupCommit>,
     next_group_id: u64,
+    #[cfg(test)]
+    columnar_build_after_scan: Option<ColumnarBuildAfterScanHook>,
 }
 
 fn current_visibility_boundaries(
@@ -2449,6 +2458,8 @@ impl Database {
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
+            #[cfg(test)]
+            columnar_build_after_scan: None,
         })
     }
 
@@ -2483,6 +2494,8 @@ impl Database {
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
+            #[cfg(test)]
+            columnar_build_after_scan: None,
         })
     }
 
@@ -2534,6 +2547,8 @@ impl Database {
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
+            #[cfg(test)]
+            columnar_build_after_scan: None,
         })
     }
 
@@ -2610,6 +2625,8 @@ impl Database {
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
+            #[cfg(test)]
+            columnar_build_after_scan: None,
         })
     }
 
@@ -3956,7 +3973,17 @@ impl Database {
         &mut self,
         spec: ColumnarProjectionSpec,
     ) -> Result<ColumnarProjectionId, DatabaseError> {
-        self.build_columnar_projection_with(spec, |_| Ok(()))
+        #[cfg(test)]
+        {
+            let after_scan = self.columnar_build_after_scan.take();
+            self.build_columnar_projection_with(spec, move |database| {
+                after_scan.map_or(Ok(()), |hook| hook(database))
+            })
+        }
+        #[cfg(not(test))]
+        {
+            self.build_columnar_projection_with(spec, |_| Ok(()))
+        }
     }
 
     /// Builds a versioned NBCS v2 base at an atomic committed-read anchor.
@@ -3965,7 +3992,17 @@ impl Database {
         &mut self,
         spec: ColumnarProjectionSpec,
     ) -> Result<ColumnarProjectionId, DatabaseError> {
-        self.build_incremental_columnar_projection_with(spec, |_| Ok(()))
+        #[cfg(test)]
+        {
+            let after_scan = self.columnar_build_after_scan.take();
+            self.build_incremental_columnar_projection_with(spec, move |database| {
+                after_scan.map_or(Ok(()), |hook| hook(database))
+            })
+        }
+        #[cfg(not(test))]
+        {
+            self.build_incremental_columnar_projection_with(spec, |_| Ok(()))
+        }
     }
 
     fn build_incremental_columnar_projection_with<F>(
@@ -8925,6 +8962,8 @@ mod tests {
             group_barrier: Rc::new(std::cell::Cell::new(None)),
             active_group: None,
             next_group_id: 1,
+            #[cfg(test)]
+            columnar_build_after_scan: None,
         };
         database
             .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
