@@ -423,6 +423,10 @@ The current code genuinely supports:
   `0600` socket exposes bounded multi-domain status, Adaptive controls,
   read-only current-inventory physical-design recommendations, and conditional
   design-evidence rotation through typed Server control paths;
+- an embedded-host-only Server physical-index proposal/apply control that binds
+  proposals to one worker evidence-window lifetime and delegates explicit
+  caller-named single-column Heap index creation to the existing Core
+  transaction path, without an NBOP, SQL, or wire apply operation;
 - a diagnostics-only synchronous `netbadb-lsp` server that loads SDK Schema
   Spec v1 or v2 once, compiles full editor buffers without database access, and maps
   stable UTF-8 byte diagnostics to UTF-16 LSP ranges;

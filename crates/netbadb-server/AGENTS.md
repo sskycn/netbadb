@@ -71,6 +71,16 @@
   current Database inventory. They MUST remain explicit worker commands and
   MUST NOT invoke DDL, scheduling, maintenance, identity reservation, or
   automatic evidence rotation.
+- Programmatic physical-index proposals MUST be bound to the exact lifetime of
+  the worker-owned Physical Design runtime. Evidence epoch values are
+  window-local and MUST NOT be used as cross-restart provenance. A proposal
+  MUST hold only a weak runtime identity, and apply MUST reject a dead or
+  different identity before reading destination evidence or calling Core.
+- Programmatic physical-index apply MUST run in the sole Database worker and
+  delegate current-state validation and mutation to Core's typed apply API and
+  existing named-index transaction. Server MUST NOT duplicate coverage,
+  incarnation, schema, storage, evidence, naming, allocation, WAL, retry, or
+  recovery authority, and MUST NOT add an operator/wire/automatic apply path.
 - Deployment and operator exposure of physical-design advice MUST remain a
   projection of the worker-owned runtime. Operator recommendations are
   observation only: they MUST NOT reserve identity, generate DDL, build

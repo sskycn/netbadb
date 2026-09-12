@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use netbadb_core::{
     AdaptiveEvidencePoolLimits, AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope,
     AutomaticSchedulerPolicy, Database, DatabaseCoordinatorConfig, MaintenanceBudget,
+    PhysicalIndexCandidate, PhysicalIndexDesignApplyError, PhysicalIndexDesignApplyOutcome,
     TableStorageCreateSpec,
 };
 use netbadb_protocol::{
@@ -22,7 +23,7 @@ use netbadb_server::{
     ServerPhysicalDesignControlError, TcpServer, TcpServerError, TransportKind,
 };
 use netbadb_storage::{wal_alternate_path, wal_path};
-use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
+use netbadb_types::{ColumnId, IndexName, PhysicalType, ScalarValue, TableId};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -399,15 +400,64 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         columnar
     );
 
+    let status_before_proposal = design.status().unwrap();
+    let proposal = design
+        .propose_index(PhysicalIndexCandidate {
+            table_id: TableId(1),
+            column_id: ColumnId(2),
+        })
+        .unwrap();
+    assert_eq!(proposal.candidate().table_id, TableId(1));
+    assert_eq!(proposal.candidate().column_id, ColumnId(2));
     assert_eq!(
-        client.request(
-            5,
-            ClientMessage::Execute {
-                sql: "CREATE INDEX users_name_idx ON users (name)".into(),
-            },
-        ),
-        vec![ServerMessage::AffectedRows { count: 0 }]
+        proposal.evidence_epoch(),
+        status_before_proposal.evidence.epoch
     );
+    assert_eq!(proposal.point_report_count(), 1);
+    assert_eq!(design.status().unwrap(), status_before_proposal);
+    let index_name = IndexName::new("users_name_idx").unwrap();
+
+    client.request(
+        5,
+        ClientMessage::Begin {
+            table_id: TableId(1),
+        },
+    );
+    client.request(
+        6,
+        ClientMessage::Execute {
+            sql: "INSERT INTO users (id, name) VALUES (2, 'Lin')".into(),
+        },
+    );
+    assert!(matches!(
+        design.apply_index(&proposal, index_name.clone()),
+        Err(ServerPhysicalDesignControlError::Apply(error))
+            if matches!(
+                error.as_ref(),
+                PhysicalIndexDesignApplyError::Database(_)
+            )
+    ));
+    client.request(7, ClientMessage::Rollback);
+
+    let created = design.apply_index(&proposal, index_name.clone()).unwrap();
+    assert!(matches!(
+        created.outcome,
+        PhysicalIndexDesignApplyOutcome::Created { .. }
+    ));
+    let after_create = design.status().unwrap();
+    assert_eq!(after_create, status_before_proposal);
+
+    let messages = client.request(
+        8,
+        ClientMessage::Execute {
+            sql: "SELECT id FROM users WHERE name = 'Ada'".into(),
+        },
+    );
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        ServerMessage::QueryRow { values }
+            if values == &vec![ScalarValue::Int64(1)]
+    )));
     let revalidated = operator.physical_design_recommendations().unwrap();
     assert_eq!(
         revalidated
@@ -433,6 +483,27 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     ));
     assert_eq!(design.status().unwrap().evidence.epoch.0, rotated.new_epoch);
 
+    let repeated = design.apply_index(&proposal, index_name).unwrap();
+    assert_eq!(
+        created.global_commit_seq_after,
+        repeated.global_commit_seq_after
+    );
+    assert!(matches!(
+        repeated.outcome,
+        PhysicalIndexDesignApplyOutcome::AlreadyApplied { .. }
+    ));
+    let covered = design
+        .apply_index(&proposal, IndexName::new("users_name_idx_other").unwrap())
+        .unwrap();
+    assert_eq!(
+        created.global_commit_seq_after,
+        covered.global_commit_seq_after
+    );
+    assert_eq!(
+        covered.outcome,
+        PhysicalIndexDesignApplyOutcome::AlreadyCovered
+    );
+
     drop(client);
     server.shutdown().unwrap();
     assert!(!socket.exists());
@@ -440,6 +511,148 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         design.status(),
         Err(ServerPhysicalDesignControlError::ServerStopped)
     ));
+    cleanup(&directory);
+}
+
+#[test]
+fn native_physical_design_proposal_is_bound_to_one_worker_runtime() {
+    let directory = test_directory("physical-design-runtime");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut database = Database::create_catalog(
+        directory.join("catalog"),
+        vec![TableStorageCreateSpec::heap(
+            directory.join("users.ndb"),
+            users_table("UserId"),
+        )],
+        Some(
+            DatabaseCoordinatorConfig::new(directory.join("coordinator")).with_global_visibility(),
+        ),
+    )
+    .unwrap();
+    database
+        .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+        .unwrap();
+    database.close().unwrap();
+
+    let manifest = directory.join("server.json");
+    let mut manifest_value: serde_json::Value =
+        serde_json::from_str(&manifest_json("users.ndb", "UserId")).unwrap();
+    manifest_value["physical_design"] = serde_json::json!({
+        "evidence_limits": {
+            "max_index_candidates": 64,
+            "max_columnar_candidates": 64,
+            "max_query_shapes_per_candidate": 32,
+            "max_columnar_columns_per_candidate": 64
+        },
+        "advisor_policy": {
+            "index": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            },
+            "columnar": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            }
+        }
+    });
+    std::fs::write(&manifest, serde_json::to_vec(&manifest_value).unwrap()).unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    let candidate = PhysicalIndexCandidate {
+        table_id: TableId(1),
+        column_id: ColumnId(2),
+    };
+
+    let first_server = TcpServer::new(config.clone()).start().unwrap();
+    let first_control = first_server.physical_design_control();
+    let first_control_clone = first_control.clone();
+    let mut first_client = Client::connect(first_server.local_addr());
+    first_client.hello();
+    first_client.request(
+        2,
+        ClientMessage::Execute {
+            sql: "SELECT id FROM users WHERE name = 'Ada'".into(),
+        },
+    );
+    let old_proposal = first_control_clone.propose_index(candidate).unwrap();
+    assert_eq!(old_proposal.evidence_epoch().0, 0);
+    drop(first_client);
+    first_server.shutdown().unwrap();
+    assert!(matches!(
+        first_control.apply_index(&old_proposal, IndexName::new("users_name_idx").unwrap()),
+        Err(ServerPhysicalDesignControlError::ServerStopped)
+    ));
+
+    let second_server = TcpServer::new(config).start().unwrap();
+    let second_control = second_server.physical_design_control();
+    let second_control_clone = second_control.clone();
+    let mut second_client = Client::connect(second_server.local_addr());
+    second_client.hello();
+    second_client.request(
+        2,
+        ClientMessage::Execute {
+            sql: "SELECT id FROM users WHERE name = 'Ada'".into(),
+        },
+    );
+    assert_eq!(second_control.status().unwrap().evidence.epoch.0, 0);
+    assert!(matches!(
+        second_control.apply_index(&old_proposal, IndexName::new("users_name_idx").unwrap()),
+        Err(ServerPhysicalDesignControlError::ProposalRuntimeChanged)
+    ));
+
+    let fresh = second_control_clone.propose_index(candidate).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let first_apply = {
+        let barrier = barrier.clone();
+        let control = second_control.clone();
+        let proposal = fresh.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            control
+                .apply_index(&proposal, IndexName::new("users_name_idx").unwrap())
+                .unwrap()
+        })
+    };
+    let second_apply = {
+        let barrier = barrier.clone();
+        let control = second_control_clone;
+        std::thread::spawn(move || {
+            barrier.wait();
+            control
+                .apply_index(&fresh, IndexName::new("users_name_idx").unwrap())
+                .unwrap()
+        })
+    };
+    barrier.wait();
+    let first_apply = first_apply.join().unwrap();
+    let second_apply = second_apply.join().unwrap();
+    assert_eq!(
+        [first_apply.outcome, second_apply.outcome]
+            .iter()
+            .filter(|outcome| matches!(outcome, PhysicalIndexDesignApplyOutcome::Created { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        [first_apply.outcome, second_apply.outcome]
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                PhysicalIndexDesignApplyOutcome::AlreadyApplied { .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        first_apply.global_commit_seq_after,
+        second_apply.global_commit_seq_after
+    );
+    drop(second_client);
+    second_server.shutdown().unwrap();
     cleanup(&directory);
 }
 

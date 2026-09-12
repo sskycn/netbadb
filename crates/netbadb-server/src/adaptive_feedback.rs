@@ -557,7 +557,7 @@ mod tests {
         let design_epoch = design.evidence.epoch;
         let (reply, response) = mpsc::sync_channel(1);
         physical_design.handle(
-            &database,
+            &mut database,
             ServerPhysicalDesignWorkerCommand::RotateEvidenceIfEpoch {
                 expected: design_epoch,
                 reply,
@@ -615,7 +615,7 @@ mod tests {
             .expect("advance schema");
         let (reply, response) = mpsc::sync_channel(1);
         design.handle(
-            &database,
+            &mut database,
             ServerPhysicalDesignWorkerCommand::Recommendations { reply },
         );
         assert!(matches!(

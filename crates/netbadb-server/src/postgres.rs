@@ -853,7 +853,7 @@ fn run_pg_worker(
                 None => handle_disabled_worker_command(command),
             },
             PgWorkerCommand::PhysicalDesign(command) => match physical_design.as_mut() {
-                Some(runtime) => runtime.handle(&database, command),
+                Some(runtime) => runtime.handle(&mut database, command),
                 None => handle_disabled_physical_design_worker_command(command),
             },
             PgWorkerCommand::Shutdown { reply } => {

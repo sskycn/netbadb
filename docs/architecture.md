@@ -351,6 +351,17 @@ mutation authority. No Columnar apply, automatic design, scheduler, server or
 operator surface, SQL syntax, wire/manifest/inspection contract, or persistent
 format is added.
 
+[Adaptive Operations Phase 24](adaptive-operations-phase24.md) carries that
+narrow Core authority through the existing Native/PostgreSQL programmatic
+Server control path. The sole Database worker proposes from its own evidence
+window and performs explicit caller-named apply through Core. A private runtime
+identity binds each Server proposal to exactly one evidence-window lifetime;
+the proposal stores only a weak reference, so equal numeric epochs after
+restart cannot alias and retained proposals cannot keep a server alive. FIFO
+worker ownership remains the serialization boundary. Manifest v7, NBOP v2,
+both database wire protocols, the operator/CLI/daemon surfaces, metrics,
+Inspection JSON v7, and persistent formats remain unchanged.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

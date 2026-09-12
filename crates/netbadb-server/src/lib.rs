@@ -60,6 +60,7 @@ pub use physical_design::{
     ServerPhysicalDesignAdvisorConfig, ServerPhysicalDesignControlError,
     ServerPhysicalDesignControlHandle, ServerPhysicalDesignDiagnostics,
     ServerPhysicalDesignRotationReport, ServerPhysicalDesignStatus,
+    ServerPhysicalIndexDesignProposal,
 };
 pub use postgres::{PostgresServerHandle, PostgresTcpServer, PostgresTcpServerError};
 pub use runtime::{ServerHandle, SessionId, TcpServer, TcpServerError, WorkerFatalError};

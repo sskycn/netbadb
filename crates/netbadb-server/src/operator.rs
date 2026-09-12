@@ -1624,6 +1624,9 @@ fn physical_design_remote_error(error: ServerPhysicalDesignControlError) -> Oper
         ServerPhysicalDesignControlError::Advisor(PhysicalDesignAdvisorError::Database(_)) => {
             OperatorErrorCodeV2::Internal
         }
+        ServerPhysicalDesignControlError::Proposal(_)
+        | ServerPhysicalDesignControlError::Apply(_)
+        | ServerPhysicalDesignControlError::ProposalRuntimeChanged => OperatorErrorCodeV2::Internal,
         ServerPhysicalDesignControlError::ServerStopped => OperatorErrorCodeV2::ServerStopped,
     };
     let message = match code {
@@ -2072,6 +2075,8 @@ mod tests {
         for payload in [
             br#"{"request_id":1,"operation":{"type":"status","extra":true}}"#.as_slice(),
             br#"{"request_id":1,"operation":{"type":"unknown"}}"#.as_slice(),
+            br#"{"request_id":1,"operation":{"type":"apply_physical_index","index_name":"idx"}}"#
+                .as_slice(),
             &[0xff][..],
         ] {
             assert!(matches!(

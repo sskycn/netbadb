@@ -1,18 +1,24 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 
 use netbadb_core::{
     AdaptiveEvidencePoolLimits, AdaptiveEvidenceRecordError, AdaptiveEvidenceRecordOutcome,
     DatabaseCoordinatorConfig, PhysicalDesignAdvisorPolicy, PhysicalDesignEvidenceLimits,
-    PhysicalDesignEvidenceRecordError, PhysicalDesignRecommendationPolicy, TableStorageCreateSpec,
+    PhysicalDesignEvidenceRecordError, PhysicalDesignRecommendationPolicy, PhysicalIndexCandidate,
+    PhysicalIndexDesignApplyOutcome, TableStorageCreateSpec,
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 
 use super::*;
 use crate::adaptive_feedback::{ServerAdaptiveFeedbackConfig, ServerAdaptiveFeedbackRuntime};
 use crate::authorization::{PrincipalGrants, TablePermissions};
-use crate::physical_design::{ServerPhysicalDesignAdvisorConfig, ServerPhysicalDesignRuntime};
+use crate::physical_design::{
+    ServerPhysicalDesignAdvisorConfig, ServerPhysicalDesignRuntime,
+    ServerPhysicalDesignWorkerCommand,
+};
+use netbadb_types::IndexName;
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 const TABLE_ID: TableId = TableId(51_520);
@@ -650,6 +656,43 @@ fn postgres_design_only_extended_portal_records_once_and_keeps_eligibility() {
         );
         assert_eq!(design.status().evidence.recorded_reports, 1);
     }
+
+    let status_before_proposal = design.status();
+    let (reply, response) = mpsc::sync_channel(1);
+    design.handle(
+        &mut fixture.database,
+        ServerPhysicalDesignWorkerCommand::ProposeIndex {
+            candidate: PhysicalIndexCandidate {
+                table_id: TABLE_ID,
+                column_id: ColumnId(2),
+            },
+            reply,
+        },
+    );
+    let proposal = response.recv().expect("proposal response").unwrap();
+    assert_eq!(design.status(), status_before_proposal);
+
+    let (reply, response) = mpsc::sync_channel(1);
+    design.handle(
+        &mut fixture.database,
+        ServerPhysicalDesignWorkerCommand::ApplyIndex {
+            proposal: Box::new(proposal),
+            index_name: IndexName::new("events_category_idx").unwrap(),
+            reply,
+        },
+    );
+    let applied = response.recv().expect("apply response").unwrap();
+    assert!(matches!(
+        applied.outcome,
+        PhysicalIndexDesignApplyOutcome::Created { .. }
+    ));
+    assert_eq!(design.status(), status_before_proposal);
+
+    let indexed_query = session.handle(
+        &mut fixture.database,
+        FrontendMessage::Query("SELECT id FROM events WHERE category = 7".into()),
+    );
+    assert_successful_query(&indexed_query);
 
     session.handle_with_server_observation(
         &mut fixture.database,

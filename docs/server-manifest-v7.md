@@ -118,8 +118,10 @@ Feedback-only and driven semantics are unchanged from v6.
 ## Physical Design
 
 Omitting `physical_design` is the sole disabled representation. `null`, an
-`enabled` flag, or a `mode` field is invalid. Presence enables only the Phase 21
-observe-only worker runtime. Every nested object is strict and every field is
+`enabled` flag, or a `mode` field is invalid. Presence enables the worker-owned
+evidence/advisor runtime and its embedded-host programmatic controls. It does
+not expose apply through the manifest, operator, daemon, CLI, SQL, Native, or
+PostgreSQL wire protocols. Every nested object is strict and every field is
 required. There are no manifest defaults.
 
 `evidence_limits` maps one-for-one to `PhysicalDesignEvidenceLimits`:

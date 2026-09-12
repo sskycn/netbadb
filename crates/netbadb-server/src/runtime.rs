@@ -1029,7 +1029,7 @@ fn run_database_worker(
                 }
             }
             WorkerCommand::PhysicalDesign(command) => {
-                let Some(database) = state.database.as_ref() else {
+                let Some(database) = state.database.as_mut() else {
                     crate::physical_design::handle_disabled_physical_design_worker_command(command);
                     continue;
                 };

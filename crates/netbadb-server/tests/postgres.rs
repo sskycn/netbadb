@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use netbadb_core::{
     AdaptiveEvidencePoolLimits, AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope,
     AutomaticSchedulerPolicy, Database, DatabaseCoordinatorConfig, MaintenanceBudget,
-    PhysicalDesignAdvisorError, PhysicalDesignEvidenceRecordError, TableStorageCreateSpec,
+    PhysicalDesignAdvisorError, PhysicalDesignEvidenceRecordError, PhysicalIndexCandidate,
+    PhysicalIndexDesignApplyOutcome, TableStorageCreateSpec,
 };
 use netbadb_pgwire::{CANCEL_REQUEST_CODE, PROTOCOL_VERSION_3, SSL_REQUEST_CODE};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
@@ -16,7 +17,7 @@ use netbadb_server::{
     ServerAdaptiveControlError, ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig,
     ServerAdaptiveMode, ServerConfig, ServerOperatorClient, ServerPhysicalDesignControlError,
 };
-use netbadb_types::{ColumnId, PhysicalType, TableId};
+use netbadb_types::{ColumnId, IndexName, PhysicalType, TableId};
 
 fn test_directory(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("netbadb-postgres-{name}-{}", std::process::id()))
@@ -345,6 +346,25 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
         candidate.column_id == 3
             && candidate.decision == OperatorPhysicalDesignDecisionV2::Recommend {}
     }));
+    let status_before_proposal = design.status().unwrap();
+    let proposal = design
+        .propose_index(PhysicalIndexCandidate {
+            table_id: TableId(1),
+            column_id: ColumnId(3),
+        })
+        .unwrap();
+    assert_eq!(design.status().unwrap(), status_before_proposal);
+    let applied = design
+        .apply_index(
+            &proposal,
+            IndexName::new("users_active_programmatic_idx").unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        applied.outcome,
+        PhysicalIndexDesignApplyOutcome::Created { .. }
+    ));
+    assert_eq!(design.status().unwrap(), status_before_proposal);
 
     stream.write_all(&frontend(b'E', &execute)).unwrap();
     stream.write_all(&frontend(b'S', &[])).unwrap();
@@ -354,6 +374,15 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
         [b'D', b'C', b'Z']
     );
     assert_eq!(design.status().unwrap().evidence.recorded_reports, 1);
+
+    let indexed = query(
+        &mut stream,
+        "SELECT id FROM users WHERE active = true ORDER BY id",
+    );
+    assert_eq!(
+        indexed.iter().map(|message| message.0).collect::<Vec<_>>(),
+        [b'T', b'D', b'D', b'C', b'Z']
+    );
 
     stream.write_all(&frontend(b'X', &[])).unwrap();
     drop(stream);

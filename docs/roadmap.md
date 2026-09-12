@@ -1,5 +1,22 @@
 # NetbaDB roadmap
 
+## Server programmatic physical index apply (Adaptive Operations Phase 24 complete)
+
+- extended the existing Native/PostgreSQL physical-design control handle with
+  exact-candidate proposal and explicit caller-named apply commands;
+- kept the sole Database worker as the only execution owner and delegated
+  proposal/current-state validation and named index mutation exactly to Core;
+- bound proposals to one worker evidence-window lifetime with a private
+  `Arc` identity and proposal-held `Weak`, rejecting dead, restarted, or other
+  live runtimes before Core or evidence access;
+- preserved Core retry, coverage, conflict, schema, capacity, transaction,
+  allocation, WAL, and recovery semantics without a Server cache or journal;
+- retained programmatic host-only authority: Manifest v7, NBOP v2, Native and
+  PostgreSQL wire contracts, CLI/daemon/operator surfaces, metrics, Inspection
+  JSON v7, and persistent formats are unchanged.
+
+See [`adaptive-operations-phase24.md`](adaptive-operations-phase24.md).
+
 ## Explicit Core physical index apply (Adaptive Operations Phase 23 complete)
 
 - added typed `PhysicalIndexDesignProposal` snapshots for exact current
