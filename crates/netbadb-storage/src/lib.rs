@@ -34,7 +34,8 @@ pub use columnar::{
     ColumnarConstraint, ColumnarDeltaSegmentMetadata, ColumnarError, ColumnarIncrementalMetadata,
     ColumnarProjection, ColumnarProjectionMetadata, ColumnarRepresentationStatistics,
     ColumnarRowGroupStatistics, ColumnarScanStatistics, ColumnarVector, PreparedColumnarAdvance,
-    PreparedColumnarProjection, StorageSnapshotToken,
+    PreparedColumnarProjection, StorageSnapshotToken, cleanup_unpublished_projection_build,
+    columnar_projection_manifest_exists,
 };
 pub use heap::{
     HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, HistoricalOrphanAdoptionReport,

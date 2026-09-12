@@ -201,6 +201,13 @@ optimizer, planner, executor core, page, buffer, storage, index, transaction,
 WAL, and recovery SHOULD remain synchronous. Async belongs at external network
 and remote-client boundaries and MUST NOT force Tokio types through the core.
 
+A managed Columnar projection MUST NOT become authoritative merely because its
+artifact files exist. New managed projection identity allocation and pending
+build intent MUST be one durable Projection Catalog transition, and a pending
+projection is never planner-visible. Recovery may promote a final artifact only
+when it exactly matches its durable pending intent; a mismatched durable
+artifact MUST fail closed.
+
 ### Errors and unsafe code
 
 Library APIs MUST expose domain-specific errors rather than public

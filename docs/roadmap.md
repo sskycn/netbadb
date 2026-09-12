@@ -1,5 +1,26 @@
 # NetbaDB roadmap
 
+## Recoverable managed Columnar publication (Adaptive Operations Phase 26 complete)
+
+- upgraded the independently versioned Projection Catalog and marker from NBPC
+  v1 to v2 while retaining a bounded v1 migration reader and exact active-entry,
+  incarnation, locator, generation, and next-ID high-water preservation;
+- made ID allocation, high-water advancement, and one exact snapshot or
+  incremental pending-build intent a single durable catalog publication;
+- ordered final NBC artifact publication before one atomic pending-to-active
+  catalog transition and in-memory registry publication afterward;
+- added synchronous open recovery: exact cleanup and permanent ID burn when no
+  manifest survived, exact-intent promotion when a complete artifact survived,
+  and fail-closed behavior for mismatch, corruption, or missing segments;
+- added a runtime reopen-required gate for ambiguous artifact/catalog I/O and
+  made incomplete managed inventory block Change Stream GC and Physical Design
+  coverage advice;
+- retained all external contracts and deferred recommendation-to-Columnar apply
+  to a future phase.
+
+See [`adaptive-operations-phase26.md`](adaptive-operations-phase26.md) and
+[`projection-catalog-v2.md`](projection-catalog-v2.md).
+
 ## Operator-approved physical index apply (Adaptive Operations Phase 25 complete)
 
 - upgraded the sole current deployment contract to strict Manifest v8 with a

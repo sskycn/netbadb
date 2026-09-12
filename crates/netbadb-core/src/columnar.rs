@@ -10,7 +10,7 @@ use netbadb_types::{
 };
 
 use crate::projection_catalog::{
-    ProjectionCatalog, ProjectionCatalogEntry, ProjectionCatalogError,
+    ProjectionBuildMode, ProjectionCatalog, ProjectionCatalogEntry, ProjectionCatalogError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +178,7 @@ pub(crate) struct ProjectionRegistry {
     catalog: Option<ProjectionCatalog>,
     catalog_path: Option<PathBuf>,
     catalog_error: Option<String>,
+    recovery_required: Option<ColumnarProjectionId>,
 }
 
 impl ProjectionRegistry {
@@ -188,6 +189,7 @@ impl ProjectionRegistry {
             catalog: None,
             catalog_path: None,
             catalog_error: None,
+            recovery_required: None,
         }
     }
 
@@ -200,6 +202,7 @@ impl ProjectionRegistry {
             catalog_path: Some(catalog.path().to_owned()),
             catalog: Some(catalog),
             catalog_error: None,
+            recovery_required: None,
             entries,
         }
     }
@@ -211,15 +214,47 @@ impl ProjectionRegistry {
             catalog: None,
             catalog_path: Some(path),
             catalog_error: Some(detail),
+            recovery_required: None,
         }
     }
 
-    pub(crate) fn reserve_id(&mut self) -> Result<ColumnarProjectionId, ProjectionCatalogError> {
-        self.ensure_catalog_available()?;
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_build(
+        &mut self,
+        table_id: TableId,
+        source_storage_id: StorageId,
+        generation: ColumnarGeneration,
+        schema_fingerprint: SchemaFingerprint,
+        directory: &Path,
+        mode: ProjectionBuildMode,
+        columns: Vec<ColumnId>,
+    ) -> Result<ColumnarProjectionId, ProjectionCatalogError> {
+        self.ensure_mutation_available()?;
         if let Some(catalog) = &mut self.catalog {
-            let id = catalog.reserve_id()?;
-            self.next_id = catalog.next_id().map_or(0, |next| next.0);
-            return Ok(id);
+            let locator = catalog.locator(directory)?;
+            let result = catalog.begin_build(
+                table_id,
+                source_storage_id,
+                generation,
+                schema_fingerprint,
+                locator,
+                mode,
+                columns,
+            );
+            let pending_id = catalog
+                .pending_build()
+                .map_or(ColumnarProjectionId(self.next_id), |pending| pending.id);
+            let next_id = catalog.next_id().map_or(0, |next| next.0);
+            match result {
+                Ok(id) => {
+                    self.next_id = next_id;
+                    return Ok(id);
+                }
+                Err(error @ ProjectionCatalogError::Io { .. }) => {
+                    return Err(self.require_recovery(pending_id, "durable build intent", error));
+                }
+                Err(error) => return Err(error),
+            }
         }
         if self.next_id == 0 {
             return Err(ProjectionCatalogError::CapacityExceeded("identity space"));
@@ -232,11 +267,22 @@ impl ProjectionRegistry {
         Ok(id)
     }
 
+    pub(crate) fn abort_build(
+        &mut self,
+        id: ColumnarProjectionId,
+    ) -> Result<(), ProjectionCatalogError> {
+        let result = self.catalog.as_mut().map(|catalog| catalog.abort_build(id));
+        if let Some(Err(error)) = result {
+            return Err(self.require_recovery(id, "pending-build abort", error));
+        }
+        Ok(())
+    }
+
     pub(crate) fn preflight_location(
         &self,
         directory: &Path,
     ) -> Result<(), ProjectionCatalogError> {
-        self.ensure_catalog_available()?;
+        self.ensure_mutation_available()?;
         if let Some(catalog) = &self.catalog {
             let locator = catalog.locator(directory)?;
             if catalog.contains_locator(&locator) {
@@ -257,11 +303,11 @@ impl ProjectionRegistry {
         Ok(())
     }
 
-    pub(crate) fn publish(
+    pub(crate) fn commit_build(
         &mut self,
         projection: ColumnarProjection,
     ) -> Result<(), ProjectionCatalogError> {
-        self.ensure_catalog_available()?;
+        self.ensure_mutation_available()?;
         let metadata = projection.metadata();
         let managed = self.catalog.is_some();
         let locator = match &self.catalog {
@@ -276,9 +322,30 @@ impl ProjectionRegistry {
             schema_fingerprint: metadata.schema_fingerprint,
             locator,
         };
-        if let Some(catalog) = &mut self.catalog {
-            catalog.insert(identity.clone())?;
-            self.next_id = catalog.next_id().map_or(0, |next| next.0);
+        let mode = if metadata.incremental.is_some() {
+            ProjectionBuildMode::Incremental
+        } else {
+            ProjectionBuildMode::Snapshot
+        };
+        let columns = metadata
+            .columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>();
+        let catalog_result = self.catalog.as_mut().map(|catalog| {
+            let result = catalog.commit_build(identity.clone(), mode, &columns);
+            let next_id = catalog.next_id().map_or(0, |next| next.0);
+            (result, next_id)
+        });
+        if let Some((result, next_id)) = catalog_result {
+            if let Err(error) = result {
+                return Err(self.require_recovery(
+                    identity.id,
+                    "pending-to-active catalog publication",
+                    error,
+                ));
+            }
+            self.next_id = next_id;
         } else {
             self.next_id = identity.id.0.checked_add(1).unwrap_or(0);
         }
@@ -298,7 +365,7 @@ impl ProjectionRegistry {
         &mut self,
         projection: ColumnarProjection,
     ) -> Result<(), ProjectionCatalogError> {
-        self.ensure_catalog_available()?;
+        self.ensure_mutation_available()?;
         let metadata = projection.metadata().clone();
         let locator = match &self.catalog {
             Some(catalog) => catalog.locator(projection.root())?,
@@ -367,7 +434,7 @@ impl ProjectionRegistry {
         id: ColumnarProjectionId,
         replacement: ColumnarProjection,
     ) -> Result<ColumnarProjection, ProjectionCatalogError> {
-        self.ensure_catalog_available()?;
+        self.ensure_mutation_available()?;
         let position = self
             .entries
             .iter()
@@ -427,7 +494,7 @@ impl ProjectionRegistry {
         &mut self,
         id: ColumnarProjectionId,
     ) -> Result<Option<ColumnarProjection>, ProjectionCatalogError> {
-        self.ensure_catalog_available()?;
+        self.ensure_mutation_available()?;
         let Some(position) = self
             .entries
             .iter()
@@ -452,13 +519,17 @@ impl ProjectionRegistry {
     }
 
     pub(crate) fn ensure_retention_catalog_available(&self) -> Result<(), ProjectionCatalogError> {
-        self.ensure_catalog_available()
+        self.ensure_mutation_available()
+    }
+
+    pub(crate) const fn is_managed(&self) -> bool {
+        self.catalog_path.is_some()
     }
 
     pub(crate) fn catalog_inspection(&self) -> ColumnarProjectionCatalogInspection {
         ColumnarProjectionCatalogInspection {
             managed: self.catalog_path.is_some(),
-            available: self.catalog_error.is_none(),
+            available: self.catalog_error.is_none() && self.recovery_required.is_none(),
             path: self.catalog_path.clone(),
             next_projection_id: (self.next_id != 0).then_some(ColumnarProjectionId(self.next_id)),
             detail: self.catalog_error.clone(),
@@ -470,6 +541,41 @@ impl ProjectionRegistry {
             Some(detail) => Err(ProjectionCatalogError::Unavailable(detail.clone())),
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn ensure_mutation_available(&self) -> Result<(), ProjectionCatalogError> {
+        self.ensure_catalog_available()?;
+        if let Some(projection_id) = self.recovery_required {
+            return Err(ProjectionCatalogError::RecoveryRequired {
+                projection_id,
+                operation: "an earlier ambiguous publication",
+                detail: "reopen the database before another managed projection mutation".into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_recovery_required(
+        &mut self,
+        projection_id: ColumnarProjectionId,
+        operation: &'static str,
+        detail: impl Into<String>,
+    ) -> ProjectionCatalogError {
+        self.recovery_required = Some(projection_id);
+        ProjectionCatalogError::RecoveryRequired {
+            projection_id,
+            operation,
+            detail: detail.into(),
+        }
+    }
+
+    fn require_recovery(
+        &mut self,
+        projection_id: ColumnarProjectionId,
+        operation: &'static str,
+        error: ProjectionCatalogError,
+    ) -> ProjectionCatalogError {
+        self.mark_recovery_required(projection_id, operation, error.to_string())
     }
 }
 

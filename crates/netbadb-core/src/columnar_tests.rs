@@ -1558,6 +1558,15 @@ fn projection_lifecycle_crash_child() {
                 ))
                 .expect("crash point should terminate build");
         }
+        "incremental-build" => {
+            database
+                .build_incremental_columnar_projection(ColumnarProjectionSpec::new(
+                    TableId(1),
+                    root.join("crashing-projection"),
+                    vec![ColumnId(1), ColumnId(2)],
+                ))
+                .expect("crash point should terminate incremental build");
+        }
         "refresh" => {
             database
                 .insert(&[
@@ -1579,6 +1588,7 @@ fn projection_lifecycle_crash_child() {
         "drop" => database
             .drop_columnar_projection(netbadb_types::ColumnarProjectionId(1))
             .expect("crash point should terminate drop"),
+        "recover" => {}
         _ => panic!("unknown crash child operation"),
     }
     panic!("configured crash point was not reached");
@@ -1594,9 +1604,13 @@ fn run_crash_child(root: &PathBuf, operation: &str, point: &str) {
         .env("NETBADB_COLUMNAR_CRASH_ROOT", root)
         .env("NETBADB_COLUMNAR_CRASH_OPERATION", operation)
         .env("NETBADB_PROJECTION_CATALOG_CRASH_POINT", point)
+        .env("NETBADB_COLUMNAR_DELTA_CRASH_POINT", point)
         .status()
         .expect("run crash child");
-    assert_eq!(status.code(), Some(88), "crash point {point}");
+    assert!(
+        matches!(status.code(), Some(88 | 89)),
+        "crash point {point}: {status:?}"
+    );
 }
 
 fn seed_crash_database(root: &PathBuf, projection: bool) {
@@ -1622,6 +1636,32 @@ fn seed_crash_database(root: &PathBuf, projection: bool) {
         );
     }
     database.close().expect("close crash seed");
+}
+
+fn seed_incremental_build_crash_database(root: &PathBuf) {
+    seed_crash_database(root, false);
+    let mut database = Database::open_catalog(root.join("catalog")).expect("reopen crash seed");
+    database
+        .enable_change_stream(TableId(1))
+        .expect("enable crash fixture stream");
+    database.close().expect("close incremental crash seed");
+}
+
+fn seed_recovered_planner_database(root: &PathBuf, incremental: bool) {
+    fs::create_dir_all(root).expect("create recovered planner root");
+    let mut database = Database::create_catalog(
+        root.join("catalog"),
+        vec![TableStorageCreateSpec::heap(root.join("heap"), table())],
+        None,
+    )
+    .expect("create recovered planner database");
+    insert_rows(&mut database, 512);
+    if incremental {
+        database
+            .enable_change_stream(TableId(1))
+            .expect("enable recovered planner stream");
+    }
+    database.close().expect("close recovered planner seed");
 }
 
 fn seed_compaction_crash_database(root: &PathBuf) {
@@ -1695,9 +1735,8 @@ fn projection_catalog_build_refresh_and_drop_crash_boundaries_reopen_determinist
         ("catalog-before-rename", 1),
         ("catalog-after-rename", 2),
         ("catalog-renamed", 2),
-        ("id-reserved", 2),
+        ("build-intent-durable", 2),
         ("build-files-synced", 2),
-        ("build-manifest-published", 2),
     ];
     for (point, expected_next) in reservation_points {
         let root = path(&format!("crash-build-{point}"));
@@ -1718,6 +1757,67 @@ fn projection_catalog_build_refresh_and_drop_crash_boundaries_reopen_determinist
         fs::remove_dir_all(root).expect("remove build crash fixture");
     }
 
+    for operation in ["build", "incremental-build"] {
+        let root = path(&format!("crash-{operation}-manifest-published"));
+        seed_recovered_planner_database(&root, operation == "incremental-build");
+        let point = if operation == "incremental-build" {
+            "incremental-build-manifest-published"
+        } else {
+            "build-manifest-published"
+        };
+        run_crash_child(&root, operation, point);
+        let mut reopened = Database::open_catalog(root.join("catalog"))
+            .expect("promote manifest-published pending build");
+        let inventory = reopened.inspect_columnar_projections();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(
+            inventory[0].projection_id,
+            Some(netbadb_types::ColumnarProjectionId(1))
+        );
+        assert_eq!(
+            inventory[0].mode,
+            Some(operation.strip_suffix("-build").unwrap_or("snapshot"))
+        );
+        assert_eq!(
+            reopened
+                .inspect_columnar_projection_catalog()
+                .next_projection_id,
+            Some(netbadb_types::ColumnarProjectionId(2))
+        );
+        assert!(statement_uses_columnar(
+            &reopened,
+            "SELECT id FROM events WHERE amount > 0"
+        ));
+        if operation == "incremental-build" {
+            let retention = reopened
+                .observe_change_stream_reclamation(TableId(1))
+                .expect("inspect recovered retention authority");
+            assert!(retention.consumers.iter().any(|consumer| matches!(
+                consumer,
+                crate::ChangeStreamRetentionConsumer::Columnar {
+                    projection_id: netbadb_types::ColumnarProjectionId(1),
+                    ..
+                }
+            )));
+            reopened
+                .execute("UPDATE events SET amount = 500 WHERE id = 1")
+                .expect("write after incremental recovery");
+            let advanced = reopened
+                .advance_columnar_projection(
+                    netbadb_types::ColumnarProjectionId(1),
+                    ColumnarAdvanceBudget::new(8, 1 << 20),
+                )
+                .expect("advance recovered incremental projection");
+            assert!(advanced.caught_up);
+        }
+        drop(reopened);
+        let reopened_again = Database::open_catalog(root.join("catalog"))
+            .expect("repeat recovered projection reopen");
+        assert_eq!(reopened_again.inspect_columnar_projections().len(), 1);
+        drop(reopened_again);
+        fs::remove_dir_all(root).expect("remove manifest recovery fixture");
+    }
+
     let root = path("crash-build-registry-publish");
     seed_crash_database(&root, false);
     run_crash_child(&root, "build", "before-registry-publish");
@@ -1729,6 +1829,26 @@ fn projection_catalog_build_refresh_and_drop_crash_boundaries_reopen_determinist
     );
     drop(reopened);
     fs::remove_dir_all(root).expect("remove registry crash fixture");
+
+    for point in ["catalog-mid-write", "catalog-after-rename"] {
+        let root = path(&format!("crash-build-active-transition-{point}"));
+        seed_crash_database(&root, false);
+        run_crash_child(&root, "build", "build-manifest-published");
+        run_crash_child(&root, "recover", point);
+        let reopened = Database::open_catalog(root.join("catalog"))
+            .expect("finish interrupted pending-to-active recovery");
+        assert_eq!(reopened.inspect_columnar_projections().len(), 1);
+        assert_eq!(
+            reopened.inspect_columnar_projections()[0].projection_id,
+            Some(netbadb_types::ColumnarProjectionId(1))
+        );
+        drop(reopened);
+        let reopened_again = Database::open_catalog(root.join("catalog"))
+            .expect("repeat active-transition recovery reopen");
+        assert_eq!(reopened_again.inspect_columnar_projections().len(), 1);
+        drop(reopened_again);
+        fs::remove_dir_all(root).expect("remove active-transition fixture");
+    }
 
     for point in [
         "refresh-files-synced",
@@ -1818,6 +1938,401 @@ fn build_aborts_if_source_commits_during_the_build_window() {
     );
     database.close().expect("close database");
     cleanup(&heap, &projection);
+}
+
+#[test]
+fn managed_source_change_aborts_pending_build_and_burns_its_identity() {
+    let root = path("managed-source-change");
+    fs::create_dir_all(&root).expect("create managed source-change root");
+    let mut database = Database::create_catalog(
+        root.join("catalog"),
+        vec![TableStorageCreateSpec::heap(root.join("heap"), table())],
+        None,
+    )
+    .expect("create managed database");
+    insert_rows(&mut database, 4);
+    let failed = root.join("failed-projection");
+    let result = database.build_columnar_projection_with(
+        ColumnarProjectionSpec::new(TableId(1), &failed, vec![ColumnId(1), ColumnId(2)]),
+        |database| {
+            database
+                .execute(
+                    "INSERT INTO events (id, amount, active, label) VALUES (9, 9, TRUE, 'race')",
+                )
+                .map(|_| ())
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(DatabaseError::ColumnarBuildSourceChanged { .. })
+    ));
+    assert_eq!(
+        database
+            .inspect_columnar_projection_catalog()
+            .next_projection_id,
+        Some(netbadb_types::ColumnarProjectionId(2))
+    );
+    assert_eq!(
+        fs::read_dir(&failed)
+            .expect("retained caller directory")
+            .count(),
+        0
+    );
+    let next = database
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("next-projection"),
+            vec![ColumnId(1)],
+        ))
+        .expect("build after clean abort");
+    assert_eq!(next, netbadb_types::ColumnarProjectionId(2));
+    database.close().expect("close managed database");
+    fs::remove_dir_all(root).expect("remove managed source-change fixture");
+}
+
+#[test]
+fn v1_managed_inventory_migrates_without_rewriting_projection_files_or_adopting_orphans() {
+    let root = path("v1-managed-migration");
+    fs::create_dir_all(&root).expect("create v1 migration root");
+    let catalog = root.join("catalog");
+    let active_directory = root.join("active-projection");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(root.join("heap"), table())],
+        None,
+    )
+    .expect("create migration database");
+    insert_rows(&mut database, 8);
+    let active = database
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            &active_directory,
+            vec![ColumnId(1), ColumnId(2)],
+        ))
+        .expect("build active projection");
+    let burned = database
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("burned-projection"),
+            vec![ColumnId(1)],
+        ))
+        .expect("build projection to drop");
+    database
+        .drop_columnar_projection(burned)
+        .expect("drop while preserving high-water gap");
+    database.close().expect("close v2 database");
+
+    let before = fs::read_dir(&active_directory)
+        .expect("read active projection files")
+        .map(|entry| {
+            let path = entry.expect("projection file").path();
+            let bytes = fs::read(&path).expect("read projection file bytes");
+            (path.file_name().unwrap().to_owned(), bytes)
+        })
+        .collect::<Vec<_>>();
+    let orphan = detached_artifact(vec![ColumnId(1)], false);
+    let orphan_destination = root.join("historical-orphan");
+    fs::rename(orphan, &orphan_destination).expect("install historical orphan");
+    crate::projection_catalog::write_v1_fixture_for_test(&catalog)
+        .expect("rewrite historical v1 fixture");
+
+    let reopened = Database::open_catalog(&catalog).expect("migrate managed v1 inventory");
+    let inventory = reopened.inspect_columnar_projections();
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].projection_id, Some(active));
+    assert_eq!(
+        reopened
+            .inspect_columnar_projection_catalog()
+            .next_projection_id,
+        Some(netbadb_types::ColumnarProjectionId(3))
+    );
+    assert!(orphan_destination.join("projection.nbcmanifest").is_file());
+    drop(reopened);
+    for (name, bytes) in before {
+        assert_eq!(
+            fs::read(active_directory.join(name)).expect("read migrated projection file"),
+            bytes
+        );
+    }
+    let catalog_bytes =
+        fs::read(crate::projection_catalog::catalog_path(&catalog)).expect("read migrated catalog");
+    assert_eq!(
+        u16::from_le_bytes(catalog_bytes[4..6].try_into().unwrap()),
+        2
+    );
+    fs::remove_dir_all(root).expect("remove v1 migration fixture");
+}
+
+fn detached_artifact(columns: Vec<ColumnId>, incremental: bool) -> PathBuf {
+    let heap = path("detached-artifact-heap");
+    let projection = path("detached-artifact-projection");
+    let mut database = Database::create(&heap, table()).expect("create detached artifact source");
+    insert_rows(&mut database, 4);
+    if incremental {
+        database
+            .enable_change_stream(TableId(1))
+            .expect("enable detached artifact stream");
+        database
+            .build_incremental_columnar_projection(ColumnarProjectionSpec::new(
+                TableId(1),
+                &projection,
+                columns,
+            ))
+            .expect("build detached incremental artifact");
+    } else {
+        database
+            .build_columnar_projection(ColumnarProjectionSpec::new(
+                TableId(1),
+                &projection,
+                columns,
+            ))
+            .expect("build detached snapshot artifact");
+    }
+    database.close().expect("close detached artifact source");
+    cleanup_created_table_files(&[heap]);
+    projection
+}
+
+#[test]
+fn pending_recovery_fails_closed_for_wrong_columns_and_mode() {
+    for (name, intent_incremental, columns, artifact_incremental) in [
+        ("columns", false, vec![ColumnId(1), ColumnId(3)], false),
+        ("column-order", false, vec![ColumnId(2), ColumnId(1)], false),
+        (
+            "snapshot-intent-incremental-artifact",
+            false,
+            vec![ColumnId(1), ColumnId(2)],
+            true,
+        ),
+        (
+            "incremental-intent-snapshot-artifact",
+            true,
+            vec![ColumnId(1), ColumnId(2)],
+            false,
+        ),
+    ] {
+        let root = path(&format!("pending-mismatch-{name}"));
+        if intent_incremental {
+            seed_incremental_build_crash_database(&root);
+            run_crash_child(&root, "incremental-build", "build-intent-durable");
+        } else {
+            seed_crash_database(&root, false);
+            run_crash_child(&root, "build", "build-intent-durable");
+        }
+        let artifact = detached_artifact(columns, artifact_incremental);
+        let destination = root.join("crashing-projection");
+        fs::rename(&artifact, &destination).expect("install mismatched final artifact");
+        assert!(matches!(
+            Database::open_catalog(root.join("catalog")),
+            Err(DatabaseError::ProjectionCatalog(
+                ProjectionCatalogError::PendingBuildMismatch(_)
+            ))
+        ));
+        assert!(destination.join("projection.nbcmanifest").is_file());
+        fs::remove_dir_all(root).expect("remove mismatch fixture");
+    }
+}
+
+#[test]
+fn pending_recovery_fails_closed_for_corrupt_manifest_and_missing_segment() {
+    for missing_segment in [false, true] {
+        let root = path(if missing_segment {
+            "pending-missing-segment"
+        } else {
+            "pending-corrupt-manifest"
+        });
+        seed_crash_database(&root, false);
+        run_crash_child(&root, "build", "build-intent-durable");
+        let artifact = detached_artifact(vec![ColumnId(1), ColumnId(2)], false);
+        let destination = root.join("crashing-projection");
+        fs::rename(&artifact, &destination).expect("install final artifact");
+        if missing_segment {
+            fs::remove_file(destination.join("projection-1-g1.nbcs"))
+                .expect("remove referenced segment");
+        } else {
+            fs::write(destination.join("projection.nbcmanifest"), b"NBCM")
+                .expect("corrupt final manifest");
+        }
+        assert!(matches!(
+            Database::open_catalog(root.join("catalog")),
+            Err(DatabaseError::ProjectionCatalog(
+                ProjectionCatalogError::PendingBuildCorrupt(_)
+            ))
+        ));
+        assert!(destination.join("projection.nbcmanifest").is_file());
+        fs::remove_dir_all(root).expect("remove corrupt pending fixture");
+    }
+}
+
+#[test]
+fn recovery_cleans_exact_final_segment_without_manifest_and_retains_unknown_files() {
+    let root = path("pending-final-segment");
+    seed_crash_database(&root, false);
+    run_crash_child(&root, "build", "build-intent-durable");
+    let projection = root.join("crashing-projection");
+    fs::create_dir_all(&projection).expect("create pending projection directory");
+    fs::write(projection.join("projection-1-g1.nbcs"), b"partial")
+        .expect("write final unpublished segment");
+    fs::write(projection.join("notes.txt"), b"operator-owned").expect("write unrelated file");
+
+    let mut reopened = Database::open_catalog(root.join("catalog"))
+        .expect("recover manifest-absent pending build");
+    assert!(!projection.join("projection-1-g1.nbcs").exists());
+    assert!(projection.join("notes.txt").is_file());
+    assert!(reopened.inspect_columnar_projections().is_empty());
+    let id = reopened
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("after-recovery"),
+            vec![ColumnId(1)],
+        ))
+        .expect("build after pending cleanup");
+    assert_eq!(id, netbadb_types::ColumnarProjectionId(2));
+    reopened.close().expect("close recovered database");
+    fs::remove_dir_all(root).expect("remove final-segment recovery fixture");
+}
+
+#[test]
+fn ambiguous_catalog_commit_requires_reopen_and_blocks_managed_mutation_and_gc() {
+    let root = path("ambiguous-catalog-commit");
+    fs::create_dir_all(&root).expect("create ambiguous commit root");
+    let catalog = root.join("catalog");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(root.join("heap"), table())],
+        None,
+    )
+    .expect("create managed database");
+    insert_rows(&mut database, 8);
+    database
+        .enable_change_stream(TableId(1))
+        .expect("enable stream");
+    let active = database
+        .build_incremental_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("active-projection"),
+            vec![ColumnId(1), ColumnId(2)],
+        ))
+        .expect("build active incremental projection");
+    let catalog_shadow = crate::schema_catalog_file::suffix(
+        &crate::projection_catalog::catalog_path(&catalog),
+        ".next",
+    );
+    let failed = root.join("pending-projection");
+    let result = database.build_columnar_projection_with(
+        ColumnarProjectionSpec::new(TableId(1), &failed, vec![ColumnId(1)]),
+        |_| {
+            fs::create_dir(&catalog_shadow).expect("block catalog shadow publication");
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::RecoveryRequired { .. }
+        ))
+    ));
+    assert!(failed.join("projection.nbcmanifest").is_file());
+    assert!(!database.inspect_columnar_projection_catalog().available);
+    assert!(matches!(
+        database.drop_columnar_projection(active),
+        Err(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::RecoveryRequired { .. }
+        ))
+    ));
+    assert!(matches!(
+        database.refresh_columnar_projection(active),
+        Err(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::RecoveryRequired { .. }
+        ))
+    ));
+    assert!(matches!(
+        database.advance_columnar_projection(active, ColumnarAdvanceBudget::new(1, 1024)),
+        Err(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::RecoveryRequired { .. }
+        ))
+    ));
+    assert!(matches!(
+        database.compact_columnar_projection(active),
+        Err(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::RecoveryRequired { .. }
+        ))
+    ));
+    assert!(matches!(
+        database.gc_change_stream(TableId(1)),
+        Err(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::RecoveryRequired { .. }
+        ))
+    ));
+    fs::remove_dir(&catalog_shadow).expect("unblock catalog publication");
+    drop(database);
+
+    let reopened = Database::open_catalog(&catalog).expect("recover durable artifact");
+    let inventory = reopened.inspect_columnar_projections();
+    assert_eq!(inventory.len(), 2);
+    assert_eq!(
+        inventory[1].projection_id,
+        Some(netbadb_types::ColumnarProjectionId(2))
+    );
+    drop(reopened);
+    let reopened_again = Database::open_catalog(&catalog).expect("repeat recovery reopen");
+    assert_eq!(reopened_again.inspect_columnar_projections().len(), 2);
+    drop(reopened_again);
+    fs::remove_dir_all(root).expect("remove ambiguous commit fixture");
+}
+
+#[test]
+fn ambiguous_artifact_publish_requires_reopen_and_aborts_when_manifest_is_absent() {
+    let root = path("ambiguous-artifact-publish");
+    fs::create_dir_all(&root).expect("create ambiguous artifact root");
+    let catalog = root.join("catalog");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::heap(root.join("heap"), table())],
+        None,
+    )
+    .expect("create managed database");
+    insert_rows(&mut database, 4);
+    let projection = root.join("projection");
+    let final_segment = projection.join("projection-1-g1.nbcs");
+    let result = database.build_columnar_projection_with(
+        ColumnarProjectionSpec::new(TableId(1), &projection, vec![ColumnId(1)]),
+        |_| {
+            fs::create_dir(&final_segment).expect("block final segment rename");
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::RecoveryRequired { .. }
+        ))
+    ));
+    assert!(matches!(
+        database.build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("blocked"),
+            vec![ColumnId(1)],
+        )),
+        Err(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::RecoveryRequired { .. }
+        ))
+    ));
+    fs::remove_dir(&final_segment).expect("remove rename blocker");
+    drop(database);
+
+    let mut reopened = Database::open_catalog(&catalog).expect("abort absent-manifest build");
+    assert!(reopened.inspect_columnar_projections().is_empty());
+    let id = reopened
+        .build_columnar_projection(ColumnarProjectionSpec::new(
+            TableId(1),
+            root.join("after-reopen"),
+            vec![ColumnId(1)],
+        ))
+        .expect("build after reopen");
+    assert_eq!(id, netbadb_types::ColumnarProjectionId(2));
+    reopened.close().expect("close recovered database");
+    fs::remove_dir_all(root).expect("remove ambiguous artifact fixture");
 }
 
 #[test]
@@ -1945,6 +2460,11 @@ fn global_snapshot_with_pending_complete_keeps_old_rr_on_authoritative_history()
             .expect("seed row");
     }
     seed.commit().expect("publish seed G1");
+    let schema_generation = database.schema_generation();
+    let published_commit_seq = database
+        .inspect_global_visibility()
+        .expect("inspect G before projection build")
+        .published_commit_seq;
     let projection_id = database
         .build_columnar_projection(ColumnarProjectionSpec::new(
             TableId(1),
@@ -1952,6 +2472,14 @@ fn global_snapshot_with_pending_complete_keeps_old_rr_on_authoritative_history()
             vec![ColumnId(1), ColumnId(2)],
         ))
         .expect("build G1 projection");
+    assert_eq!(database.schema_generation(), schema_generation);
+    assert_eq!(
+        database
+            .inspect_global_visibility()
+            .expect("inspect G after projection build")
+            .published_commit_seq,
+        published_commit_seq
+    );
 
     let mut old = database
         .begin_transaction_with_isolation(IsolationLevel::RepeatableRead)

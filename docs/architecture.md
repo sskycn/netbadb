@@ -373,6 +373,23 @@ Phase 23 apply inside one command. Exact durable named truth remains retryable
 across restart. There is no automatic or Columnar apply, proposal serialization,
 audit persistence, scheduler lane, SQL generation, or persistent-format change.
 
+[Adaptive Operations Phase 26](adaptive-operations-phase26.md) closes the
+managed Columnar new-build publication gap with [NBPC
+v2](projection-catalog-v2.md). One durable catalog snapshot now allocates the
+`ColumnarProjectionId`, advances its never-reuse high-water, and records the
+exact snapshot/incremental build intent before NBC publication begins. The
+artifact is published before one atomic pending-to-active catalog transition,
+and only the resulting active entry may enter the in-memory registry or planner.
+Open synchronously abandons an intent with no final manifest after exact
+storage-owned cleanup, promotes an exactly matching complete artifact, and
+fails closed for a corrupt or mismatched final artifact. Ambiguous publication
+errors require reopen and block managed projection mutation and Change Stream
+GC in the current process. V1 catalogs and markers migrate crash-safely without
+changing active entries or allocator gaps; historical unregistered artifacts
+are never scanned or adopted. NBCM/NBCS/NBCD, schema/coordinator/WAL, Manifest
+v8, NBOP v3, Native Protocol v2, Inspection JSON v7, and Server behavior remain
+unchanged, and Columnar recommendation apply remains deferred.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,
@@ -385,7 +402,7 @@ defer retirement until the last reader is gone. See [Columnar Phase
 The `netbadb` CLI is an offline adapter, not a new compiler or planner layer:
 
 ```text
-deployment manifest v7
+deployment manifest v8
           ↓
 netbadb-server ServerConfig bootstrap
           ↓

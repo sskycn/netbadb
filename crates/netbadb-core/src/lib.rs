@@ -97,6 +97,7 @@ use netbadb_schema::{Schema, SchemaError, TableDef};
 use netbadb_storage::{
     ColumnarProjection, HeapRecoveryInspection, PreparedDecision, PreparedTransaction,
     PreparedTransactionState, PreparedTxnResolution, StorageVisibilityBoundary, TableStorage,
+    cleanup_unpublished_projection_build, columnar_projection_manifest_exists,
 };
 use netbadb_types::{
     AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, DatabaseCommitSeq,
@@ -106,6 +107,7 @@ use netbadb_types::{
 use columnar::{ProjectionRegistry, ProjectionRegistryEntry};
 use coordinator_log::{CoordinatorDecision, CoordinatorLog};
 use partition_catalog::{CatalogTable, PartitionCatalog, canonicalize_partitions, route_partition};
+use projection_catalog::ProjectionBuildMode;
 use registry::{
     PhysicalBindings, RangePartitionBinding, StorageRegistry, StorageRegistryEntry, TablePlacement,
 };
@@ -1717,21 +1719,113 @@ impl Database {
         })
     }
 
-    fn configure_managed_projection_catalog(&mut self, incarnation: [u8; 16]) {
-        let Some(schema_catalog_path) = self.catalog_path.as_deref() else {
-            return;
+    fn configure_managed_projection_catalog(
+        &mut self,
+        incarnation: [u8; 16],
+    ) -> Result<(), DatabaseError> {
+        let Some(schema_catalog_path) = self.catalog_path.clone() else {
+            return Ok(());
         };
-        let catalog_path = projection_catalog::catalog_path(schema_catalog_path);
+        let catalog_path = projection_catalog::catalog_path(&schema_catalog_path);
         let mut catalog = match projection_catalog::ProjectionCatalog::open_or_initialize(
-            schema_catalog_path,
+            &schema_catalog_path,
             incarnation,
         ) {
             Ok(catalog) => catalog,
+            Err(
+                error @ (ProjectionCatalogError::PendingBuildMismatch(_)
+                | ProjectionCatalogError::PendingBuildCorrupt(_)),
+            ) => return Err(error.into()),
             Err(error) => {
                 self.projections = ProjectionRegistry::degraded(catalog_path, error.to_string());
-                return;
+                return Ok(());
             }
         };
+        if let Some(intent) = catalog.pending_build().cloned() {
+            let directory = catalog.resolve_pending(&intent);
+            let manifest_exists = columnar_projection_manifest_exists(&directory)
+                .map_err(|error| ProjectionCatalogError::PendingBuildCorrupt(error.to_string()))?;
+            if !manifest_exists {
+                cleanup_unpublished_projection_build(&directory, intent.id, intent.generation)
+                    .map_err(|error| ProjectionCatalogError::RecoveryRequired {
+                        projection_id: intent.id,
+                        operation: "recovery cleanup",
+                        detail: error.to_string(),
+                    })?;
+                catalog.abort_build(intent.id).map_err(|error| {
+                    ProjectionCatalogError::RecoveryRequired {
+                        projection_id: intent.id,
+                        operation: "recovery pending-build abort",
+                        detail: error.to_string(),
+                    }
+                })?;
+            } else {
+                let table = self
+                    .committed
+                    .schema
+                    .tables()
+                    .iter()
+                    .find(|table| table.id == intent.table_id)
+                    .ok_or(ProjectionCatalogError::PendingBuildMismatch(
+                        "pending table is absent from the authoritative schema",
+                    ))?;
+                if table.fingerprint()? != intent.schema_fingerprint {
+                    return Err(ProjectionCatalogError::PendingBuildMismatch(
+                        "pending schema fingerprint differs from the authoritative schema",
+                    )
+                    .into());
+                }
+                let expected_storage = match self.bindings.placement(intent.table_id)? {
+                    TablePlacement::Single { storage_id, .. } => *storage_id,
+                    TablePlacement::RangePartitioned { .. } => {
+                        return Err(ProjectionCatalogError::PendingBuildMismatch(
+                            "pending projection refers to a partitioned table",
+                        )
+                        .into());
+                    }
+                };
+                if expected_storage != intent.source_storage_id
+                    || self.registry.get(expected_storage).is_none()
+                {
+                    return Err(ProjectionCatalogError::PendingBuildMismatch(
+                        "pending source storage identity is unavailable",
+                    )
+                    .into());
+                }
+                let projection = ColumnarProjection::open(&directory, table).map_err(|error| {
+                    ProjectionCatalogError::PendingBuildCorrupt(error.to_string())
+                })?;
+                let metadata = projection.metadata();
+                let entry = projection_catalog::ProjectionCatalogEntry {
+                    id: metadata.id,
+                    table_id: metadata.table_id,
+                    source_storage_id: metadata.source_storage_id,
+                    generation: metadata.generation,
+                    schema_fingerprint: metadata.schema_fingerprint,
+                    locator: intent.locator.clone(),
+                };
+                let mode = if metadata.incremental.is_some() {
+                    ProjectionBuildMode::Incremental
+                } else {
+                    ProjectionBuildMode::Snapshot
+                };
+                let columns = metadata
+                    .columns
+                    .iter()
+                    .map(|column| column.column_id)
+                    .collect::<Vec<_>>();
+                catalog
+                    .commit_build(entry, mode, &columns)
+                    .map_err(|error| match error {
+                        error @ ProjectionCatalogError::PendingBuildMismatch(_) => error,
+                        error => ProjectionCatalogError::RecoveryRequired {
+                            projection_id: intent.id,
+                            operation: "recovery pending-to-active publication",
+                            detail: error.to_string(),
+                        },
+                    })?;
+            }
+        }
         let mut entries = Vec::with_capacity(catalog.entries().len());
         for mut identity in catalog.entries().to_vec() {
             let directory = catalog.resolve(&identity);
@@ -1800,6 +1894,7 @@ impl Database {
             });
         }
         self.projections = ProjectionRegistry::managed(catalog, entries);
+        Ok(())
     }
 
     /// Creates an explicit mixed Heap/LSM catalog without a durable database
@@ -3884,7 +3979,7 @@ impl Database {
         self.ensure_schema_available(None)?;
         spec.directory = schema_catalog_file::absolute(&spec.directory)?;
         self.projections.preflight_location(&spec.directory)?;
-        if spec.directory.join("projection.nbcmanifest").exists() {
+        if columnar_projection_manifest_exists(&spec.directory)? {
             return Err(
                 StorageError::from(netbadb_storage::ColumnarError::InvalidInput(
                     "projection directory already contains a manifest",
@@ -3892,12 +3987,22 @@ impl Database {
                 .into(),
             );
         }
-        let id = self.projections.reserve_id()?;
         let captured = self.capture_incremental_columnar_source(spec.table_id, &spec.columns)?;
-        let prepared = ColumnarProjection::prepare_incremental(
+        let generation = ColumnarGeneration(1);
+        let id = self.projections.begin_build(
+            spec.table_id,
+            captured.storage_id,
+            generation,
+            captured.table.fingerprint()?,
+            &spec.directory,
+            ProjectionBuildMode::Incremental,
+            spec.columns.clone(),
+        )?;
+        columnar::crash("incremental-build-intent-durable");
+        let prepared = match ColumnarProjection::prepare_incremental(
             &spec.directory,
             id,
-            ColumnarGeneration(1),
+            generation,
             &captured.table,
             captured.storage_id,
             captured.token,
@@ -3905,12 +4010,40 @@ impl Database {
             &spec.columns,
             &captured.rows,
             spec.row_group_rows,
-        )?;
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let original = StorageError::from(error).into();
+                return Err(self.abort_unpublished_columnar_build(
+                    &spec.directory,
+                    id,
+                    generation,
+                    original,
+                ));
+            }
+        };
         columnar::crash("incremental-build-files-synced");
-        after_scan(self)?;
-        let projection = prepared.publish()?;
+        if let Err(error) = after_scan(self) {
+            drop(prepared);
+            return Err(self.abort_unpublished_columnar_build(
+                &spec.directory,
+                id,
+                generation,
+                error,
+            ));
+        }
+        let projection = match prepared.publish() {
+            Ok(projection) => projection,
+            Err(error) if self.projections.is_managed() => {
+                return Err(self
+                    .projections
+                    .mark_recovery_required(id, "columnar artifact publication", error.to_string())
+                    .into());
+            }
+            Err(error) => return Err(StorageError::from(error).into()),
+        };
         columnar::crash("incremental-build-manifest-published");
-        self.projections.publish(projection)?;
+        self.projections.commit_build(projection)?;
         Ok(id)
     }
 
@@ -3925,7 +4058,7 @@ impl Database {
         self.ensure_schema_available(None)?;
         spec.directory = schema_catalog_file::absolute(&spec.directory)?;
         self.projections.preflight_location(&spec.directory)?;
-        if spec.directory.join("projection.nbcmanifest").exists() {
+        if columnar_projection_manifest_exists(&spec.directory)? {
             return Err(
                 StorageError::from(netbadb_storage::ColumnarError::InvalidInput(
                     "projection directory already contains a manifest",
@@ -3933,38 +4066,120 @@ impl Database {
                 .into(),
             );
         }
-        let id = self.projections.reserve_id()?;
         let CapturedColumnarSource {
             storage_id,
             table,
             token: source_token,
             rows,
         } = self.capture_columnar_source(spec.table_id, &spec.columns)?;
-        let prepared = ColumnarProjection::prepare(
+        let generation = ColumnarGeneration(1);
+        let id = self.projections.begin_build(
+            spec.table_id,
+            storage_id,
+            generation,
+            table.fingerprint()?,
+            &spec.directory,
+            ProjectionBuildMode::Snapshot,
+            spec.columns.clone(),
+        )?;
+        columnar::crash("build-intent-durable");
+        let prepared = match ColumnarProjection::prepare(
             &spec.directory,
             id,
-            ColumnarGeneration(1),
+            generation,
             &table,
             storage_id,
             source_token,
             &spec.columns,
             &rows,
             spec.row_group_rows,
-        )?;
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let original = StorageError::from(error).into();
+                return Err(self.abort_unpublished_columnar_build(
+                    &spec.directory,
+                    id,
+                    generation,
+                    original,
+                ));
+            }
+        };
         columnar::crash("build-files-synced");
-        after_scan(self)?;
-        let current = self
+        if let Err(error) = after_scan(self) {
+            drop(prepared);
+            return Err(self.abort_unpublished_columnar_build(
+                &spec.directory,
+                id,
+                generation,
+                error,
+            ));
+        }
+        let current = match self
             .registry
             .get(storage_id)
-            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })?
-            .current_snapshot_token()?;
+            .ok_or(StorageRegistryError::UnknownStorageId { storage_id })
+            .map_err(DatabaseError::from)
+            .and_then(|storage| {
+                storage
+                    .current_snapshot_token()
+                    .map_err(DatabaseError::from)
+            }) {
+            Ok(current) => current,
+            Err(error) => {
+                drop(prepared);
+                return Err(self.abort_unpublished_columnar_build(
+                    &spec.directory,
+                    id,
+                    generation,
+                    error,
+                ));
+            }
+        };
         if current != source_token {
-            return Err(DatabaseError::ColumnarBuildSourceChanged { storage_id });
+            drop(prepared);
+            return Err(self.abort_unpublished_columnar_build(
+                &spec.directory,
+                id,
+                generation,
+                DatabaseError::ColumnarBuildSourceChanged { storage_id },
+            ));
         }
-        let projection = prepared.publish()?;
+        let projection = match prepared.publish() {
+            Ok(projection) => projection,
+            Err(error) if self.projections.is_managed() => {
+                return Err(self
+                    .projections
+                    .mark_recovery_required(id, "columnar artifact publication", error.to_string())
+                    .into());
+            }
+            Err(error) => return Err(StorageError::from(error).into()),
+        };
         columnar::crash("build-manifest-published");
-        self.projections.publish(projection)?;
+        self.projections.commit_build(projection)?;
         Ok(id)
+    }
+
+    fn abort_unpublished_columnar_build(
+        &mut self,
+        directory: &Path,
+        id: ColumnarProjectionId,
+        generation: ColumnarGeneration,
+        original: DatabaseError,
+    ) -> DatabaseError {
+        if let Err(error) = cleanup_unpublished_projection_build(directory, id, generation) {
+            if self.projections.is_managed() {
+                return self
+                    .projections
+                    .mark_recovery_required(id, "unpublished artifact cleanup", error.to_string())
+                    .into();
+            }
+            return StorageError::from(error).into();
+        }
+        if let Err(error) = self.projections.abort_build(id) {
+            return error.into();
+        }
+        original
     }
 
     /// Applies one bounded contiguous NBCL range and publishes at most one
@@ -3974,6 +4189,7 @@ impl Database {
         id: ColumnarProjectionId,
         budget: ColumnarAdvanceBudget,
     ) -> Result<ColumnarAdvanceReport, DatabaseError> {
+        self.projections.ensure_mutation_available()?;
         if budget.max_batches == 0 || budget.max_change_bytes == 0 {
             return Err(
                 StorageError::from(netbadb_storage::ColumnarError::InvalidInput(
@@ -4062,6 +4278,7 @@ impl Database {
         &mut self,
         id: ColumnarProjectionId,
     ) -> Result<ColumnarCompactionReport, DatabaseError> {
+        self.projections.ensure_mutation_available()?;
         let projection = self
             .projections
             .get(id)
@@ -4144,6 +4361,7 @@ impl Database {
         &mut self,
         id: ColumnarProjectionId,
     ) -> Result<ColumnarGeneration, DatabaseError> {
+        self.projections.ensure_mutation_available()?;
         let existing = self
             .projections
             .get(id)
@@ -4218,6 +4436,7 @@ impl Database {
         directory: impl AsRef<Path>,
         table_id: TableId,
     ) -> Result<ColumnarProjectionId, DatabaseError> {
+        self.projections.ensure_mutation_available()?;
         self.ensure_schema_available(None)?;
         let table = self
             .committed
@@ -4254,6 +4473,7 @@ impl Database {
         &mut self,
         id: ColumnarProjectionId,
     ) -> Result<(), DatabaseError> {
+        self.projections.ensure_mutation_available()?;
         if let Some(projection) = self.projections.remove(id)? {
             projection.drop_files()?;
         }

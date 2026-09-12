@@ -49,6 +49,64 @@ const MAX_LAZY_BLOCK_BYTES: u64 = 1 << 26;
 const MAX_INDEX_BYTES: u64 = 1 << 28;
 const DEFAULT_ROW_GROUP_ROWS: usize = 256;
 
+/// Reports whether the one final manifest that authorizes an NBC artifact is
+/// present at this exact projection root.
+pub fn columnar_projection_manifest_exists(root: impl AsRef<Path>) -> Result<bool, ColumnarError> {
+    match fs::symlink_metadata(root.as_ref().join(MANIFEST_FILE)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ColumnarError::Io(error)),
+    }
+}
+
+/// Removes only unpublished files owned by one exact projection generation.
+///
+/// The directory and unknown files are retained. A final manifest makes
+/// ownership ambiguous and therefore prevents cleanup.
+pub fn cleanup_unpublished_projection_build(
+    root: impl AsRef<Path>,
+    projection_id: ColumnarProjectionId,
+    generation: ColumnarGeneration,
+) -> Result<(), ColumnarError> {
+    let root = root.as_ref();
+    if columnar_projection_manifest_exists(root)? {
+        return Err(ColumnarError::InvalidInput(
+            "cannot clean an unpublished projection while its final manifest exists",
+        ));
+    }
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ColumnarError::Io(error)),
+    };
+    let final_segment = format!("projection-{}-g{}.nbcs", projection_id.0, generation.0);
+    let temporary_segment_prefix = format!(".{final_segment}.tmp.");
+    let temporary_manifest_prefix = format!(".{MANIFEST_FILE}.tmp.");
+    let identity_suffix = format!(".{}.{}", projection_id.0, generation.0);
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(ColumnarError::Io)?;
+        if !entry.file_type().map_err(ColumnarError::Io)?.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let owned = name == final_segment
+            || ((name.starts_with(&temporary_segment_prefix)
+                || name.starts_with(&temporary_manifest_prefix))
+                && name.ends_with(&identity_suffix));
+        if owned {
+            fs::remove_file(entry.path()).map_err(ColumnarError::Io)?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(root)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotKind {
     Heap,
@@ -5900,7 +5958,8 @@ fn crash(_: &str) {}
 mod tests {
     use super::{
         ColumnarColumnSpec, ColumnarConstraint, ColumnarError, ColumnarProjection,
-        StorageSnapshotToken, decode_vector_data, encode_vector_data, vector_from_values,
+        StorageSnapshotToken, cleanup_unpublished_projection_build, decode_vector_data,
+        encode_vector_data, vector_from_values,
     };
     use crate::{ChangeBatch, StorageChange, StorageVersionKey};
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
@@ -5929,6 +5988,87 @@ mod tests {
             )
             .and_then(|prepared| prepared.publish())
         };
+    }
+
+    #[test]
+    fn unpublished_cleanup_is_exact_idempotent_and_never_removes_the_directory() {
+        let directory = test_directory("unpublished-cleanup");
+        fs::create_dir_all(directory.join("nested")).expect("create cleanup fixture");
+        for name in [
+            "projection-42-g3.nbcs",
+            ".projection-42-g3.nbcs.tmp.900.42.3",
+            ".projection.nbcmanifest.tmp.900.42.3",
+            "projection-41-g3.nbcs",
+            ".projection-42-g3.nbcs.tmp.900.42.4",
+            "notes.txt",
+        ] {
+            fs::write(directory.join(name), b"fixture").expect("write cleanup fixture");
+        }
+        cleanup_unpublished_projection_build(
+            &directory,
+            ColumnarProjectionId(42),
+            ColumnarGeneration(3),
+        )
+        .expect("clean exact unpublished generation");
+        cleanup_unpublished_projection_build(
+            &directory,
+            ColumnarProjectionId(42),
+            ColumnarGeneration(3),
+        )
+        .expect("repeat cleanup");
+        assert!(directory.is_dir());
+        assert!(directory.join("nested").is_dir());
+        assert!(directory.join("notes.txt").is_file());
+        assert!(directory.join("projection-41-g3.nbcs").is_file());
+        assert!(
+            directory
+                .join(".projection-42-g3.nbcs.tmp.900.42.4")
+                .is_file()
+        );
+        assert!(!directory.join("projection-42-g3.nbcs").exists());
+        assert!(
+            !directory
+                .join(".projection-42-g3.nbcs.tmp.900.42.3")
+                .exists()
+        );
+        assert!(
+            !directory
+                .join(".projection.nbcmanifest.tmp.900.42.3")
+                .exists()
+        );
+
+        fs::write(directory.join("projection-42-g3.nbcs"), b"ambiguous")
+            .expect("restore exact segment");
+        fs::write(directory.join("projection.nbcmanifest"), b"NBCM").expect("write final manifest");
+        assert!(
+            cleanup_unpublished_projection_build(
+                &directory,
+                ColumnarProjectionId(42),
+                ColumnarGeneration(3),
+            )
+            .is_err()
+        );
+        assert!(directory.join("projection-42-g3.nbcs").is_file());
+        fs::remove_file(directory.join("projection.nbcmanifest"))
+            .expect("remove final manifest fixture");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                "missing-manifest-target",
+                directory.join("projection.nbcmanifest"),
+            )
+            .expect("write dangling manifest symlink");
+            assert!(
+                cleanup_unpublished_projection_build(
+                    &directory,
+                    ColumnarProjectionId(42),
+                    ColumnarGeneration(3),
+                )
+                .is_err()
+            );
+            assert!(directory.join("projection-42-g3.nbcs").is_file());
+        }
+        fs::remove_dir_all(directory).expect("remove cleanup fixture");
     }
 
     #[test]

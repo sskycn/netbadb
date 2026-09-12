@@ -34,7 +34,14 @@ Freshness remains an equality check between the source-authored
 `StorageSnapshotToken` in NBCM and the current exact source storage. NBPC does
 not duplicate the token or segment inventory.
 
-## NBPC v1
+## Historical NBPC v1
+
+NBPC v1 is the original Phase 1.5 layout. Current binaries read it only as a
+migration source and durably rewrite the catalog and marker as [NBPC
+v2](projection-catalog-v2.md). Its active inventory, incarnation, locators,
+generations, and exact next-ID high-water—including gaps from burned IDs—are
+preserved. V1 had no pending-build authority, so unregistered historical NBC
+artifacts remain unregistered and are never discovered by a filesystem scan.
 
 The projection catalog file is `<schema-catalog>.projections` and its independent
 publication marker is `<schema-catalog>.projections.state`.
@@ -82,7 +89,7 @@ For a new identity it may only adopt the manifest's exact ID at or above the
 durable high-water; an already reserved ID, duplicate location, or identity
 collision is rejected. The manifest ID is never silently rewritten.
 
-Build ordering is:
+The historical v1 build ordering was:
 
 1. Reject an already registered canonical location.
 2. Durably reserve the ID.
@@ -95,6 +102,11 @@ Build ordering is:
 An interruption before step 5 leaves only removable temporary files. Between
 steps 5 and 6 it leaves an unregistered physical orphan and a burned ID. Between
 steps 6 and 7 reopen discovers the complete projection.
+
+Adaptive Operations Phase 26 replaces this new-build sequence with an NBPC v2
+pending intent before physical publication. See
+[`adaptive-operations-phase26.md`](adaptive-operations-phase26.md); refresh and
+drop retain the lifecycle described below.
 
 Refresh preserves the projection ID and orders synced N+1 files, NBCM
 publication, NBPC observed-generation update, in-memory replacement, and old

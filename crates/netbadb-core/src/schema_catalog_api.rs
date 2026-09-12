@@ -607,7 +607,7 @@ fn finish_install(
     // caller's TableDefs. Physical handles have already validated against it.
     database.committed = file::install_initial(path, &snapshot)?.committed;
     database.catalog_path = Some(path.to_owned());
-    database.configure_managed_projection_catalog(incarnation);
+    database.configure_managed_projection_catalog(incarnation)?;
     Ok(database)
 }
 
@@ -689,7 +689,7 @@ fn open_authority(
     let mut database = recover_physical(&path, &snapshot, overrides)?;
     database.committed = snapshot.committed;
     database.catalog_path = Some(path);
-    database.configure_managed_projection_catalog(incarnation);
+    database.configure_managed_projection_catalog(incarnation)?;
     if let Some(journal) = journal {
         if let Some(id) = journal
             .reservations
