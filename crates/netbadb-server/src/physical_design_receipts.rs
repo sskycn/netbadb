@@ -2092,6 +2092,15 @@ mod tests {
             ))
         ));
 
+        let mut zero_version = encode_v2_header([7; 16], incarnation);
+        zero_version[4..6].copy_from_slice(&0_u16.to_le_bytes());
+        let checksum = crc32c::crc32c(&zero_version[..40]).to_le_bytes();
+        zero_version[40..].copy_from_slice(&checksum);
+        assert!(matches!(
+            validate_v2_header(&zero_version, [7; 16]),
+            Err(ServerPhysicalDesignMutationReceiptJournalError::UnsupportedVersion(0))
+        ));
+
         let mut future = encode_v2_header([7; 16], incarnation);
         future[4..6].copy_from_slice(&3_u16.to_le_bytes());
         let checksum = crc32c::crc32c(&future[..40]).to_le_bytes();
