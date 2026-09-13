@@ -13,8 +13,11 @@ and `physical_columnar_apply` objects. The Columnar object reports `enabled`,
 `allow_snapshot`, `allow_incremental`, and an optional ephemeral
 `runtime_token`. The token is shared with index approval when both permissions
 are enabled; it is absent when neither permission is enabled. The root path is
-never returned. Recommendations expose the same shared token and the exact
-evidence epoch needed for a subsequent approval.
+never returned. Recommendations expose the same shared token, independent
+`physical_index_apply.enabled` and `physical_columnar_apply` capability objects,
+and the exact evidence epoch needed for a subsequent approval. The Columnar
+capability includes `enabled`, `allow_snapshot`, and `allow_incremental`;
+clients must not infer either permission from token presence.
 
 ## Explicit Columnar approval
 
@@ -35,7 +38,8 @@ The operation is `apply_physical_columnar`:
 }
 ```
 
-`columns` is an ordered, nonempty list. `mode` is explicit (`snapshot` or
+`columns` is an ordered, nonempty list; an empty list is rejected as
+`malformed_request` before any worker command. `mode` is explicit (`snapshot` or
 `incremental`), and `placement_key` is a validated logical key, not a path.
 Unknown fields are rejected. The listener checks the manifest permission before
 forwarding. A syntactically valid but stale token is forwarded so the worker
@@ -54,7 +58,10 @@ logical placement key, and one of `created`, `already_applied`, or
 invalid keys, disallowed modes, unavailable or occupied placements, registered
 conflicts, stale evidence/runtime, missing recommendations, Change Stream
 state, recovery-required publication, and bounded apply failure. Error text
-does not expose filesystem paths.
+does not expose filesystem paths. `server_stopped` means the mutation command
+was not accepted by the worker path. If the worker accepted the command but its
+reply was lost, the response uses `mutation_outcome_uncertain`; the operator
+must retry the same exact approval to obtain the idempotent durable outcome.
 
 ## CLI
 
@@ -73,6 +80,8 @@ netbadb operator physical-design apply-columnar \
 
 The CLI requires every approval input, preserves repeated column order, and
 does not infer a token or epoch, accept a path, run recommendations, or retry.
+After an uncertain transport/control outcome it instructs the operator to
+manually retry the same exact approval without refreshing the token or epoch.
 
 NBOP v3 is documented at [server-operator-protocol-v3.md](server-operator-protocol-v3.md)
 for historical reference only.

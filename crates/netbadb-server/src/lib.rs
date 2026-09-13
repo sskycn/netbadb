@@ -7,6 +7,7 @@ mod limits;
 mod manifest;
 mod metrics;
 mod operator;
+mod operator_v3;
 mod physical_design;
 mod physical_design_receipts;
 mod postgres;
@@ -42,13 +43,31 @@ pub use limits::{
 pub use manifest::{DEPLOYMENT_MANIFEST_VERSION, ManifestError, ServerConfig, TableBootstrap};
 pub use metrics::{ServerMetricsHandle, ServerMetricsSnapshot};
 pub use operator::{
-    MAX_OPERATOR_PAYLOAD_BYTES, OPERATOR_PROTOCOL_VERSION, OperatorAdaptiveModeV3,
-    OperatorAdaptiveStatusV3, OperatorClientError, OperatorDriverStatusV3, OperatorErrorCodeV3,
+    MAX_OPERATOR_PAYLOAD_BYTES, OPERATOR_PROTOCOL_VERSION, OperatorAdaptiveModeV4,
+    OperatorAdaptiveStatusV4, OperatorClientError, OperatorDriverStatusV4, OperatorErrorCodeV4,
+    OperatorEvidencePoolHealthV4, OperatorEvidenceRecordErrorV4, OperatorEvidenceRecordOutcomeV4,
+    OperatorEvidenceRenewalReasonV4, OperatorEvidenceRotationV4, OperatorFeedbackStatusV4,
+    OperatorOrchestrationStopReasonV4, OperatorPhysicalColumnarApplyCapabilityV4,
+    OperatorPhysicalColumnarApplyOutcomeV4, OperatorPhysicalColumnarApplyResultV4,
+    OperatorPhysicalColumnarApplyStatusV4, OperatorPhysicalColumnarCandidateV4,
+    OperatorPhysicalColumnarDesignModeV4, OperatorPhysicalDesignAdvisorReportV4,
+    OperatorPhysicalDesignDecisionV4, OperatorPhysicalDesignDiagnosticsV4,
+    OperatorPhysicalDesignEvidenceLimitsV4, OperatorPhysicalDesignEvidenceStatusV4,
+    OperatorPhysicalDesignEvidenceSummaryV4, OperatorPhysicalDesignNoActionReasonV4,
+    OperatorPhysicalDesignRecommendationsV4, OperatorPhysicalDesignRecordErrorV4,
+    OperatorPhysicalDesignRecordOutcomeV4, OperatorPhysicalDesignRotationV4,
+    OperatorPhysicalDesignStatusV4, OperatorPhysicalIndexApplyCapabilityV4,
+    OperatorPhysicalIndexApplyOutcomeV4, OperatorPhysicalIndexApplyResultV4,
+    OperatorPhysicalIndexApplyStatusV4, OperatorPhysicalIndexCandidateV4, OperatorRemoteErrorV4,
+    OperatorSchedulerDelayClassV4, OperatorSchedulerFaultV4, OperatorSchedulerGateV4,
+    OperatorStatusV4, ServerOperatorClient, ServerOperatorConfig, ServerOperatorConfigError,
+    ServerOperatorError,
+};
+pub use operator_v3::{
+    OperatorAdaptiveModeV3, OperatorAdaptiveStatusV3, OperatorDriverStatusV3, OperatorErrorCodeV3,
     OperatorEvidencePoolHealthV3, OperatorEvidenceRecordErrorV3, OperatorEvidenceRecordOutcomeV3,
     OperatorEvidenceRenewalReasonV3, OperatorEvidenceRotationV3, OperatorFeedbackStatusV3,
-    OperatorOrchestrationStopReasonV3, OperatorPhysicalColumnarApplyOutcomeV3,
-    OperatorPhysicalColumnarApplyResultV3, OperatorPhysicalColumnarApplyStatusV3,
-    OperatorPhysicalColumnarCandidateV3, OperatorPhysicalColumnarDesignModeV3,
+    OperatorOrchestrationStopReasonV3, OperatorPhysicalColumnarCandidateV3,
     OperatorPhysicalDesignAdvisorReportV3, OperatorPhysicalDesignDecisionV3,
     OperatorPhysicalDesignDiagnosticsV3, OperatorPhysicalDesignEvidenceLimitsV3,
     OperatorPhysicalDesignEvidenceStatusV3, OperatorPhysicalDesignEvidenceSummaryV3,
@@ -58,45 +77,7 @@ pub use operator::{
     OperatorPhysicalIndexApplyOutcomeV3, OperatorPhysicalIndexApplyResultV3,
     OperatorPhysicalIndexApplyStatusV3, OperatorPhysicalIndexCandidateV3, OperatorRemoteErrorV3,
     OperatorSchedulerDelayClassV3, OperatorSchedulerFaultV3, OperatorSchedulerGateV3,
-    OperatorStatusV3, ServerOperatorClient, ServerOperatorConfig, ServerOperatorConfigError,
-    ServerOperatorError,
-};
-pub use operator::{
-    OperatorAdaptiveModeV3 as OperatorAdaptiveModeV4,
-    OperatorAdaptiveStatusV3 as OperatorAdaptiveStatusV4,
-    OperatorDriverStatusV3 as OperatorDriverStatusV4, OperatorErrorCodeV3 as OperatorErrorCodeV4,
-    OperatorEvidencePoolHealthV3 as OperatorEvidencePoolHealthV4,
-    OperatorEvidenceRecordErrorV3 as OperatorEvidenceRecordErrorV4,
-    OperatorEvidenceRecordOutcomeV3 as OperatorEvidenceRecordOutcomeV4,
-    OperatorEvidenceRenewalReasonV3 as OperatorEvidenceRenewalReasonV4,
-    OperatorEvidenceRotationV3 as OperatorEvidenceRotationV4,
-    OperatorFeedbackStatusV3 as OperatorFeedbackStatusV4,
-    OperatorOrchestrationStopReasonV3 as OperatorOrchestrationStopReasonV4,
-    OperatorPhysicalColumnarApplyOutcomeV3 as OperatorPhysicalColumnarApplyOutcomeV4,
-    OperatorPhysicalColumnarApplyResultV3 as OperatorPhysicalColumnarApplyResultV4,
-    OperatorPhysicalColumnarApplyStatusV3 as OperatorPhysicalColumnarApplyStatusV4,
-    OperatorPhysicalColumnarCandidateV3 as OperatorPhysicalColumnarCandidateV4,
-    OperatorPhysicalColumnarDesignModeV3 as OperatorPhysicalColumnarDesignModeV4,
-    OperatorPhysicalDesignAdvisorReportV3 as OperatorPhysicalDesignAdvisorReportV4,
-    OperatorPhysicalDesignDecisionV3 as OperatorPhysicalDesignDecisionV4,
-    OperatorPhysicalDesignDiagnosticsV3 as OperatorPhysicalDesignDiagnosticsV4,
-    OperatorPhysicalDesignEvidenceLimitsV3 as OperatorPhysicalDesignEvidenceLimitsV4,
-    OperatorPhysicalDesignEvidenceStatusV3 as OperatorPhysicalDesignEvidenceStatusV4,
-    OperatorPhysicalDesignEvidenceSummaryV3 as OperatorPhysicalDesignEvidenceSummaryV4,
-    OperatorPhysicalDesignNoActionReasonV3 as OperatorPhysicalDesignNoActionReasonV4,
-    OperatorPhysicalDesignRecommendationsV3 as OperatorPhysicalDesignRecommendationsV4,
-    OperatorPhysicalDesignRecordErrorV3 as OperatorPhysicalDesignRecordErrorV4,
-    OperatorPhysicalDesignRecordOutcomeV3 as OperatorPhysicalDesignRecordOutcomeV4,
-    OperatorPhysicalDesignRotationV3 as OperatorPhysicalDesignRotationV4,
-    OperatorPhysicalDesignStatusV3 as OperatorPhysicalDesignStatusV4,
-    OperatorPhysicalIndexApplyOutcomeV3 as OperatorPhysicalIndexApplyOutcomeV4,
-    OperatorPhysicalIndexApplyResultV3 as OperatorPhysicalIndexApplyResultV4,
-    OperatorPhysicalIndexApplyStatusV3 as OperatorPhysicalIndexApplyStatusV4,
-    OperatorPhysicalIndexCandidateV3 as OperatorPhysicalIndexCandidateV4,
-    OperatorRemoteErrorV3 as OperatorRemoteErrorV4,
-    OperatorSchedulerDelayClassV3 as OperatorSchedulerDelayClassV4,
-    OperatorSchedulerFaultV3 as OperatorSchedulerFaultV4,
-    OperatorSchedulerGateV3 as OperatorSchedulerGateV4, OperatorStatusV3 as OperatorStatusV4,
+    OperatorStatusV3,
 };
 pub use physical_design::{
     ServerPhysicalColumnarApplyConfig, ServerPhysicalColumnarApplyConfigError,

@@ -17,8 +17,8 @@ use netbadb_protocol::{
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
-    AuthorizationConfigError, ManifestError, OperatorAdaptiveModeV3, OperatorClientError,
-    OperatorErrorCodeV3, OperatorPhysicalDesignDecisionV3, OperatorPhysicalDesignNoActionReasonV3,
+    AuthorizationConfigError, ManifestError, OperatorAdaptiveModeV4, OperatorClientError,
+    OperatorErrorCodeV4, OperatorPhysicalDesignDecisionV4, OperatorPhysicalDesignNoActionReasonV4,
     ServerAdaptiveControlError, ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig,
     ServerAdaptiveMode, ServerConfig, ServerHandle, ServerOperatorClient,
     ServerPhysicalColumnarApplyConfig, ServerPhysicalColumnarApplyStartupError,
@@ -42,6 +42,26 @@ fn test_directory(name: &str) -> PathBuf {
 
 fn cleanup(directory: &Path) {
     let _ = std::fs::remove_dir_all(directory);
+}
+
+#[cfg(unix)]
+fn raw_operator_request(socket: &Path, request: serde_json::Value) -> serde_json::Value {
+    let payload = serde_json::to_vec(&request).unwrap();
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    let mut frame = b"NBOP\0\x04\0\0".to_vec();
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    stream.write_all(&frame).unwrap();
+
+    let mut header = [0_u8; 12];
+    stream.read_exact(&mut header).unwrap();
+    assert_eq!(&header[..4], b"NBOP");
+    assert_eq!(&header[4..6], &[0, 4]);
+    assert_eq!(&header[6..8], &[0, 0]);
+    let length = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
+    let mut response = vec![0_u8; length];
+    stream.read_exact(&mut response).unwrap();
+    serde_json::from_slice(&response).unwrap()
 }
 
 fn adaptive_driver_config(table_id: TableId) -> ServerAdaptiveDriverConfig {
@@ -505,6 +525,244 @@ fn native_programmatic_columnar_apply_uses_manifest_advisor_and_approved_root() 
     cleanup(&directory);
 }
 
+#[cfg(unix)]
+#[test]
+fn nbop_v4_columnar_apply_end_to_end_preserves_retry_and_guard_invariants() {
+    let directory = test_directory("operator-columnar-e2e");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let placements = directory.join("columnar");
+    std::fs::create_dir(&placements).unwrap();
+    let mut database = Database::create_catalog(
+        directory.join("catalog"),
+        vec![TableStorageCreateSpec::heap(
+            directory.join("users.ndb"),
+            users_table("UserId"),
+        )],
+        Some(
+            DatabaseCoordinatorConfig::new(directory.join("coordinator")).with_global_visibility(),
+        ),
+    )
+    .unwrap();
+    database
+        .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+        .unwrap();
+    database.close().unwrap();
+
+    let manifest = directory.join("server.json");
+    let socket = PathBuf::from(format!(
+        "/tmp/netbadb-columnar-e2e-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&manifest_json("users.ndb", "UserId")).unwrap();
+    value["physical_design"] = physical_design_manifest();
+    value["physical_design"]["columnar_apply"] = serde_json::json!({
+        "root": "columnar",
+        "allow_snapshot": true,
+        "allow_incremental": false
+    });
+    value["operator"] = serde_json::json!({
+        "unix_socket": socket,
+        "io_timeout_ms": 1000,
+        "allow_physical_index_apply": false,
+        "allow_physical_columnar_apply": true
+    });
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let server = TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .start()
+        .unwrap();
+    let mut client = Client::connect(server.local_addr());
+    client.hello();
+    client.request(
+        2,
+        ClientMessage::Execute {
+            sql: "SELECT id FROM users".into(),
+        },
+    );
+
+    let status = raw_operator_request(
+        &socket,
+        serde_json::json!({"request_id": 1, "operation": {"type": "status"}}),
+    );
+    let token =
+        status["result"]["status"]["physical_design"]["physical_columnar_apply"]["runtime_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let epoch = status["result"]["status"]["physical_design"]["evidence"]["epoch"]
+        .as_u64()
+        .unwrap();
+    let apply = |request_id, token: &str, epoch, columns: Vec<u32>, mode, placement| {
+        raw_operator_request(
+            &socket,
+            serde_json::json!({
+                "request_id": request_id,
+                "operation": {
+                    "type": "apply_physical_columnar",
+                    "expected_runtime_token": token,
+                    "expected_evidence_epoch": epoch,
+                    "table_id": 1,
+                    "columns": columns,
+                    "mode": mode,
+                    "placement_key": placement
+                }
+            }),
+        )
+    };
+    let assert_private = |response: &serde_json::Value| {
+        let encoded = serde_json::to_string(response).unwrap();
+        assert!(!encoded.contains(directory.to_string_lossy().as_ref()));
+        assert!(!encoded.contains(placements.to_string_lossy().as_ref()));
+    };
+
+    let created = apply(10, &token, epoch, vec![1], "snapshot", "created");
+    assert_eq!(
+        created["result"]["apply"]["outcome"]["kind"],
+        serde_json::json!("created")
+    );
+    assert!(placements.join("created").is_dir());
+    assert_private(&created);
+
+    let retry = apply(11, &token, epoch, vec![1], "snapshot", "created");
+    assert_eq!(
+        retry["result"]["apply"]["outcome"]["kind"],
+        serde_json::json!("already_applied")
+    );
+    let stale_retry = apply(
+        12,
+        "ffffffffffffffffffffffffffffffff",
+        epoch + 99,
+        vec![1],
+        "snapshot",
+        "created",
+    );
+    assert_eq!(
+        stale_retry["result"]["apply"]["outcome"]["kind"],
+        serde_json::json!("already_applied")
+    );
+
+    let stale_runtime = apply(
+        13,
+        "ffffffffffffffffffffffffffffffff",
+        epoch,
+        vec![1],
+        "snapshot",
+        "stale-runtime",
+    );
+    assert_eq!(
+        stale_runtime["error"]["code"],
+        serde_json::json!("physical_design_runtime_changed")
+    );
+    assert!(!placements.join("stale-runtime").exists());
+    assert_private(&stale_runtime);
+
+    let stale_epoch = apply(14, &token, epoch + 1, vec![1], "snapshot", "stale-epoch");
+    assert_eq!(
+        stale_epoch["error"]["code"],
+        serde_json::json!("physical_design_evidence_epoch_changed")
+    );
+    assert!(!placements.join("stale-epoch").exists());
+
+    let mode_not_allowed = apply(
+        15,
+        &token,
+        epoch,
+        vec![1],
+        "incremental",
+        "mode-not-allowed",
+    );
+    assert_eq!(
+        mode_not_allowed["error"]["code"],
+        serde_json::json!("physical_columnar_mode_not_allowed")
+    );
+    assert!(!placements.join("mode-not-allowed").exists());
+
+    std::fs::write(placements.join("occupied"), b"owned elsewhere").unwrap();
+    let occupied = apply(16, &token, epoch, vec![1], "snapshot", "occupied");
+    assert_eq!(
+        occupied["error"]["code"],
+        serde_json::json!("physical_columnar_placement_occupied")
+    );
+    assert_private(&occupied);
+
+    let empty = apply(17, &token, epoch, Vec::new(), "snapshot", "empty");
+    assert_eq!(
+        empty["error"]["code"],
+        serde_json::json!("malformed_request")
+    );
+    assert_eq!(
+        empty["error"]["message"],
+        serde_json::json!("columns must contain at least one column")
+    );
+    assert!(!placements.join("empty").exists());
+    for response in [
+        &retry,
+        &stale_retry,
+        &stale_epoch,
+        &mode_not_allowed,
+        &empty,
+    ] {
+        assert_private(response);
+    }
+
+    drop(client);
+    server.shutdown().unwrap();
+
+    value["physical_design"]["columnar_apply"]["allow_incremental"] = true.into();
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let server = TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .start()
+        .unwrap();
+    let mut client = Client::connect(server.local_addr());
+    client.hello();
+    client.request(
+        3,
+        ClientMessage::Execute {
+            sql: "SELECT name FROM users".into(),
+        },
+    );
+    let status = raw_operator_request(
+        &socket,
+        serde_json::json!({"request_id": 20, "operation": {"type": "status"}}),
+    );
+    let token =
+        status["result"]["status"]["physical_design"]["physical_columnar_apply"]["runtime_token"]
+            .as_str()
+            .unwrap();
+    let epoch = status["result"]["status"]["physical_design"]["evidence"]["epoch"]
+        .as_u64()
+        .unwrap();
+    let no_stream = raw_operator_request(
+        &socket,
+        serde_json::json!({
+            "request_id": 21,
+            "operation": {
+                "type": "apply_physical_columnar",
+                "expected_runtime_token": token,
+                "expected_evidence_epoch": epoch,
+                "table_id": 1,
+                "columns": [2],
+                "mode": "incremental",
+                "placement_key": "incremental-no-stream"
+            }
+        }),
+    );
+    assert_eq!(
+        no_stream["error"]["code"],
+        serde_json::json!("physical_columnar_change_stream_not_enabled")
+    );
+    assert!(!placements.join("incremental-no-stream").exists());
+    assert_private(&no_stream);
+
+    drop(client);
+    server.shutdown().unwrap();
+    assert!(!socket.exists());
+    cleanup(&directory);
+}
+
 #[test]
 fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     let directory = test_directory("physical-design");
@@ -600,12 +858,12 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     assert!(matches!(
         operator.rotate_evidence(0),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV3::AdaptiveNotEnabled
+            if error.code == OperatorErrorCodeV4::AdaptiveNotEnabled
     ));
     assert!(matches!(
         operator.physical_design_recommendations(),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV3::PhysicalDesignNoEvidence
+            if error.code == OperatorErrorCodeV4::PhysicalDesignNoEvidence
     ));
 
     let mut client = Client::connect(server.local_addr());
@@ -641,7 +899,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         .unwrap();
     assert_eq!(
         name_candidate.decision,
-        OperatorPhysicalDesignDecisionV3::Recommend {}
+        OperatorPhysicalDesignDecisionV4::Recommend {}
     );
 
     client.request(
@@ -658,7 +916,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     );
     let columnar = operator.physical_design_recommendations().unwrap();
     assert!(columnar.columnar_candidates.iter().any(|entry| {
-        entry.columns == vec![1] && entry.decision == OperatorPhysicalDesignDecisionV3::Recommend {}
+        entry.columns == vec![1] && entry.decision == OperatorPhysicalDesignDecisionV4::Recommend {}
     }));
     assert!(
         columnar
@@ -710,7 +968,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
             index_name.as_str().to_owned(),
         ),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV3::PhysicalIndexApplyFailed
+            if error.code == OperatorErrorCodeV4::PhysicalIndexApplyFailed
     ));
     client.request(7, ClientMessage::Rollback);
 
@@ -748,7 +1006,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         .unwrap();
     assert!(matches!(
         operator_retry.outcome,
-        netbadb_server::OperatorPhysicalIndexApplyOutcomeV3::AlreadyApplied { .. }
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV4::AlreadyApplied { .. }
     ));
     let operator_covered = operator
         .apply_physical_index(
@@ -761,7 +1019,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         .unwrap();
     assert_eq!(
         operator_covered.outcome,
-        netbadb_server::OperatorPhysicalIndexApplyOutcomeV3::AlreadyCovered
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV4::AlreadyCovered
     );
     let created = design.apply_index(&proposal, index_name.clone()).unwrap();
     assert!(matches!(
@@ -790,8 +1048,8 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
             .find(|entry| entry.column_id == 2)
             .unwrap()
             .decision,
-        OperatorPhysicalDesignDecisionV3::NoAction {
-            reason: OperatorPhysicalDesignNoActionReasonV3::ExistingDesignCovers
+        OperatorPhysicalDesignDecisionV4::NoAction {
+            reason: OperatorPhysicalDesignNoActionReasonV4::ExistingDesignCovers
         }
     );
 
@@ -803,7 +1061,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     assert!(matches!(
         operator.rotate_physical_design_evidence(epoch.0),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV3::PhysicalDesignEvidenceEpochChanged
+            if error.code == OperatorErrorCodeV4::PhysicalDesignEvidenceEpochChanged
     ));
     assert_eq!(design.status().unwrap().evidence.epoch.0, rotated.new_epoch);
     assert_eq!(
@@ -928,7 +1186,7 @@ fn old_operator_approval_only_recognizes_exact_durable_truth_after_restart() {
         .unwrap();
     assert!(matches!(
         created.outcome,
-        netbadb_server::OperatorPhysicalIndexApplyOutcomeV3::Created { .. }
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV4::Created { .. }
     ));
     drop(first_client);
     first_server.shutdown().unwrap();
@@ -963,7 +1221,7 @@ fn old_operator_approval_only_recognizes_exact_durable_truth_after_restart() {
         .unwrap();
     assert!(matches!(
         recovered.outcome,
-        netbadb_server::OperatorPhysicalIndexApplyOutcomeV3::AlreadyApplied { .. }
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV4::AlreadyApplied { .. }
     ));
     second_server.shutdown().unwrap();
     assert!(!socket.exists());
@@ -1375,13 +1633,13 @@ fn native_query_continues_across_live_operator_status_and_rotation() {
     let status = operator.status().unwrap();
     assert_eq!(
         status.adaptive.unwrap().mode,
-        OperatorAdaptiveModeV3::FeedbackOnly
+        OperatorAdaptiveModeV4::FeedbackOnly
     );
     assert!(status.physical_design.is_none());
     assert!(matches!(
         operator.physical_design_recommendations(),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV3::PhysicalDesignNotEnabled
+            if error.code == OperatorErrorCodeV4::PhysicalDesignNotEnabled
     ));
 
     let mut client = Client::connect(server.local_addr());

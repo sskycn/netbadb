@@ -1,7 +1,7 @@
 # NetbaDB deployment manifest v9
 
 Deployment Manifest v9 is the only current `netbadbd` startup configuration.
-Versions 1 through 9 are not decoded by compatibility shims: versions 1 through
+Versions 1 through 8 are not decoded by compatibility shims: versions 1 through
 8 and future versions are rejected explicitly. The manifest is strict, loaded
 once, and never watched or rewritten.
 

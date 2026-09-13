@@ -12,9 +12,9 @@ use netbadb_core::{
 use netbadb_pgwire::{CANCEL_REQUEST_CODE, PROTOCOL_VERSION_3, SSL_REQUEST_CODE};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
-    OperatorAdaptiveModeV3, OperatorClientError, OperatorErrorCodeV3,
-    OperatorPhysicalDesignDecisionV3, OperatorPhysicalDesignRecordErrorV3,
-    OperatorPhysicalIndexApplyOutcomeV3, PostgresTcpServer, PostgresTcpServerError,
+    OperatorAdaptiveModeV4, OperatorClientError, OperatorErrorCodeV4,
+    OperatorPhysicalDesignDecisionV4, OperatorPhysicalDesignRecordErrorV4,
+    OperatorPhysicalIndexApplyOutcomeV4, PostgresTcpServer, PostgresTcpServerError,
     ServerAdaptiveControlError, ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig,
     ServerAdaptiveMode, ServerConfig, ServerOperatorClient, ServerPhysicalColumnarApplyConfig,
     ServerPhysicalColumnarApplyStartupError, ServerPhysicalColumnarPlacementKey,
@@ -341,7 +341,7 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
     assert!(matches!(
         operator.physical_design_recommendations(),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV3::PhysicalDesignNoEvidence
+            if error.code == OperatorErrorCodeV4::PhysicalDesignNoEvidence
     ));
 
     let mut stream = TcpStream::connect(server.local_addr()).unwrap();
@@ -365,7 +365,7 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
             .unwrap()
             .diagnostics
             .last_record_error,
-        Some(OperatorPhysicalDesignRecordErrorV3::GlobalVisibilityRequired)
+        Some(OperatorPhysicalDesignRecordErrorV4::GlobalVisibilityRequired)
     );
 
     stream.write_all(&frontend(b'X', &[])).unwrap();
@@ -491,7 +491,7 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
     assert_eq!(report.recorded_reports, 1);
     assert!(report.index_candidates.iter().any(|candidate| {
         candidate.column_id == 3
-            && candidate.decision == OperatorPhysicalDesignDecisionV3::Recommend {}
+            && candidate.decision == OperatorPhysicalDesignDecisionV4::Recommend {}
     }));
     let status_before_proposal = design.status().unwrap();
     let applied = operator
@@ -505,7 +505,7 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
         .unwrap();
     assert!(matches!(
         applied.outcome,
-        OperatorPhysicalIndexApplyOutcomeV3::Created { .. }
+        OperatorPhysicalIndexApplyOutcomeV4::Created { .. }
     ));
     assert_eq!(design.status().unwrap(), status_before_proposal);
 
@@ -674,7 +674,7 @@ fn postgres_query_and_transaction_status_are_isolated_from_live_operator_request
     let operator = ServerOperatorClient::new(&operator_config);
     assert_eq!(
         operator.status().unwrap().adaptive.unwrap().mode,
-        OperatorAdaptiveModeV3::FeedbackOnly
+        OperatorAdaptiveModeV4::FeedbackOnly
     );
 
     let mut stream = TcpStream::connect(server.local_addr()).unwrap();

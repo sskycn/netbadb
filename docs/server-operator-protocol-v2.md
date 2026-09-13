@@ -1,10 +1,10 @@
 # NetBaDB Operator Protocol v2
 
-> Historical protocol contract. The current operator plane requires NBOP v3;
+> Historical protocol contract. The current operator plane requires NBOP v4;
 > NBOP v2 is explicitly rejected.
 
-NBOP v2 is the current local operator contract. NBOP v1 is historical and is
-explicitly rejected. This version is independent of Deployment Manifest v7,
+NBOP v2 is a historical local operator contract. NBOP v1 is also historical
+and explicitly rejected. This version is independent of Deployment Manifest v7,
 Native Protocol v2, PostgreSQL wire, Inspection JSON v7, and persistent formats.
 
 ## Trust, lifecycle, and frame

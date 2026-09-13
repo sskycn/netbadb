@@ -2126,7 +2126,7 @@ mod tests {
         let client = crate::ServerOperatorClient::new(&operator_config);
         let before = client.status().unwrap();
         let adaptive = before.adaptive.as_ref().unwrap();
-        assert_eq!(adaptive.mode, crate::OperatorAdaptiveModeV3::FeedbackOnly);
+        assert_eq!(adaptive.mode, crate::OperatorAdaptiveModeV4::FeedbackOnly);
         assert_eq!(adaptive.feedback.window_epoch, 0);
         assert!(adaptive.driver.is_none());
         assert!(before.physical_design.is_none());
@@ -2175,8 +2175,8 @@ mod tests {
         assert!(matches!(
             client.rotate_evidence(0),
             Err(crate::OperatorClientError::Remote(
-                crate::OperatorRemoteErrorV3 {
-                    code: crate::OperatorErrorCodeV3::EvidenceWindowChanged,
+                crate::OperatorRemoteErrorV4 {
+                    code: crate::OperatorErrorCodeV4::EvidenceWindowChanged,
                     ..
                 }
             ))
@@ -2194,8 +2194,8 @@ mod tests {
         assert!(matches!(
             client.reset_faulted_scheduler(),
             Err(crate::OperatorClientError::Remote(
-                crate::OperatorRemoteErrorV3 {
-                    code: crate::OperatorErrorCodeV3::DriverNotEnabled,
+                crate::OperatorRemoteErrorV4 {
+                    code: crate::OperatorErrorCodeV4::DriverNotEnabled,
                     ..
                 }
             ))

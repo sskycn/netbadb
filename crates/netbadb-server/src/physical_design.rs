@@ -639,6 +639,7 @@ pub enum ServerPhysicalColumnarDesignControlError {
     ProposalRuntimeChanged,
     PlacementInvariantViolated,
     ServerStopped,
+    MutationOutcomeUncertain,
 }
 
 impl fmt::Display for ServerPhysicalColumnarDesignControlError {
@@ -687,6 +688,9 @@ impl fmt::Display for ServerPhysicalColumnarDesignControlError {
             Self::ServerStopped => {
                 formatter.write_str("server physical-columnar control is stopped")
             }
+            Self::MutationOutcomeUncertain => formatter.write_str(
+                "server physical-columnar control stopped after accepting the mutation command",
+            ),
         }
     }
 }
@@ -709,7 +713,8 @@ impl Error for ServerPhysicalColumnarDesignControlError {
             | Self::PhysicalDesignRuntimeChanged
             | Self::ProposalRuntimeChanged
             | Self::PlacementInvariantViolated
-            | Self::ServerStopped => None,
+            | Self::ServerStopped
+            | Self::MutationOutcomeUncertain => None,
         }
     }
 }
@@ -730,6 +735,7 @@ pub enum ServerPhysicalDesignControlError {
     PhysicalDesignRuntimeChanged,
     PhysicalIndexNameConflict(IndexName),
     ServerStopped,
+    MutationOutcomeUncertain,
 }
 
 impl fmt::Display for ServerPhysicalDesignControlError {
@@ -757,6 +763,9 @@ impl fmt::Display for ServerPhysicalDesignControlError {
                 write!(formatter, "physical-index name `{name}` is already in use")
             }
             Self::ServerStopped => formatter.write_str("server physical-design control is stopped"),
+            Self::MutationOutcomeUncertain => formatter.write_str(
+                "server physical-design control stopped after accepting the mutation command",
+            ),
         }
     }
 }
@@ -774,7 +783,8 @@ impl Error for ServerPhysicalDesignControlError {
             | Self::ProposalRuntimeChanged
             | Self::PhysicalDesignRuntimeChanged
             | Self::PhysicalIndexNameConflict(_)
-            | Self::ServerStopped => None,
+            | Self::ServerStopped
+            | Self::MutationOutcomeUncertain => None,
         }
     }
 }
@@ -932,7 +942,7 @@ impl ServerPhysicalDesignControlHandle {
             .map_err(|_| ServerPhysicalDesignControlError::ServerStopped)?;
         response
             .recv()
-            .map_err(|_| ServerPhysicalDesignControlError::ServerStopped)?
+            .map_err(|_| ServerPhysicalDesignControlError::MutationOutcomeUncertain)?
     }
 
     pub(crate) fn apply_approved_columnar(
@@ -957,7 +967,7 @@ impl ServerPhysicalDesignControlHandle {
             .map_err(|_| ServerPhysicalColumnarDesignControlError::ServerStopped)?;
         response
             .recv()
-            .map_err(|_| ServerPhysicalColumnarDesignControlError::ServerStopped)?
+            .map_err(|_| ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain)?
     }
 
     /// Compares and rotates as one command in the sole Database worker.
@@ -2207,6 +2217,46 @@ mod tests {
             table_id: TABLE_ID,
             columns: vec![ColumnId(1)],
         }
+    }
+
+    #[test]
+    fn approved_columnar_control_distinguishes_not_sent_from_uncertain_reply_loss() {
+        let (requests, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        let stopped = ServerPhysicalDesignControlHandle::new(requests).apply_approved_columnar(
+            true,
+            PhysicalDesignEvidenceEpoch(1),
+            columnar_candidate(),
+            PhysicalColumnarDesignMode::Snapshot,
+            ServerPhysicalColumnarPlacementKey::new("not-sent").unwrap(),
+        );
+        assert!(matches!(
+            stopped,
+            Err(ServerPhysicalColumnarDesignControlError::ServerStopped)
+        ));
+
+        let (requests, receiver) = std::sync::mpsc::channel();
+        let control = ServerPhysicalDesignControlHandle::new(requests);
+        let worker = std::thread::spawn(move || {
+            let request = receiver.recv().unwrap();
+            assert!(matches!(
+                request,
+                ServerPhysicalDesignControlRequest::ApplyApprovedColumnar { .. }
+            ));
+            drop(request);
+        });
+        let uncertain = control.apply_approved_columnar(
+            true,
+            PhysicalDesignEvidenceEpoch(1),
+            columnar_candidate(),
+            PhysicalColumnarDesignMode::Snapshot,
+            ServerPhysicalColumnarPlacementKey::new("reply-lost").unwrap(),
+        );
+        worker.join().unwrap();
+        assert!(matches!(
+            uncertain,
+            Err(ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain)
+        ));
     }
 
     struct Fixture {

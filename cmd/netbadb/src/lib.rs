@@ -10,23 +10,23 @@ use std::path::PathBuf;
 use netbadb_sdk::inspection::{render_catalog, render_statement};
 use netbadb_sdk::{Database, DatabaseError};
 use netbadb_server::{
-    ManifestError, OperatorAdaptiveModeV3, OperatorClientError, OperatorErrorCodeV3,
-    OperatorPhysicalColumnarApplyOutcomeV3, OperatorPhysicalColumnarDesignModeV3,
-    OperatorPhysicalDesignDecisionV3, OperatorPhysicalDesignNoActionReasonV3,
-    OperatorPhysicalDesignRecommendationsV3, OperatorPhysicalIndexApplyOutcomeV3,
-    OperatorRemoteErrorV3, OperatorSchedulerDelayClassV3, OperatorSchedulerFaultV3,
-    OperatorSchedulerGateV3, OperatorStatusV3, ServerConfig, ServerOperatorClient,
+    ManifestError, OperatorAdaptiveModeV4, OperatorClientError, OperatorErrorCodeV4,
+    OperatorPhysicalColumnarApplyOutcomeV4, OperatorPhysicalColumnarDesignModeV4,
+    OperatorPhysicalDesignDecisionV4, OperatorPhysicalDesignNoActionReasonV4,
+    OperatorPhysicalDesignRecommendationsV4, OperatorPhysicalIndexApplyOutcomeV4,
+    OperatorRemoteErrorV4, OperatorSchedulerDelayClassV4, OperatorSchedulerFaultV4,
+    OperatorSchedulerGateV4, OperatorStatusV4, ServerConfig, ServerOperatorClient,
 };
 
 const ROOT_HELP: &str = "Usage:\n  netbadb inspect <catalog|statement> [options]\n  netbadb operator <status|rotate-evidence|reset-faulted-scheduler|physical-design> [options]\n\nUse `netbadb inspect --help` or `netbadb operator --help` for commands.\n";
 const INSPECT_HELP: &str = "Usage:\n  netbadb inspect catalog --manifest <server.json> [--format text|json]\n  netbadb inspect statement --manifest <server.json> (--sql <SQL>|--sql-file <path>) [--format text|json]\n";
 const CATALOG_HELP: &str = "Usage: netbadb inspect catalog --manifest <server.json> [--format text|json]\n\nInspects the complete offline local catalog.\n";
 const STATEMENT_HELP: &str = "Usage: netbadb inspect statement --manifest <server.json> (--sql <SQL>|--sql-file <path>) [--format text|json]\n\nCompiles and inspects one statement without executing it.\n";
-const OPERATOR_HELP: &str = "Usage:\n  netbadb operator status --manifest <server.json>\n  netbadb operator rotate-evidence --manifest <server.json> --expected-window-epoch <epoch>\n  netbadb operator reset-faulted-scheduler --manifest <server.json>\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n  netbadb operator physical-design apply-index --manifest <server.json> --expected-runtime-token <token> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id> --index-name <name>\n";
+const OPERATOR_HELP: &str = "Usage:\n  netbadb operator status --manifest <server.json>\n  netbadb operator rotate-evidence --manifest <server.json> --expected-window-epoch <epoch>\n  netbadb operator reset-faulted-scheduler --manifest <server.json>\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n  netbadb operator physical-design apply-index --manifest <server.json> --expected-runtime-token <token> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id> --index-name <name>\n  netbadb operator physical-design apply-columnar --manifest <server.json> --expected-runtime-token <token> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id>... --mode <snapshot|incremental> --placement-key <key>\n";
 const OPERATOR_STATUS_HELP: &str = "Usage: netbadb operator status --manifest <server.json>\n\nReads bounded live Adaptive and Physical Design status over NBOP v4.\n";
 const OPERATOR_ROTATE_HELP: &str = "Usage: netbadb operator rotate-evidence --manifest <server.json> --expected-window-epoch <epoch>\n\nConditionally rotates the live evidence window. The expected epoch is required and is never inferred.\n";
 const OPERATOR_RESET_HELP: &str = "Usage: netbadb operator reset-faulted-scheduler --manifest <server.json>\n\nAcknowledges and resets only a genuinely faulted scheduler.\n";
-const OPERATOR_PHYSICAL_DESIGN_HELP: &str = "Usage:\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n  netbadb operator physical-design apply-index --manifest <server.json> --expected-runtime-token <token> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id> --index-name <name>\n";
+const OPERATOR_PHYSICAL_DESIGN_HELP: &str = "Usage:\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n  netbadb operator physical-design apply-index --manifest <server.json> --expected-runtime-token <token> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id> --index-name <name>\n  netbadb operator physical-design apply-columnar --manifest <server.json> --expected-runtime-token <token> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id>... --mode <snapshot|incremental> --placement-key <key>\n";
 const OPERATOR_PHYSICAL_DESIGN_RECOMMENDATIONS_HELP: &str = "Usage: netbadb operator physical-design recommendations --manifest <server.json>\n\nReads current-inventory physical-design advice without applying it.\n";
 const OPERATOR_PHYSICAL_DESIGN_ROTATE_HELP: &str = "Usage: netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n\nConditionally rotates design evidence. The expected epoch is required and is never inferred.\n";
 const OPERATOR_PHYSICAL_DESIGN_APPLY_HELP: &str = "Usage: netbadb operator physical-design apply-index --manifest <server.json> --expected-runtime-token <32-lowercase-hex> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id> --index-name <name>\n\nExplicitly approves one exact current physical-index candidate. No value is inferred or refreshed and the mutation is never retried automatically.\n";
@@ -157,13 +157,21 @@ fn run_operator_apply<T>(
         OperatorClientError::OperatorNotConfigured,
     ))?;
     operation(&ServerOperatorClient::new(operator))
-        .map_err(|error| match error {
-            OperatorClientError::Protocol(_) => {
-                OperationalError::OperatorApplyOutcomeUncertain(error)
-            }
-            _ => OperationalError::Operator(error),
-        })
+        .map_err(classify_operator_apply_error)
         .map_err(Into::into)
+}
+
+fn classify_operator_apply_error(error: OperatorClientError) -> OperationalError {
+    match &error {
+        OperatorClientError::Protocol(_)
+        | OperatorClientError::RequestIdMismatch { .. }
+        | OperatorClientError::UnexpectedResult
+        | OperatorClientError::Remote(OperatorRemoteErrorV4 {
+            code: OperatorErrorCodeV4::MutationOutcomeUncertain,
+            ..
+        }) => OperationalError::OperatorApplyOutcomeUncertain(error),
+        _ => OperationalError::Operator(error),
+    }
 }
 
 fn run_operator<T>(
@@ -179,14 +187,14 @@ fn run_operator<T>(
         .map_err(Into::into)
 }
 
-fn render_operator_status(status: &OperatorStatusV3) -> String {
+fn render_operator_status(status: &OperatorStatusV4) -> String {
     let mut output = String::new();
     match &status.adaptive {
         None => output.push_str("Adaptive: disabled\n"),
         Some(adaptive) => {
             let mode = match adaptive.mode {
-                OperatorAdaptiveModeV3::FeedbackOnly => "feedback-only",
-                OperatorAdaptiveModeV3::Driven => "driven",
+                OperatorAdaptiveModeV4::FeedbackOnly => "feedback-only",
+                OperatorAdaptiveModeV4::Driven => "driven",
             };
             let feedback = &adaptive.feedback;
             output.push_str(&format!(
@@ -220,7 +228,10 @@ fn render_operator_status(status: &OperatorStatusV3) -> String {
             "Physical Design: enabled\nPhysical index apply: {}\nPhysical Columnar apply: {}\nAllowed Columnar modes: {}\nRuntime token: {}\nRuntime token purpose: stale-request guard, not a credential\ndesign evidence epoch: {}\ndesign recorded reports: {}\nindex candidate count: {}\ncolumnar candidate count: {}\ndesign evidence truncated: {}\ndesign evidence incomplete: {}\n",
             if design.physical_index_apply.enabled { "enabled" } else { "disabled" },
             if design.physical_columnar_apply.enabled { "enabled" } else { "disabled" },
-            render_columnar_modes(&design.physical_columnar_apply),
+            render_columnar_modes(
+                design.physical_columnar_apply.allow_snapshot,
+                design.physical_columnar_apply.allow_incremental,
+            ),
             design
                 .physical_index_apply
                 .runtime_token
@@ -238,10 +249,8 @@ fn render_operator_status(status: &OperatorStatusV3) -> String {
     output
 }
 
-const fn render_columnar_modes(
-    status: &netbadb_server::OperatorPhysicalColumnarApplyStatusV3,
-) -> &'static str {
-    match (status.allow_snapshot, status.allow_incremental) {
+const fn render_columnar_modes(allow_snapshot: bool, allow_incremental: bool) -> &'static str {
+    match (allow_snapshot, allow_incremental) {
         (true, true) => "snapshot, incremental",
         (true, false) => "snapshot",
         (false, true) => "incremental",
@@ -250,16 +259,25 @@ const fn render_columnar_modes(
 }
 
 fn render_physical_design_recommendations(
-    recommendations: &OperatorPhysicalDesignRecommendationsV3,
+    recommendations: &OperatorPhysicalDesignRecommendationsV4,
 ) -> String {
     let report = &recommendations.report;
     let mut output = format!(
-        "Physical index apply: {}\nRuntime token: {}\nEvidence epoch: {}\nphysical-design evidence epoch: {}\nschema generation: {}\nG range: {}..={}\nrecorded reports: {}\ndiscarded incomplete reports: {}\noverflowed: {}\nincomplete: {}\n",
-        if recommendations.runtime_token.is_some() {
+        "Physical index apply: {}\nPhysical Columnar apply: {}\nAllowed Columnar modes: {}\nRuntime token: {}\nEvidence epoch: {}\nphysical-design evidence epoch: {}\nschema generation: {}\nG range: {}..={}\nrecorded reports: {}\ndiscarded incomplete reports: {}\noverflowed: {}\nincomplete: {}\n",
+        if recommendations.physical_index_apply.enabled {
             "enabled"
         } else {
             "disabled"
         },
+        if recommendations.physical_columnar_apply.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        render_columnar_modes(
+            recommendations.physical_columnar_apply.allow_snapshot,
+            recommendations.physical_columnar_apply.allow_incremental,
+        ),
         recommendations.runtime_token.as_deref().unwrap_or("none"),
         report.evidence_epoch,
         report.evidence_epoch,
@@ -307,18 +325,18 @@ fn render_physical_design_recommendations(
 }
 
 fn render_physical_index_apply(
-    apply: &netbadb_server::OperatorPhysicalIndexApplyResultV3,
+    apply: &netbadb_server::OperatorPhysicalIndexApplyResultV4,
 ) -> String {
     match apply.outcome {
-        OperatorPhysicalIndexApplyOutcomeV3::Created { index_id } => format!(
+        OperatorPhysicalIndexApplyOutcomeV4::Created { index_id } => format!(
             "physical index created: IndexId({index_id}), TableId({}), ColumnId({}), name {}\n",
             apply.table_id, apply.column_id, apply.index_name
         ),
-        OperatorPhysicalIndexApplyOutcomeV3::AlreadyApplied { index_id } => format!(
+        OperatorPhysicalIndexApplyOutcomeV4::AlreadyApplied { index_id } => format!(
             "physical index already applied: IndexId({index_id}), TableId({}), ColumnId({}), name {}\n",
             apply.table_id, apply.column_id, apply.index_name
         ),
-        OperatorPhysicalIndexApplyOutcomeV3::AlreadyCovered => format!(
+        OperatorPhysicalIndexApplyOutcomeV4::AlreadyCovered => format!(
             "physical index already covered: TableId({}), ColumnId({}), name {}; no new index was created because current physical state already covers the candidate.\n",
             apply.table_id, apply.column_id, apply.index_name
         ),
@@ -326,7 +344,7 @@ fn render_physical_index_apply(
 }
 
 fn render_physical_columnar_apply(
-    apply: &netbadb_server::OperatorPhysicalColumnarApplyResultV3,
+    apply: &netbadb_server::OperatorPhysicalColumnarApplyResultV4,
 ) -> String {
     let columns = apply
         .columns
@@ -335,78 +353,78 @@ fn render_physical_columnar_apply(
         .collect::<Vec<_>>()
         .join(", ");
     let mode = match apply.mode {
-        OperatorPhysicalColumnarDesignModeV3::Snapshot => "snapshot",
-        OperatorPhysicalColumnarDesignModeV3::Incremental => "incremental",
+        OperatorPhysicalColumnarDesignModeV4::Snapshot => "snapshot",
+        OperatorPhysicalColumnarDesignModeV4::Incremental => "incremental",
     };
     match apply.outcome {
-        OperatorPhysicalColumnarApplyOutcomeV3::Created { projection_id } => format!(
+        OperatorPhysicalColumnarApplyOutcomeV4::Created { projection_id } => format!(
             "created projection {projection_id} (TableId({}), columns [{columns}], mode {mode}, placement key {})\n",
             apply.table_id, apply.placement_key
         ),
-        OperatorPhysicalColumnarApplyOutcomeV3::AlreadyApplied { projection_id } => format!(
+        OperatorPhysicalColumnarApplyOutcomeV4::AlreadyApplied { projection_id } => format!(
             "already applied as projection {projection_id} (TableId({}), columns [{columns}], mode {mode}, placement key {})\n",
             apply.table_id, apply.placement_key
         ),
-        OperatorPhysicalColumnarApplyOutcomeV3::AlreadyCovered => format!(
+        OperatorPhysicalColumnarApplyOutcomeV4::AlreadyCovered => format!(
             "already covered; no projection created (TableId({}), columns [{columns}], mode {mode}, placement key {})\n",
             apply.table_id, apply.placement_key
         ),
     }
 }
 
-const fn render_design_decision(decision: OperatorPhysicalDesignDecisionV3) -> &'static str {
+const fn render_design_decision(decision: OperatorPhysicalDesignDecisionV4) -> &'static str {
     match decision {
-        OperatorPhysicalDesignDecisionV3::Recommend {} => "recommend",
-        OperatorPhysicalDesignDecisionV3::NoAction { reason } => match reason {
-            OperatorPhysicalDesignNoActionReasonV3::BelowMinimumReports => {
+        OperatorPhysicalDesignDecisionV4::Recommend {} => "recommend",
+        OperatorPhysicalDesignDecisionV4::NoAction { reason } => match reason {
+            OperatorPhysicalDesignNoActionReasonV4::BelowMinimumReports => {
                 "no_action: below_minimum_reports"
             }
-            OperatorPhysicalDesignNoActionReasonV3::BelowMinimumShapeDiversity => {
+            OperatorPhysicalDesignNoActionReasonV4::BelowMinimumShapeDiversity => {
                 "no_action: below_minimum_shape_diversity"
             }
-            OperatorPhysicalDesignNoActionReasonV3::BelowMinimumActualWork => {
+            OperatorPhysicalDesignNoActionReasonV4::BelowMinimumActualWork => {
                 "no_action: below_minimum_actual_work"
             }
-            OperatorPhysicalDesignNoActionReasonV3::ExistingDesignCovers => {
+            OperatorPhysicalDesignNoActionReasonV4::ExistingDesignCovers => {
                 "no_action: existing_design_covers"
             }
-            OperatorPhysicalDesignNoActionReasonV3::UnsupportedCurrentLayout => {
+            OperatorPhysicalDesignNoActionReasonV4::UnsupportedCurrentLayout => {
                 "no_action: unsupported_current_layout"
             }
-            OperatorPhysicalDesignNoActionReasonV3::IncompleteEvidence => {
+            OperatorPhysicalDesignNoActionReasonV4::IncompleteEvidence => {
                 "no_action: incomplete_evidence"
             }
-            OperatorPhysicalDesignNoActionReasonV3::CurrentProjectionUnavailable => {
+            OperatorPhysicalDesignNoActionReasonV4::CurrentProjectionUnavailable => {
                 "no_action: current_projection_unavailable"
             }
-            OperatorPhysicalDesignNoActionReasonV3::RecommendationLimitReached => {
+            OperatorPhysicalDesignNoActionReasonV4::RecommendationLimitReached => {
                 "no_action: recommendation_limit_reached"
             }
         },
     }
 }
 
-const fn render_scheduler_gate(gate: OperatorSchedulerGateV3) -> &'static str {
+const fn render_scheduler_gate(gate: OperatorSchedulerGateV4) -> &'static str {
     match gate {
-        OperatorSchedulerGateV3::Open {
-            delay_class: OperatorSchedulerDelayClassV3::Normal,
+        OperatorSchedulerGateV4::Open {
+            delay_class: OperatorSchedulerDelayClassV4::Normal,
         } => "open (normal)",
-        OperatorSchedulerGateV3::Open {
-            delay_class: OperatorSchedulerDelayClassV3::Idle,
+        OperatorSchedulerGateV4::Open {
+            delay_class: OperatorSchedulerDelayClassV4::Idle,
         } => "open (idle)",
-        OperatorSchedulerGateV3::Open {
-            delay_class: OperatorSchedulerDelayClassV3::NoProgress,
+        OperatorSchedulerGateV4::Open {
+            delay_class: OperatorSchedulerDelayClassV4::NoProgress,
         } => "open (no_progress)",
-        OperatorSchedulerGateV3::AwaitingTrialProgress { .. } => "awaiting_trial_progress",
-        OperatorSchedulerGateV3::AwaitingEvidenceRenewal { .. } => "awaiting_evidence_renewal",
-        OperatorSchedulerGateV3::Faulted {
-            fault: OperatorSchedulerFaultV3::MaintenanceEnvelopeExceeded,
+        OperatorSchedulerGateV4::AwaitingTrialProgress { .. } => "awaiting_trial_progress",
+        OperatorSchedulerGateV4::AwaitingEvidenceRenewal { .. } => "awaiting_evidence_renewal",
+        OperatorSchedulerGateV4::Faulted {
+            fault: OperatorSchedulerFaultV4::MaintenanceEnvelopeExceeded,
         } => "faulted (maintenance_envelope_exceeded)",
-        OperatorSchedulerGateV3::Faulted {
-            fault: OperatorSchedulerFaultV3::StepFailed,
+        OperatorSchedulerGateV4::Faulted {
+            fault: OperatorSchedulerFaultV4::StepFailed,
         } => "faulted (step_failed)",
-        OperatorSchedulerGateV3::Faulted {
-            fault: OperatorSchedulerFaultV3::ConsumptionOverflow,
+        OperatorSchedulerGateV4::Faulted {
+            fault: OperatorSchedulerFaultV4::ConsumptionOverflow,
         } => "faulted (consumption_overflow)",
     }
 }
@@ -478,7 +496,7 @@ enum Action {
         expected_evidence_epoch: u64,
         table_id: u64,
         columns: Vec<u32>,
-        mode: OperatorPhysicalColumnarDesignModeV3,
+        mode: OperatorPhysicalColumnarDesignModeV4,
         placement_key: String,
     },
 }
@@ -683,8 +701,8 @@ fn parse_operator_physical_design_apply_columnar(
             Some("--mode") => {
                 let value = required_utf8(&mut arguments, "--mode")?;
                 let parsed = match value.as_str() {
-                    "snapshot" => OperatorPhysicalColumnarDesignModeV3::Snapshot,
-                    "incremental" => OperatorPhysicalColumnarDesignModeV3::Incremental,
+                    "snapshot" => OperatorPhysicalColumnarDesignModeV4::Snapshot,
+                    "incremental" => OperatorPhysicalColumnarDesignModeV4::Incremental,
                     _ => return Err(UsageError::InvalidColumnarMode(value)),
                 };
                 set_once(&mut mode, parsed, "--mode")?;
@@ -1045,14 +1063,14 @@ impl fmt::Display for OperationalError {
                 formatter,
                 "inspection failed: {primary}; additionally failed to close database: {close}"
             ),
-            Self::Operator(OperatorClientError::Remote(OperatorRemoteErrorV3 {
-                code: OperatorErrorCodeV3::ResponseTooLarge,
+            Self::Operator(OperatorClientError::Remote(OperatorRemoteErrorV4 {
+                code: OperatorErrorCodeV4::ResponseTooLarge,
                 ..
             })) => formatter.write_str(
                 "operator recommendation response exceeds NBOP v4 payload limit; reduce physical-design evidence/recommendation cardinality in Manifest and restart",
             ),
-            Self::Operator(OperatorClientError::Remote(OperatorRemoteErrorV3 {
-                code: OperatorErrorCodeV3::PhysicalDesignRuntimeChanged,
+            Self::Operator(OperatorClientError::Remote(OperatorRemoteErrorV4 {
+                code: OperatorErrorCodeV4::PhysicalDesignRuntimeChanged,
                 ..
             })) => formatter.write_str(
                 "recommendation approval belonged to a previous daemon/operator runtime; fetch fresh recommendations before authorizing a new mutation",
@@ -1060,7 +1078,7 @@ impl fmt::Display for OperationalError {
             Self::Operator(error) => error.fmt(formatter),
             Self::OperatorApplyOutcomeUncertain(error) => write!(
                 formatter,
-                "physical-index apply outcome is uncertain because the NBOP response was not received ({error}); re-run the exact same command; the CLI did not retry automatically"
+                "operator apply outcome is uncertain because no definitive NBOP result was received ({error}); re-run the same exact approval; the CLI did not retry or refresh its token or evidence epoch"
             ),
         }
     }
@@ -1252,8 +1270,9 @@ impl From<OperationalError> for CliError {
 mod tests {
     use super::*;
     use netbadb_server::{
-        OperatorPhysicalDesignAdvisorReportV3, OperatorPhysicalDesignEvidenceSummaryV3,
-        OperatorPhysicalIndexCandidateV3,
+        OperatorPhysicalColumnarApplyCapabilityV4, OperatorPhysicalDesignAdvisorReportV4,
+        OperatorPhysicalDesignEvidenceSummaryV4, OperatorPhysicalIndexApplyCapabilityV4,
+        OperatorPhysicalIndexCandidateV4,
     };
 
     fn args(values: &[&str]) -> Vec<OsString> {
@@ -1278,6 +1297,16 @@ mod tests {
             parse_args(args(&["inspect", "statement", "--help"])).unwrap(),
             Action::Help(HelpTopic::Statement)
         );
+        assert_eq!(
+            parse_args(args(&["operator", "--help"])).unwrap(),
+            Action::Help(HelpTopic::Operator)
+        );
+        assert_eq!(
+            parse_args(args(&["operator", "physical-design", "--help"])).unwrap(),
+            Action::Help(HelpTopic::OperatorPhysicalDesign)
+        );
+        assert!(OPERATOR_HELP.contains("physical-design apply-columnar"));
+        assert!(OPERATOR_PHYSICAL_DESIGN_HELP.contains("physical-design apply-columnar"));
         assert_eq!(parse_args(args(&["--version"])).unwrap(), Action::Version);
         assert_eq!(
             parse_args(args(&[
@@ -1489,9 +1518,15 @@ mod tests {
     #[test]
     fn recommendation_output_uses_canonical_ids_and_observed_work_only() {
         let output =
-            render_physical_design_recommendations(&OperatorPhysicalDesignRecommendationsV3 {
+            render_physical_design_recommendations(&OperatorPhysicalDesignRecommendationsV4 {
                 runtime_token: Some("00".repeat(16)),
-                report: OperatorPhysicalDesignAdvisorReportV3 {
+                physical_index_apply: OperatorPhysicalIndexApplyCapabilityV4 { enabled: true },
+                physical_columnar_apply: OperatorPhysicalColumnarApplyCapabilityV4 {
+                    enabled: false,
+                    allow_snapshot: false,
+                    allow_incremental: false,
+                },
+                report: OperatorPhysicalDesignAdvisorReportV4 {
                     evidence_epoch: 7,
                     schema_generation: 8,
                     first_global_commit_seq: 9,
@@ -1500,12 +1535,12 @@ mod tests {
                     discarded_incomplete_reports: 0,
                     overflowed: false,
                     incomplete: false,
-                    index_candidates: vec![OperatorPhysicalIndexCandidateV3 {
+                    index_candidates: vec![OperatorPhysicalIndexCandidateV4 {
                         table_id: 12,
                         column_id: 13,
                         point_report_count: 14,
                         range_report_count: 15,
-                        evidence: OperatorPhysicalDesignEvidenceSummaryV3 {
+                        evidence: OperatorPhysicalDesignEvidenceSummaryV4 {
                             report_count: 16,
                             distinct_query_shapes: 17,
                             total_actual_scan_work_units: 18,
@@ -1514,8 +1549,8 @@ mod tests {
                             incomplete: false,
                             truncated: false,
                         },
-                        decision: OperatorPhysicalDesignDecisionV3::NoAction {
-                            reason: OperatorPhysicalDesignNoActionReasonV3::ExistingDesignCovers,
+                        decision: OperatorPhysicalDesignDecisionV4::NoAction {
+                            reason: OperatorPhysicalDesignNoActionReasonV4::ExistingDesignCovers,
                         },
                     }],
                     columnar_candidates: Vec::new(),
@@ -1530,23 +1565,96 @@ mod tests {
     }
 
     #[test]
+    fn recommendation_permissions_render_all_independent_combinations() {
+        let render = |index_enabled, columnar_enabled| {
+            render_physical_design_recommendations(&OperatorPhysicalDesignRecommendationsV4 {
+                runtime_token: (index_enabled || columnar_enabled).then(|| "11".repeat(16)),
+                physical_index_apply: OperatorPhysicalIndexApplyCapabilityV4 {
+                    enabled: index_enabled,
+                },
+                physical_columnar_apply: OperatorPhysicalColumnarApplyCapabilityV4 {
+                    enabled: columnar_enabled,
+                    allow_snapshot: columnar_enabled,
+                    allow_incremental: false,
+                },
+                report: OperatorPhysicalDesignAdvisorReportV4 {
+                    evidence_epoch: 1,
+                    schema_generation: 1,
+                    first_global_commit_seq: 1,
+                    last_global_commit_seq: 1,
+                    recorded_reports: 1,
+                    discarded_incomplete_reports: 0,
+                    overflowed: false,
+                    incomplete: false,
+                    index_candidates: Vec::new(),
+                    columnar_candidates: Vec::new(),
+                },
+            })
+        };
+
+        for (index, columnar, expected_index, expected_columnar) in [
+            (true, false, "enabled", "disabled"),
+            (false, true, "disabled", "enabled"),
+            (true, true, "enabled", "enabled"),
+            (false, false, "disabled", "disabled"),
+        ] {
+            let output = render(index, columnar);
+            assert!(output.contains(&format!("Physical index apply: {expected_index}\n")));
+            assert!(output.contains(&format!("Physical Columnar apply: {expected_columnar}\n")));
+            assert_eq!(output.contains("Runtime token: none"), !index && !columnar);
+        }
+    }
+
+    #[test]
+    fn apply_error_classification_is_conservative_after_dispatch() {
+        let uncertain =
+            classify_operator_apply_error(OperatorClientError::Remote(OperatorRemoteErrorV4 {
+                code: OperatorErrorCodeV4::MutationOutcomeUncertain,
+                message: "reply lost".into(),
+            }));
+        assert!(matches!(
+            uncertain,
+            OperationalError::OperatorApplyOutcomeUncertain(_)
+        ));
+        let rendered = uncertain.to_string();
+        assert!(rendered.contains("same exact approval"));
+        assert!(!rendered.contains("without creating"));
+
+        let definite =
+            classify_operator_apply_error(OperatorClientError::Remote(OperatorRemoteErrorV4 {
+                code: OperatorErrorCodeV4::ServerStopped,
+                message: "command was not sent".into(),
+            }));
+        assert!(matches!(definite, OperationalError::Operator(_)));
+
+        let transport = classify_operator_apply_error(OperatorClientError::RequestIdMismatch {
+            expected: 1,
+            received: 2,
+        });
+        assert!(matches!(
+            transport,
+            OperationalError::OperatorApplyOutcomeUncertain(_)
+        ));
+    }
+
+    #[test]
     fn apply_output_distinguishes_all_stable_success_outcomes() {
         for (outcome, expected) in [
             (
-                OperatorPhysicalIndexApplyOutcomeV3::Created { index_id: 7 },
+                OperatorPhysicalIndexApplyOutcomeV4::Created { index_id: 7 },
                 "physical index created",
             ),
             (
-                OperatorPhysicalIndexApplyOutcomeV3::AlreadyApplied { index_id: 7 },
+                OperatorPhysicalIndexApplyOutcomeV4::AlreadyApplied { index_id: 7 },
                 "physical index already applied",
             ),
             (
-                OperatorPhysicalIndexApplyOutcomeV3::AlreadyCovered,
+                OperatorPhysicalIndexApplyOutcomeV4::AlreadyCovered,
                 "no new index was created because current physical state already covers",
             ),
         ] {
             let output =
-                render_physical_index_apply(&netbadb_server::OperatorPhysicalIndexApplyResultV3 {
+                render_physical_index_apply(&netbadb_server::OperatorPhysicalIndexApplyResultV4 {
                     table_id: 1,
                     column_id: 3,
                     index_name: "idx_users_email".into(),
