@@ -32,9 +32,10 @@ use crate::{
     ServerAdaptiveMode,
 };
 use crate::{ServerOperatorConfig, ServerOperatorConfigError};
+use crate::{ServerPhysicalColumnarApplyConfig, ServerPhysicalColumnarApplyConfigError};
 use crate::{TlsConfigError, TransportKind};
 
-pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 8;
+pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 9;
 pub const DEFAULT_LISTEN_ADDRESS: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878);
 
@@ -55,6 +56,7 @@ pub struct ServerConfig {
     authorization: AuthorizationPolicy,
     adaptive_mode: ServerAdaptiveStartupMode,
     physical_design: Option<ServerPhysicalDesignAdvisorConfig>,
+    physical_columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,
     operator: Option<ServerOperatorConfig>,
 }
 
@@ -66,6 +68,7 @@ pub(crate) type ServerConfigParts = (
     AuthorizationPolicy,
     ServerAdaptiveStartupMode,
     Option<ServerPhysicalDesignAdvisorConfig>,
+    Option<ServerPhysicalColumnarApplyConfig>,
     Option<ServerOperatorConfig>,
 );
 
@@ -92,19 +95,26 @@ impl ServerConfig {
             .map_or(Ok(ServerAdaptiveStartupMode::Disabled), |adaptive| {
                 adaptive.into_runtime()
             })?;
-        let physical_design = manifest
-            .physical_design
-            .map(ManifestPhysicalDesign::into_config);
+        let physical_design_manifest = manifest.physical_design;
         if operator
             .as_ref()
             .is_some_and(|operator| operator.allow_physical_index_apply)
-            && physical_design.is_none()
+            && physical_design_manifest.is_none()
         {
             return Err(ManifestError::OperatorPhysicalIndexApplyRequiresPhysicalDesign);
         }
+        if operator
+            .as_ref()
+            .is_some_and(|operator| operator.allow_physical_columnar_apply)
+            && physical_design_manifest
+                .as_ref()
+                .is_none_or(|physical_design| physical_design.columnar_apply.is_none())
+        {
+            return Err(ManifestError::OperatorPhysicalColumnarApplyRequiresPlacementPolicy);
+        }
         if operator.is_some()
             && matches!(adaptive_mode, ServerAdaptiveStartupMode::Disabled)
-            && physical_design.is_none()
+            && physical_design_manifest.is_none()
         {
             return Err(ManifestError::OperatorRequiresManagedRuntime);
         }
@@ -129,6 +139,12 @@ impl ServerConfig {
                 path: path.to_path_buf(),
                 source,
             })?;
+        let physical_columnar_apply = physical_design_manifest
+            .as_ref()
+            .and_then(|physical_design| physical_design.columnar_apply.as_ref())
+            .map(|columnar| columnar.to_config(&manifest_directory))
+            .transpose()?;
+        let physical_design = physical_design_manifest.map(ManifestPhysicalDesign::into_config);
         let operator = operator
             .map(|operator| operator.into_config(&manifest_directory))
             .transpose()?;
@@ -204,6 +220,7 @@ impl ServerConfig {
             authorization,
             adaptive_mode,
             physical_design,
+            physical_columnar_apply,
             operator,
         })
     }
@@ -251,6 +268,14 @@ impl ServerConfig {
         self.physical_design.as_ref()
     }
 
+    /// Returns the manifest-derived Columnar placement policy, if configured.
+    #[must_use]
+    pub const fn physical_columnar_apply_config(
+        &self,
+    ) -> Option<&ServerPhysicalColumnarApplyConfig> {
+        self.physical_columnar_apply.as_ref()
+    }
+
     /// Returns the resolved local operator configuration without binding or
     /// connecting to its socket.
     #[must_use]
@@ -272,6 +297,7 @@ impl ServerConfig {
             self.authorization,
             self.adaptive_mode,
             self.physical_design,
+            self.physical_columnar_apply,
             self.operator,
         )
     }
@@ -332,6 +358,8 @@ pub enum ManifestError {
     AdaptiveDriverConfig(ServerAdaptiveDriverConfigError),
     OperatorRequiresManagedRuntime,
     OperatorPhysicalIndexApplyRequiresPhysicalDesign,
+    OperatorPhysicalColumnarApplyRequiresPlacementPolicy,
+    PhysicalColumnarApplyConfig(ServerPhysicalColumnarApplyConfigError),
     OperatorSocketPath(PathBuf),
     OperatorSocketParent {
         path: PathBuf,
@@ -418,6 +446,10 @@ impl fmt::Display for ManifestError {
                 .write_str("operator plane requires Adaptive or Physical Design to be enabled"),
             Self::OperatorPhysicalIndexApplyRequiresPhysicalDesign => formatter
                 .write_str("operator physical-index apply requires Physical Design to be enabled"),
+            Self::OperatorPhysicalColumnarApplyRequiresPlacementPolicy => formatter.write_str(
+                "operator physical-columnar apply requires a Physical Design columnar_apply placement policy",
+            ),
+            Self::PhysicalColumnarApplyConfig(error) => error.fmt(formatter),
             Self::OperatorSocketPath(path) => write!(
                 formatter,
                 "operator Unix socket path `{}` must name a file",
@@ -459,6 +491,7 @@ impl Error for ManifestError {
             Self::AdaptiveDriverConfig(error) => Some(error),
             Self::OperatorConfig(error) => Some(error),
             Self::Schema(error) => Some(error),
+            Self::PhysicalColumnarApplyConfig(error) => Some(error),
             Self::UnsupportedVersion(_)
             | Self::EmptyTables
             | Self::RemoteListenRequiresMutualTls(_)
@@ -467,6 +500,7 @@ impl Error for ManifestError {
             | Self::TlsPathIsNotFile { .. }
             | Self::OperatorRequiresManagedRuntime
             | Self::OperatorPhysicalIndexApplyRequiresPhysicalDesign
+            | Self::OperatorPhysicalColumnarApplyRequiresPlacementPolicy
             | Self::OperatorSocketPath(_)
             | Self::OperatorSocketParentNotDirectory(_) => None,
         }
@@ -510,10 +544,12 @@ where
 struct ManifestPhysicalDesign {
     evidence_limits: ManifestPhysicalDesignEvidenceLimits,
     advisor_policy: ManifestPhysicalDesignAdvisorPolicy,
+    #[serde(default, deserialize_with = "deserialize_optional_columnar_apply")]
+    columnar_apply: Option<ManifestPhysicalColumnarApply>,
 }
 
 impl ManifestPhysicalDesign {
-    const fn into_config(self) -> ServerPhysicalDesignAdvisorConfig {
+    fn into_config(self) -> ServerPhysicalDesignAdvisorConfig {
         ServerPhysicalDesignAdvisorConfig::new(
             self.evidence_limits.into_limits(),
             self.advisor_policy.into_policy(),
@@ -586,12 +622,50 @@ where
     ManifestOperator::deserialize(deserializer).map(Some)
 }
 
+fn deserialize_optional_columnar_apply<'de, D>(
+    deserializer: D,
+) -> Result<Option<ManifestPhysicalColumnarApply>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    ManifestPhysicalColumnarApply::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestPhysicalColumnarApply {
+    root: String,
+    allow_snapshot: bool,
+    allow_incremental: bool,
+}
+
+impl ManifestPhysicalColumnarApply {
+    fn to_config(
+        &self,
+        manifest_directory: &Path,
+    ) -> Result<ServerPhysicalColumnarApplyConfig, ManifestError> {
+        let configured = PathBuf::from(&self.root);
+        let resolved = if configured.is_absolute() {
+            configured
+        } else {
+            manifest_directory.join(configured)
+        };
+        ServerPhysicalColumnarApplyConfig::new(
+            resolved,
+            self.allow_snapshot,
+            self.allow_incremental,
+        )
+        .map_err(ManifestError::PhysicalColumnarApplyConfig)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestOperator {
     unix_socket: String,
     io_timeout_ms: u64,
     allow_physical_index_apply: bool,
+    allow_physical_columnar_apply: bool,
 }
 
 impl ManifestOperator {
@@ -619,10 +693,11 @@ impl ManifestOperator {
         if !parent.is_dir() {
             return Err(ManifestError::OperatorSocketParentNotDirectory(parent));
         }
-        ServerOperatorConfig::new(
+        ServerOperatorConfig::new_with_columnar(
             parent.join(file_name),
             Duration::from_millis(self.io_timeout_ms),
             self.allow_physical_index_apply,
+            self.allow_physical_columnar_apply,
         )
         .map_err(ManifestError::OperatorConfig)
     }
@@ -1330,7 +1405,7 @@ mod tests {
         let listen = listen.map_or_else(String::new, |listen| format!("\"listen\": \"{listen}\","));
         format!(
             r#"{{
-                "version": 8,
+                "version": 9,
                 {listen}
                 "authorization": {{
                     "local_plaintext": {{
@@ -1553,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_operator_migrates_to_v8_with_explicit_false_permission() {
+    fn historical_manifest_versions_are_rejected_and_v9_requires_explicit_permissions() {
         let directory = test_directory("v7-v8-migration");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
@@ -1566,9 +1641,10 @@ mod tests {
         value["operator"] = json!({
             "unix_socket": "operator.sock",
             "io_timeout_ms": 1000,
-            "allow_physical_index_apply": false
+            "allow_physical_index_apply": false,
+            "allow_physical_columnar_apply": false
         });
-        let v8 = serde_json::to_string(&value).unwrap();
+        let current = serde_json::to_string(&value).unwrap();
         let mut v7_value = value.clone();
         v7_value["version"] = json!(7);
         v7_value["operator"]
@@ -1581,7 +1657,15 @@ mod tests {
             Err(ManifestError::UnsupportedVersion(7))
         ));
 
-        std::fs::write(&manifest, v8).unwrap();
+        let mut v8_value = value.clone();
+        v8_value["version"] = json!(8);
+        std::fs::write(&manifest, serde_json::to_vec(&v8_value).unwrap()).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::UnsupportedVersion(8))
+        ));
+
+        std::fs::write(&manifest, current).unwrap();
         let config = ServerConfig::from_manifest_path(&manifest).unwrap();
         assert_eq!(config.listen(), "127.0.0.1:0".parse().unwrap());
         assert_eq!(config.limits(), ServerLimits::default());
@@ -1793,6 +1877,59 @@ mod tests {
     }
 
     #[test]
+    fn manifest_v9_columnar_apply_policy_is_strict_relative_and_explicit() {
+        let directory = test_directory("physical-columnar-manifest");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("columnar")).unwrap();
+        create_heap(&directory.join("users.ndb"));
+        let manifest = directory.join("server.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&manifest_json(None, "users.ndb", "UserId")).unwrap();
+        value["physical_design"] = physical_design_json();
+        value["physical_design"]["columnar_apply"] = json!({
+            "root": "columnar",
+            "allow_snapshot": true,
+            "allow_incremental": false
+        });
+        value["operator"] = json!({
+            "unix_socket": "operator.sock",
+            "io_timeout_ms": 1000,
+            "allow_physical_index_apply": false,
+            "allow_physical_columnar_apply": true
+        });
+        std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+        let apply = config.physical_columnar_apply_config().unwrap();
+        assert_eq!(
+            apply.root(),
+            directory.join("columnar").canonicalize().unwrap()
+        );
+        assert!(apply.allow_snapshot());
+        assert!(!apply.allow_incremental());
+        assert!(
+            config
+                .operator_config()
+                .unwrap()
+                .allow_physical_columnar_apply()
+        );
+
+        value["physical_design"]["columnar_apply"] = json!({
+            "root": "columnar",
+            "allow_snapshot": false,
+            "allow_incremental": false
+        });
+        std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::PhysicalColumnarApplyConfig(
+                ServerPhysicalColumnarApplyConfigError::NoModesEnabled
+            ))
+        ));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn operator_is_optional_requires_a_managed_runtime_and_resolves_from_manifest_directory() {
         let directory = test_directory("operator-config");
         let _ = std::fs::remove_dir_all(&directory);
@@ -1811,7 +1948,8 @@ mod tests {
         invalid["operator"] = json!({
             "unix_socket": "run/operator.sock",
             "io_timeout_ms": 5000,
-            "allow_physical_index_apply": false
+            "allow_physical_index_apply": false,
+            "allow_physical_columnar_apply": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&invalid).unwrap()).unwrap();
         assert!(matches!(
@@ -1828,7 +1966,8 @@ mod tests {
             value["operator"] = json!({
                 "unix_socket": "run/operator.sock",
                 "io_timeout_ms": 5000,
-                "allow_physical_index_apply": false
+                "allow_physical_index_apply": false,
+                "allow_physical_columnar_apply": false
             });
             std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
             let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -1846,7 +1985,8 @@ mod tests {
         design_only["operator"] = json!({
             "unix_socket": "run/operator.sock",
             "io_timeout_ms": 5000,
-            "allow_physical_index_apply": false
+            "allow_physical_index_apply": false,
+            "allow_physical_columnar_apply": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&design_only).unwrap()).unwrap();
         let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -1867,7 +2007,8 @@ mod tests {
         adaptive_apply["operator"] = json!({
             "unix_socket": "run/operator.sock",
             "io_timeout_ms": 5000,
-            "allow_physical_index_apply": true
+            "allow_physical_index_apply": true,
+            "allow_physical_columnar_apply": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&adaptive_apply).unwrap()).unwrap();
         assert!(matches!(
@@ -1905,11 +2046,12 @@ mod tests {
             json!(null),
             json!({"unix_socket": "operator.sock"}),
             json!({"unix_socket": "operator.sock", "io_timeout_ms": 1}),
-            json!({"unix_socket": "operator.sock", "io_timeout_ms": 0, "allow_physical_index_apply": false}),
+            json!({"unix_socket": "operator.sock", "io_timeout_ms": 0, "allow_physical_index_apply": false, "allow_physical_columnar_apply": false}),
             json!({
                 "unix_socket": "operator.sock",
                 "io_timeout_ms": 1,
                 "allow_physical_index_apply": false,
+                "allow_physical_columnar_apply": false,
                 "token": "forbidden"
             }),
         ] {
@@ -1926,7 +2068,8 @@ mod tests {
         value["operator"] = json!({
             "unix_socket": "missing/operator.sock",
             "io_timeout_ms": 1,
-            "allow_physical_index_apply": false
+            "allow_physical_index_apply": false,
+            "allow_physical_columnar_apply": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(matches!(
@@ -1972,7 +2115,8 @@ mod tests {
         value["operator"] = json!({
             "unix_socket": socket,
             "io_timeout_ms": 1000,
-            "allow_physical_index_apply": false
+            "allow_physical_index_apply": false,
+            "allow_physical_columnar_apply": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
 
@@ -1998,7 +2142,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let mut frame = b"NBOP\0\x03\0\0".to_vec();
+        let mut frame = b"NBOP\0\x04\0\0".to_vec();
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&payload);
         let mut lost_response = UnixStream::connect(operator_config.unix_socket()).unwrap();
@@ -2084,7 +2228,8 @@ mod tests {
         value["operator"] = json!({
             "unix_socket": socket,
             "io_timeout_ms": 100,
-            "allow_physical_index_apply": false
+            "allow_physical_index_apply": false,
+            "allow_physical_columnar_apply": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
 
@@ -2122,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn documented_v8_driven_example_is_a_golden_manifest() {
+    fn documented_v8_driven_example_is_historical_and_rejected() {
         let directory = test_directory("documented-v8-example");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(directory.join("run")).unwrap();
@@ -2138,9 +2283,10 @@ mod tests {
             .replace("data/users.ndb", "users.ndb");
         std::fs::write(&manifest, example).unwrap();
 
-        let config = ServerConfig::from_manifest_path(&manifest).unwrap();
-        assert_eq!(config.adaptive_mode(), ServerAdaptiveMode::Driven);
-        assert_eq!(config.tables().len(), 1);
+        assert!(matches!(
+            ServerConfig::from_manifest_path(&manifest),
+            Err(ManifestError::UnsupportedVersion(8))
+        ));
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -2683,7 +2829,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let manifest = directory.join("server.json");
 
-        for version in [1, 2, 3, 4, 5, 6, 7, 9] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 8] {
             std::fs::write(&manifest, format!(r#"{{"version":{version},"tables":[]}}"#)).unwrap();
             assert!(matches!(
                 ServerConfig::from_manifest_path(&manifest),
@@ -2693,7 +2839,7 @@ mod tests {
 
         std::fs::write(
             &manifest,
-            r#"{"version":8,"unexpected":true,"authorization":{"local_plaintext":{"tables":[{"table_id":1,"read":true}]}},"tables":[]}"#,
+            r#"{"version":9,"unexpected":true,"authorization":{"local_plaintext":{"tables":[{"table_id":1,"read":true}]}},"tables":[]}"#,
         )
         .unwrap();
         assert!(matches!(

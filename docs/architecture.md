@@ -362,9 +362,8 @@ worker ownership remains the serialization boundary. Manifest v7, NBOP v2,
 both database wire protocols, the operator/CLI/daemon surfaces, metrics,
 Inspection JSON v7, and persistent formats remain unchanged.
 
-[Adaptive Operations Phase 25](adaptive-operations-phase25.md) upgrades the
-strict deployment contract to Manifest v8 and the local operator plane to
-[NBOP v3](server-operator-protocol-v3.md). A local filesystem-authenticated
+[Adaptive Operations Phase 25](adaptive-operations-phase25.md) introduced the
+historical Manifest v8 and [NBOP v3](server-operator-protocol-v3.md). A local filesystem-authenticated
 operator may explicitly approve one current single-column Heap index candidate
 only when the manifest grants physical-index apply. A random ephemeral runtime
 token plus exact design evidence epoch prevents stale cross-restart authority;
@@ -388,7 +387,7 @@ GC in the current process. V1 catalogs and markers migrate crash-safely without
 changing active entries or allocator gaps; historical unregistered artifacts
 are never scanned or adopted. NBCM/NBCS/NBCD, schema/coordinator/WAL, Manifest
 v8, NBOP v3, Native Protocol v2, Inspection JSON v7, and Server behavior remain
-unchanged, and Columnar recommendation apply remains deferred.
+unchanged by Phase 26, and Columnar recommendation apply remained deferred.
 
 [Adaptive Operations Phase 27](adaptive-operations-phase27.md) adds a
 Core-only, explicit bridge from one current recommended
@@ -413,9 +412,20 @@ child. The sole Database worker reuses its Phase 24 weak runtime identity,
 rejects unregistered filesystem occupants with `symlink_metadata`, preserves
 exact registered retry/conflict precedence through Core's classifier, and
 delegates the only mutation to Core Phase 27. Proposals reserve neither paths
-nor IDs and expire with their evidence runtime. No manifest, NBOP, daemon, CLI,
-wire, automatic maintenance, scheduler, metrics, inspection, or persistent
-format surface changes.
+nor IDs and expire with their evidence runtime.
+
+[Adaptive Operations Phase 29](adaptive-operations-phase29.md) makes that
+authority available through a separate, explicit local operator approval path.
+Manifest v9 requires a complete Columnar placement policy when the operator
+permission is granted, and NBOP v4 retains the fixed frame while adding
+ordered-column Snapshot/Incremental approvals. Index and Columnar status remain
+independent but share one ephemeral runtime token whenever either domain is
+authorized. The listener never forwards a disabled request; the sole Database
+worker revalidates the root, registered location, mode, token, evidence epoch,
+and occupancy before deriving and immediately applying one fresh Core proposal.
+Paths, proposals, automatic stream enablement, maintenance, scheduling,
+retry, evidence rotation, and persistent operator audit remain outside the
+contract.
 
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
@@ -429,7 +439,7 @@ defer retirement until the last reader is gone. See [Columnar Phase
 The `netbadb` CLI is an offline adapter, not a new compiler or planner layer:
 
 ```text
-deployment manifest v8
+deployment manifest v9
           ↓
 netbadb-server ServerConfig bootstrap
           ↓

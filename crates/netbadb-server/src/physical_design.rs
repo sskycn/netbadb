@@ -21,8 +21,8 @@ use netbadb_core::{
 };
 use netbadb_schema::SchemaFingerprint;
 use netbadb_types::{
-    ChangeStreamGeneration, DatabaseCommitSeq, IndexId, IndexName, SchemaGeneration, StorageId,
-    TableSchemaVersion,
+    ChangeStreamGeneration, ColumnarProjectionId, DatabaseCommitSeq, IndexId, IndexName,
+    SchemaGeneration, StorageId, TableSchemaVersion,
 };
 
 use crate::adaptive_driver::ServerAdaptiveHostConfig;
@@ -77,6 +77,12 @@ pub struct ServerPhysicalColumnarApplyConfig {
     allow_incremental: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServerPhysicalColumnarApplyCapabilities {
+    pub(crate) allow_snapshot: bool,
+    pub(crate) allow_incremental: bool,
+}
+
 impl ServerPhysicalColumnarApplyConfig {
     pub fn new(
         root: impl AsRef<Path>,
@@ -118,6 +124,13 @@ impl ServerPhysicalColumnarApplyConfig {
     #[must_use]
     pub const fn allow_incremental(&self) -> bool {
         self.allow_incremental
+    }
+
+    pub(crate) const fn capabilities(&self) -> ServerPhysicalColumnarApplyCapabilities {
+        ServerPhysicalColumnarApplyCapabilities {
+            allow_snapshot: self.allow_snapshot,
+            allow_incremental: self.allow_incremental,
+        }
     }
 
     #[must_use]
@@ -233,6 +246,7 @@ impl Error for ServerPhysicalColumnarPlacementRootError {
 #[derive(Debug)]
 pub enum ServerPhysicalColumnarApplyStartupError {
     PhysicalDesignRequired,
+    OperatorPolicyMismatch,
     PlacementRoot(ServerPhysicalColumnarPlacementRootError),
 }
 
@@ -241,6 +255,9 @@ impl fmt::Display for ServerPhysicalColumnarApplyStartupError {
         match self {
             Self::PhysicalDesignRequired => formatter
                 .write_str("physical-columnar apply requires a configured physical-design advisor"),
+            Self::OperatorPolicyMismatch => formatter.write_str(
+                "operator-authorized physical-columnar apply cannot use a different builder placement policy",
+            ),
             Self::PlacementRoot(error) => error.fmt(formatter),
         }
     }
@@ -250,6 +267,7 @@ impl Error for ServerPhysicalColumnarApplyStartupError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::PhysicalDesignRequired => None,
+            Self::OperatorPolicyMismatch => None,
             Self::PlacementRoot(error) => Some(error),
         }
     }
@@ -347,6 +365,21 @@ pub(crate) enum ServerApprovedPhysicalIndexApplyOutcome {
     Created { index_id: IndexId },
     AlreadyApplied { index_id: IndexId },
     AlreadyCovered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerApprovedPhysicalColumnarApplyOutcome {
+    Created { projection_id: ColumnarProjectionId },
+    AlreadyApplied { projection_id: ColumnarProjectionId },
+    AlreadyCovered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerApprovedPhysicalColumnarApplyReport {
+    pub(crate) candidate: PhysicalColumnarCandidate,
+    pub(crate) mode: PhysicalColumnarDesignMode,
+    pub(crate) placement: ServerPhysicalColumnarPlacementKey,
+    pub(crate) outcome: ServerApprovedPhysicalColumnarApplyOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -580,6 +613,9 @@ pub enum ServerPhysicalColumnarDesignControlError {
     PlacementOccupied {
         placement: ServerPhysicalColumnarPlacementKey,
     },
+    LocationConflict {
+        placement: ServerPhysicalColumnarPlacementKey,
+    },
     PlacementInspection {
         placement: ServerPhysicalColumnarPlacementKey,
         source: io::Error,
@@ -587,6 +623,11 @@ pub enum ServerPhysicalColumnarDesignControlError {
     LocationInspection(DatabaseError),
     Proposal(Box<PhysicalColumnarDesignProposalError>),
     Apply(Box<PhysicalColumnarDesignApplyError>),
+    EvidenceEpochChanged {
+        expected: PhysicalDesignEvidenceEpoch,
+        actual: PhysicalDesignEvidenceEpoch,
+    },
+    PhysicalDesignRuntimeChanged,
     ProposalRuntimeChanged,
     PlacementInvariantViolated,
     ServerStopped,
@@ -610,6 +651,10 @@ impl fmt::Display for ServerPhysicalColumnarDesignControlError {
                 formatter,
                 "physical-columnar placement `{placement}` is occupied by an unregistered filesystem object"
             ),
+            Self::LocationConflict { placement } => write!(
+                formatter,
+                "physical-columnar placement `{placement}` conflicts with a registered projection"
+            ),
             Self::PlacementInspection { placement, source } => write!(
                 formatter,
                 "failed to inspect physical-columnar placement `{placement}`: {source}"
@@ -617,6 +662,13 @@ impl fmt::Display for ServerPhysicalColumnarDesignControlError {
             Self::LocationInspection(error) => error.fmt(formatter),
             Self::Proposal(error) => error.fmt(formatter),
             Self::Apply(error) => error.fmt(formatter),
+            Self::EvidenceEpochChanged { expected, actual } => write!(
+                formatter,
+                "physical-design evidence epoch changed from expected {} to {}",
+                expected.0, actual.0
+            ),
+            Self::PhysicalDesignRuntimeChanged => formatter
+                .write_str("physical-columnar approval belongs to another operator/design runtime"),
             Self::ProposalRuntimeChanged => formatter.write_str(
                 "physical-columnar proposal belongs to another server physical-design runtime",
             ),
@@ -642,6 +694,9 @@ impl Error for ServerPhysicalColumnarDesignControlError {
             | Self::ColumnarApplyNotEnabled
             | Self::ModeNotAllowed(_)
             | Self::PlacementOccupied { .. }
+            | Self::LocationConflict { .. }
+            | Self::EvidenceEpochChanged { .. }
+            | Self::PhysicalDesignRuntimeChanged
             | Self::ProposalRuntimeChanged
             | Self::PlacementInvariantViolated
             | Self::ServerStopped => None,
@@ -845,6 +900,31 @@ impl ServerPhysicalDesignControlHandle {
             .map_err(|_| ServerPhysicalDesignControlError::ServerStopped)?
     }
 
+    pub(crate) fn apply_approved_columnar(
+        &self,
+        runtime_token_matches: bool,
+        expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalColumnarCandidate,
+        mode: PhysicalColumnarDesignMode,
+        placement: ServerPhysicalColumnarPlacementKey,
+    ) -> Result<ServerApprovedPhysicalColumnarApplyReport, ServerPhysicalColumnarDesignControlError>
+    {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.requests
+            .send(ServerPhysicalDesignControlRequest::ApplyApprovedColumnar {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate,
+                mode,
+                placement,
+                reply,
+            })
+            .map_err(|_| ServerPhysicalColumnarDesignControlError::ServerStopped)?;
+        response
+            .recv()
+            .map_err(|_| ServerPhysicalColumnarDesignControlError::ServerStopped)?
+    }
+
     /// Compares and rotates as one command in the sole Database worker.
     pub fn rotate_evidence_if_epoch(
         &self,
@@ -903,6 +983,19 @@ pub(crate) enum ServerPhysicalDesignControlRequest {
             Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError>,
         >,
     },
+    ApplyApprovedColumnar {
+        runtime_token_matches: bool,
+        expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalColumnarCandidate,
+        mode: PhysicalColumnarDesignMode,
+        placement: ServerPhysicalColumnarPlacementKey,
+        reply: SyncSender<
+            Result<
+                ServerApprovedPhysicalColumnarApplyReport,
+                ServerPhysicalColumnarDesignControlError,
+            >,
+        >,
+    },
     RotateEvidenceIfEpoch {
         expected: PhysicalDesignEvidenceEpoch,
         reply: SyncSender<
@@ -952,6 +1045,19 @@ pub(crate) enum ServerPhysicalDesignWorkerCommand {
         index_name: IndexName,
         reply: SyncSender<
             Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError>,
+        >,
+    },
+    ApplyApprovedColumnar {
+        runtime_token_matches: bool,
+        expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalColumnarCandidate,
+        mode: PhysicalColumnarDesignMode,
+        placement: ServerPhysicalColumnarPlacementKey,
+        reply: SyncSender<
+            Result<
+                ServerApprovedPhysicalColumnarApplyReport,
+                ServerPhysicalColumnarDesignControlError,
+            >,
         >,
     },
     RotateEvidenceIfEpoch {
@@ -1116,6 +1222,24 @@ impl ServerPhysicalDesignRuntime {
                     expected_evidence_epoch,
                     candidate,
                     index_name,
+                );
+                let _ = reply.send(result);
+            }
+            ServerPhysicalDesignWorkerCommand::ApplyApprovedColumnar {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate,
+                mode,
+                placement,
+                reply,
+            } => {
+                let result = self.apply_approved_columnar(
+                    database,
+                    runtime_token_matches,
+                    expected_evidence_epoch,
+                    candidate,
+                    mode,
+                    placement,
                 );
                 let _ = reply.send(result);
             }
@@ -1300,6 +1424,109 @@ impl ServerPhysicalDesignRuntime {
             outcome,
         })
     }
+
+    fn apply_approved_columnar(
+        &mut self,
+        database: &mut Database,
+        runtime_token_matches: bool,
+        expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalColumnarCandidate,
+        mode: PhysicalColumnarDesignMode,
+        placement: ServerPhysicalColumnarPlacementKey,
+    ) -> Result<ServerApprovedPhysicalColumnarApplyReport, ServerPhysicalColumnarDesignControlError>
+    {
+        let config = self
+            .columnar_apply
+            .as_ref()
+            .ok_or(ServerPhysicalColumnarDesignControlError::ColumnarApplyNotEnabled)?;
+        let directory = config
+            .resolve(&placement)
+            .map_err(ServerPhysicalColumnarDesignControlError::PlacementRootUnavailable)?;
+        match database
+            .inspect_physical_columnar_design_location(&candidate, mode, &directory)
+            .map_err(ServerPhysicalColumnarDesignControlError::LocationInspection)?
+        {
+            PhysicalColumnarDesignLocationState::AlreadyApplied { projection_id } => {
+                return Ok(ServerApprovedPhysicalColumnarApplyReport {
+                    candidate,
+                    mode,
+                    placement,
+                    outcome: ServerApprovedPhysicalColumnarApplyOutcome::AlreadyApplied {
+                        projection_id,
+                    },
+                });
+            }
+            PhysicalColumnarDesignLocationState::Conflict { .. } => {
+                return Err(ServerPhysicalColumnarDesignControlError::LocationConflict {
+                    placement,
+                });
+            }
+            PhysicalColumnarDesignLocationState::Available => {}
+        }
+        if !config.allows(mode) {
+            return Err(ServerPhysicalColumnarDesignControlError::ModeNotAllowed(
+                mode,
+            ));
+        }
+        if !runtime_token_matches {
+            return Err(ServerPhysicalColumnarDesignControlError::PhysicalDesignRuntimeChanged);
+        }
+        let actual = self.evidence.epoch();
+        if actual != expected_evidence_epoch {
+            return Err(
+                ServerPhysicalColumnarDesignControlError::EvidenceEpochChanged {
+                    expected: expected_evidence_epoch,
+                    actual,
+                },
+            );
+        }
+        require_unoccupied(&directory, &placement)?;
+        let proposal = match database.propose_physical_columnar_design(
+            &self.evidence,
+            self.policy,
+            candidate.clone(),
+            mode,
+            &directory,
+        ) {
+            Ok(proposal) => proposal,
+            Err(PhysicalColumnarDesignProposalError::CandidateNotRecommended {
+                reason: PhysicalDesignNoActionReason::ExistingDesignCovers,
+                ..
+            }) => {
+                return Ok(ServerApprovedPhysicalColumnarApplyReport {
+                    candidate,
+                    mode,
+                    placement,
+                    outcome: ServerApprovedPhysicalColumnarApplyOutcome::AlreadyCovered,
+                });
+            }
+            Err(error) => {
+                return Err(ServerPhysicalColumnarDesignControlError::Proposal(
+                    Box::new(error),
+                ));
+            }
+        };
+        let report = database
+            .apply_physical_columnar_design(&self.evidence, &proposal)
+            .map_err(|error| ServerPhysicalColumnarDesignControlError::Apply(Box::new(error)))?;
+        let outcome = match report.outcome {
+            PhysicalColumnarDesignApplyOutcome::Created { projection_id } => {
+                ServerApprovedPhysicalColumnarApplyOutcome::Created { projection_id }
+            }
+            PhysicalColumnarDesignApplyOutcome::AlreadyApplied { projection_id } => {
+                ServerApprovedPhysicalColumnarApplyOutcome::AlreadyApplied { projection_id }
+            }
+            PhysicalColumnarDesignApplyOutcome::AlreadyCovered => {
+                ServerApprovedPhysicalColumnarApplyOutcome::AlreadyCovered
+            }
+        };
+        Ok(ServerApprovedPhysicalColumnarApplyReport {
+            candidate,
+            mode,
+            placement,
+            outcome,
+        })
+    }
 }
 
 fn require_unoccupied(
@@ -1418,6 +1645,29 @@ pub(crate) fn forward_physical_design_control_requests<F>(
                     let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
                 }
             }
+            ServerPhysicalDesignControlRequest::ApplyApprovedColumnar {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate,
+                mode,
+                placement,
+                reply,
+            } => {
+                let fallback = reply.clone();
+                if submit(ServerPhysicalDesignWorkerCommand::ApplyApprovedColumnar {
+                    runtime_token_matches,
+                    expected_evidence_epoch,
+                    candidate,
+                    mode,
+                    placement,
+                    reply,
+                })
+                .is_err()
+                {
+                    let _ =
+                        fallback.send(Err(ServerPhysicalColumnarDesignControlError::ServerStopped));
+                }
+            }
             ServerPhysicalDesignControlRequest::RotateEvidenceIfEpoch { expected, reply } => {
                 let fallback = reply.clone();
                 if submit(ServerPhysicalDesignWorkerCommand::RotateEvidenceIfEpoch {
@@ -1470,6 +1720,11 @@ pub(crate) fn handle_disabled_physical_design_worker_command(
         ServerPhysicalDesignWorkerCommand::ApplyApprovedIndex { reply, .. } => {
             let _ = reply.send(Err(
                 ServerPhysicalDesignControlError::PhysicalDesignNotEnabled,
+            ));
+        }
+        ServerPhysicalDesignWorkerCommand::ApplyApprovedColumnar { reply, .. } => {
+            let _ = reply.send(Err(
+                ServerPhysicalColumnarDesignControlError::PhysicalDesignNotEnabled,
             ));
         }
         ServerPhysicalDesignWorkerCommand::RotateEvidenceIfEpoch { reply, .. } => {

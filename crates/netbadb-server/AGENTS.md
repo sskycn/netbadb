@@ -92,6 +92,18 @@
   Physical Design runtime that issued it.
 - Durable physical-index mutation from the local operator plane MUST require
   explicit deployment authorization in addition to filesystem access.
+- Durable physical-Columnar mutation from the local operator plane MUST require
+  both the explicit Manifest v9 `allow_physical_columnar_apply` permission and
+  the complete `physical_design.columnar_apply` placement policy. The policy
+  root MUST already exist, MUST be revalidated before each worker command, and
+  MUST never cross the operator wire as a path.
+- NBOP v4 Columnar approval MUST contain an exact runtime token and evidence
+  epoch, table ID, ordered columns, explicit mode, and logical placement key.
+  The listener MUST check permission before forwarding, while the sole
+  Database worker MUST perform exact-location retry recognition, mode/token/
+  epoch/occupancy revalidation, fresh Core proposal, and immediate Core apply
+  in one typed command. No automatic Change Stream enablement, maintenance,
+  scheduling, retry, or evidence rotation may be introduced.
 - A wire approval MUST bind both an operator/runtime lifetime and an exact
   Physical Design evidence epoch. Numeric evidence epochs alone are
   insufficient across daemon restart.

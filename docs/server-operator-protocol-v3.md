@@ -1,7 +1,8 @@
-# NetBaDB Operator Protocol v3
+# NetBaDB Operator Protocol v3 (historical)
 
-NBOP v3 is the sole current local operator contract. NBOP v2 is historical and
-is explicitly rejected with `unsupported_protocol_version`. It is independent
+NBOP v3 is a historical local operator contract. The current daemon accepts
+NBOP v4; v3 is explicitly rejected with `unsupported_protocol_version`. NBOP v2
+is also historical and is explicitly rejected. It is independent
 of Native Protocol v2, PostgreSQL wire, Inspection JSON v7, and database
 persistent formats.
 

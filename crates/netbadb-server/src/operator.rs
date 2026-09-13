@@ -9,26 +9,32 @@ use netbadb_core::{
     AdaptiveEvidencePoolHealth, AdaptiveEvidenceRecordError, AdaptiveEvidenceRecordOutcome,
     AdaptiveEvidenceRotationError, AdaptiveEvidenceRotationReport, AdaptiveEvidenceWindowEpoch,
     AutomaticEvidenceRenewalReason, AutomaticOrchestrationStopReason, AutomaticSchedulerDelayClass,
-    AutomaticSchedulerFault, AutomaticSchedulerGate, PhysicalColumnarRecommendationInspection,
-    PhysicalDesignAdvisorError, PhysicalDesignAdvisorReport, PhysicalDesignCandidateDecision,
+    AutomaticSchedulerFault, AutomaticSchedulerGate, DatabaseError, PhysicalColumnarCandidate,
+    PhysicalColumnarDesignApplyError, PhysicalColumnarDesignMode,
+    PhysicalColumnarDesignProposalError, PhysicalColumnarDesignProposalStaleReason,
+    PhysicalColumnarRecommendationInspection, PhysicalDesignAdvisorError,
+    PhysicalDesignAdvisorReport, PhysicalDesignCandidateDecision,
     PhysicalDesignEvidenceRecordError, PhysicalDesignEvidenceRecordOutcome,
     PhysicalDesignEvidenceSummary, PhysicalDesignNoActionReason, PhysicalIndexCandidate,
     PhysicalIndexDesignApplyError, PhysicalIndexDesignProposalError,
-    PhysicalIndexRecommendationInspection,
+    PhysicalIndexRecommendationInspection, ProjectionCatalogError,
 };
 use netbadb_types::{ColumnId, IndexName, TableId};
 use serde::{Deserialize, Serialize};
 
 use crate::physical_design::{
+    ServerApprovedPhysicalColumnarApplyOutcome, ServerApprovedPhysicalColumnarApplyReport,
     ServerApprovedPhysicalIndexApplyOutcome, ServerApprovedPhysicalIndexApplyReport,
+    ServerPhysicalColumnarApplyCapabilities,
 };
 use crate::{
     ServerAdaptiveControlError, ServerAdaptiveControlHandle, ServerAdaptiveMode,
-    ServerAdaptiveStatus, ServerPhysicalDesignControlError, ServerPhysicalDesignControlHandle,
+    ServerAdaptiveStatus, ServerPhysicalColumnarDesignControlError,
+    ServerPhysicalDesignControlError, ServerPhysicalDesignControlHandle,
     ServerPhysicalDesignRotationReport, ServerPhysicalDesignStatus,
 };
 
-pub const OPERATOR_PROTOCOL_VERSION: u16 = 3;
+pub const OPERATOR_PROTOCOL_VERSION: u16 = 4;
 pub const MAX_OPERATOR_PAYLOAD_BYTES: u32 = 64 * 1024;
 
 const OPERATOR_MAGIC: [u8; 4] = *b"NBOP";
@@ -85,13 +91,24 @@ pub struct ServerOperatorConfig {
     unix_socket: PathBuf,
     io_timeout: Duration,
     allow_physical_index_apply: bool,
+    allow_physical_columnar_apply: bool,
 }
 
 impl ServerOperatorConfig {
+    #[cfg(test)]
     pub(crate) fn new(
         unix_socket: PathBuf,
         io_timeout: Duration,
         allow_physical_index_apply: bool,
+    ) -> Result<Self, ServerOperatorConfigError> {
+        Self::new_with_columnar(unix_socket, io_timeout, allow_physical_index_apply, false)
+    }
+
+    pub(crate) fn new_with_columnar(
+        unix_socket: PathBuf,
+        io_timeout: Duration,
+        allow_physical_index_apply: bool,
+        allow_physical_columnar_apply: bool,
     ) -> Result<Self, ServerOperatorConfigError> {
         if io_timeout.is_zero() {
             return Err(ServerOperatorConfigError::ZeroIoTimeout);
@@ -100,6 +117,7 @@ impl ServerOperatorConfig {
             unix_socket,
             io_timeout,
             allow_physical_index_apply,
+            allow_physical_columnar_apply,
         })
     }
 
@@ -116,6 +134,11 @@ impl ServerOperatorConfig {
     #[must_use]
     pub const fn allow_physical_index_apply(&self) -> bool {
         self.allow_physical_index_apply
+    }
+
+    #[must_use]
+    pub const fn allow_physical_columnar_apply(&self) -> bool {
+        self.allow_physical_columnar_apply
     }
 }
 
@@ -284,6 +307,15 @@ pub struct OperatorPhysicalIndexApplyStatusV3 {
     pub runtime_token: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalColumnarApplyStatusV3 {
+    pub enabled: bool,
+    pub allow_snapshot: bool,
+    pub allow_incremental: bool,
+    pub runtime_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperatorPhysicalDesignRecordOutcomeV3 {
@@ -350,6 +382,7 @@ pub struct OperatorPhysicalDesignStatusV3 {
     pub diagnostics: OperatorPhysicalDesignDiagnosticsV3,
     pub evidence: OperatorPhysicalDesignEvidenceStatusV3,
     pub physical_index_apply: OperatorPhysicalIndexApplyStatusV3,
+    pub physical_columnar_apply: OperatorPhysicalColumnarApplyStatusV3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -444,6 +477,31 @@ pub enum OperatorPhysicalIndexApplyOutcomeV3 {
     AlreadyCovered,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorPhysicalColumnarDesignModeV3 {
+    Snapshot,
+    Incremental,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorPhysicalColumnarApplyOutcomeV3 {
+    Created { projection_id: u64 },
+    AlreadyApplied { projection_id: u64 },
+    AlreadyCovered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalColumnarApplyResultV3 {
+    pub table_id: u64,
+    pub columns: Vec<u32>,
+    pub mode: OperatorPhysicalColumnarDesignModeV3,
+    pub placement_key: String,
+    pub outcome: OperatorPhysicalColumnarApplyOutcomeV3,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorPhysicalIndexApplyResultV3 {
@@ -495,6 +553,19 @@ pub enum OperatorErrorCodeV3 {
     PhysicalIndexNotRecommended,
     PhysicalIndexNameConflict,
     PhysicalIndexApplyFailed,
+    PhysicalColumnarApplyNotEnabled,
+    InvalidPhysicalColumnarPlacementKey,
+    PhysicalColumnarModeNotAllowed,
+    PhysicalColumnarPlacementUnavailable,
+    PhysicalColumnarPlacementOccupied,
+    PhysicalColumnarLocationConflict,
+    PhysicalColumnarCandidateNotObserved,
+    PhysicalColumnarNotRecommended,
+    PhysicalColumnarChangeStreamNotEnabled,
+    PhysicalColumnarChangeStreamUnavailable,
+    PhysicalColumnarChangeStreamChanged,
+    PhysicalColumnarRecoveryRequired,
+    PhysicalColumnarApplyFailed,
     ResponseTooLarge,
     ServerStopped,
     MalformedRequest,
@@ -536,6 +607,14 @@ enum OperatorOperationV3 {
         column_id: u32,
         index_name: String,
     },
+    ApplyPhysicalColumnar {
+        expected_runtime_token: String,
+        expected_evidence_epoch: u64,
+        table_id: u64,
+        columns: Vec<u32>,
+        mode: OperatorPhysicalColumnarDesignModeV3,
+        placement_key: String,
+    },
 }
 
 struct OperatorPhysicalIndexApplyInput {
@@ -544,6 +623,15 @@ struct OperatorPhysicalIndexApplyInput {
     table_id: u64,
     column_id: u32,
     index_name: String,
+}
+
+struct OperatorPhysicalColumnarApplyInput {
+    expected_runtime_token: String,
+    expected_evidence_epoch: u64,
+    table_id: u64,
+    columns: Vec<u32>,
+    mode: OperatorPhysicalColumnarDesignModeV3,
+    placement_key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -586,6 +674,9 @@ enum OperatorResultV3 {
     },
     PhysicalIndexApplied {
         apply: OperatorPhysicalIndexApplyResultV3,
+    },
+    PhysicalColumnarApplied {
+        apply: OperatorPhysicalColumnarApplyResultV3,
     },
 }
 
@@ -837,6 +928,28 @@ impl<'a> ServerOperatorClient<'a> {
         }
     }
 
+    pub fn apply_physical_columnar(
+        &self,
+        expected_runtime_token: impl Into<String>,
+        expected_evidence_epoch: u64,
+        table_id: u64,
+        columns: Vec<u32>,
+        mode: OperatorPhysicalColumnarDesignModeV3,
+        placement_key: impl Into<String>,
+    ) -> Result<OperatorPhysicalColumnarApplyResultV3, OperatorClientError> {
+        match self.exchange(OperatorOperationV3::ApplyPhysicalColumnar {
+            expected_runtime_token: expected_runtime_token.into(),
+            expected_evidence_epoch,
+            table_id,
+            columns,
+            mode,
+            placement_key: placement_key.into(),
+        })? {
+            OperatorResultV3::PhysicalColumnarApplied { apply } => Ok(apply),
+            _ => Err(OperatorClientError::UnexpectedResult),
+        }
+    }
+
     #[cfg(unix)]
     fn exchange(
         &self,
@@ -978,6 +1091,7 @@ pub(crate) struct ServerOperatorPlane {
 }
 
 impl ServerOperatorPlane {
+    #[cfg(test)]
     #[cfg(unix)]
     pub(crate) fn start(
         config: ServerOperatorConfig,
@@ -985,15 +1099,32 @@ impl ServerOperatorPlane {
         physical_design_control: ServerPhysicalDesignControlHandle,
         failure_notification: Sender<()>,
     ) -> Result<Self, ServerOperatorError> {
+        Self::start_with_capabilities(
+            config,
+            adaptive_control,
+            physical_design_control,
+            failure_notification,
+            None,
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn start_with_capabilities(
+        config: ServerOperatorConfig,
+        adaptive_control: ServerAdaptiveControlHandle,
+        physical_design_control: ServerPhysicalDesignControlHandle,
+        failure_notification: Sender<()>,
+        columnar_capabilities: Option<ServerPhysicalColumnarApplyCapabilities>,
+    ) -> Result<Self, ServerOperatorError> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         use std::os::unix::net::UnixListener;
         use std::sync::mpsc;
 
-        let runtime_token = config
-            .allow_physical_index_apply()
-            .then(OperatorPhysicalDesignRuntimeToken::generate)
-            .transpose()
-            .map_err(ServerOperatorError::Randomness)?;
+        let runtime_token = (config.allow_physical_index_apply()
+            || config.allow_physical_columnar_apply())
+        .then(OperatorPhysicalDesignRuntimeToken::generate)
+        .transpose()
+        .map_err(ServerOperatorError::Randomness)?;
         let path = config.unix_socket().to_path_buf();
         match std::fs::symlink_metadata(&path) {
             Ok(_) => return Err(ServerOperatorError::PathExists(path)),
@@ -1036,6 +1167,12 @@ impl ServerOperatorPlane {
             return Err(ServerOperatorError::Configure { path, source });
         }
         let (shutdown, shutdown_rx) = mpsc::channel();
+        let listener_policy = OperatorListenerPolicy {
+            allow_physical_index_apply: config.allow_physical_index_apply(),
+            allow_physical_columnar_apply: config.allow_physical_columnar_apply(),
+            columnar_capabilities,
+            runtime_token,
+        };
         let join = std::thread::Builder::new()
             .name("netbadb-operator-listener".into())
             .spawn(move || {
@@ -1046,8 +1183,7 @@ impl ServerOperatorPlane {
                     config.io_timeout(),
                     &adaptive_control,
                     &physical_design_control,
-                    config.allow_physical_index_apply(),
-                    runtime_token,
+                    listener_policy,
                 );
                 let result = run.and(owned.cleanup());
                 if result.is_ok() {
@@ -1062,6 +1198,7 @@ impl ServerOperatorPlane {
         })
     }
 
+    #[cfg(test)]
     #[cfg(not(unix))]
     pub(crate) fn start(
         _config: ServerOperatorConfig,
@@ -1069,6 +1206,24 @@ impl ServerOperatorPlane {
         _physical_design_control: ServerPhysicalDesignControlHandle,
         _failure_notification: Sender<()>,
     ) -> Result<Self, ServerOperatorError> {
+        Err(ServerOperatorError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn start_with_capabilities(
+        config: ServerOperatorConfig,
+        adaptive_control: ServerAdaptiveControlHandle,
+        physical_design_control: ServerPhysicalDesignControlHandle,
+        failure_notification: Sender<()>,
+        columnar_capabilities: Option<ServerPhysicalColumnarApplyCapabilities>,
+    ) -> Result<Self, ServerOperatorError> {
+        let _ = (
+            config,
+            adaptive_control,
+            physical_design_control,
+            failure_notification,
+            columnar_capabilities,
+        );
         Err(ServerOperatorError::UnsupportedPlatform)
     }
 
@@ -1182,14 +1337,22 @@ impl Drop for OwnedSocketPath {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+struct OperatorListenerPolicy {
+    allow_physical_index_apply: bool,
+    allow_physical_columnar_apply: bool,
+    columnar_capabilities: Option<ServerPhysicalColumnarApplyCapabilities>,
+    runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
+}
+
+#[cfg(unix)]
 fn run_operator_listener(
     listener: &std::os::unix::net::UnixListener,
     shutdown: &std::sync::mpsc::Receiver<()>,
     io_timeout: Duration,
     adaptive_control: &ServerAdaptiveControlHandle,
     physical_design_control: &ServerPhysicalDesignControlHandle,
-    allow_physical_index_apply: bool,
-    runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
+    policy: OperatorListenerPolicy,
 ) -> Result<(), ServerOperatorError> {
     use std::sync::mpsc::TryRecvError;
 
@@ -1206,12 +1369,14 @@ fn run_operator_listener(
                     .and_then(|()| stream.set_write_timeout(Some(io_timeout)))
                     .is_ok()
                 {
-                    let _ = serve_operator_connection(
+                    let _ = serve_operator_connection_with_capabilities(
                         &mut stream,
                         adaptive_control,
                         physical_design_control,
-                        allow_physical_index_apply,
-                        runtime_token,
+                        policy.allow_physical_index_apply,
+                        policy.allow_physical_columnar_apply,
+                        policy.columnar_capabilities,
+                        policy.runtime_token,
                     );
                 }
             }
@@ -1224,11 +1389,33 @@ fn run_operator_listener(
 }
 
 #[cfg(unix)]
+#[cfg(test)]
 fn serve_operator_connection(
     stream: &mut std::os::unix::net::UnixStream,
     adaptive_control: &ServerAdaptiveControlHandle,
     physical_design_control: &ServerPhysicalDesignControlHandle,
     allow_physical_index_apply: bool,
+    runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
+) -> Result<(), OperatorProtocolError> {
+    serve_operator_connection_with_capabilities(
+        stream,
+        adaptive_control,
+        physical_design_control,
+        allow_physical_index_apply,
+        false,
+        None,
+        runtime_token,
+    )
+}
+
+#[cfg(unix)]
+fn serve_operator_connection_with_capabilities(
+    stream: &mut std::os::unix::net::UnixStream,
+    adaptive_control: &ServerAdaptiveControlHandle,
+    physical_design_control: &ServerPhysicalDesignControlHandle,
+    allow_physical_index_apply: bool,
+    allow_physical_columnar_apply: bool,
+    columnar_capabilities: Option<ServerPhysicalColumnarApplyCapabilities>,
     runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
 ) -> Result<(), OperatorProtocolError> {
     let request = match read_frame::<OperatorRequestV3>(stream) {
@@ -1242,11 +1429,13 @@ fn serve_operator_connection(
             return Err(error);
         }
     };
-    let response = execute_operator_request(
+    let response = execute_operator_request_with_capabilities(
         request,
         adaptive_control,
         physical_design_control,
         allow_physical_index_apply,
+        allow_physical_columnar_apply,
+        columnar_capabilities,
         runtime_token,
     );
     write_operator_response(stream, &response)
@@ -1269,6 +1458,7 @@ fn write_operator_response(
     }
 }
 
+#[cfg(test)]
 fn execute_operator_request(
     request: OperatorRequestV3,
     adaptive_control: &ServerAdaptiveControlHandle,
@@ -1276,11 +1466,33 @@ fn execute_operator_request(
     allow_physical_index_apply: bool,
     runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
 ) -> OperatorResponseV3 {
+    execute_operator_request_with_capabilities(
+        request,
+        adaptive_control,
+        physical_design_control,
+        allow_physical_index_apply,
+        false,
+        None,
+        runtime_token,
+    )
+}
+
+fn execute_operator_request_with_capabilities(
+    request: OperatorRequestV3,
+    adaptive_control: &ServerAdaptiveControlHandle,
+    physical_design_control: &ServerPhysicalDesignControlHandle,
+    allow_physical_index_apply: bool,
+    allow_physical_columnar_apply: bool,
+    columnar_capabilities: Option<ServerPhysicalColumnarApplyCapabilities>,
+    runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
+) -> OperatorResponseV3 {
     let result = match request.operation {
-        OperatorOperationV3::Status {} => operator_status(
+        OperatorOperationV3::Status {} => operator_status_with_capabilities(
             adaptive_control,
             physical_design_control,
             allow_physical_index_apply,
+            allow_physical_columnar_apply,
+            columnar_capabilities,
             runtime_token,
         )
         .map(|status| OperatorResultV3::Status {
@@ -1330,6 +1542,26 @@ fn execute_operator_request(
                 table_id,
                 column_id,
                 index_name,
+            },
+        ),
+        OperatorOperationV3::ApplyPhysicalColumnar {
+            expected_runtime_token,
+            expected_evidence_epoch,
+            table_id,
+            columns,
+            mode,
+            placement_key,
+        } => execute_physical_columnar_apply(
+            physical_design_control,
+            allow_physical_columnar_apply,
+            runtime_token,
+            OperatorPhysicalColumnarApplyInput {
+                expected_runtime_token,
+                expected_evidence_epoch,
+                table_id,
+                columns,
+                mode,
+                placement_key,
             },
         ),
     };
@@ -1409,10 +1641,98 @@ fn operator_physical_index_apply_result(
     }
 }
 
-fn operator_status(
+fn execute_physical_columnar_apply(
+    physical_design_control: &ServerPhysicalDesignControlHandle,
+    allow_physical_columnar_apply: bool,
+    runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
+    input: OperatorPhysicalColumnarApplyInput,
+) -> Result<OperatorResultV3, OperatorRemoteErrorV3> {
+    if !allow_physical_columnar_apply {
+        return Err(OperatorRemoteErrorV3 {
+            code: OperatorErrorCodeV3::PhysicalColumnarApplyNotEnabled,
+            message: "operator physical-columnar apply is not enabled by the manifest".into(),
+        });
+    }
+    let expected = OperatorPhysicalDesignRuntimeToken::parse(&input.expected_runtime_token)
+        .ok_or_else(|| OperatorRemoteErrorV3 {
+            code: OperatorErrorCodeV3::MalformedRequest,
+            message: "expected_runtime_token must be exactly 32 lowercase hexadecimal characters"
+                .into(),
+        })?;
+    let runtime_token_matches = runtime_token == Some(expected);
+    let placement =
+        crate::ServerPhysicalColumnarPlacementKey::new(input.placement_key).map_err(|_| {
+            OperatorRemoteErrorV3 {
+                code: OperatorErrorCodeV3::InvalidPhysicalColumnarPlacementKey,
+                message: "placement_key must be one direct-child ASCII namespace key".into(),
+            }
+        })?;
+    physical_design_control
+        .apply_approved_columnar(
+            runtime_token_matches,
+            netbadb_core::PhysicalDesignEvidenceEpoch(input.expected_evidence_epoch),
+            PhysicalColumnarCandidate {
+                table_id: TableId(input.table_id),
+                columns: input.columns.into_iter().map(ColumnId).collect(),
+            },
+            match input.mode {
+                OperatorPhysicalColumnarDesignModeV3::Snapshot => {
+                    PhysicalColumnarDesignMode::Snapshot
+                }
+                OperatorPhysicalColumnarDesignModeV3::Incremental => {
+                    PhysicalColumnarDesignMode::Incremental
+                }
+            },
+            placement,
+        )
+        .map(operator_physical_columnar_apply_result)
+        .map(|apply| OperatorResultV3::PhysicalColumnarApplied { apply })
+        .map_err(physical_columnar_remote_error)
+}
+
+fn operator_physical_columnar_apply_result(
+    report: ServerApprovedPhysicalColumnarApplyReport,
+) -> OperatorPhysicalColumnarApplyResultV3 {
+    let outcome = match report.outcome {
+        ServerApprovedPhysicalColumnarApplyOutcome::Created { projection_id } => {
+            OperatorPhysicalColumnarApplyOutcomeV3::Created {
+                projection_id: projection_id.0,
+            }
+        }
+        ServerApprovedPhysicalColumnarApplyOutcome::AlreadyApplied { projection_id } => {
+            OperatorPhysicalColumnarApplyOutcomeV3::AlreadyApplied {
+                projection_id: projection_id.0,
+            }
+        }
+        ServerApprovedPhysicalColumnarApplyOutcome::AlreadyCovered => {
+            OperatorPhysicalColumnarApplyOutcomeV3::AlreadyCovered
+        }
+    };
+    OperatorPhysicalColumnarApplyResultV3 {
+        table_id: report.candidate.table_id.0,
+        columns: report
+            .candidate
+            .columns
+            .into_iter()
+            .map(|column| column.0)
+            .collect(),
+        mode: match report.mode {
+            PhysicalColumnarDesignMode::Snapshot => OperatorPhysicalColumnarDesignModeV3::Snapshot,
+            PhysicalColumnarDesignMode::Incremental => {
+                OperatorPhysicalColumnarDesignModeV3::Incremental
+            }
+        },
+        placement_key: report.placement.as_str().to_owned(),
+        outcome,
+    }
+}
+
+fn operator_status_with_capabilities(
     adaptive_control: &ServerAdaptiveControlHandle,
     physical_design_control: &ServerPhysicalDesignControlHandle,
     allow_physical_index_apply: bool,
+    allow_physical_columnar_apply: bool,
+    columnar_capabilities: Option<ServerPhysicalColumnarApplyCapabilities>,
     runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
 ) -> Result<OperatorStatusV3, OperatorRemoteErrorV3> {
     let adaptive = match adaptive_control.status() {
@@ -1422,9 +1742,11 @@ fn operator_status(
         Err(error) => return Err(control_remote_error(error)),
     };
     let physical_design = match physical_design_control.status() {
-        Ok(status) => Some(operator_physical_design_status(
+        Ok(status) => Some(operator_physical_design_status_with_capabilities(
             status,
             allow_physical_index_apply,
+            allow_physical_columnar_apply,
+            columnar_capabilities,
             runtime_token,
         )),
         Err(ServerPhysicalDesignControlError::PhysicalDesignNotEnabled) => None,
@@ -1633,9 +1955,26 @@ fn operator_rotation(report: AdaptiveEvidenceRotationReport) -> OperatorEvidence
     }
 }
 
+#[cfg(test)]
 fn operator_physical_design_status(
     status: ServerPhysicalDesignStatus,
     allow_physical_index_apply: bool,
+    runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
+) -> OperatorPhysicalDesignStatusV3 {
+    operator_physical_design_status_with_capabilities(
+        status,
+        allow_physical_index_apply,
+        false,
+        None,
+        runtime_token,
+    )
+}
+
+fn operator_physical_design_status_with_capabilities(
+    status: ServerPhysicalDesignStatus,
+    allow_physical_index_apply: bool,
+    allow_physical_columnar_apply: bool,
+    columnar_capabilities: Option<ServerPhysicalColumnarApplyCapabilities>,
     runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
 ) -> OperatorPhysicalDesignStatusV3 {
     let diagnostics = status.diagnostics;
@@ -1681,7 +2020,19 @@ fn operator_physical_design_status(
         },
         physical_index_apply: OperatorPhysicalIndexApplyStatusV3 {
             enabled: allow_physical_index_apply,
-            runtime_token: runtime_token.map(OperatorPhysicalDesignRuntimeToken::encode),
+            runtime_token: allow_physical_index_apply
+                .then(|| runtime_token.map(OperatorPhysicalDesignRuntimeToken::encode))
+                .flatten(),
+        },
+        physical_columnar_apply: OperatorPhysicalColumnarApplyStatusV3 {
+            enabled: allow_physical_columnar_apply,
+            allow_snapshot: allow_physical_columnar_apply
+                && columnar_capabilities.is_some_and(|capabilities| capabilities.allow_snapshot),
+            allow_incremental: allow_physical_columnar_apply
+                && columnar_capabilities.is_some_and(|capabilities| capabilities.allow_incremental),
+            runtime_token: allow_physical_columnar_apply
+                .then(|| runtime_token.map(OperatorPhysicalDesignRuntimeToken::encode))
+                .flatten(),
         },
     }
 }
@@ -1874,6 +2225,188 @@ fn control_remote_error(error: ServerAdaptiveControlError) -> OperatorRemoteErro
     OperatorRemoteErrorV3 {
         code,
         message: message.into(),
+    }
+}
+
+fn physical_columnar_remote_error(
+    error: ServerPhysicalColumnarDesignControlError,
+) -> OperatorRemoteErrorV3 {
+    let code = match error {
+        ServerPhysicalColumnarDesignControlError::PhysicalDesignNotEnabled => {
+            OperatorErrorCodeV3::PhysicalDesignNotEnabled
+        }
+        ServerPhysicalColumnarDesignControlError::ColumnarApplyNotEnabled => {
+            OperatorErrorCodeV3::PhysicalColumnarApplyNotEnabled
+        }
+        ServerPhysicalColumnarDesignControlError::ModeNotAllowed(_) => {
+            OperatorErrorCodeV3::PhysicalColumnarModeNotAllowed
+        }
+        ServerPhysicalColumnarDesignControlError::PlacementRootUnavailable(_) => {
+            OperatorErrorCodeV3::PhysicalColumnarPlacementUnavailable
+        }
+        ServerPhysicalColumnarDesignControlError::PlacementOccupied { .. } => {
+            OperatorErrorCodeV3::PhysicalColumnarPlacementOccupied
+        }
+        ServerPhysicalColumnarDesignControlError::LocationConflict { .. } => {
+            OperatorErrorCodeV3::PhysicalColumnarLocationConflict
+        }
+        ServerPhysicalColumnarDesignControlError::PlacementInspection { .. }
+        | ServerPhysicalColumnarDesignControlError::LocationInspection(_) => {
+            OperatorErrorCodeV3::PhysicalColumnarPlacementUnavailable
+        }
+        ServerPhysicalColumnarDesignControlError::EvidenceEpochChanged { .. } => {
+            OperatorErrorCodeV3::PhysicalDesignEvidenceEpochChanged
+        }
+        ServerPhysicalColumnarDesignControlError::PhysicalDesignRuntimeChanged => {
+            OperatorErrorCodeV3::PhysicalDesignRuntimeChanged
+        }
+        ServerPhysicalColumnarDesignControlError::Proposal(error) => {
+            physical_columnar_proposal_code(*error)
+        }
+        ServerPhysicalColumnarDesignControlError::Apply(error) => {
+            physical_columnar_apply_code(*error)
+        }
+        ServerPhysicalColumnarDesignControlError::ProposalRuntimeChanged => {
+            OperatorErrorCodeV3::PhysicalDesignRuntimeChanged
+        }
+        ServerPhysicalColumnarDesignControlError::PlacementInvariantViolated
+        | ServerPhysicalColumnarDesignControlError::ServerStopped => {
+            OperatorErrorCodeV3::PhysicalColumnarApplyFailed
+        }
+    };
+    let message = match code {
+        OperatorErrorCodeV3::PhysicalDesignNotEnabled => "physical-design advisor is not enabled",
+        OperatorErrorCodeV3::PhysicalColumnarApplyNotEnabled => {
+            "physical-columnar apply is not enabled"
+        }
+        OperatorErrorCodeV3::PhysicalColumnarModeNotAllowed => {
+            "physical-columnar mode is not allowed"
+        }
+        OperatorErrorCodeV3::PhysicalColumnarPlacementUnavailable => {
+            "physical-columnar placement is unavailable"
+        }
+        OperatorErrorCodeV3::PhysicalColumnarPlacementOccupied => {
+            "physical-columnar placement is occupied"
+        }
+        OperatorErrorCodeV3::PhysicalColumnarLocationConflict => {
+            "physical-columnar placement conflicts with a registered projection"
+        }
+        OperatorErrorCodeV3::PhysicalColumnarCandidateNotObserved => {
+            "physical-columnar candidate was not observed in current evidence"
+        }
+        OperatorErrorCodeV3::PhysicalColumnarNotRecommended => {
+            "physical-columnar candidate is not currently recommended"
+        }
+        OperatorErrorCodeV3::PhysicalColumnarChangeStreamNotEnabled => {
+            "incremental physical-columnar apply requires an enabled change stream"
+        }
+        OperatorErrorCodeV3::PhysicalColumnarChangeStreamUnavailable => {
+            "incremental physical-columnar change stream is unavailable"
+        }
+        OperatorErrorCodeV3::PhysicalColumnarChangeStreamChanged => {
+            "incremental physical-columnar change stream changed"
+        }
+        OperatorErrorCodeV3::PhysicalColumnarRecoveryRequired => {
+            "physical-columnar publication is ambiguous; restart/reopen the daemon before retrying the exact approval"
+        }
+        OperatorErrorCodeV3::PhysicalColumnarApplyFailed => {
+            "physical-columnar apply failed without creating a new projection"
+        }
+        OperatorErrorCodeV3::PhysicalDesignEvidenceEpochChanged => {
+            "physical-design evidence epoch changed"
+        }
+        OperatorErrorCodeV3::PhysicalDesignRuntimeChanged => {
+            "physical-design approval belongs to a previous daemon/operator runtime"
+        }
+        OperatorErrorCodeV3::ServerStopped => "server physical-design control is stopped",
+        _ => "operator request failed",
+    };
+    OperatorRemoteErrorV3 {
+        code,
+        message: message.into(),
+    }
+}
+
+fn physical_columnar_proposal_code(
+    error: PhysicalColumnarDesignProposalError,
+) -> OperatorErrorCodeV3 {
+    match error {
+        PhysicalColumnarDesignProposalError::Advisor(PhysicalDesignAdvisorError::NoEvidence) => {
+            OperatorErrorCodeV3::PhysicalDesignNoEvidence
+        }
+        PhysicalColumnarDesignProposalError::Advisor(PhysicalDesignAdvisorError::StaleSchema {
+            ..
+        }) => OperatorErrorCodeV3::PhysicalDesignStaleSchema,
+        PhysicalColumnarDesignProposalError::Advisor(
+            PhysicalDesignAdvisorError::InconclusiveCapacity { .. },
+        ) => OperatorErrorCodeV3::PhysicalDesignInconclusiveCapacity,
+        PhysicalColumnarDesignProposalError::CandidateNotObserved(_) => {
+            OperatorErrorCodeV3::PhysicalColumnarCandidateNotObserved
+        }
+        PhysicalColumnarDesignProposalError::CandidateNotRecommended { .. } => {
+            OperatorErrorCodeV3::PhysicalColumnarNotRecommended
+        }
+        PhysicalColumnarDesignProposalError::IncrementalChangeStreamNotEnabled { .. } => {
+            OperatorErrorCodeV3::PhysicalColumnarChangeStreamNotEnabled
+        }
+        PhysicalColumnarDesignProposalError::IncrementalChangeStreamUnavailable { .. } => {
+            OperatorErrorCodeV3::PhysicalColumnarChangeStreamUnavailable
+        }
+        PhysicalColumnarDesignProposalError::ProjectionLocationConflict { .. } => {
+            OperatorErrorCodeV3::PhysicalColumnarLocationConflict
+        }
+        PhysicalColumnarDesignProposalError::GlobalVisibilityRequired
+        | PhysicalColumnarDesignProposalError::DurableCatalogRequired
+        | PhysicalColumnarDesignProposalError::Advisor(PhysicalDesignAdvisorError::Database(_))
+        | PhysicalColumnarDesignProposalError::Database(_) => {
+            OperatorErrorCodeV3::PhysicalColumnarApplyFailed
+        }
+    }
+}
+
+fn physical_columnar_apply_code(error: PhysicalColumnarDesignApplyError) -> OperatorErrorCodeV3 {
+    match error {
+        PhysicalColumnarDesignApplyError::EvidenceEpochChanged { .. } => {
+            OperatorErrorCodeV3::PhysicalDesignEvidenceEpochChanged
+        }
+        PhysicalColumnarDesignApplyError::CandidateNotObserved(_) => {
+            OperatorErrorCodeV3::PhysicalColumnarCandidateNotObserved
+        }
+        PhysicalColumnarDesignApplyError::RecommendationNoLongerValid(_) => {
+            OperatorErrorCodeV3::PhysicalColumnarNotRecommended
+        }
+        PhysicalColumnarDesignApplyError::StaleProposal(reason) => match reason {
+            PhysicalColumnarDesignProposalStaleReason::ChangeStreamDisabled => {
+                OperatorErrorCodeV3::PhysicalColumnarChangeStreamNotEnabled
+            }
+            PhysicalColumnarDesignProposalStaleReason::ChangeStreamUnavailable => {
+                OperatorErrorCodeV3::PhysicalColumnarChangeStreamUnavailable
+            }
+            PhysicalColumnarDesignProposalStaleReason::ChangeStreamGenerationChanged { .. } => {
+                OperatorErrorCodeV3::PhysicalColumnarChangeStreamChanged
+            }
+            _ => OperatorErrorCodeV3::PhysicalColumnarApplyFailed,
+        },
+        PhysicalColumnarDesignApplyError::ProjectionLocationConflict { .. } => {
+            OperatorErrorCodeV3::PhysicalColumnarLocationConflict
+        }
+        PhysicalColumnarDesignApplyError::Advisor(PhysicalDesignAdvisorError::NoEvidence) => {
+            OperatorErrorCodeV3::PhysicalDesignNoEvidence
+        }
+        PhysicalColumnarDesignApplyError::Advisor(PhysicalDesignAdvisorError::StaleSchema {
+            ..
+        }) => OperatorErrorCodeV3::PhysicalDesignStaleSchema,
+        PhysicalColumnarDesignApplyError::Advisor(
+            PhysicalDesignAdvisorError::InconclusiveCapacity { .. },
+        ) => OperatorErrorCodeV3::PhysicalDesignInconclusiveCapacity,
+        PhysicalColumnarDesignApplyError::Database(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::RecoveryRequired { .. },
+        )) => OperatorErrorCodeV3::PhysicalColumnarRecoveryRequired,
+        PhysicalColumnarDesignApplyError::DatabaseIdentityChanged
+        | PhysicalColumnarDesignApplyError::Advisor(PhysicalDesignAdvisorError::Database(_))
+        | PhysicalColumnarDesignApplyError::Database(_) => {
+            OperatorErrorCodeV3::PhysicalColumnarApplyFailed
+        }
     }
 }
 
@@ -2087,7 +2620,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_header_is_exact_big_endian_nbop_v3() {
+    fn frame_header_is_exact_big_endian_nbop_v4() {
         let request = OperatorRequestV3 {
             request_id: 42,
             operation: OperatorOperationV3::Status {},
@@ -2095,7 +2628,7 @@ mod tests {
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &request).unwrap();
         assert_eq!(&bytes[..4], b"NBOP");
-        assert_eq!(&bytes[4..6], &[0, 3]);
+        assert_eq!(&bytes[4..6], &[0, 4]);
         assert_eq!(&bytes[6..8], &[0, 0]);
         assert_eq!(
             u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize,
@@ -2116,7 +2649,7 @@ mod tests {
         write_frame(&mut bytes, &response).unwrap();
         let payload = br#"{"outcome":"ok","request_id":42,"result":{"type":"scheduler_reset"}}"#;
         assert_eq!(&bytes[..4], b"NBOP");
-        assert_eq!(&bytes[4..8], &[0, 3, 0, 0]);
+        assert_eq!(&bytes[4..8], &[0, 4, 0, 0]);
         assert_eq!(&bytes[8..12], &(payload.len() as u32).to_be_bytes());
         assert_eq!(&bytes[12..], payload);
     }
@@ -2488,7 +3021,7 @@ mod tests {
 
         let mut reserved = [0_u8; OPERATOR_HEADER_BYTES];
         reserved[..4].copy_from_slice(b"NBOP");
-        reserved[4..6].copy_from_slice(&3_u16.to_be_bytes());
+        reserved[4..6].copy_from_slice(&4_u16.to_be_bytes());
         reserved[6..8].copy_from_slice(&1_u16.to_be_bytes());
         assert!(matches!(
             read_frame::<OperatorRequestV3>(&mut reserved.as_slice()),
@@ -2497,7 +3030,7 @@ mod tests {
 
         let mut oversized = [0_u8; OPERATOR_HEADER_BYTES];
         oversized[..4].copy_from_slice(b"NBOP");
-        oversized[4..6].copy_from_slice(&3_u16.to_be_bytes());
+        oversized[4..6].copy_from_slice(&4_u16.to_be_bytes());
         oversized[8..12].copy_from_slice(&(MAX_OPERATOR_PAYLOAD_BYTES + 1).to_be_bytes());
         assert!(matches!(
             read_frame::<OperatorRequestV3>(&mut oversized.as_slice()),
@@ -2508,7 +3041,7 @@ mod tests {
             Err(OperatorProtocolError::TruncatedHeader)
         ));
 
-        let truncated_payload = b"NBOP\0\x03\0\0\0\0\0\x02{".to_vec();
+        let truncated_payload = b"NBOP\0\x04\0\0\0\0\0\x02{".to_vec();
         assert!(matches!(
             read_frame::<OperatorRequestV3>(&mut truncated_payload.as_slice()),
             Err(OperatorProtocolError::TruncatedPayload)
@@ -2555,7 +3088,7 @@ mod tests {
     #[test]
     fn strict_request_json_rejects_unknown_fields_and_operations() {
         fn framed(payload: &[u8]) -> Vec<u8> {
-            let mut bytes = Vec::from(b"NBOP\0\x03\0\0".as_slice());
+            let mut bytes = Vec::from(b"NBOP\0\x04\0\0".as_slice());
             bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
             bytes.extend_from_slice(payload);
             bytes

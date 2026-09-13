@@ -86,7 +86,7 @@ impl Fixture {
         database.close().unwrap();
 
         let manifest = directory.join("server.json");
-        write_manifest(&manifest, 8, "users");
+        write_manifest(&manifest, 9, "users");
         Self {
             directory,
             manifest,
@@ -293,7 +293,7 @@ fn catalog_text_and_json_are_complete_deterministic_and_ignore_network_acl_filte
 }
 
 #[test]
-fn inspect_accepts_and_validates_v8_adaptive_without_rewriting_the_manifest() {
+fn inspect_accepts_and_validates_v9_adaptive_without_rewriting_the_manifest() {
     let fixture = Fixture::new("adaptive-manifest");
     let mut manifest: Value =
         serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
@@ -521,7 +521,7 @@ fn manifest_and_input_failures_precede_output_and_schema_mismatch_is_rejected() 
     assert!(stderr(&old_manifest).contains("unsupported deployment manifest version 5"));
 
     let mismatch = fixture.directory.join("mismatch.json");
-    write_manifest(&mismatch, 8, "other_users");
+    write_manifest(&mismatch, 9, "other_users");
     let mismatch = netbadb()
         .args(["inspect", "catalog", "--manifest"])
         .arg(&mismatch)
@@ -597,7 +597,8 @@ fn operator_cli_uses_live_nbop_and_never_infers_rotation_epoch() {
     manifest["operator"] = json!({
         "unix_socket": socket,
         "io_timeout_ms": 1000,
-        "allow_physical_index_apply": false
+        "allow_physical_index_apply": false,
+        "allow_physical_columnar_apply": false
     });
     std::fs::write(
         &fixture.manifest,
@@ -764,7 +765,7 @@ fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation(
     let _ = std::fs::remove_file(&socket);
     let manifest_path = directory.join("server.json");
     let manifest = json!({
-        "version": 8,
+        "version": 9,
         "listen": "127.0.0.1:0",
         "authorization": {
             "local_plaintext": {
@@ -812,7 +813,8 @@ fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation(
         "operator": {
             "unix_socket": socket,
             "io_timeout_ms": 1000,
-            "allow_physical_index_apply": true
+            "allow_physical_index_apply": true,
+            "allow_physical_columnar_apply": false
         }
     });
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -941,7 +943,8 @@ fn operator_cli_reports_unconfigured_and_offline_planes_without_opening_database
     manifest["operator"] = json!({
         "unix_socket": "offline.sock",
         "io_timeout_ms": 50,
-        "allow_physical_index_apply": false
+        "allow_physical_index_apply": false,
+        "allow_physical_columnar_apply": false
     });
     std::fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let inspected = catalog(&fixture, "text");

@@ -1,6 +1,6 @@
 # NetbaDB deployment manifest v7
 
-> Historical deployment contract. Current `netbadbd` requires Manifest v8.
+> Historical deployment contract. Current `netbadbd` requires Manifest v9.
 > Manifest v7 is explicitly rejected.
 
 Deployment Manifest v7 is the only current `netbadbd` startup configuration.

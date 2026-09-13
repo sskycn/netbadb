@@ -1,5 +1,25 @@
 # NetbaDB roadmap
 
+## Operator-approved Columnar apply (Adaptive Operations Phase 29 complete)
+
+- upgraded the current deployment contract to strict Manifest v9 with an
+  optional complete Columnar placement policy and required explicit operator
+  permission;
+- carried the existing Server-owned canonical-root and logical-placement-key
+  authority into NBOP v4 while preserving the 12-byte frame and payload cap;
+- added independent Index/Columnar status with one shared ephemeral runtime
+  token whenever either apply domain is authorized;
+- added one explicit `apply_physical_columnar` worker command with ordered
+  columns, explicit Snapshot/Incremental mode, exact runtime/evidence guards,
+  typed retry/occupancy/conflict/recovery outcomes, and no path on the wire;
+- kept Core as the only Columnar mutation authority and added no automatic
+  stream enablement, maintenance, scheduling, retry, evidence rotation, or
+  persistent operator audit.
+
+See [`adaptive-operations-phase29.md`](adaptive-operations-phase29.md),
+[`server-manifest-v9.md`](server-manifest-v9.md), and
+[`server-operator-protocol-v4.md`](server-operator-protocol-v4.md).
+
 ## Server programmatic Columnar design apply (Adaptive Operations Phase 28 complete)
 
 - added no-default programmatic Server placement configuration with a
@@ -16,9 +36,8 @@
 - delegated the only mutation to Core Phase 27 and retained Phase 26 NBPC v2,
   artifact, ID-burn, and `RecoveryRequired` authority without automatic stream
   enablement, maintenance, apply, path generation, retry, or reopen;
-- kept the placement policy programmatic-only: there is no daemon/operator
-  Columnar apply, Manifest v8 field, NBOP v3 operation, or external/persistent
-  contract change.
+- kept the placement policy programmatic-only until Phase 29 added the explicit
+  Manifest v9/NBOP v4 operator approval path.
 
 See [`adaptive-operations-phase28.md`](adaptive-operations-phase28.md).
 

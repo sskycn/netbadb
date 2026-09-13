@@ -119,11 +119,35 @@ impl PostgresTcpServer {
             authorization,
             manifest_adaptive_mode,
             manifest_physical_design,
+            manifest_physical_columnar_apply,
             operator_config,
         ) = self.config.into_parts();
         let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
         let physical_design = self.physical_design_override.or(manifest_physical_design);
-        let physical_columnar_apply = self.physical_columnar_apply_override;
+        let physical_columnar_apply = if operator_config
+            .as_ref()
+            .is_some_and(|operator| operator.allow_physical_columnar_apply())
+        {
+            match (
+                manifest_physical_columnar_apply,
+                self.physical_columnar_apply_override,
+            ) {
+                (Some(manifest), Some(builder)) if manifest != builder => {
+                    return Err(PostgresTcpServerError::PhysicalColumnarApplyConfig(
+                        ServerPhysicalColumnarApplyStartupError::OperatorPolicyMismatch,
+                    ));
+                }
+                (Some(manifest), _) => Some(manifest),
+                (None, _) => {
+                    return Err(PostgresTcpServerError::PhysicalColumnarApplyConfig(
+                        ServerPhysicalColumnarApplyStartupError::PhysicalDesignRequired,
+                    ));
+                }
+            }
+        } else {
+            self.physical_columnar_apply_override
+                .or(manifest_physical_columnar_apply)
+        };
         if physical_columnar_apply.is_some() && physical_design.is_none() {
             return Err(PostgresTcpServerError::PhysicalColumnarApplyConfig(
                 ServerPhysicalColumnarApplyStartupError::PhysicalDesignRequired,
@@ -136,6 +160,9 @@ impl PostgresTcpServer {
                 )
             })?;
         }
+        let columnar_capabilities = physical_columnar_apply
+            .as_ref()
+            .map(ServerPhysicalColumnarApplyConfig::capabilities);
         if security.kind() != TransportKind::PlaintextLoopback {
             return Err(PostgresTcpServerError::TlsManifestUnsupported);
         }
@@ -221,11 +248,12 @@ impl PostgresTcpServer {
         let physical_design_control =
             ServerPhysicalDesignControlHandle::new(physical_design_control_tx);
         let operator = match operator_config {
-            Some(config) => match ServerOperatorPlane::start(
+            Some(config) => match ServerOperatorPlane::start_with_capabilities(
                 config,
                 adaptive_control.clone(),
                 physical_design_control.clone(),
                 operator_failure_tx,
+                columnar_capabilities,
             ) {
                 Ok(operator) => Some(operator),
                 Err(error) => {

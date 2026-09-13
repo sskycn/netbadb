@@ -103,7 +103,7 @@ fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
     std::fs::write(
         &manifest,
         r#"{
-            "version": 8,
+            "version": 9,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -163,7 +163,7 @@ fn postgres_programmatic_columnar_apply_has_native_builder_parity() {
     let manifest = directory.join("server.json");
     let mut value: serde_json::Value = serde_json::from_str(
         r#"{
-            "version": 8,
+            "version": 9,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": false,
@@ -265,7 +265,7 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
     std::fs::write(
         &manifest,
         r#"{
-            "version": 8,
+            "version": 9,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -316,7 +316,8 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
     value["operator"] = serde_json::json!({
         "unix_socket": socket,
         "io_timeout_ms": 1000,
-        "allow_physical_index_apply": false
+        "allow_physical_index_apply": false,
+        "allow_physical_columnar_apply": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -410,7 +411,7 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
     let _ = std::fs::remove_file(&socket);
     let mut value: serde_json::Value = serde_json::from_str(
         r#"{
-            "version": 8,
+            "version": 9,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": false,
@@ -454,7 +455,8 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
     value["operator"] = serde_json::json!({
         "unix_socket": socket,
         "io_timeout_ms": 1000,
-        "allow_physical_index_apply": true
+        "allow_physical_index_apply": true,
+        "allow_physical_columnar_apply": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -545,7 +547,7 @@ fn postgres_adaptive_driver_reaches_worker_without_changing_wire_state() {
     std::fs::write(
         &manifest,
         r#"{
-            "version": 8,
+            "version": 9,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -630,7 +632,7 @@ fn postgres_query_and_transaction_status_are_isolated_from_live_operator_request
     let manifest = directory.join("server.json");
     let source = format!(
         r#"{{
-            "version": 8,
+            "version": 9,
             "listen": "127.0.0.1:0",
             "authorization": {{
                 "local_plaintext": {{"schema_admin": true,
@@ -659,7 +661,8 @@ fn postgres_query_and_transaction_status_are_isolated_from_live_operator_request
             "operator": {{
                 "unix_socket": "{}",
                 "io_timeout_ms": 1000,
-                "allow_physical_index_apply": false
+                "allow_physical_index_apply": false,
+                "allow_physical_columnar_apply": false
             }}
         }}"#,
         socket.display()

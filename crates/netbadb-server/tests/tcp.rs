@@ -167,7 +167,7 @@ fn manifest_json_with_transport(
     let tls = tls.map_or_else(String::new, |tls| format!("\"tls\": {tls},"));
     format!(
         r#"{{
-            "version": 8,
+            "version": 9,
             "listen": "127.0.0.1:0",
             {limits}
             {tls}
@@ -265,7 +265,7 @@ fn create_two_table_server(name: &str, authorization: &str) -> (PathBuf, ServerH
         &manifest,
         format!(
             r#"{{
-                "version":8,
+                "version":9,
                 "listen":"127.0.0.1:0",
                 "authorization":{authorization},
                 "tables":[
@@ -559,7 +559,8 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     manifest_value["operator"] = serde_json::json!({
         "unix_socket": socket,
         "io_timeout_ms": 1000,
-        "allow_physical_index_apply": true
+        "allow_physical_index_apply": true,
+        "allow_physical_columnar_apply": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&manifest_value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -725,7 +726,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         }
     }))
     .unwrap();
-    let mut lost_response_frame = b"NBOP\0\x03\0\0".to_vec();
+    let mut lost_response_frame = b"NBOP\0\x04\0\0".to_vec();
     lost_response_frame.extend_from_slice(&(lost_response_payload.len() as u32).to_be_bytes());
     lost_response_frame.extend_from_slice(&lost_response_payload);
     let mut lost_response =
@@ -902,7 +903,8 @@ fn old_operator_approval_only_recognizes_exact_durable_truth_after_restart() {
     value["operator"] = serde_json::json!({
         "unix_socket": socket,
         "io_timeout_ms": 1000,
-        "allow_physical_index_apply": true
+        "allow_physical_index_apply": true,
+        "allow_physical_columnar_apply": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -1022,7 +1024,8 @@ fn native_physical_design_proposal_is_bound_to_one_worker_runtime() {
     manifest_value["operator"] = serde_json::json!({
         "unix_socket": socket,
         "io_timeout_ms": 1000,
-        "allow_physical_index_apply": false
+        "allow_physical_index_apply": false,
+        "allow_physical_columnar_apply": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&manifest_value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -1180,7 +1183,8 @@ fn native_adaptive_and_physical_design_share_one_successful_query_report() {
     value["operator"] = serde_json::json!({
         "unix_socket": socket,
         "io_timeout_ms": 1000,
-        "allow_physical_index_apply": false
+        "allow_physical_index_apply": false,
+        "allow_physical_columnar_apply": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -1360,7 +1364,8 @@ fn native_query_continues_across_live_operator_status_and_rotation() {
     value["operator"] = serde_json::json!({
         "unix_socket": socket,
         "io_timeout_ms": 1000,
-        "allow_physical_index_apply": false
+        "allow_physical_index_apply": false,
+        "allow_physical_columnar_apply": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();

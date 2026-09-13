@@ -1,12 +1,13 @@
-# NetbaDB deployment manifest v8
+# NetbaDB deployment manifest v8 (historical)
 
-Deployment Manifest v8 is the only current `netbadbd` startup configuration.
-Versions 1 through 7 and future versions are rejected explicitly; there is no
-dual v7/v8 decoder. This version is independent of Native Protocol v2,
+Deployment Manifest v8 is a historical contract retained for migration
+reference only. It is rejected by the current daemon, which accepts only
+Manifest v9. Versions 1 through 8 and future versions are rejected explicitly;
+there is no dual decoder. This version is independent of Native Protocol v2,
 PostgreSQL wire, Inspection JSON v7, SDK Schema Spec, Canonical Schema, and all
 database persistent formats.
 
-The manifest is strict and loaded once. Unknown fields fail decoding. It is
+The historical manifest was strict and loaded once. Unknown fields failed decoding. It is
 never watched or rewritten; policy changes require editing the file and
 restarting the daemon. Runtime evidence, epochs, candidates, and recommendations
 are never persisted back into it.
@@ -177,7 +178,7 @@ Native Protocol, PostgreSQL wire, or SQL `CREATE INDEX` authority.
 readiness line reports physical-design and physical-index-apply as enabled or
 disabled, but never prints the runtime token, policy, or candidates.
 
-`netbadb inspect` parses and fully validates Manifest v8 through
+Historically, `netbadb inspect` parsed and fully validated Manifest v8 through
 `ServerConfig::from_manifest_path`, but starts no server, socket, evidence
 window, query, or advisor. Inspection does not require a daemon online.
 

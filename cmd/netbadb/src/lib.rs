@@ -11,6 +11,7 @@ use netbadb_sdk::inspection::{render_catalog, render_statement};
 use netbadb_sdk::{Database, DatabaseError};
 use netbadb_server::{
     ManifestError, OperatorAdaptiveModeV3, OperatorClientError, OperatorErrorCodeV3,
+    OperatorPhysicalColumnarApplyOutcomeV3, OperatorPhysicalColumnarDesignModeV3,
     OperatorPhysicalDesignDecisionV3, OperatorPhysicalDesignNoActionReasonV3,
     OperatorPhysicalDesignRecommendationsV3, OperatorPhysicalIndexApplyOutcomeV3,
     OperatorRemoteErrorV3, OperatorSchedulerDelayClassV3, OperatorSchedulerFaultV3,
@@ -22,13 +23,14 @@ const INSPECT_HELP: &str = "Usage:\n  netbadb inspect catalog --manifest <server
 const CATALOG_HELP: &str = "Usage: netbadb inspect catalog --manifest <server.json> [--format text|json]\n\nInspects the complete offline local catalog.\n";
 const STATEMENT_HELP: &str = "Usage: netbadb inspect statement --manifest <server.json> (--sql <SQL>|--sql-file <path>) [--format text|json]\n\nCompiles and inspects one statement without executing it.\n";
 const OPERATOR_HELP: &str = "Usage:\n  netbadb operator status --manifest <server.json>\n  netbadb operator rotate-evidence --manifest <server.json> --expected-window-epoch <epoch>\n  netbadb operator reset-faulted-scheduler --manifest <server.json>\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n  netbadb operator physical-design apply-index --manifest <server.json> --expected-runtime-token <token> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id> --index-name <name>\n";
-const OPERATOR_STATUS_HELP: &str = "Usage: netbadb operator status --manifest <server.json>\n\nReads bounded live Adaptive and Physical Design status over NBOP v3.\n";
+const OPERATOR_STATUS_HELP: &str = "Usage: netbadb operator status --manifest <server.json>\n\nReads bounded live Adaptive and Physical Design status over NBOP v4.\n";
 const OPERATOR_ROTATE_HELP: &str = "Usage: netbadb operator rotate-evidence --manifest <server.json> --expected-window-epoch <epoch>\n\nConditionally rotates the live evidence window. The expected epoch is required and is never inferred.\n";
 const OPERATOR_RESET_HELP: &str = "Usage: netbadb operator reset-faulted-scheduler --manifest <server.json>\n\nAcknowledges and resets only a genuinely faulted scheduler.\n";
 const OPERATOR_PHYSICAL_DESIGN_HELP: &str = "Usage:\n  netbadb operator physical-design recommendations --manifest <server.json>\n  netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n  netbadb operator physical-design apply-index --manifest <server.json> --expected-runtime-token <token> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id> --index-name <name>\n";
 const OPERATOR_PHYSICAL_DESIGN_RECOMMENDATIONS_HELP: &str = "Usage: netbadb operator physical-design recommendations --manifest <server.json>\n\nReads current-inventory physical-design advice without applying it.\n";
 const OPERATOR_PHYSICAL_DESIGN_ROTATE_HELP: &str = "Usage: netbadb operator physical-design rotate-evidence --manifest <server.json> --expected-evidence-epoch <epoch>\n\nConditionally rotates design evidence. The expected epoch is required and is never inferred.\n";
 const OPERATOR_PHYSICAL_DESIGN_APPLY_HELP: &str = "Usage: netbadb operator physical-design apply-index --manifest <server.json> --expected-runtime-token <32-lowercase-hex> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id> --index-name <name>\n\nExplicitly approves one exact current physical-index candidate. No value is inferred or refreshed and the mutation is never retried automatically.\n";
+const OPERATOR_PHYSICAL_DESIGN_APPLY_COLUMNAR_HELP: &str = "Usage: netbadb operator physical-design apply-columnar --manifest <server.json> --expected-runtime-token <32-lowercase-hex> --expected-evidence-epoch <epoch> --table-id <id> --column-id <id>... --mode <snapshot|incremental> --placement-key <key>\n\nExplicitly approves one exact ordered Columnar candidate and logical placement. No path, token, epoch, mode, or candidate is inferred.\n";
 
 /// Parses and runs one CLI invocation and returns its complete stdout after
 /// the requested operation reaches a definitive outcome.
@@ -122,6 +124,27 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<String, 
             })?;
             Ok(render_physical_index_apply(&apply))
         }
+        Action::OperatorPhysicalDesignApplyColumnar {
+            manifest,
+            expected_runtime_token,
+            expected_evidence_epoch,
+            table_id,
+            columns,
+            mode,
+            placement_key,
+        } => {
+            let apply = run_operator_apply(manifest, |client| {
+                client.apply_physical_columnar(
+                    expected_runtime_token,
+                    expected_evidence_epoch,
+                    table_id,
+                    columns,
+                    mode,
+                    placement_key,
+                )
+            })?;
+            Ok(render_physical_columnar_apply(&apply))
+        }
     }
 }
 
@@ -194,9 +217,16 @@ fn render_operator_status(status: &OperatorStatusV3) -> String {
     match &status.physical_design {
         None => output.push_str("Physical Design: disabled\n"),
         Some(design) => output.push_str(&format!(
-            "Physical Design: enabled\nPhysical index apply: {}\nRuntime token: {}\nRuntime token purpose: stale-request guard, not a credential\ndesign evidence epoch: {}\ndesign recorded reports: {}\nindex candidate count: {}\ncolumnar candidate count: {}\ndesign evidence truncated: {}\ndesign evidence incomplete: {}\n",
+            "Physical Design: enabled\nPhysical index apply: {}\nPhysical Columnar apply: {}\nAllowed Columnar modes: {}\nRuntime token: {}\nRuntime token purpose: stale-request guard, not a credential\ndesign evidence epoch: {}\ndesign recorded reports: {}\nindex candidate count: {}\ncolumnar candidate count: {}\ndesign evidence truncated: {}\ndesign evidence incomplete: {}\n",
             if design.physical_index_apply.enabled { "enabled" } else { "disabled" },
-            design.physical_index_apply.runtime_token.as_deref().unwrap_or("none"),
+            if design.physical_columnar_apply.enabled { "enabled" } else { "disabled" },
+            render_columnar_modes(&design.physical_columnar_apply),
+            design
+                .physical_index_apply
+                .runtime_token
+                .as_deref()
+                .or(design.physical_columnar_apply.runtime_token.as_deref())
+                .unwrap_or("none"),
             design.evidence.epoch,
             design.evidence.recorded_reports,
             design.evidence.index_candidate_count,
@@ -206,6 +236,17 @@ fn render_operator_status(status: &OperatorStatusV3) -> String {
         )),
     }
     output
+}
+
+const fn render_columnar_modes(
+    status: &netbadb_server::OperatorPhysicalColumnarApplyStatusV3,
+) -> &'static str {
+    match (status.allow_snapshot, status.allow_incremental) {
+        (true, true) => "snapshot, incremental",
+        (true, false) => "snapshot",
+        (false, true) => "incremental",
+        (false, false) => "none",
+    }
 }
 
 fn render_physical_design_recommendations(
@@ -280,6 +321,35 @@ fn render_physical_index_apply(
         OperatorPhysicalIndexApplyOutcomeV3::AlreadyCovered => format!(
             "physical index already covered: TableId({}), ColumnId({}), name {}; no new index was created because current physical state already covers the candidate.\n",
             apply.table_id, apply.column_id, apply.index_name
+        ),
+    }
+}
+
+fn render_physical_columnar_apply(
+    apply: &netbadb_server::OperatorPhysicalColumnarApplyResultV3,
+) -> String {
+    let columns = apply
+        .columns
+        .iter()
+        .map(|column| column.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mode = match apply.mode {
+        OperatorPhysicalColumnarDesignModeV3::Snapshot => "snapshot",
+        OperatorPhysicalColumnarDesignModeV3::Incremental => "incremental",
+    };
+    match apply.outcome {
+        OperatorPhysicalColumnarApplyOutcomeV3::Created { projection_id } => format!(
+            "created projection {projection_id} (TableId({}), columns [{columns}], mode {mode}, placement key {})\n",
+            apply.table_id, apply.placement_key
+        ),
+        OperatorPhysicalColumnarApplyOutcomeV3::AlreadyApplied { projection_id } => format!(
+            "already applied as projection {projection_id} (TableId({}), columns [{columns}], mode {mode}, placement key {})\n",
+            apply.table_id, apply.placement_key
+        ),
+        OperatorPhysicalColumnarApplyOutcomeV3::AlreadyCovered => format!(
+            "already covered; no projection created (TableId({}), columns [{columns}], mode {mode}, placement key {})\n",
+            apply.table_id, apply.placement_key
         ),
     }
 }
@@ -402,6 +472,15 @@ enum Action {
         column_id: u32,
         index_name: String,
     },
+    OperatorPhysicalDesignApplyColumnar {
+        manifest: PathBuf,
+        expected_runtime_token: String,
+        expected_evidence_epoch: u64,
+        table_id: u64,
+        columns: Vec<u32>,
+        mode: OperatorPhysicalColumnarDesignModeV3,
+        placement_key: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +497,7 @@ enum HelpTopic {
     OperatorPhysicalDesignRecommendations,
     OperatorPhysicalDesignRotate,
     OperatorPhysicalDesignApply,
+    OperatorPhysicalDesignApplyColumnar,
 }
 
 impl HelpTopic {
@@ -437,6 +517,9 @@ impl HelpTopic {
             }
             Self::OperatorPhysicalDesignRotate => OPERATOR_PHYSICAL_DESIGN_ROTATE_HELP,
             Self::OperatorPhysicalDesignApply => OPERATOR_PHYSICAL_DESIGN_APPLY_HELP,
+            Self::OperatorPhysicalDesignApplyColumnar => {
+                OPERATOR_PHYSICAL_DESIGN_APPLY_COLUMNAR_HELP
+            }
         }
     }
 }
@@ -531,8 +614,100 @@ fn parse_operator_physical_design(
         ),
         Some("rotate-evidence") => parse_operator_physical_design_rotate(arguments),
         Some("apply-index") => parse_operator_physical_design_apply(arguments),
+        Some("apply-columnar") => parse_operator_physical_design_apply_columnar(arguments),
         _ => Err(UsageError::UnknownPhysicalDesignCommand(subcommand)),
     }
+}
+
+fn parse_operator_physical_design_apply_columnar(
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<Action, UsageError> {
+    let mut manifest = None;
+    let mut runtime_token = None;
+    let mut evidence_epoch = None;
+    let mut table_id = None;
+    let mut columns = Vec::new();
+    let mut mode = None;
+    let mut placement_key = None;
+    while let Some(argument) = arguments.next() {
+        if argument == "--help" || argument == "-h" {
+            if manifest.is_none()
+                && runtime_token.is_none()
+                && evidence_epoch.is_none()
+                && table_id.is_none()
+                && columns.is_empty()
+                && mode.is_none()
+                && placement_key.is_none()
+            {
+                return no_extra(
+                    arguments,
+                    Action::Help(HelpTopic::OperatorPhysicalDesignApplyColumnar),
+                );
+            }
+            return Err(UsageError::UnexpectedArgument(argument));
+        }
+        match argument.to_str() {
+            Some("--manifest") => set_once(
+                &mut manifest,
+                PathBuf::from(required_value(&mut arguments, "--manifest")?),
+                "--manifest",
+            )?,
+            Some("--expected-runtime-token") => {
+                let value = required_utf8(&mut arguments, "--expected-runtime-token")?;
+                set_once(&mut runtime_token, value, "--expected-runtime-token")?;
+            }
+            Some("--expected-evidence-epoch") => {
+                let raw = required_value(&mut arguments, "--expected-evidence-epoch")?;
+                set_once(
+                    &mut evidence_epoch,
+                    parse_u64(raw, UsageError::InvalidEvidenceEpoch)?,
+                    "--expected-evidence-epoch",
+                )?;
+            }
+            Some("--table-id") => {
+                let raw = required_value(&mut arguments, "--table-id")?;
+                set_once(
+                    &mut table_id,
+                    parse_u64(raw, UsageError::InvalidTableId)?,
+                    "--table-id",
+                )?;
+            }
+            Some("--column-id") => {
+                let raw = required_value(&mut arguments, "--column-id")?;
+                let value = raw
+                    .to_str()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .ok_or(UsageError::InvalidColumnId(raw))?;
+                columns.push(value);
+            }
+            Some("--mode") => {
+                let value = required_utf8(&mut arguments, "--mode")?;
+                let parsed = match value.as_str() {
+                    "snapshot" => OperatorPhysicalColumnarDesignModeV3::Snapshot,
+                    "incremental" => OperatorPhysicalColumnarDesignModeV3::Incremental,
+                    _ => return Err(UsageError::InvalidColumnarMode(value)),
+                };
+                set_once(&mut mode, parsed, "--mode")?;
+            }
+            Some("--placement-key") => {
+                let value = required_utf8(&mut arguments, "--placement-key")?;
+                set_once(&mut placement_key, value, "--placement-key")?;
+            }
+            _ => return Err(UsageError::UnknownArgument(argument)),
+        }
+    }
+    if columns.is_empty() {
+        return Err(UsageError::ColumnIdsRequired);
+    }
+    Ok(Action::OperatorPhysicalDesignApplyColumnar {
+        manifest: manifest.ok_or(UsageError::ManifestRequired)?,
+        expected_runtime_token: runtime_token.ok_or(UsageError::ExpectedRuntimeTokenRequired)?,
+        expected_evidence_epoch: evidence_epoch.ok_or(UsageError::ExpectedEvidenceEpochRequired)?,
+        table_id: table_id.ok_or(UsageError::TableIdRequired)?,
+        columns,
+        mode: mode.ok_or(UsageError::ColumnarModeRequired)?,
+        placement_key: placement_key.ok_or(UsageError::PlacementKeyRequired)?,
+    })
 }
 
 fn parse_operator_physical_design_apply(
@@ -874,7 +1049,7 @@ impl fmt::Display for OperationalError {
                 code: OperatorErrorCodeV3::ResponseTooLarge,
                 ..
             })) => formatter.write_str(
-                "operator recommendation response exceeds NBOP v3 payload limit; reduce physical-design evidence/recommendation cardinality in Manifest and restart",
+                "operator recommendation response exceeds NBOP v4 payload limit; reduce physical-design evidence/recommendation cardinality in Manifest and restart",
             ),
             Self::Operator(OperatorClientError::Remote(OperatorRemoteErrorV3 {
                 code: OperatorErrorCodeV3::PhysicalDesignRuntimeChanged,
@@ -919,6 +1094,10 @@ enum UsageError {
     TableIdRequired,
     ColumnIdRequired,
     IndexNameRequired,
+    ColumnIdsRequired,
+    ColumnarModeRequired,
+    InvalidColumnarMode(String),
+    PlacementKeyRequired,
     InvalidTableId(OsString),
     InvalidColumnId(OsString),
     ValueMustBeUtf8(&'static str),
@@ -945,7 +1124,7 @@ impl fmt::Display for UsageError {
                 command.to_string_lossy()
             ),
             Self::PhysicalDesignCommandRequired => formatter.write_str(
-                "physical-design requires `recommendations`, `rotate-evidence`, or `apply-index`",
+                "physical-design requires `recommendations`, `rotate-evidence`, `apply-index`, or `apply-columnar`",
             ),
             Self::UnknownPhysicalDesignCommand(command) => write!(
                 formatter,
@@ -1001,6 +1180,13 @@ impl fmt::Display for UsageError {
             Self::TableIdRequired => formatter.write_str("--table-id is required"),
             Self::ColumnIdRequired => formatter.write_str("--column-id is required"),
             Self::IndexNameRequired => formatter.write_str("--index-name is required"),
+            Self::ColumnIdsRequired => formatter.write_str("at least one --column-id is required"),
+            Self::ColumnarModeRequired => formatter.write_str("--mode is required"),
+            Self::InvalidColumnarMode(value) => write!(
+                formatter,
+                "invalid Columnar mode `{value}`; expected `snapshot` or `incremental`"
+            ),
+            Self::PlacementKeyRequired => formatter.write_str("--placement-key is required"),
             Self::InvalidTableId(value) => write!(
                 formatter,
                 "invalid table ID `{}`; expected an unsigned integer",

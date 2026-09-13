@@ -14,9 +14,11 @@ worker-owned Physical Design evidence
     -> Phase 26 managed publication
 ```
 
-This is a programmatic host API only. Manifest v8, NBOP v3, `netbadbd`,
+This is a programmatic host API introduced before the local operator bridge.
+Manifest v8 and NBOP v3 are historical; the current operator bridge is defined
+by Manifest v9 and NBOP v4. `netbadbd`,
 `netbadb operator`, Native Protocol v2, PostgreSQL wire, Inspection JSON v7,
-and every persistent format remain unchanged.
+and every persistent format remain unchanged by Phase 28.
 
 ## Host placement and mode policy
 

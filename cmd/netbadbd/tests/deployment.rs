@@ -59,11 +59,12 @@ fn manifest_fixture(
 ) -> Fixture {
     let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
-        "netbadbd-v8-{transport}-{}-{sequence}",
+        "netbadbd-v9-{transport}-{}-{sequence}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(directory.join("data")).unwrap();
+    std::fs::create_dir_all(directory.join("data/columnar")).unwrap();
     let heap = directory.join("data/users.ndb");
     let table = users_table();
     Database::create(&heap, table.clone())
@@ -76,24 +77,40 @@ fn manifest_fixture(
         std::process::id()
     ));
     let _ = std::fs::remove_file(&socket);
-    let document = include_str!("../../../docs/server-manifest-v8.md");
+    let document = include_str!("../../../docs/server-manifest-v9.md");
     let example = document
         .split_once("```json\n")
         .and_then(|(_, remainder)| remainder.split_once("\n```"))
         .map(|(example, _)| example)
-        .expect("v8 documentation contains a JSON example");
+        .expect("v9 documentation contains a JSON example");
     let mut source: serde_json::Value = serde_json::from_str(example).unwrap();
     source["listen"] = "127.0.0.1:0".into();
+    source["tables"][0]["path"] = "data/users.ndb".into();
+    source["tables"][0]["columns"][0]["physical_type"] = "uint64".into();
+    source["tables"][0]["columns"][0]["semantic_type"] = "UserId".into();
     source["operator"]["unix_socket"] = socket.to_string_lossy().into_owned().into();
     let object = source.as_object_mut().unwrap();
     if !driven {
         object.remove("adaptive");
+    } else {
+        let historical = include_str!("../../../docs/server-manifest-v8.md");
+        let historical_example = historical
+            .split_once("```json\n")
+            .and_then(|(_, remainder)| remainder.split_once("\n```"))
+            .map(|(example, _)| example)
+            .expect("v8 documentation contains a JSON example");
+        let historical_source: serde_json::Value =
+            serde_json::from_str(historical_example).unwrap();
+        object.insert("adaptive".into(), historical_source["adaptive"].clone());
     }
     if !with_physical_design {
         object.remove("physical_design");
         if with_operator {
             object["operator"]["allow_physical_index_apply"] = false.into();
+            object["operator"]["allow_physical_columnar_apply"] = false.into();
         }
+    } else if with_operator {
+        object["operator"]["allow_physical_index_apply"] = true.into();
     }
     if !with_operator {
         object.remove("operator");
@@ -358,7 +375,7 @@ fn native_design_only_daemon_exposes_status_and_conditional_rotation() {
 }
 
 #[test]
-fn postgres_design_only_daemon_exposes_nbop_v3_status() {
+fn postgres_design_only_daemon_exposes_nbop_v4_status() {
     let fixture = manifest_fixture("postgres-design-only", false, true, true);
     let mut daemon = DaemonProcess::spawn(&fixture.manifest, true);
     let ready = daemon.wait_for_readiness();
