@@ -1,5 +1,25 @@
 # NetbaDB roadmap
 
+## Durable Server mutation receipts (Adaptive Operations Phase 30 complete)
+
+- added optional programmatic-only NBMR v1 configuration with a canonical
+  path, explicit capacity, strict regular-file/symlink checks, durable database
+  identity binding, and identical Native/PostgreSQL builder composition;
+- placed the only journal writer in the sole Database worker and made readiness
+  follow Database/NBPC recovery, journal validation and tail repair, pending
+  receipt reconciliation, and recovered-outcome sync;
+- wrapped all four explicit programmatic/operator Index/Columnar apply paths in
+  durable monotonic Begin/Outcome records without changing Core mutation
+  authority or compensating for a receipt failure;
+- added bounded ascending programmatic receipt pagination with logical-only
+  public targets and journal-private exact Columnar recovery paths;
+- retained Manifest v9, NBOP v4, Native Protocol v2, PostgreSQL wire behavior,
+  Inspection JSON v7, SDK Schema Spec, daemon/CLI surfaces, and all database
+  persistent formats.
+
+See [`adaptive-operations-phase30.md`](adaptive-operations-phase30.md) and
+[`physical-design-mutation-receipts-v1.md`](physical-design-mutation-receipts-v1.md).
+
 ## Operator-approved Columnar apply (Adaptive Operations Phase 29 complete)
 
 - upgraded the current deployment contract to strict Manifest v9 with an

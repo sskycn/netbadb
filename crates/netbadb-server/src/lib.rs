@@ -8,6 +8,7 @@ mod manifest;
 mod metrics;
 mod operator;
 mod physical_design;
+mod physical_design_receipts;
 mod postgres;
 mod runtime;
 mod tls;
@@ -106,6 +107,16 @@ pub use physical_design::{
     ServerPhysicalDesignControlError, ServerPhysicalDesignControlHandle,
     ServerPhysicalDesignDiagnostics, ServerPhysicalDesignRotationReport,
     ServerPhysicalDesignStatus, ServerPhysicalIndexDesignProposal,
+};
+pub use physical_design_receipts::{
+    MAX_MUTATION_RECEIPT_RECORD_BYTES, MAX_MUTATION_RECEIPTS_PER_READ,
+    ServerPhysicalDesignMutationReceipt, ServerPhysicalDesignMutationReceiptConfig,
+    ServerPhysicalDesignMutationReceiptConfigError,
+    ServerPhysicalDesignMutationReceiptControlError, ServerPhysicalDesignMutationReceiptId,
+    ServerPhysicalDesignMutationReceiptJournalError, ServerPhysicalDesignMutationReceiptOutcome,
+    ServerPhysicalDesignMutationReceiptPage, ServerPhysicalDesignMutationReceiptPathError,
+    ServerPhysicalDesignMutationReceiptStartupError, ServerPhysicalDesignMutationSource,
+    ServerPhysicalDesignMutationTarget,
 };
 pub use postgres::{PostgresServerHandle, PostgresTcpServer, PostgresTcpServerError};
 pub use runtime::{ServerHandle, SessionId, TcpServer, TcpServerError, WorkerFatalError};

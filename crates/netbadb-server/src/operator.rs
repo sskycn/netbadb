@@ -2266,6 +2266,9 @@ fn physical_columnar_remote_error(
         ServerPhysicalColumnarDesignControlError::Apply(error) => {
             physical_columnar_apply_code(*error)
         }
+        ServerPhysicalColumnarDesignControlError::MutationReceipt(_) => {
+            OperatorErrorCodeV3::Internal
+        }
         ServerPhysicalColumnarDesignControlError::ProposalRuntimeChanged => {
             OperatorErrorCodeV3::PhysicalDesignRuntimeChanged
         }
@@ -2493,6 +2496,7 @@ fn physical_design_remote_error(error: ServerPhysicalDesignControlError) -> Oper
         ServerPhysicalDesignControlError::PhysicalIndexNameConflict(_) => {
             OperatorErrorCodeV3::PhysicalIndexNameConflict
         }
+        ServerPhysicalDesignControlError::MutationReceipt(_) => OperatorErrorCodeV3::Internal,
         ServerPhysicalDesignControlError::ServerStopped => OperatorErrorCodeV3::ServerStopped,
     };
     let message = match code {

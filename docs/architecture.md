@@ -427,6 +427,21 @@ Paths, proposals, automatic stream enablement, maintenance, scheduling,
 retry, evidence rotation, and persistent operator audit remain outside the
 contract.
 
+[Adaptive Operations Phase 30](adaptive-operations-phase30.md) adds the
+optional Server-owned [NBMR v1](physical-design-mutation-receipts-v1.md)
+receipt journal around all four explicit programmatic/operator Index and
+Columnar apply controls. The sole Database worker durably appends a bounded
+logical Begin before entering the existing apply flow and a coarse Outcome
+afterward. Startup follows Database and NBPC recovery, repairs only an
+incomplete final record, and reconciles one pending target read-only against
+exact current physical state before readiness. Public pagination omits the
+journal-private absolute Columnar path and all identity, token, SQL, principal,
+session, address, and timestamp data. Receipt ambiguity gates later receipt
+controls but never compensates Database state or changes protocol/session
+health. Manifest v9, NBOP v4, Native Protocol v2, PostgreSQL wire behavior,
+Inspection JSON v7, SDK Schema Spec, and database persistent formats remain
+unchanged.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

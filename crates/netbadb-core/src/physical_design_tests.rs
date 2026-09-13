@@ -1540,3 +1540,45 @@ fn columnar_proposal_is_bound_to_durable_database_incarnation() {
     fs::remove_dir_all(root).expect("remove second fixture");
     first.close();
 }
+
+#[test]
+fn physical_design_database_identity_is_stable_and_read_only() {
+    let fixture = Fixture::create("phase30-database-identity", false);
+    let catalog_path = fixture
+        .database
+        .catalog_path
+        .as_ref()
+        .expect("durable catalog")
+        .clone();
+    let catalog_before = fs::read(&catalog_path).expect("read catalog before identity");
+    let snapshot_before = fixture
+        .database
+        .current_database_snapshot()
+        .expect("database snapshot before identity");
+    let schema_before = fixture.database.schema_generation();
+
+    let first = fixture
+        .database
+        .physical_design_database_identity()
+        .expect("first identity read");
+    let second = fixture
+        .database
+        .physical_design_database_identity()
+        .expect("second identity read");
+
+    assert_eq!(first, second);
+    assert_ne!(first.as_bytes(), &[0; 16]);
+    assert_eq!(
+        fixture
+            .database
+            .current_database_snapshot()
+            .expect("database snapshot after identity"),
+        snapshot_before
+    );
+    assert_eq!(fixture.database.schema_generation(), schema_before);
+    assert_eq!(
+        fs::read(catalog_path).expect("read catalog after identity"),
+        catalog_before
+    );
+    fixture.close();
+}

@@ -82,6 +82,16 @@
   incarnation, schema, storage, evidence, naming, allocation, WAL, retry, or
   recovery authority. It MUST NOT create an automatic apply path; an operator
   wire path must satisfy the explicit approval rules below.
+- Optional Physical Design mutation receipts MUST remain a bounded,
+  programmatic-only, Server-owned NBMR journal in the sole Database worker.
+  A durable Begin precedes every Server Index or Columnar apply control, and a
+  durable coarse Outcome follows each definitive result. Receipt failure MUST
+  NOT roll back Database truth, mutate evidence, poison client protocol state,
+  or create another writer; ambiguous outcome failure gates later receipt
+  controls until startup reconciliation. Public receipts MUST expose only
+  bounded logical targets and MUST NOT expose the journal path, absolute
+  Columnar recovery path, database incarnation, runtime token, SQL, principal,
+  session, or network address.
 - Programmatic Server Columnar apply MUST use a configured Server-owned
   placement namespace. The control caller supplies only a validated logical
   placement key, never an arbitrary filesystem path, and the resolved

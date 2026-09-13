@@ -31,6 +31,9 @@ use crate::physical_design::{
     ServerPhysicalDesignControlHandle, ServerPhysicalDesignRuntime,
     ServerPhysicalDesignWorkerCommand, forward_physical_design_control_requests,
 };
+use crate::physical_design_receipts::{
+    ServerPhysicalDesignMutationReceiptConfig, ServerPhysicalDesignMutationReceiptStartupError,
+};
 use crate::tls::{ConnectionStream, TlsHandshakeError, TransportSecurity};
 use crate::{
     ClientIdentity, ManifestError, ResponseBatch, ServerAdaptiveFeedbackConfig, ServerConfig,
@@ -85,6 +88,7 @@ pub enum TcpServerError {
     Database(DatabaseError),
     AdaptiveConfig(ServerAdaptiveDriverConfigError),
     PhysicalColumnarApplyConfig(ServerPhysicalColumnarApplyStartupError),
+    PhysicalDesignMutationReceipts(Box<ServerPhysicalDesignMutationReceiptStartupError>),
     Operator(ServerOperatorError),
     Bind {
         address: SocketAddr,
@@ -118,6 +122,9 @@ impl fmt::Display for TcpServerError {
             }
             Self::PhysicalColumnarApplyConfig(error) => {
                 write!(formatter, "physical-columnar apply startup failed: {error}")
+            }
+            Self::PhysicalDesignMutationReceipts(error) => {
+                write!(formatter, "physical-design receipt startup failed: {error}")
             }
             Self::Operator(error) => error.fmt(formatter),
             Self::Bind { address, source } => {
@@ -155,6 +162,7 @@ impl Error for TcpServerError {
             Self::Database(error) => Some(error),
             Self::AdaptiveConfig(error) => Some(error),
             Self::PhysicalColumnarApplyConfig(error) => Some(error),
+            Self::PhysicalDesignMutationReceipts(error) => Some(error),
             Self::Operator(error) => Some(error),
             Self::Bind { source, .. }
             | Self::ListenerConfiguration(source)
@@ -182,6 +190,7 @@ pub struct TcpServer {
     adaptive_override: Option<ServerAdaptiveStartupMode>,
     physical_design_override: Option<ServerPhysicalDesignAdvisorConfig>,
     physical_columnar_apply_override: Option<ServerPhysicalColumnarApplyConfig>,
+    physical_design_mutation_receipts: Option<ServerPhysicalDesignMutationReceiptConfig>,
 }
 
 impl TcpServer {
@@ -192,6 +201,7 @@ impl TcpServer {
             adaptive_override: None,
             physical_design_override: None,
             physical_columnar_apply_override: None,
+            physical_design_mutation_receipts: None,
         }
     }
 
@@ -233,6 +243,17 @@ impl TcpServer {
         self
     }
 
+    /// Enables the bounded Server-owned NBMR v1 journal for explicit
+    /// physical-design mutations. This does not add a wire operation.
+    #[must_use]
+    pub fn with_physical_design_mutation_receipts(
+        mut self,
+        config: ServerPhysicalDesignMutationReceiptConfig,
+    ) -> Self {
+        self.physical_design_mutation_receipts = Some(config);
+        self
+    }
+
     pub fn start(self) -> Result<ServerHandle, TcpServerError> {
         let (
             listen,
@@ -247,6 +268,11 @@ impl TcpServer {
         ) = self.config.into_parts();
         let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
         let physical_design = self.physical_design_override.or(manifest_physical_design);
+        if self.physical_design_mutation_receipts.is_some() && physical_design.is_none() {
+            return Err(TcpServerError::PhysicalDesignMutationReceipts(Box::new(
+                ServerPhysicalDesignMutationReceiptStartupError::PhysicalDesignRequired,
+            )));
+        }
         let physical_columnar_apply = if operator_config
             .as_ref()
             .is_some_and(|operator| operator.allow_physical_columnar_apply())
@@ -297,6 +323,7 @@ impl TcpServer {
             adaptive_mode,
             physical_design,
             physical_columnar_apply,
+            self.physical_design_mutation_receipts,
         )?;
         let metrics = ServerMetricsHandle::new();
         let listener = match TcpListener::bind(listen) {
@@ -577,6 +604,7 @@ impl DatabaseWorker {
         adaptive_mode: ServerAdaptiveStartupMode,
         physical_design_config: Option<ServerPhysicalDesignAdvisorConfig>,
         physical_columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,
+        physical_design_mutation_receipts: Option<ServerPhysicalDesignMutationReceiptConfig>,
     ) -> Result<Self, TcpServerError> {
         let (commands, command_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
@@ -595,6 +623,27 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
+                let physical_design = match physical_design_config {
+                    Some(config) => match ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+                        config,
+                        physical_columnar_apply,
+                        physical_design_mutation_receipts,
+                        &database,
+                    ) {
+                        Ok(runtime) => Some(runtime),
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(
+                                WorkerStartupError::PhysicalDesignMutationReceipts(error),
+                            ));
+                            return database.close().map_err(|error| {
+                                WorkerFatalError::DatabaseCloseFailed {
+                                    message: error.to_string(),
+                                }
+                            });
+                        }
+                    },
+                    None => None,
+                };
                 let adaptive = match ServerAdaptiveWorkerRuntime::new(adaptive_mode, &database) {
                     Ok(adaptive) => adaptive,
                     Err(error) => {
@@ -606,9 +655,6 @@ impl DatabaseWorker {
                         });
                     }
                 };
-                let physical_design = physical_design_config.map(|config| {
-                    ServerPhysicalDesignRuntime::new_with_columnar(config, physical_columnar_apply)
-                });
                 if ready_tx.send(Ok(())).is_err() {
                     return database.close().map_err(|error| {
                         WorkerFatalError::DatabaseCloseFailed {
@@ -640,6 +686,12 @@ impl DatabaseWorker {
             Ok(Err(WorkerStartupError::Adaptive(error))) => {
                 let _ = join.join();
                 Err(TcpServerError::AdaptiveConfig(error))
+            }
+            Ok(Err(WorkerStartupError::PhysicalDesignMutationReceipts(error))) => {
+                let _ = join.join();
+                Err(TcpServerError::PhysicalDesignMutationReceipts(Box::new(
+                    error,
+                )))
             }
             Err(_) => match join.join() {
                 Ok(Err(error)) => Err(TcpServerError::WorkerFatal(error)),
@@ -741,6 +793,7 @@ enum WorkerCommand {
 enum WorkerStartupError {
     Database(DatabaseError),
     Adaptive(ServerAdaptiveDriverConfigError),
+    PhysicalDesignMutationReceipts(ServerPhysicalDesignMutationReceiptStartupError),
 }
 
 #[derive(Debug, Clone)]

@@ -20,6 +20,21 @@ use crate::{
     ProjectionCatalogError, SchemaCatalogError,
 };
 
+/// Stable identity of one durable database installation.
+///
+/// This is the existing Schema Catalog incarnation, exposed narrowly for
+/// server-owned operational state that must reject attachment to another
+/// database. It is not a protocol, transaction, or physical-object identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PhysicalDesignDatabaseIdentity([u8; 16]);
+
+impl PhysicalDesignDatabaseIdentity {
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
 /// Fixed-width cardinality limits for one caller-owned in-memory window.
 /// These are memory/evidence bounds, not recommendation thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1288,6 +1303,19 @@ impl From<DatabaseError> for PhysicalDesignAdvisorError {
 }
 
 impl Database {
+    /// Returns the existing durable Schema Catalog incarnation without
+    /// changing database, catalog, filesystem, visibility, or evidence state.
+    pub fn physical_design_database_identity(
+        &self,
+    ) -> Result<PhysicalDesignDatabaseIdentity, DatabaseError> {
+        let catalog_path = self
+            .catalog_path
+            .as_deref()
+            .ok_or(SchemaCatalogError::SchemaCatalogMissing)?;
+        let incarnation = crate::schema_catalog_file::load(catalog_path)?.incarnation;
+        Ok(PhysicalDesignDatabaseIdentity(incarnation))
+    }
+
     /// Inspects evidence against current production inventory and capability.
     /// This method reserves no identity and mutates neither database nor input.
     pub fn advise_physical_design(

@@ -298,6 +298,7 @@ fn postgres_server_builder_is_default_disabled_and_explicitly_enabled() {
     let disabled = PostgresTcpServer::new(config.clone());
     assert!(disabled.adaptive_override.is_none());
     assert!(disabled.physical_design_override.is_none());
+    assert!(disabled.physical_design_mutation_receipts.is_none());
     let limits = AdaptiveEvidencePoolLimits::default();
     let design = design_runtime().status().evidence.limits;
     let recommendation = PhysicalDesignRecommendationPolicy {
@@ -313,8 +314,23 @@ fn postgres_server_builder_is_default_disabled_and_explicitly_enabled() {
             columnar: recommendation,
         },
     );
+    let receipt_path = root.join("receipts.nbmr");
+    let receipts =
+        crate::ServerPhysicalDesignMutationReceiptConfig::new(&receipt_path, 1_000_000).unwrap();
+    assert!(matches!(
+        PostgresTcpServer::new(config.clone())
+            .with_physical_design_mutation_receipts(receipts.clone())
+            .start(),
+        Err(crate::PostgresTcpServerError::PhysicalDesignMutationReceipts(error))
+            if matches!(
+                error.as_ref(),
+                crate::ServerPhysicalDesignMutationReceiptStartupError::PhysicalDesignRequired
+            )
+    ));
+    assert!(!receipt_path.exists());
     let enabled = disabled
         .with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits))
+        .with_physical_design_mutation_receipts(receipts.clone())
         .with_physical_design_advisor(design);
     assert!(matches!(
         enabled.adaptive_override,
@@ -322,7 +338,12 @@ fn postgres_server_builder_is_default_disabled_and_explicitly_enabled() {
             if config.limits() == limits
     ));
     assert_eq!(enabled.physical_design_override, Some(design));
+    assert_eq!(
+        enabled.physical_design_mutation_receipts,
+        Some(receipts.clone())
+    );
     let reverse = PostgresTcpServer::new(config)
+        .with_physical_design_mutation_receipts(receipts.clone())
         .with_physical_design_advisor(design)
         .with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(limits));
     assert!(matches!(
@@ -331,6 +352,7 @@ fn postgres_server_builder_is_default_disabled_and_explicitly_enabled() {
             if config.limits() == limits
     ));
     assert_eq!(reverse.physical_design_override, Some(design));
+    assert_eq!(reverse.physical_design_mutation_receipts, Some(receipts));
     fs::remove_dir_all(root).expect("remove PostgreSQL config root");
 }
 

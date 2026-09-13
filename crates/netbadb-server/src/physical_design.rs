@@ -26,6 +26,13 @@ use netbadb_types::{
 };
 
 use crate::adaptive_driver::ServerAdaptiveHostConfig;
+use crate::physical_design_receipts::{
+    MutationReceiptTarget, ServerPhysicalDesignMutationReceiptConfig,
+    ServerPhysicalDesignMutationReceiptControlError, ServerPhysicalDesignMutationReceiptId,
+    ServerPhysicalDesignMutationReceiptJournal, ServerPhysicalDesignMutationReceiptOutcome,
+    ServerPhysicalDesignMutationReceiptPage, ServerPhysicalDesignMutationReceiptStartupError,
+    ServerPhysicalDesignMutationSource,
+};
 
 pub(crate) struct ServerHostObservationConfig {
     pub(crate) adaptive: ServerAdaptiveHostConfig,
@@ -623,6 +630,7 @@ pub enum ServerPhysicalColumnarDesignControlError {
     LocationInspection(DatabaseError),
     Proposal(Box<PhysicalColumnarDesignProposalError>),
     Apply(Box<PhysicalColumnarDesignApplyError>),
+    MutationReceipt(ServerPhysicalDesignMutationReceiptControlError),
     EvidenceEpochChanged {
         expected: PhysicalDesignEvidenceEpoch,
         actual: PhysicalDesignEvidenceEpoch,
@@ -662,6 +670,7 @@ impl fmt::Display for ServerPhysicalColumnarDesignControlError {
             Self::LocationInspection(error) => error.fmt(formatter),
             Self::Proposal(error) => error.fmt(formatter),
             Self::Apply(error) => error.fmt(formatter),
+            Self::MutationReceipt(error) => error.fmt(formatter),
             Self::EvidenceEpochChanged { expected, actual } => write!(
                 formatter,
                 "physical-design evidence epoch changed from expected {} to {}",
@@ -690,6 +699,7 @@ impl Error for ServerPhysicalColumnarDesignControlError {
             Self::LocationInspection(error) => Some(error),
             Self::Proposal(error) => Some(error.as_ref()),
             Self::Apply(error) => Some(error.as_ref()),
+            Self::MutationReceipt(error) => Some(error),
             Self::PhysicalDesignNotEnabled
             | Self::ColumnarApplyNotEnabled
             | Self::ModeNotAllowed(_)
@@ -715,6 +725,7 @@ pub enum ServerPhysicalDesignControlError {
     Advisor(PhysicalDesignAdvisorError),
     Proposal(Box<PhysicalIndexDesignProposalError>),
     Apply(Box<PhysicalIndexDesignApplyError>),
+    MutationReceipt(ServerPhysicalDesignMutationReceiptControlError),
     ProposalRuntimeChanged,
     PhysicalDesignRuntimeChanged,
     PhysicalIndexNameConflict(IndexName),
@@ -736,6 +747,7 @@ impl fmt::Display for ServerPhysicalDesignControlError {
             Self::Advisor(error) => error.fmt(formatter),
             Self::Proposal(error) => error.fmt(formatter),
             Self::Apply(error) => error.fmt(formatter),
+            Self::MutationReceipt(error) => error.fmt(formatter),
             Self::ProposalRuntimeChanged => formatter.write_str(
                 "physical-index proposal belongs to another server physical-design runtime",
             ),
@@ -756,6 +768,7 @@ impl Error for ServerPhysicalDesignControlError {
             Self::Advisor(error) => Some(error),
             Self::Proposal(error) => Some(error),
             Self::Apply(error) => Some(error),
+            Self::MutationReceipt(error) => Some(error),
             Self::PhysicalDesignNotEnabled
             | Self::EvidenceEpochChanged { .. }
             | Self::ProposalRuntimeChanged
@@ -784,6 +797,28 @@ impl ServerPhysicalDesignControlHandle {
         response
             .recv()
             .map_err(|_| ServerPhysicalDesignControlError::ServerStopped)?
+    }
+
+    /// Reads one bounded page of durable mutation receipts in receipt-ID order.
+    pub fn mutation_receipts(
+        &self,
+        after: Option<ServerPhysicalDesignMutationReceiptId>,
+        limit: u32,
+    ) -> Result<
+        ServerPhysicalDesignMutationReceiptPage,
+        ServerPhysicalDesignMutationReceiptControlError,
+    > {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.requests
+            .send(ServerPhysicalDesignControlRequest::MutationReceipts {
+                after,
+                limit,
+                reply,
+            })
+            .map_err(|_| ServerPhysicalDesignMutationReceiptControlError::ServerStopped)?;
+        response
+            .recv()
+            .map_err(|_| ServerPhysicalDesignMutationReceiptControlError::ServerStopped)?
     }
 
     pub fn recommendations(
@@ -944,6 +979,16 @@ pub(crate) enum ServerPhysicalDesignControlRequest {
     Status {
         reply: SyncSender<Result<ServerPhysicalDesignStatus, ServerPhysicalDesignControlError>>,
     },
+    MutationReceipts {
+        after: Option<ServerPhysicalDesignMutationReceiptId>,
+        limit: u32,
+        reply: SyncSender<
+            Result<
+                ServerPhysicalDesignMutationReceiptPage,
+                ServerPhysicalDesignMutationReceiptControlError,
+            >,
+        >,
+    },
     Recommendations {
         reply: SyncSender<Result<PhysicalDesignAdvisorReport, ServerPhysicalDesignControlError>>,
     },
@@ -1007,6 +1052,16 @@ pub(crate) enum ServerPhysicalDesignControlRequest {
 pub(crate) enum ServerPhysicalDesignWorkerCommand {
     Status {
         reply: SyncSender<Result<ServerPhysicalDesignStatus, ServerPhysicalDesignControlError>>,
+    },
+    MutationReceipts {
+        after: Option<ServerPhysicalDesignMutationReceiptId>,
+        limit: u32,
+        reply: SyncSender<
+            Result<
+                ServerPhysicalDesignMutationReceiptPage,
+                ServerPhysicalDesignMutationReceiptControlError,
+            >,
+        >,
     },
     Recommendations {
         reply: SyncSender<Result<PhysicalDesignAdvisorReport, ServerPhysicalDesignControlError>>,
@@ -1074,6 +1129,7 @@ pub(crate) struct ServerPhysicalDesignRuntime {
     evidence: PhysicalDesignEvidenceWindow,
     policy: PhysicalDesignAdvisorPolicy,
     columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,
+    mutation_receipts: Option<ServerPhysicalDesignMutationReceiptJournal>,
     diagnostics: ServerPhysicalDesignDiagnostics,
 }
 
@@ -1092,6 +1148,7 @@ impl ServerPhysicalDesignRuntime {
             evidence: PhysicalDesignEvidenceWindow::new(config.evidence_limits()),
             policy: config.advisor_policy(),
             columnar_apply,
+            mutation_receipts: None,
             diagnostics: ServerPhysicalDesignDiagnostics {
                 eligible_query_count: 0,
                 record_success_count: 0,
@@ -1104,6 +1161,48 @@ impl ServerPhysicalDesignRuntime {
                 last_record_error: None,
             },
         }
+    }
+
+    pub(crate) fn new_with_mutation_receipts(
+        config: ServerPhysicalDesignAdvisorConfig,
+        columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,
+        mutation_receipts: Option<ServerPhysicalDesignMutationReceiptConfig>,
+        database: &Database,
+    ) -> Result<Self, ServerPhysicalDesignMutationReceiptStartupError> {
+        let mutation_receipts = if let Some(receipt_config) = mutation_receipts {
+            let identity = database
+                .physical_design_database_identity()
+                .map_err(ServerPhysicalDesignMutationReceiptStartupError::DatabaseIdentity)?;
+            Some(
+                ServerPhysicalDesignMutationReceiptJournal::open(
+                    receipt_config,
+                    identity,
+                    database,
+                )
+                .map_err(ServerPhysicalDesignMutationReceiptStartupError::Journal)?,
+            )
+        } else {
+            None
+        };
+        let mut runtime = Self::new_with_columnar(config, columnar_apply);
+        runtime.mutation_receipts = mutation_receipts;
+        Ok(runtime)
+    }
+
+    #[cfg(test)]
+    fn fail_next_receipt_begin_append(&mut self) {
+        self.mutation_receipts
+            .as_mut()
+            .expect("test runtime has mutation receipts")
+            .fail_next_begin_append();
+    }
+
+    #[cfg(test)]
+    fn fail_next_receipt_outcome_append(&mut self) {
+        self.mutation_receipts
+            .as_mut()
+            .expect("test runtime has mutation receipts")
+            .fail_next_outcome_append();
     }
 
     pub(crate) fn status(&self) -> ServerPhysicalDesignStatus {
@@ -1167,6 +1266,18 @@ impl ServerPhysicalDesignRuntime {
             ServerPhysicalDesignWorkerCommand::Status { reply } => {
                 let _ = reply.send(Ok(self.status()));
             }
+            ServerPhysicalDesignWorkerCommand::MutationReceipts {
+                after,
+                limit,
+                reply,
+            } => {
+                let result = self
+                    .mutation_receipts
+                    .as_ref()
+                    .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+                    .and_then(|journal| journal.page(after, limit));
+                let _ = reply.send(result);
+            }
             ServerPhysicalDesignWorkerCommand::Recommendations { reply } => {
                 let result = database
                     .advise_physical_design(&self.evidence, self.policy)
@@ -1188,12 +1299,41 @@ impl ServerPhysicalDesignRuntime {
                 index_name,
                 reply,
             } => {
-                let result = match proposal.origin.upgrade() {
-                    Some(origin) if Arc::ptr_eq(&origin, &self.identity) => database
-                        .apply_physical_index_design(&self.evidence, &proposal.proposal, index_name)
-                        .map_err(|error| ServerPhysicalDesignControlError::Apply(Box::new(error))),
-                    Some(_) | None => Err(ServerPhysicalDesignControlError::ProposalRuntimeChanged),
-                };
+                let receipt_id = self.begin_index_receipt(
+                    ServerPhysicalDesignMutationSource::Programmatic,
+                    proposal.evidence_epoch(),
+                    proposal.candidate(),
+                    index_name.clone(),
+                );
+                let result = receipt_id.and_then(|receipt_id| {
+                    let result = match proposal.origin.upgrade() {
+                        Some(origin) if Arc::ptr_eq(&origin, &self.identity) => database
+                            .apply_physical_index_design(
+                                &self.evidence,
+                                &proposal.proposal,
+                                index_name,
+                            )
+                            .map_err(|error| {
+                                ServerPhysicalDesignControlError::Apply(Box::new(error))
+                            }),
+                        Some(_) | None => {
+                            Err(ServerPhysicalDesignControlError::ProposalRuntimeChanged)
+                        }
+                    };
+                    self.finish_index_result(receipt_id, result, |report| match report.outcome {
+                        PhysicalIndexDesignApplyOutcome::Created { index_id } => {
+                            ServerPhysicalDesignMutationReceiptOutcome::CreatedIndex { index_id }
+                        }
+                        PhysicalIndexDesignApplyOutcome::AlreadyApplied { index_id } => {
+                            ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedIndex {
+                                index_id,
+                            }
+                        }
+                        PhysicalIndexDesignApplyOutcome::AlreadyCovered => {
+                            ServerPhysicalDesignMutationReceiptOutcome::AlreadyCovered
+                        }
+                    })
+                });
                 let _ = reply.send(result);
             }
             ServerPhysicalDesignWorkerCommand::ProposeColumnar {
@@ -1261,6 +1401,132 @@ impl ServerPhysicalDesignRuntime {
         }
     }
 
+    fn begin_index_receipt(
+        &mut self,
+        source: ServerPhysicalDesignMutationSource,
+        evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalIndexCandidate,
+        index_name: IndexName,
+    ) -> Result<Option<ServerPhysicalDesignMutationReceiptId>, ServerPhysicalDesignControlError>
+    {
+        self.mutation_receipts
+            .as_mut()
+            .map(|journal| {
+                journal.begin(
+                    source,
+                    evidence_epoch,
+                    MutationReceiptTarget::Index {
+                        candidate,
+                        index_name,
+                    },
+                )
+            })
+            .transpose()
+            .map_err(ServerPhysicalDesignControlError::MutationReceipt)
+    }
+
+    fn finish_index_result<T>(
+        &mut self,
+        receipt_id: Option<ServerPhysicalDesignMutationReceiptId>,
+        result: Result<T, ServerPhysicalDesignControlError>,
+        success_outcome: impl FnOnce(&T) -> ServerPhysicalDesignMutationReceiptOutcome,
+    ) -> Result<T, ServerPhysicalDesignControlError> {
+        let Some(receipt_id) = receipt_id else {
+            return result;
+        };
+        match result {
+            Ok(report) => {
+                let outcome = success_outcome(&report);
+                self.mutation_receipts
+                    .as_mut()
+                    .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+                    .and_then(|journal| journal.finish(receipt_id, outcome))
+                    .map_err(ServerPhysicalDesignControlError::MutationReceipt)?;
+                Ok(report)
+            }
+            Err(error) => {
+                let Some(outcome) = index_error_receipt_outcome(&error) else {
+                    if let Some(journal) = self.mutation_receipts.as_mut() {
+                        journal.mark_recovery_required();
+                    }
+                    return Err(error);
+                };
+                self.mutation_receipts
+                    .as_mut()
+                    .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+                    .and_then(|journal| journal.finish(receipt_id, outcome))
+                    .map_err(ServerPhysicalDesignControlError::MutationReceipt)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn begin_columnar_receipt(
+        &mut self,
+        source: ServerPhysicalDesignMutationSource,
+        evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalColumnarCandidate,
+        mode: PhysicalColumnarDesignMode,
+        placement: ServerPhysicalColumnarPlacementKey,
+        directory: PathBuf,
+    ) -> Result<
+        Option<ServerPhysicalDesignMutationReceiptId>,
+        ServerPhysicalColumnarDesignControlError,
+    > {
+        self.mutation_receipts
+            .as_mut()
+            .map(|journal| {
+                journal.begin(
+                    source,
+                    evidence_epoch,
+                    MutationReceiptTarget::Columnar {
+                        candidate,
+                        mode,
+                        placement,
+                        directory,
+                    },
+                )
+            })
+            .transpose()
+            .map_err(ServerPhysicalColumnarDesignControlError::MutationReceipt)
+    }
+
+    fn finish_columnar_result<T>(
+        &mut self,
+        receipt_id: Option<ServerPhysicalDesignMutationReceiptId>,
+        result: Result<T, ServerPhysicalColumnarDesignControlError>,
+        success_outcome: impl FnOnce(&T) -> ServerPhysicalDesignMutationReceiptOutcome,
+    ) -> Result<T, ServerPhysicalColumnarDesignControlError> {
+        let Some(receipt_id) = receipt_id else {
+            return result;
+        };
+        match result {
+            Ok(report) => {
+                let outcome = success_outcome(&report);
+                self.mutation_receipts
+                    .as_mut()
+                    .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+                    .and_then(|journal| journal.finish(receipt_id, outcome))
+                    .map_err(ServerPhysicalColumnarDesignControlError::MutationReceipt)?;
+                Ok(report)
+            }
+            Err(error) => {
+                let Some(outcome) = columnar_error_receipt_outcome(&error) else {
+                    if let Some(journal) = self.mutation_receipts.as_mut() {
+                        journal.mark_recovery_required();
+                    }
+                    return Err(error);
+                };
+                self.mutation_receipts
+                    .as_mut()
+                    .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+                    .and_then(|journal| journal.finish(receipt_id, outcome))
+                    .map_err(ServerPhysicalColumnarDesignControlError::MutationReceipt)?;
+                Err(error)
+            }
+        }
+    }
+
     fn propose_columnar(
         &self,
         database: &Database,
@@ -1302,6 +1568,35 @@ impl ServerPhysicalDesignRuntime {
     }
 
     fn apply_columnar(
+        &mut self,
+        database: &mut Database,
+        proposal: &ServerPhysicalColumnarDesignProposal,
+    ) -> Result<ServerPhysicalColumnarDesignApplyReport, ServerPhysicalColumnarDesignControlError>
+    {
+        let directory = proposal.proposal.directory().to_path_buf();
+        let receipt_id = self.begin_columnar_receipt(
+            ServerPhysicalDesignMutationSource::Programmatic,
+            proposal.evidence_epoch(),
+            proposal.candidate().clone(),
+            proposal.mode(),
+            proposal.placement().clone(),
+            directory,
+        )?;
+        let result = self.apply_columnar_unreceipted(database, proposal);
+        self.finish_columnar_result(receipt_id, result, |report| match report.outcome {
+            PhysicalColumnarDesignApplyOutcome::Created { projection_id } => {
+                ServerPhysicalDesignMutationReceiptOutcome::CreatedColumnar { projection_id }
+            }
+            PhysicalColumnarDesignApplyOutcome::AlreadyApplied { projection_id } => {
+                ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedColumnar { projection_id }
+            }
+            PhysicalColumnarDesignApplyOutcome::AlreadyCovered => {
+                ServerPhysicalDesignMutationReceiptOutcome::AlreadyCovered
+            }
+        })
+    }
+
+    fn apply_columnar_unreceipted(
         &mut self,
         database: &mut Database,
         proposal: &ServerPhysicalColumnarDesignProposal,
@@ -1354,6 +1649,40 @@ impl ServerPhysicalDesignRuntime {
     }
 
     fn apply_approved_index(
+        &mut self,
+        database: &mut Database,
+        runtime_token_matches: bool,
+        expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalIndexCandidate,
+        index_name: IndexName,
+    ) -> Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError> {
+        let receipt_id = self.begin_index_receipt(
+            ServerPhysicalDesignMutationSource::LocalOperator,
+            expected_evidence_epoch,
+            candidate,
+            index_name.clone(),
+        )?;
+        let result = self.apply_approved_index_unreceipted(
+            database,
+            runtime_token_matches,
+            expected_evidence_epoch,
+            candidate,
+            index_name,
+        );
+        self.finish_index_result(receipt_id, result, |report| match report.outcome {
+            ServerApprovedPhysicalIndexApplyOutcome::Created { index_id } => {
+                ServerPhysicalDesignMutationReceiptOutcome::CreatedIndex { index_id }
+            }
+            ServerApprovedPhysicalIndexApplyOutcome::AlreadyApplied { index_id } => {
+                ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedIndex { index_id }
+            }
+            ServerApprovedPhysicalIndexApplyOutcome::AlreadyCovered => {
+                ServerPhysicalDesignMutationReceiptOutcome::AlreadyCovered
+            }
+        })
+    }
+
+    fn apply_approved_index_unreceipted(
         &mut self,
         database: &mut Database,
         runtime_token_matches: bool,
@@ -1426,6 +1755,51 @@ impl ServerPhysicalDesignRuntime {
     }
 
     fn apply_approved_columnar(
+        &mut self,
+        database: &mut Database,
+        runtime_token_matches: bool,
+        expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
+        candidate: PhysicalColumnarCandidate,
+        mode: PhysicalColumnarDesignMode,
+        placement: ServerPhysicalColumnarPlacementKey,
+    ) -> Result<ServerApprovedPhysicalColumnarApplyReport, ServerPhysicalColumnarDesignControlError>
+    {
+        let directory = self
+            .columnar_apply
+            .as_ref()
+            .ok_or(ServerPhysicalColumnarDesignControlError::ColumnarApplyNotEnabled)?
+            .root()
+            .join(placement.as_str());
+        let receipt_id = self.begin_columnar_receipt(
+            ServerPhysicalDesignMutationSource::LocalOperator,
+            expected_evidence_epoch,
+            candidate.clone(),
+            mode,
+            placement.clone(),
+            directory,
+        )?;
+        let result = self.apply_approved_columnar_unreceipted(
+            database,
+            runtime_token_matches,
+            expected_evidence_epoch,
+            candidate,
+            mode,
+            placement,
+        );
+        self.finish_columnar_result(receipt_id, result, |report| match report.outcome {
+            ServerApprovedPhysicalColumnarApplyOutcome::Created { projection_id } => {
+                ServerPhysicalDesignMutationReceiptOutcome::CreatedColumnar { projection_id }
+            }
+            ServerApprovedPhysicalColumnarApplyOutcome::AlreadyApplied { projection_id } => {
+                ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedColumnar { projection_id }
+            }
+            ServerApprovedPhysicalColumnarApplyOutcome::AlreadyCovered => {
+                ServerPhysicalDesignMutationReceiptOutcome::AlreadyCovered
+            }
+        })
+    }
+
+    fn apply_approved_columnar_unreceipted(
         &mut self,
         database: &mut Database,
         runtime_token_matches: bool,
@@ -1529,6 +1903,52 @@ impl ServerPhysicalDesignRuntime {
     }
 }
 
+fn index_error_receipt_outcome(
+    error: &ServerPhysicalDesignControlError,
+) -> Option<ServerPhysicalDesignMutationReceiptOutcome> {
+    match error {
+        ServerPhysicalDesignControlError::Apply(error)
+            if matches!(
+                error.as_ref(),
+                PhysicalIndexDesignApplyError::Database(_)
+                    | PhysicalIndexDesignApplyError::Advisor(PhysicalDesignAdvisorError::Database(
+                        _,
+                    ))
+            ) =>
+        {
+            None
+        }
+        ServerPhysicalDesignControlError::Apply(_) => {
+            Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected)
+        }
+        ServerPhysicalDesignControlError::MutationReceipt(_) => None,
+        _ => Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected),
+    }
+}
+
+fn columnar_error_receipt_outcome(
+    error: &ServerPhysicalColumnarDesignControlError,
+) -> Option<ServerPhysicalDesignMutationReceiptOutcome> {
+    match error {
+        ServerPhysicalColumnarDesignControlError::Apply(error)
+            if matches!(
+                error.as_ref(),
+                PhysicalColumnarDesignApplyError::Database(_)
+                    | PhysicalColumnarDesignApplyError::Advisor(
+                        PhysicalDesignAdvisorError::Database(_),
+                    )
+            ) =>
+        {
+            None
+        }
+        ServerPhysicalColumnarDesignControlError::Apply(_) => {
+            Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected)
+        }
+        ServerPhysicalColumnarDesignControlError::MutationReceipt(_) => None,
+        _ => Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected),
+    }
+}
+
 fn require_unoccupied(
     directory: &Path,
     placement: &ServerPhysicalColumnarPlacementKey,
@@ -1565,6 +1985,24 @@ pub(crate) fn forward_physical_design_control_requests<F>(
                 let fallback = reply.clone();
                 if submit(ServerPhysicalDesignWorkerCommand::Status { reply }).is_err() {
                     let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
+                }
+            }
+            ServerPhysicalDesignControlRequest::MutationReceipts {
+                after,
+                limit,
+                reply,
+            } => {
+                let fallback = reply.clone();
+                if submit(ServerPhysicalDesignWorkerCommand::MutationReceipts {
+                    after,
+                    limit,
+                    reply,
+                })
+                .is_err()
+                {
+                    let _ = fallback.send(Err(
+                        ServerPhysicalDesignMutationReceiptControlError::ServerStopped,
+                    ));
                 }
             }
             ServerPhysicalDesignControlRequest::Recommendations { reply } => {
@@ -1690,6 +2128,11 @@ pub(crate) fn handle_disabled_physical_design_worker_command(
         ServerPhysicalDesignWorkerCommand::Status { reply } => {
             let _ = reply.send(Err(
                 ServerPhysicalDesignControlError::PhysicalDesignNotEnabled,
+            ));
+        }
+        ServerPhysicalDesignWorkerCommand::MutationReceipts { reply, .. } => {
+            let _ = reply.send(Err(
+                ServerPhysicalDesignMutationReceiptControlError::NotEnabled,
             ));
         }
         ServerPhysicalDesignWorkerCommand::Recommendations { reply } => {
@@ -1966,6 +2409,27 @@ mod tests {
         response.recv().expect("approved apply response")
     }
 
+    fn receipts(
+        database: &mut Database,
+        runtime: &mut ServerPhysicalDesignRuntime,
+        after: Option<ServerPhysicalDesignMutationReceiptId>,
+        limit: u32,
+    ) -> Result<
+        ServerPhysicalDesignMutationReceiptPage,
+        ServerPhysicalDesignMutationReceiptControlError,
+    > {
+        let (reply, response) = mpsc::sync_channel(1);
+        runtime.handle(
+            database,
+            ServerPhysicalDesignWorkerCommand::MutationReceipts {
+                after,
+                limit,
+                reply,
+            },
+        );
+        response.recv().expect("receipt response")
+    }
+
     fn current_commit_seq(database: &Database) -> DatabaseCommitSeq {
         database
             .current_database_snapshot()
@@ -2155,6 +2619,18 @@ mod tests {
         assert!(matches!(
             response.recv().expect("disabled proposal response"),
             Err(ServerPhysicalDesignControlError::PhysicalDesignNotEnabled)
+        ));
+        let (reply, response) = mpsc::sync_channel(1);
+        handle_disabled_physical_design_worker_command(
+            ServerPhysicalDesignWorkerCommand::MutationReceipts {
+                after: None,
+                limit: 1,
+                reply,
+            },
+        );
+        assert!(matches!(
+            response.recv().expect("disabled receipt response"),
+            Err(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
         ));
         let (reply, response) = mpsc::sync_channel(1);
         handle_disabled_physical_design_worker_command(
@@ -2689,5 +3165,373 @@ mod tests {
             Err(ServerPhysicalColumnarDesignControlError::PlacementOccupied { .. })
         ));
         fixture.close();
+    }
+
+    #[test]
+    fn index_receipts_cover_programmatic_retry_and_local_operator_sources() {
+        let mut fixture = Fixture::create("index-receipts");
+        let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+            fixture.root.join("physical-design.nbmr"),
+            1_000_000,
+        )
+        .unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config),
+            &fixture.database,
+        )
+        .unwrap();
+        record_candidate(&mut fixture.database, &mut runtime);
+        let status_before = runtime.status();
+        let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
+        let created = apply(
+            &mut fixture.database,
+            &mut runtime,
+            proposal.clone(),
+            "events_category_idx",
+        )
+        .unwrap();
+        let PhysicalIndexDesignApplyOutcome::Created { index_id } = created.outcome else {
+            panic!("expected created index");
+        };
+        let repeated = apply(
+            &mut fixture.database,
+            &mut runtime,
+            proposal,
+            "events_category_idx",
+        )
+        .unwrap();
+        assert_eq!(
+            repeated.outcome,
+            PhysicalIndexDesignApplyOutcome::AlreadyApplied { index_id }
+        );
+        let evidence_epoch = runtime.evidence.epoch();
+        let operator = apply_approved(
+            &mut fixture.database,
+            &mut runtime,
+            true,
+            evidence_epoch,
+            "events_category_idx_other",
+        )
+        .unwrap();
+        assert_eq!(
+            operator.outcome,
+            ServerApprovedPhysicalIndexApplyOutcome::AlreadyCovered
+        );
+
+        let page = receipts(&mut fixture.database, &mut runtime, None, 128).unwrap();
+        assert_eq!(page.receipts.len(), 3);
+        assert_eq!(page.receipts[0].id.0, 1);
+        assert_eq!(page.receipts[1].id.0, 2);
+        assert_eq!(page.receipts[2].id.0, 3);
+        assert_eq!(
+            page.receipts[0].source,
+            ServerPhysicalDesignMutationSource::Programmatic
+        );
+        assert_eq!(
+            page.receipts[0].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::CreatedIndex { index_id }
+        );
+        assert_eq!(
+            page.receipts[1].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedIndex { index_id }
+        );
+        assert_eq!(
+            page.receipts[2].source,
+            ServerPhysicalDesignMutationSource::LocalOperator
+        );
+        assert_eq!(
+            page.receipts[2].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::AlreadyCovered
+        );
+        assert_eq!(runtime.status(), status_before);
+        assert!(matches!(
+            page.receipts[0].target,
+            crate::ServerPhysicalDesignMutationTarget::Index { .. }
+        ));
+        fixture.close();
+    }
+
+    #[test]
+    fn columnar_receipts_cover_both_modes_without_exposing_recovery_paths() {
+        for (name, mode) in [
+            ("receipt-snapshot", PhysicalColumnarDesignMode::Snapshot),
+            (
+                "receipt-incremental",
+                PhysicalColumnarDesignMode::Incremental,
+            ),
+        ] {
+            let mut fixture = Fixture::create(name);
+            let placements = fixture.root.join("private-placements");
+            fs::create_dir(&placements).unwrap();
+            let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+                fixture.root.join("physical-design.nbmr"),
+                1_000_000,
+            )
+            .unwrap();
+            let columnar = ServerPhysicalColumnarApplyConfig::new(&placements, true, true).unwrap();
+            let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+                config(),
+                Some(columnar),
+                Some(receipt_config),
+                &fixture.database,
+            )
+            .unwrap();
+            if mode == PhysicalColumnarDesignMode::Incremental {
+                fixture.database.enable_change_stream(TABLE_ID).unwrap();
+            }
+            record_columnar_candidate(&mut fixture.database, &mut runtime);
+            let proposal = propose_columnar(
+                &mut fixture.database,
+                &mut runtime,
+                mode,
+                "events-reporting",
+            )
+            .unwrap();
+            let report = apply_columnar(&mut fixture.database, &mut runtime, proposal).unwrap();
+            let projection_id = match report.outcome {
+                PhysicalColumnarDesignApplyOutcome::Created { projection_id } => projection_id,
+                _ => panic!("expected created Columnar projection"),
+            };
+            let page = receipts(&mut fixture.database, &mut runtime, None, 1).unwrap();
+            assert_eq!(page.receipts.len(), 1);
+            assert_eq!(
+                page.receipts[0].outcome,
+                ServerPhysicalDesignMutationReceiptOutcome::CreatedColumnar { projection_id }
+            );
+            assert!(matches!(
+                &page.receipts[0].target,
+                crate::ServerPhysicalDesignMutationTarget::Columnar {
+                    mode: receipt_mode,
+                    placement,
+                    ..
+                } if *receipt_mode == mode && placement.as_str() == "events-reporting"
+            ));
+            assert!(!format!("{:?}", page.receipts[0]).contains("private-placements"));
+            fixture.close();
+        }
+    }
+
+    #[test]
+    fn receipt_reads_are_bounded_paginated_and_side_effect_free() {
+        let mut fixture = Fixture::create("receipt-pages");
+        let receipt_path = fixture.root.join("physical-design.nbmr");
+        let receipt_config =
+            ServerPhysicalDesignMutationReceiptConfig::new(&receipt_path, 1_000_000).unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config),
+            &fixture.database,
+        )
+        .unwrap();
+        record_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
+        for suffix in 0..130 {
+            apply(
+                &mut fixture.database,
+                &mut runtime,
+                proposal.clone(),
+                &format!("events_category_idx_{suffix}"),
+            )
+            .unwrap();
+        }
+        let bytes_before = fs::read(&receipt_path).unwrap();
+        let first = receipts(&mut fixture.database, &mut runtime, None, 128).unwrap();
+        assert_eq!(first.receipts.len(), 128);
+        assert_eq!(first.receipts[0].id.0, 1);
+        assert_eq!(first.next_after, Some(first.receipts[127].id));
+        assert_eq!(
+            receipts(&mut fixture.database, &mut runtime, None, 128).unwrap(),
+            first
+        );
+        let second = receipts(&mut fixture.database, &mut runtime, first.next_after, 128).unwrap();
+        assert_eq!(second.receipts.len(), 2);
+        assert_eq!(second.receipts[0].id.0, 129);
+        assert_eq!(second.receipts[1].id.0, 130);
+        assert_eq!(second.next_after, None);
+        assert_eq!(fs::read(&receipt_path).unwrap(), bytes_before);
+        assert!(matches!(
+            receipts(&mut fixture.database, &mut runtime, None, 129),
+            Err(ServerPhysicalDesignMutationReceiptControlError::InvalidLimit { .. })
+        ));
+        fixture.close();
+    }
+
+    #[test]
+    fn begin_failure_prevents_mutation_without_burning_a_receipt_id() {
+        let mut fixture = Fixture::create("receipt-begin-failure");
+        let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+            fixture.root.join("physical-design.nbmr"),
+            1_000_000,
+        )
+        .unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config),
+            &fixture.database,
+        )
+        .unwrap();
+        record_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
+        let before = current_commit_seq(&fixture.database);
+        runtime.fail_next_receipt_begin_append();
+        assert!(matches!(
+            apply(
+                &mut fixture.database,
+                &mut runtime,
+                proposal,
+                "events_category_idx"
+            ),
+            Err(ServerPhysicalDesignControlError::MutationReceipt(
+                ServerPhysicalDesignMutationReceiptControlError::Journal(_)
+            ))
+        ));
+        assert_eq!(current_commit_seq(&fixture.database), before);
+        assert_eq!(
+            fixture.database.inspect_physical_index_design_name(
+                CANDIDATE,
+                &IndexName::new("events_category_idx").unwrap()
+            ),
+            PhysicalIndexDesignNameState::Available
+        );
+        assert!(
+            receipts(&mut fixture.database, &mut runtime, None, 1)
+                .unwrap()
+                .receipts
+                .is_empty()
+        );
+        fixture.close();
+    }
+
+    #[test]
+    fn outcome_failure_gates_mutations_and_restart_reconciles_created_index() {
+        let mut fixture = Fixture::create("receipt-outcome-failure");
+        let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+            fixture.root.join("physical-design.nbmr"),
+            1_000_000,
+        )
+        .unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config.clone()),
+            &fixture.database,
+        )
+        .unwrap();
+        record_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
+        runtime.fail_next_receipt_outcome_append();
+        assert!(matches!(
+            apply(
+                &mut fixture.database,
+                &mut runtime,
+                proposal.clone(),
+                "events_category_idx"
+            ),
+            Err(ServerPhysicalDesignControlError::MutationReceipt(
+                ServerPhysicalDesignMutationReceiptControlError::Journal(_)
+            ))
+        ));
+        let index_id = match fixture.database.inspect_physical_index_design_name(
+            CANDIDATE,
+            &IndexName::new("events_category_idx").unwrap(),
+        ) {
+            PhysicalIndexDesignNameState::AlreadyApplied { index_id } => index_id,
+            state => panic!("expected created index after receipt failure, got {state:?}"),
+        };
+        assert_eq!(
+            receipts(&mut fixture.database, &mut runtime, None, 1)
+                .unwrap()
+                .receipts[0]
+                .outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::Pending
+        );
+        assert!(matches!(
+            apply(
+                &mut fixture.database,
+                &mut runtime,
+                proposal,
+                "events_category_idx"
+            ),
+            Err(ServerPhysicalDesignControlError::MutationReceipt(
+                ServerPhysicalDesignMutationReceiptControlError::RecoveryRequired
+            ))
+        ));
+        drop(runtime);
+
+        let mut reopened = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config),
+            &fixture.database,
+        )
+        .unwrap();
+        let page = receipts(&mut fixture.database, &mut reopened, None, 1).unwrap();
+        assert_eq!(
+            page.receipts[0].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::RecoveredAppliedIndex { index_id }
+        );
+        fixture.close();
+    }
+
+    #[test]
+    fn columnar_outcome_failure_reconciles_after_database_reopen() {
+        let mut fixture = Fixture::create("columnar-receipt-outcome-failure");
+        let placements = fixture.root.join("private-placements");
+        fs::create_dir(&placements).unwrap();
+        let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+            fixture.root.join("physical-design.nbmr"),
+            1_000_000,
+        )
+        .unwrap();
+        let columnar = ServerPhysicalColumnarApplyConfig::new(&placements, true, false).unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            Some(columnar.clone()),
+            Some(receipt_config.clone()),
+            &fixture.database,
+        )
+        .unwrap();
+        record_columnar_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose_columnar(
+            &mut fixture.database,
+            &mut runtime,
+            PhysicalColumnarDesignMode::Snapshot,
+            "events-reporting",
+        )
+        .unwrap();
+        runtime.fail_next_receipt_outcome_append();
+        assert!(matches!(
+            apply_columnar(&mut fixture.database, &mut runtime, proposal),
+            Err(ServerPhysicalColumnarDesignControlError::MutationReceipt(
+                ServerPhysicalDesignMutationReceiptControlError::Journal(_)
+            ))
+        ));
+        let projection_id = fixture.database.inspect_columnar_projections()[0]
+            .projection_id
+            .unwrap();
+        drop(runtime);
+        let Fixture { root, database } = fixture;
+        database.close().unwrap();
+
+        let mut database = Database::open_catalog(root.join("catalog")).unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            Some(columnar),
+            Some(receipt_config),
+            &database,
+        )
+        .unwrap();
+        let page = receipts(&mut database, &mut runtime, None, 1).unwrap();
+        assert_eq!(
+            page.receipts[0].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::RecoveredAppliedColumnar { projection_id }
+        );
+        drop(runtime);
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }
