@@ -2563,6 +2563,7 @@ mod tests {
         for payload in [
             br#"{"request_id":1,"operation":{"type":"status","extra":true}}"#.as_slice(),
             br#"{"request_id":1,"operation":{"type":"unknown"}}"#.as_slice(),
+            br#"{"request_id":1,"operation":{"type":"apply_physical_columnar"}}"#.as_slice(),
             br#"{"request_id":1,"operation":{"type":"apply_physical_index","index_name":"idx"}}"#
                 .as_slice(),
             &[0xff][..],

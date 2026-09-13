@@ -35,7 +35,8 @@ use crate::adaptive_feedback::{
 use crate::authorization::{AuthorizationPolicy, PrincipalAuthorization};
 use crate::operator::ServerOperatorPlane;
 use crate::physical_design::{
-    ServerHostObservationConfig, ServerPhysicalDesignAdvisorConfig,
+    ServerHostObservationConfig, ServerPhysicalColumnarApplyConfig,
+    ServerPhysicalColumnarApplyStartupError, ServerPhysicalDesignAdvisorConfig,
     ServerPhysicalDesignControlHandle, ServerPhysicalDesignRuntime,
     ServerPhysicalDesignWorkerCommand, forward_physical_design_control_requests,
     handle_disabled_physical_design_worker_command,
@@ -57,6 +58,7 @@ pub struct PostgresTcpServer {
     config: ServerConfig,
     adaptive_override: Option<ServerAdaptiveStartupMode>,
     physical_design_override: Option<ServerPhysicalDesignAdvisorConfig>,
+    physical_columnar_apply_override: Option<ServerPhysicalColumnarApplyConfig>,
 }
 
 impl PostgresTcpServer {
@@ -66,6 +68,7 @@ impl PostgresTcpServer {
             config,
             adaptive_override: None,
             physical_design_override: None,
+            physical_columnar_apply_override: None,
         }
     }
 
@@ -96,6 +99,17 @@ impl PostgresTcpServer {
         self
     }
 
+    /// Approves one pre-provisioned Server-owned namespace and explicit modes
+    /// for programmatic Columnar apply. The PostgreSQL wire contract is unchanged.
+    #[must_use]
+    pub fn with_physical_columnar_apply(
+        mut self,
+        config: ServerPhysicalColumnarApplyConfig,
+    ) -> Self {
+        self.physical_columnar_apply_override = Some(config);
+        self
+    }
+
     pub fn start(self) -> Result<PostgresServerHandle, PostgresTcpServerError> {
         let (
             listen,
@@ -109,6 +123,19 @@ impl PostgresTcpServer {
         ) = self.config.into_parts();
         let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
         let physical_design = self.physical_design_override.or(manifest_physical_design);
+        let physical_columnar_apply = self.physical_columnar_apply_override;
+        if physical_columnar_apply.is_some() && physical_design.is_none() {
+            return Err(PostgresTcpServerError::PhysicalColumnarApplyConfig(
+                ServerPhysicalColumnarApplyStartupError::PhysicalDesignRequired,
+            ));
+        }
+        if let Some(config) = physical_columnar_apply.as_ref() {
+            config.revalidate().map_err(|error| {
+                PostgresTcpServerError::PhysicalColumnarApplyConfig(
+                    ServerPhysicalColumnarApplyStartupError::PlacementRoot(error),
+                )
+            })?;
+        }
         if security.kind() != TransportKind::PlaintextLoopback {
             return Err(PostgresTcpServerError::TlsManifestUnsupported);
         }
@@ -119,6 +146,7 @@ impl PostgresTcpServer {
             authorization,
             adaptive_mode,
             physical_design,
+            physical_columnar_apply,
         )?;
         let listener = match TcpListener::bind(listen) {
             Ok(listener) => listener,
@@ -317,6 +345,7 @@ pub enum PostgresTcpServerError {
     ThreadSpawn(io::Error),
     Database(DatabaseError),
     AdaptiveConfig(ServerAdaptiveDriverConfigError),
+    PhysicalColumnarApplyConfig(ServerPhysicalColumnarApplyStartupError),
     Operator(ServerOperatorError),
     OperatorAndServerCleanup {
         operator: Box<ServerOperatorError>,
@@ -357,6 +386,9 @@ impl fmt::Display for PostgresTcpServerError {
             Self::AdaptiveConfig(error) => {
                 write!(formatter, "adaptive driver startup failed: {error}")
             }
+            Self::PhysicalColumnarApplyConfig(error) => {
+                write!(formatter, "physical-columnar apply startup failed: {error}")
+            }
             Self::Operator(error) => error.fmt(formatter),
             Self::OperatorAndServerCleanup { operator, server } => write!(
                 formatter,
@@ -388,6 +420,7 @@ impl Error for PostgresTcpServerError {
             | Self::ThreadSpawn(source) => Some(source),
             Self::Database(error) => Some(error),
             Self::AdaptiveConfig(error) => Some(error),
+            Self::PhysicalColumnarApplyConfig(error) => Some(error),
             Self::Operator(error) => Some(error),
             Self::OperatorAndServerCleanup { server, .. } => Some(server.as_ref()),
             Self::StartupCleanup { cleanup, .. } => Some(cleanup.as_ref()),
@@ -671,6 +704,7 @@ impl PgDatabaseWorker {
         authorization: AuthorizationPolicy,
         adaptive_mode: ServerAdaptiveStartupMode,
         physical_design_config: Option<ServerPhysicalDesignAdvisorConfig>,
+        physical_columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,
     ) -> Result<Self, PostgresTcpServerError> {
         let (commands, receiver) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -695,7 +729,9 @@ impl PgDatabaseWorker {
                         return database.close().map_err(|error| error.to_string());
                     }
                 };
-                let physical_design = physical_design_config.map(ServerPhysicalDesignRuntime::new);
+                let physical_design = physical_design_config.map(|config| {
+                    ServerPhysicalDesignRuntime::new_with_columnar(config, physical_columnar_apply)
+                });
                 if ready_tx.send(Ok(())).is_err() {
                     return database.close().map_err(|error| error.to_string());
                 }

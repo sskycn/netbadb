@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use netbadb_core::{
     AdaptiveEvidencePoolLimits, AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope,
     AutomaticSchedulerPolicy, Database, DatabaseCoordinatorConfig, MaintenanceBudget,
+    PhysicalColumnarCandidate, PhysicalColumnarDesignApplyOutcome, PhysicalColumnarDesignMode,
     PhysicalDesignAdvisorError, PhysicalDesignEvidenceRecordError, TableStorageCreateSpec,
 };
 use netbadb_pgwire::{CANCEL_REQUEST_CODE, PROTOCOL_VERSION_3, SSL_REQUEST_CODE};
@@ -13,9 +14,11 @@ use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
     OperatorAdaptiveModeV3, OperatorClientError, OperatorErrorCodeV3,
     OperatorPhysicalDesignDecisionV3, OperatorPhysicalDesignRecordErrorV3,
-    OperatorPhysicalIndexApplyOutcomeV3, PostgresTcpServer, ServerAdaptiveControlError,
-    ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig, ServerAdaptiveMode, ServerConfig,
-    ServerOperatorClient, ServerPhysicalDesignControlError,
+    OperatorPhysicalIndexApplyOutcomeV3, PostgresTcpServer, PostgresTcpServerError,
+    ServerAdaptiveControlError, ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig,
+    ServerAdaptiveMode, ServerConfig, ServerOperatorClient, ServerPhysicalColumnarApplyConfig,
+    ServerPhysicalColumnarApplyStartupError, ServerPhysicalColumnarPlacementKey,
+    ServerPhysicalDesignControlError,
 };
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 
@@ -63,6 +66,31 @@ fn users_table() -> TableDef {
     )
 }
 
+fn physical_design_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "evidence_limits": {
+            "max_index_candidates": 64,
+            "max_columnar_candidates": 64,
+            "max_query_shapes_per_candidate": 32,
+            "max_columnar_columns_per_candidate": 64
+        },
+        "advisor_policy": {
+            "index": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            },
+            "columnar": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            }
+        }
+    })
+}
+
 fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
     let directory = test_directory(name);
     cleanup(&directory);
@@ -106,6 +134,121 @@ fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
         .start()
         .unwrap();
     (directory, server)
+}
+
+#[cfg(unix)]
+#[test]
+fn postgres_programmatic_columnar_apply_has_native_builder_parity() {
+    let directory = test_directory("physical-columnar-apply");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let placements = directory.join("columnar");
+    std::fs::create_dir(&placements).unwrap();
+    let mut database = Database::create_catalog(
+        directory.join("catalog"),
+        vec![TableStorageCreateSpec::heap(
+            directory.join("users.ndb"),
+            users_table(),
+        )],
+        Some(
+            DatabaseCoordinatorConfig::new(directory.join("coordinator")).with_global_visibility(),
+        ),
+    )
+    .unwrap();
+    database
+        .execute("INSERT INTO users (id, name, active) VALUES (1, 'Ada', true)")
+        .unwrap();
+    let change_stream = database.enable_change_stream(TableId(1)).unwrap();
+    database.close().unwrap();
+    let manifest = directory.join("server.json");
+    let mut value: serde_json::Value = serde_json::from_str(
+        r#"{
+            "version": 8,
+            "listen": "127.0.0.1:0",
+            "authorization": {
+                "local_plaintext": {"schema_admin": false,
+                    "tables": [{"table_id":1,"read":true,"write":false,"transaction":false,"analyze":false}]
+                },
+                "clients": []
+            },
+            "tables": [{
+                "path":"users.ndb","id":1,"name":"users",
+                "columns":[
+                    {"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false,"primary_key":true},
+                    {"id":2,"name":"name","physical_type":"text","semantic_type":null,"nullable":true,"primary_key":false},
+                    {"id":3,"name":"active","physical_type":"bool","semantic_type":null,"nullable":false,"primary_key":false}
+                ]
+            }]
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(matches!(
+        PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+            .with_physical_columnar_apply(
+                ServerPhysicalColumnarApplyConfig::new(&placements, true, true).unwrap(),
+            )
+            .start(),
+        Err(PostgresTcpServerError::PhysicalColumnarApplyConfig(
+            ServerPhysicalColumnarApplyStartupError::PhysicalDesignRequired
+        ))
+    ));
+    value["physical_design"] = physical_design_manifest();
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let server = PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .with_physical_columnar_apply(
+            ServerPhysicalColumnarApplyConfig::new(&placements, true, true).unwrap(),
+        )
+        .start()
+        .unwrap();
+    let control = server.physical_design_control();
+    let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+    startup(&mut stream);
+    let messages = query(&mut stream, "SELECT id FROM users");
+    assert_eq!(messages.last().map(|message| message.0), Some(b'Z'));
+    let messages = query(&mut stream, "SELECT name FROM users");
+    assert_eq!(messages.last().map(|message| message.0), Some(b'Z'));
+    let snapshot = control
+        .propose_columnar(
+            PhysicalColumnarCandidate {
+                table_id: TableId(1),
+                columns: vec![ColumnId(2)],
+            },
+            PhysicalColumnarDesignMode::Snapshot,
+            ServerPhysicalColumnarPlacementKey::new("users-name").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(snapshot.change_stream_generation(), None);
+    assert!(!placements.join("users-name").exists());
+    assert!(matches!(
+        control.apply_columnar(&snapshot).unwrap().outcome,
+        PhysicalColumnarDesignApplyOutcome::Created { .. }
+    ));
+    let proposal = control
+        .propose_columnar(
+            PhysicalColumnarCandidate {
+                table_id: TableId(1),
+                columns: vec![ColumnId(1)],
+            },
+            PhysicalColumnarDesignMode::Incremental,
+            ServerPhysicalColumnarPlacementKey::new("users-id").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        proposal.change_stream_generation(),
+        Some(change_stream.generation)
+    );
+    assert!(!placements.join("users-id").exists());
+    assert!(matches!(
+        control.apply_columnar(&proposal).unwrap().outcome,
+        PhysicalColumnarDesignApplyOutcome::Created { .. }
+    ));
+    let messages = query(&mut stream, "SELECT id FROM users");
+    assert_eq!(messages.last().map(|message| message.0), Some(b'Z'));
+    stream.write_all(&frontend(b'X', &[])).unwrap();
+    drop(stream);
+    server.shutdown().unwrap();
+    cleanup(&directory);
 }
 
 #[cfg(unix)]

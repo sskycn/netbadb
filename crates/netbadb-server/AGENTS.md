@@ -82,6 +82,14 @@
   incarnation, schema, storage, evidence, naming, allocation, WAL, retry, or
   recovery authority. It MUST NOT create an automatic apply path; an operator
   wire path must satisfy the explicit approval rules below.
+- Programmatic Server Columnar apply MUST use a configured Server-owned
+  placement namespace. The control caller supplies only a validated logical
+  placement key, never an arbitrary filesystem path, and the resolved
+  directory MUST be one direct child of the configured canonical root. Server
+  owns only placement policy and runtime provenance; database, schema, storage,
+  Change Stream, evidence, ProjectionId, NBPC, artifact, and recovery decisions
+  remain Core authority. A Server Columnar proposal MUST expire with the exact
+  Physical Design runtime that issued it.
 - Durable physical-index mutation from the local operator plane MUST require
   explicit deployment authorization in addition to filesystem access.
 - A wire approval MUST bind both an operator/runtime lifetime and an exact

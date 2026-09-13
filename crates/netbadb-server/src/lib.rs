@@ -59,10 +59,14 @@ pub use operator::{
     ServerOperatorError,
 };
 pub use physical_design::{
-    ServerPhysicalDesignAdvisorConfig, ServerPhysicalDesignControlError,
-    ServerPhysicalDesignControlHandle, ServerPhysicalDesignDiagnostics,
-    ServerPhysicalDesignRotationReport, ServerPhysicalDesignStatus,
-    ServerPhysicalIndexDesignProposal,
+    ServerPhysicalColumnarApplyConfig, ServerPhysicalColumnarApplyConfigError,
+    ServerPhysicalColumnarApplyStartupError, ServerPhysicalColumnarDesignApplyReport,
+    ServerPhysicalColumnarDesignControlError, ServerPhysicalColumnarDesignProposal,
+    ServerPhysicalColumnarPlacementKey, ServerPhysicalColumnarPlacementKeyError,
+    ServerPhysicalColumnarPlacementRootError, ServerPhysicalDesignAdvisorConfig,
+    ServerPhysicalDesignControlError, ServerPhysicalDesignControlHandle,
+    ServerPhysicalDesignDiagnostics, ServerPhysicalDesignRotationReport,
+    ServerPhysicalDesignStatus, ServerPhysicalIndexDesignProposal,
 };
 pub use postgres::{PostgresServerHandle, PostgresTcpServer, PostgresTcpServerError};
 pub use runtime::{ServerHandle, SessionId, TcpServer, TcpServerError, WorkerFatalError};

@@ -404,6 +404,19 @@ no path, row-group policy, stream enablement, identity allocation, artifact
 publication, refresh, scheduler, Server/operator surface, external contract, or
 persistent format authority is added.
 
+[Adaptive Operations Phase 28](adaptive-operations-phase28.md) carries that
+Core authority through the Native/PostgreSQL embedded-host control path under a
+separate Server-owned placement policy. The host configures one pre-existing
+canonical root and explicit Snapshot/Incremental permissions; the caller can
+supply only a validated one-component logical key resolving to one direct
+child. The sole Database worker reuses its Phase 24 weak runtime identity,
+rejects unregistered filesystem occupants with `symlink_metadata`, preserves
+exact registered retry/conflict precedence through Core's classifier, and
+delegates the only mutation to Core Phase 27. Proposals reserve neither paths
+nor IDs and expire with their evidence runtime. No manifest, NBOP, daemon, CLI,
+wire, automatic maintenance, scheduler, metrics, inspection, or persistent
+format surface changes.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

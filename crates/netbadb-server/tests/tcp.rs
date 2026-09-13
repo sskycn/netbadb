@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use netbadb_core::{
     AdaptiveEvidencePoolLimits, AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope,
     AutomaticSchedulerPolicy, Database, DatabaseCoordinatorConfig, MaintenanceBudget,
+    PhysicalColumnarCandidate, PhysicalColumnarDesignApplyOutcome, PhysicalColumnarDesignMode,
+    PhysicalDesignAdvisorPolicy, PhysicalDesignEvidenceLimits, PhysicalDesignRecommendationPolicy,
     PhysicalIndexCandidate, PhysicalIndexDesignApplyOutcome, TableStorageCreateSpec,
 };
 use netbadb_protocol::{
@@ -19,7 +21,10 @@ use netbadb_server::{
     OperatorErrorCodeV3, OperatorPhysicalDesignDecisionV3, OperatorPhysicalDesignNoActionReasonV3,
     ServerAdaptiveControlError, ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig,
     ServerAdaptiveMode, ServerConfig, ServerHandle, ServerOperatorClient,
-    ServerPhysicalDesignControlError, TcpServer, TcpServerError, TransportKind,
+    ServerPhysicalColumnarApplyConfig, ServerPhysicalColumnarApplyStartupError,
+    ServerPhysicalColumnarDesignControlError, ServerPhysicalColumnarPlacementKey,
+    ServerPhysicalDesignAdvisorConfig, ServerPhysicalDesignControlError, TcpServer, TcpServerError,
+    TransportKind,
 };
 use netbadb_storage::{wal_alternate_path, wal_path};
 use netbadb_types::{ColumnId, IndexName, PhysicalType, ScalarValue, TableId};
@@ -98,6 +103,47 @@ fn teams_table() -> TableDef {
 
 fn manifest_json(heap_name: &str, semantic_name: &str) -> String {
     manifest_json_with_limits(heap_name, semantic_name, None)
+}
+
+fn physical_design_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "evidence_limits": {
+            "max_index_candidates": 64,
+            "max_columnar_candidates": 64,
+            "max_query_shapes_per_candidate": 32,
+            "max_columnar_columns_per_candidate": 64
+        },
+        "advisor_policy": {
+            "index": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            },
+            "columnar": {
+                "minimum_reports": 1,
+                "minimum_distinct_query_shapes": 1,
+                "minimum_actual_scan_work_units": 0,
+                "max_recommendations": 8
+            }
+        }
+    })
+}
+
+fn physical_design_config() -> ServerPhysicalDesignAdvisorConfig {
+    let recommendation = PhysicalDesignRecommendationPolicy {
+        minimum_reports: 1,
+        minimum_distinct_query_shapes: 1,
+        minimum_actual_scan_work_units: 0,
+        max_recommendations: 8,
+    };
+    ServerPhysicalDesignAdvisorConfig::new(
+        PhysicalDesignEvidenceLimits::default(),
+        PhysicalDesignAdvisorPolicy {
+            index: recommendation,
+            columnar: recommendation,
+        },
+    )
 }
 
 fn manifest_json_with_limits(heap_name: &str, semantic_name: &str, limits: Option<&str>) -> String {
@@ -246,6 +292,217 @@ fn create_two_table_server(name: &str, authorization: &str) -> (PathBuf, ServerH
         .start()
         .unwrap();
     (directory, server)
+}
+
+#[test]
+fn native_columnar_apply_requires_design_and_revalidates_root_at_startup() {
+    let directory = test_directory("physical-columnar-startup");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    Database::create(directory.join("users.ndb"), users_table("UserId"))
+        .unwrap()
+        .close()
+        .unwrap();
+    let manifest = directory.join("server.json");
+    std::fs::write(&manifest, manifest_json("users.ndb", "UserId")).unwrap();
+    let placements = directory.join("columnar");
+    std::fs::create_dir(&placements).unwrap();
+    let apply = ServerPhysicalColumnarApplyConfig::new(&placements, true, false).unwrap();
+    assert!(matches!(
+        TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+            .with_physical_columnar_apply(apply.clone())
+            .start(),
+        Err(TcpServerError::PhysicalColumnarApplyConfig(
+            ServerPhysicalColumnarApplyStartupError::PhysicalDesignRequired
+        ))
+    ));
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(&manifest_json("users.ndb", "UserId")).unwrap();
+    value["physical_design"] = physical_design_manifest();
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    std::fs::remove_dir(&placements).unwrap();
+    assert!(matches!(
+        TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+            .with_physical_columnar_apply(apply)
+            .start(),
+        Err(TcpServerError::PhysicalColumnarApplyConfig(
+            ServerPhysicalColumnarApplyStartupError::PlacementRoot(_)
+        ))
+    ));
+
+    std::fs::write(&manifest, manifest_json("users.ndb", "UserId")).unwrap();
+    std::fs::create_dir(&placements).unwrap();
+    let apply = ServerPhysicalColumnarApplyConfig::new(&placements, true, true).unwrap();
+    let config = ServerConfig::from_manifest_path(&manifest).unwrap();
+    let first = TcpServer::new(config.clone())
+        .with_physical_columnar_apply(apply.clone())
+        .with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(
+            AdaptiveEvidencePoolLimits::default(),
+        ))
+        .with_physical_design_advisor(physical_design_config())
+        .start()
+        .unwrap();
+    assert_eq!(
+        first.adaptive_control().status().unwrap().mode,
+        ServerAdaptiveMode::FeedbackOnly
+    );
+    assert_eq!(
+        first
+            .physical_design_control()
+            .status()
+            .unwrap()
+            .evidence
+            .recorded_reports,
+        0
+    );
+    first.shutdown().unwrap();
+    let second = TcpServer::new(config)
+        .with_physical_design_advisor(physical_design_config())
+        .with_physical_columnar_apply(apply)
+        .with_adaptive_feedback(ServerAdaptiveFeedbackConfig::new(
+            AdaptiveEvidencePoolLimits::default(),
+        ))
+        .start()
+        .unwrap();
+    assert_eq!(
+        second.adaptive_control().status().unwrap().mode,
+        ServerAdaptiveMode::FeedbackOnly
+    );
+    second.shutdown().unwrap();
+    cleanup(&directory);
+}
+
+#[test]
+fn native_programmatic_columnar_apply_uses_manifest_advisor_and_approved_root() {
+    let directory = test_directory("physical-columnar-apply");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let placements = directory.join("columnar");
+    std::fs::create_dir(&placements).unwrap();
+    let mut database = Database::create_catalog(
+        directory.join("catalog"),
+        vec![TableStorageCreateSpec::heap(
+            directory.join("users.ndb"),
+            users_table("UserId"),
+        )],
+        Some(
+            DatabaseCoordinatorConfig::new(directory.join("coordinator")).with_global_visibility(),
+        ),
+    )
+    .unwrap();
+    database
+        .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+        .unwrap();
+    database.close().unwrap();
+
+    let manifest = directory.join("server.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&manifest_json("users.ndb", "UserId")).unwrap();
+    value["physical_design"] = physical_design_manifest();
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let apply = ServerPhysicalColumnarApplyConfig::new(&placements, true, false).unwrap();
+    let server = TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .with_physical_columnar_apply(apply)
+        .start()
+        .unwrap();
+    let control = server.physical_design_control();
+    let mut client = Client::connect(server.local_addr());
+    client.hello();
+    client.request(
+        2,
+        ClientMessage::Execute {
+            sql: "SELECT id FROM users".into(),
+        },
+    );
+    let before = control.status().unwrap();
+    let proposal = control
+        .propose_columnar(
+            PhysicalColumnarCandidate {
+                table_id: TableId(1),
+                columns: vec![ColumnId(1)],
+            },
+            PhysicalColumnarDesignMode::Snapshot,
+            ServerPhysicalColumnarPlacementKey::new("users-id").unwrap(),
+        )
+        .unwrap();
+    assert!(!placements.join("users-id").exists());
+    assert_eq!(control.status().unwrap(), before);
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let first_apply = {
+        let control = control.clone();
+        let proposal = proposal.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            control.apply_columnar(&proposal).unwrap()
+        })
+    };
+    let second_apply = {
+        let control = control.clone();
+        let proposal = proposal.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            control.apply_columnar(&proposal).unwrap()
+        })
+    };
+    barrier.wait();
+    let reports = [first_apply.join().unwrap(), second_apply.join().unwrap()];
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|report| matches!(
+                report.outcome,
+                PhysicalColumnarDesignApplyOutcome::Created { .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|report| matches!(
+                report.outcome,
+                PhysicalColumnarDesignApplyOutcome::AlreadyApplied { .. }
+            ))
+            .count(),
+        1
+    );
+    let projection_id = reports
+        .iter()
+        .find_map(|report| match report.outcome {
+            PhysicalColumnarDesignApplyOutcome::Created { projection_id } => Some(projection_id),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        reports
+            .iter()
+            .all(|report| { report.global_commit_seq_before == report.global_commit_seq_after })
+    );
+    assert_eq!(control.status().unwrap(), before);
+    assert_eq!(
+        control.apply_columnar(&proposal).unwrap().outcome,
+        PhysicalColumnarDesignApplyOutcome::AlreadyApplied { projection_id }
+    );
+    let messages = client.request(
+        3,
+        ClientMessage::Execute {
+            sql: "SELECT id FROM users".into(),
+        },
+    );
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        ServerMessage::QueryRow { values } if values == &vec![ScalarValue::Int64(1)]
+    )));
+    drop(client);
+    server.shutdown().unwrap();
+    assert!(matches!(
+        control.apply_columnar(&proposal),
+        Err(ServerPhysicalColumnarDesignControlError::ServerStopped)
+    ));
+    cleanup(&directory);
 }
 
 #[test]

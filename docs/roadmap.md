@@ -1,5 +1,27 @@
 # NetbaDB roadmap
 
+## Server programmatic Columnar design apply (Adaptive Operations Phase 28 complete)
+
+- added no-default programmatic Server placement configuration with a
+  pre-existing canonical root and explicit Snapshot/Incremental mode allowlist;
+- added a validated 1–128-byte portable logical placement key whose resolution
+  is exactly one direct child, with fail-closed root revalidation and
+  `symlink_metadata` occupancy checks for unregistered targets;
+- extended the shared Native/PostgreSQL control handle and sole Database worker
+  with same-runtime Columnar proposal/apply commands, reusing the Phase 24 weak
+  runtime identity and semantic-only proposal `Debug`/getters;
+- preserved Core location classification so exact retries return
+  `AlreadyApplied`, registered conflicts stay typed, and newer covering designs
+  return `AlreadyCovered`, while Server-only rejection consumes no ID;
+- delegated the only mutation to Core Phase 27 and retained Phase 26 NBPC v2,
+  artifact, ID-burn, and `RecoveryRequired` authority without automatic stream
+  enablement, maintenance, apply, path generation, retry, or reopen;
+- kept the placement policy programmatic-only: there is no daemon/operator
+  Columnar apply, Manifest v8 field, NBOP v3 operation, or external/persistent
+  contract change.
+
+See [`adaptive-operations-phase28.md`](adaptive-operations-phase28.md).
+
 ## Explicit Core Columnar design apply (Adaptive Operations Phase 27 complete)
 
 - added a no-default `PhysicalColumnarDesignMode` and runtime-only proposals

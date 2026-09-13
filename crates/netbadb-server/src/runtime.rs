@@ -26,7 +26,8 @@ use crate::authorization::{
 use crate::manifest::validate_listener_security;
 use crate::operator::ServerOperatorPlane;
 use crate::physical_design::{
-    ServerHostObservationConfig, ServerPhysicalDesignAdvisorConfig,
+    ServerHostObservationConfig, ServerPhysicalColumnarApplyConfig,
+    ServerPhysicalColumnarApplyStartupError, ServerPhysicalDesignAdvisorConfig,
     ServerPhysicalDesignControlHandle, ServerPhysicalDesignRuntime,
     ServerPhysicalDesignWorkerCommand, forward_physical_design_control_requests,
 };
@@ -83,6 +84,7 @@ pub enum TcpServerError {
     Manifest(ManifestError),
     Database(DatabaseError),
     AdaptiveConfig(ServerAdaptiveDriverConfigError),
+    PhysicalColumnarApplyConfig(ServerPhysicalColumnarApplyStartupError),
     Operator(ServerOperatorError),
     Bind {
         address: SocketAddr,
@@ -113,6 +115,9 @@ impl fmt::Display for TcpServerError {
             Self::Database(error) => write!(formatter, "database worker startup failed: {error}"),
             Self::AdaptiveConfig(error) => {
                 write!(formatter, "adaptive driver startup failed: {error}")
+            }
+            Self::PhysicalColumnarApplyConfig(error) => {
+                write!(formatter, "physical-columnar apply startup failed: {error}")
             }
             Self::Operator(error) => error.fmt(formatter),
             Self::Bind { address, source } => {
@@ -149,6 +154,7 @@ impl Error for TcpServerError {
             Self::Manifest(error) => Some(error),
             Self::Database(error) => Some(error),
             Self::AdaptiveConfig(error) => Some(error),
+            Self::PhysicalColumnarApplyConfig(error) => Some(error),
             Self::Operator(error) => Some(error),
             Self::Bind { source, .. }
             | Self::ListenerConfiguration(source)
@@ -175,6 +181,7 @@ pub struct TcpServer {
     config: ServerConfig,
     adaptive_override: Option<ServerAdaptiveStartupMode>,
     physical_design_override: Option<ServerPhysicalDesignAdvisorConfig>,
+    physical_columnar_apply_override: Option<ServerPhysicalColumnarApplyConfig>,
 }
 
 impl TcpServer {
@@ -184,6 +191,7 @@ impl TcpServer {
             config,
             adaptive_override: None,
             physical_design_override: None,
+            physical_columnar_apply_override: None,
         }
     }
 
@@ -214,6 +222,17 @@ impl TcpServer {
         self
     }
 
+    /// Approves one pre-provisioned Server-owned namespace and explicit modes
+    /// for programmatic Columnar apply. This does not add a wire operation.
+    #[must_use]
+    pub fn with_physical_columnar_apply(
+        mut self,
+        config: ServerPhysicalColumnarApplyConfig,
+    ) -> Self {
+        self.physical_columnar_apply_override = Some(config);
+        self
+    }
+
     pub fn start(self) -> Result<ServerHandle, TcpServerError> {
         let (
             listen,
@@ -227,6 +246,19 @@ impl TcpServer {
         ) = self.config.into_parts();
         let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
         let physical_design = self.physical_design_override.or(manifest_physical_design);
+        let physical_columnar_apply = self.physical_columnar_apply_override;
+        if physical_columnar_apply.is_some() && physical_design.is_none() {
+            return Err(TcpServerError::PhysicalColumnarApplyConfig(
+                ServerPhysicalColumnarApplyStartupError::PhysicalDesignRequired,
+            ));
+        }
+        if let Some(config) = physical_columnar_apply.as_ref() {
+            config.revalidate().map_err(|error| {
+                TcpServerError::PhysicalColumnarApplyConfig(
+                    ServerPhysicalColumnarApplyStartupError::PlacementRoot(error),
+                )
+            })?;
+        }
         validate_listener_security(listen, security.kind() == TransportKind::MutualTls)?;
         let table_count = tables.len();
         let transport_kind = security.kind();
@@ -237,6 +269,7 @@ impl TcpServer {
             authorization,
             adaptive_mode,
             physical_design,
+            physical_columnar_apply,
         )?;
         let metrics = ServerMetricsHandle::new();
         let listener = match TcpListener::bind(listen) {
@@ -515,6 +548,7 @@ impl DatabaseWorker {
         authorization: AuthorizationPolicy,
         adaptive_mode: ServerAdaptiveStartupMode,
         physical_design_config: Option<ServerPhysicalDesignAdvisorConfig>,
+        physical_columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,
     ) -> Result<Self, TcpServerError> {
         let (commands, command_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
@@ -544,7 +578,9 @@ impl DatabaseWorker {
                         });
                     }
                 };
-                let physical_design = physical_design_config.map(ServerPhysicalDesignRuntime::new);
+                let physical_design = physical_design_config.map(|config| {
+                    ServerPhysicalDesignRuntime::new_with_columnar(config, physical_columnar_apply)
+                });
                 if ready_tx.send(Ok(())).is_err() {
                     return database.close().map_err(|error| {
                         WorkerFatalError::DatabaseCloseFailed {
