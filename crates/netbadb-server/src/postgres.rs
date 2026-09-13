@@ -115,7 +115,7 @@ impl PostgresTcpServer {
         self
     }
 
-    /// Enables the bounded Server-owned NBMR v1 journal without changing the
+    /// Enables the bounded Server-owned NBMR v2 journal without changing the
     /// PostgreSQL wire contract.
     #[must_use]
     pub fn with_physical_design_mutation_receipts(

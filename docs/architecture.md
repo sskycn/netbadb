@@ -427,7 +427,20 @@ Paths, proposals, automatic stream enablement, maintenance, scheduling,
 retry, evidence rotation, and persistent operator audit remain outside the
 contract.
 
-[Adaptive Operations Phase 30](adaptive-operations-phase30.md) adds the
+[Adaptive Operations Phase 31](adaptive-operations-phase31.md) upgrades the
+receipt layer to [NBMR v2](physical-design-mutation-receipts-v2.md). Its
+44-byte header keeps the durable database incarnation and adds a separate
+nonzero OS-random journal incarnation. A durable receipt identity is therefore
+the pair `(journal incarnation, receipt ID)`: reopening preserves the namespace
+while offline replacement creates another namespace. Valid v1 history migrates
+through the exact reserved `<journal>.next` shadow with sync, atomic rename,
+and parent sync before unresolved-receipt reconciliation. Scoped pagination
+rejects cursors from another journal; read-only status and receipt inspection
+remain available during recovery gating. The existing record framing,
+mutation/reconciliation authority, and all external and Database persistent
+contracts remain unchanged; receipt wire externalization is still deferred.
+
+[Adaptive Operations Phase 30](adaptive-operations-phase30.md) added the
 optional Server-owned [NBMR v1](physical-design-mutation-receipts-v1.md)
 receipt journal around all four explicit programmatic/operator Index and
 Columnar apply controls. The sole Database worker durably appends a bounded

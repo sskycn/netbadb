@@ -93,11 +93,15 @@ pub use physical_design_receipts::{
     MAX_MUTATION_RECEIPT_RECORD_BYTES, MAX_MUTATION_RECEIPTS_PER_READ,
     ServerPhysicalDesignMutationReceipt, ServerPhysicalDesignMutationReceiptConfig,
     ServerPhysicalDesignMutationReceiptConfigError,
-    ServerPhysicalDesignMutationReceiptControlError, ServerPhysicalDesignMutationReceiptId,
-    ServerPhysicalDesignMutationReceiptJournalError, ServerPhysicalDesignMutationReceiptOutcome,
-    ServerPhysicalDesignMutationReceiptPage, ServerPhysicalDesignMutationReceiptPathError,
-    ServerPhysicalDesignMutationReceiptStartupError, ServerPhysicalDesignMutationSource,
-    ServerPhysicalDesignMutationTarget,
+    ServerPhysicalDesignMutationReceiptControlError, ServerPhysicalDesignMutationReceiptCursor,
+    ServerPhysicalDesignMutationReceiptCursorError, ServerPhysicalDesignMutationReceiptId,
+    ServerPhysicalDesignMutationReceiptJournalError,
+    ServerPhysicalDesignMutationReceiptJournalIncarnation,
+    ServerPhysicalDesignMutationReceiptJournalIncarnationError,
+    ServerPhysicalDesignMutationReceiptOutcome, ServerPhysicalDesignMutationReceiptPage,
+    ServerPhysicalDesignMutationReceiptPathError, ServerPhysicalDesignMutationReceiptScopedPage,
+    ServerPhysicalDesignMutationReceiptStartupError, ServerPhysicalDesignMutationReceiptStatus,
+    ServerPhysicalDesignMutationSource, ServerPhysicalDesignMutationTarget,
 };
 pub use postgres::{PostgresServerHandle, PostgresTcpServer, PostgresTcpServerError};
 pub use runtime::{ServerHandle, SessionId, TcpServer, TcpServerError, WorkerFatalError};

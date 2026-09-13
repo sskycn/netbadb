@@ -1,5 +1,25 @@
 # NetbaDB roadmap
 
+## Stable receipt namespaces (Adaptive Operations Phase 31 complete)
+
+- upgraded current receipt writes to NBMR v2 with a separate nonzero,
+  OS-random, durable journal incarnation in the checksummed 44-byte header;
+- added an atomic v1 migration reader that preserves complete record bytes and
+  receipt IDs through the reserved `<journal>.next` shadow, repairs only an
+  incomplete final tail, and reconciles pending work after v2 publication;
+- added scoped receipt cursors/pages that bind journal incarnation and receipt
+  ID, reject replacement-journal cursors, and retain the Phase 30 unscoped API
+  as a current-journal-local convenience;
+- added pure receipt status and kept status/scoped inspection available while
+  outcome ambiguity gates later mutation controls;
+- preserved Phase 30 Begin/Outcome semantics, Core mutation authority, every
+  Database persistent format, Manifest v9, NBOP v4, Native Protocol v2,
+  PostgreSQL wire behavior, Inspection JSON v7, SDK and CLI contracts.
+
+Receipt externalization and its exact wire encoding remain deferred to the
+next phase. See [`adaptive-operations-phase31.md`](adaptive-operations-phase31.md)
+and [`physical-design-mutation-receipts-v2.md`](physical-design-mutation-receipts-v2.md).
+
 ## Durable Server mutation receipts (Adaptive Operations Phase 30 complete)
 
 - added optional programmatic-only NBMR v1 configuration with a canonical

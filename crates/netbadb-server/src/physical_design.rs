@@ -28,10 +28,11 @@ use netbadb_types::{
 use crate::adaptive_driver::ServerAdaptiveHostConfig;
 use crate::physical_design_receipts::{
     MutationReceiptTarget, ServerPhysicalDesignMutationReceiptConfig,
-    ServerPhysicalDesignMutationReceiptControlError, ServerPhysicalDesignMutationReceiptId,
-    ServerPhysicalDesignMutationReceiptJournal, ServerPhysicalDesignMutationReceiptOutcome,
-    ServerPhysicalDesignMutationReceiptPage, ServerPhysicalDesignMutationReceiptStartupError,
-    ServerPhysicalDesignMutationSource,
+    ServerPhysicalDesignMutationReceiptControlError, ServerPhysicalDesignMutationReceiptCursor,
+    ServerPhysicalDesignMutationReceiptId, ServerPhysicalDesignMutationReceiptJournal,
+    ServerPhysicalDesignMutationReceiptOutcome, ServerPhysicalDesignMutationReceiptPage,
+    ServerPhysicalDesignMutationReceiptScopedPage, ServerPhysicalDesignMutationReceiptStartupError,
+    ServerPhysicalDesignMutationReceiptStatus, ServerPhysicalDesignMutationSource,
 };
 
 pub(crate) struct ServerHostObservationConfig {
@@ -809,7 +810,9 @@ impl ServerPhysicalDesignControlHandle {
             .map_err(|_| ServerPhysicalDesignControlError::ServerStopped)?
     }
 
-    /// Reads one bounded page of durable mutation receipts in receipt-ID order.
+    /// Reads one bounded page in the current journal's local receipt-ID order.
+    /// Persisted cursors should use [`Self::mutation_receipts_scoped`] so a
+    /// replacement journal cannot silently reinterpret a numeric receipt ID.
     pub fn mutation_receipts(
         &self,
         after: Option<ServerPhysicalDesignMutationReceiptId>,
@@ -825,6 +828,44 @@ impl ServerPhysicalDesignControlHandle {
                 limit,
                 reply,
             })
+            .map_err(|_| ServerPhysicalDesignMutationReceiptControlError::ServerStopped)?;
+        response
+            .recv()
+            .map_err(|_| ServerPhysicalDesignMutationReceiptControlError::ServerStopped)?
+    }
+
+    /// Reads one bounded page under an explicit durable journal namespace.
+    pub fn mutation_receipts_scoped(
+        &self,
+        after: Option<ServerPhysicalDesignMutationReceiptCursor>,
+        limit: u32,
+    ) -> Result<
+        ServerPhysicalDesignMutationReceiptScopedPage,
+        ServerPhysicalDesignMutationReceiptControlError,
+    > {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.requests
+            .send(ServerPhysicalDesignControlRequest::MutationReceiptsScoped {
+                after,
+                limit,
+                reply,
+            })
+            .map_err(|_| ServerPhysicalDesignMutationReceiptControlError::ServerStopped)?;
+        response
+            .recv()
+            .map_err(|_| ServerPhysicalDesignMutationReceiptControlError::ServerStopped)?
+    }
+
+    /// Reports the current durable receipt namespace and bounded local state.
+    pub fn mutation_receipt_status(
+        &self,
+    ) -> Result<
+        ServerPhysicalDesignMutationReceiptStatus,
+        ServerPhysicalDesignMutationReceiptControlError,
+    > {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.requests
+            .send(ServerPhysicalDesignControlRequest::MutationReceiptStatus { reply })
             .map_err(|_| ServerPhysicalDesignMutationReceiptControlError::ServerStopped)?;
         response
             .recv()
@@ -999,6 +1040,24 @@ pub(crate) enum ServerPhysicalDesignControlRequest {
             >,
         >,
     },
+    MutationReceiptsScoped {
+        after: Option<ServerPhysicalDesignMutationReceiptCursor>,
+        limit: u32,
+        reply: SyncSender<
+            Result<
+                ServerPhysicalDesignMutationReceiptScopedPage,
+                ServerPhysicalDesignMutationReceiptControlError,
+            >,
+        >,
+    },
+    MutationReceiptStatus {
+        reply: SyncSender<
+            Result<
+                ServerPhysicalDesignMutationReceiptStatus,
+                ServerPhysicalDesignMutationReceiptControlError,
+            >,
+        >,
+    },
     Recommendations {
         reply: SyncSender<Result<PhysicalDesignAdvisorReport, ServerPhysicalDesignControlError>>,
     },
@@ -1069,6 +1128,24 @@ pub(crate) enum ServerPhysicalDesignWorkerCommand {
         reply: SyncSender<
             Result<
                 ServerPhysicalDesignMutationReceiptPage,
+                ServerPhysicalDesignMutationReceiptControlError,
+            >,
+        >,
+    },
+    MutationReceiptsScoped {
+        after: Option<ServerPhysicalDesignMutationReceiptCursor>,
+        limit: u32,
+        reply: SyncSender<
+            Result<
+                ServerPhysicalDesignMutationReceiptScopedPage,
+                ServerPhysicalDesignMutationReceiptControlError,
+            >,
+        >,
+    },
+    MutationReceiptStatus {
+        reply: SyncSender<
+            Result<
+                ServerPhysicalDesignMutationReceiptStatus,
                 ServerPhysicalDesignMutationReceiptControlError,
             >,
         >,
@@ -1286,6 +1363,26 @@ impl ServerPhysicalDesignRuntime {
                     .as_ref()
                     .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
                     .and_then(|journal| journal.page(after, limit));
+                let _ = reply.send(result);
+            }
+            ServerPhysicalDesignWorkerCommand::MutationReceiptsScoped {
+                after,
+                limit,
+                reply,
+            } => {
+                let result = self
+                    .mutation_receipts
+                    .as_ref()
+                    .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+                    .and_then(|journal| journal.scoped_page(after, limit));
+                let _ = reply.send(result);
+            }
+            ServerPhysicalDesignWorkerCommand::MutationReceiptStatus { reply } => {
+                let result = self
+                    .mutation_receipts
+                    .as_ref()
+                    .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+                    .map(ServerPhysicalDesignMutationReceiptJournal::status);
                 let _ = reply.send(result);
             }
             ServerPhysicalDesignWorkerCommand::Recommendations { reply } => {
@@ -2015,6 +2112,34 @@ pub(crate) fn forward_physical_design_control_requests<F>(
                     ));
                 }
             }
+            ServerPhysicalDesignControlRequest::MutationReceiptsScoped {
+                after,
+                limit,
+                reply,
+            } => {
+                let fallback = reply.clone();
+                if submit(ServerPhysicalDesignWorkerCommand::MutationReceiptsScoped {
+                    after,
+                    limit,
+                    reply,
+                })
+                .is_err()
+                {
+                    let _ = fallback.send(Err(
+                        ServerPhysicalDesignMutationReceiptControlError::ServerStopped,
+                    ));
+                }
+            }
+            ServerPhysicalDesignControlRequest::MutationReceiptStatus { reply } => {
+                let fallback = reply.clone();
+                if submit(ServerPhysicalDesignWorkerCommand::MutationReceiptStatus { reply })
+                    .is_err()
+                {
+                    let _ = fallback.send(Err(
+                        ServerPhysicalDesignMutationReceiptControlError::ServerStopped,
+                    ));
+                }
+            }
             ServerPhysicalDesignControlRequest::Recommendations { reply } => {
                 let fallback = reply.clone();
                 if submit(ServerPhysicalDesignWorkerCommand::Recommendations { reply }).is_err() {
@@ -2141,6 +2266,16 @@ pub(crate) fn handle_disabled_physical_design_worker_command(
             ));
         }
         ServerPhysicalDesignWorkerCommand::MutationReceipts { reply, .. } => {
+            let _ = reply.send(Err(
+                ServerPhysicalDesignMutationReceiptControlError::NotEnabled,
+            ));
+        }
+        ServerPhysicalDesignWorkerCommand::MutationReceiptsScoped { reply, .. } => {
+            let _ = reply.send(Err(
+                ServerPhysicalDesignMutationReceiptControlError::NotEnabled,
+            ));
+        }
+        ServerPhysicalDesignWorkerCommand::MutationReceiptStatus { reply } => {
             let _ = reply.send(Err(
                 ServerPhysicalDesignMutationReceiptControlError::NotEnabled,
             ));
@@ -2480,6 +2615,42 @@ mod tests {
         response.recv().expect("receipt response")
     }
 
+    fn scoped_receipts(
+        database: &mut Database,
+        runtime: &mut ServerPhysicalDesignRuntime,
+        after: Option<ServerPhysicalDesignMutationReceiptCursor>,
+        limit: u32,
+    ) -> Result<
+        ServerPhysicalDesignMutationReceiptScopedPage,
+        ServerPhysicalDesignMutationReceiptControlError,
+    > {
+        let (reply, response) = mpsc::sync_channel(1);
+        runtime.handle(
+            database,
+            ServerPhysicalDesignWorkerCommand::MutationReceiptsScoped {
+                after,
+                limit,
+                reply,
+            },
+        );
+        response.recv().expect("scoped receipt response")
+    }
+
+    fn receipt_status(
+        database: &mut Database,
+        runtime: &mut ServerPhysicalDesignRuntime,
+    ) -> Result<
+        ServerPhysicalDesignMutationReceiptStatus,
+        ServerPhysicalDesignMutationReceiptControlError,
+    > {
+        let (reply, response) = mpsc::sync_channel(1);
+        runtime.handle(
+            database,
+            ServerPhysicalDesignWorkerCommand::MutationReceiptStatus { reply },
+        );
+        response.recv().expect("receipt status response")
+    }
+
     fn current_commit_seq(database: &Database) -> DatabaseCommitSeq {
         database
             .current_database_snapshot()
@@ -2680,6 +2851,26 @@ mod tests {
         );
         assert!(matches!(
             response.recv().expect("disabled receipt response"),
+            Err(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+        ));
+        let (reply, response) = mpsc::sync_channel(1);
+        handle_disabled_physical_design_worker_command(
+            ServerPhysicalDesignWorkerCommand::MutationReceiptsScoped {
+                after: None,
+                limit: 1,
+                reply,
+            },
+        );
+        assert!(matches!(
+            response.recv().expect("disabled scoped receipt response"),
+            Err(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+        ));
+        let (reply, response) = mpsc::sync_channel(1);
+        handle_disabled_physical_design_worker_command(
+            ServerPhysicalDesignWorkerCommand::MutationReceiptStatus { reply },
+        );
+        assert!(matches!(
+            response.recv().expect("disabled receipt status response"),
             Err(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
         ));
         let (reply, response) = mpsc::sync_channel(1);
@@ -3304,6 +3495,54 @@ mod tests {
     }
 
     #[test]
+    fn receipt_namespace_survives_evidence_rotation_and_runtime_recreation() {
+        let mut fixture = Fixture::create("receipt-namespace-lifetime");
+        let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+            fixture.root.join("physical-design.nbmr"),
+            1_000_000,
+        )
+        .unwrap();
+        let database_before = current_commit_seq(&fixture.database);
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config.clone()),
+            &fixture.database,
+        )
+        .unwrap();
+        let old_runtime = Arc::downgrade(&runtime.identity);
+        let before = receipt_status(&mut fixture.database, &mut runtime).unwrap();
+        let epoch = runtime.evidence.epoch();
+        runtime.evidence.rotate_window().unwrap();
+        assert_ne!(runtime.evidence.epoch(), epoch);
+        assert_eq!(
+            receipt_status(&mut fixture.database, &mut runtime)
+                .unwrap()
+                .journal_incarnation,
+            before.journal_incarnation
+        );
+        drop(runtime);
+        assert!(old_runtime.upgrade().is_none());
+
+        let mut reopened = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config),
+            &fixture.database,
+        )
+        .unwrap();
+        assert_eq!(
+            receipt_status(&mut fixture.database, &mut reopened)
+                .unwrap()
+                .journal_incarnation,
+            before.journal_incarnation
+        );
+        assert_eq!(current_commit_seq(&fixture.database), database_before);
+        drop(reopened);
+        fixture.close();
+    }
+
+    #[test]
     fn columnar_receipts_cover_both_modes_without_exposing_recovery_paths() {
         for (name, mode) in [
             ("receipt-snapshot", PhysicalColumnarDesignMode::Snapshot),
@@ -3471,6 +3710,9 @@ mod tests {
             &fixture.database,
         )
         .unwrap();
+        let journal_incarnation = receipt_status(&mut fixture.database, &mut runtime)
+            .unwrap()
+            .journal_incarnation;
         record_candidate(&mut fixture.database, &mut runtime);
         let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
         runtime.fail_next_receipt_outcome_append();
@@ -3499,6 +3741,21 @@ mod tests {
                 .outcome,
             ServerPhysicalDesignMutationReceiptOutcome::Pending
         );
+        let bytes_before_reads = fs::read(receipt_config.path()).unwrap();
+        let status = receipt_status(&mut fixture.database, &mut runtime).unwrap();
+        assert_eq!(status.journal_incarnation, journal_incarnation);
+        assert!(status.recovery_required);
+        assert_eq!(
+            status.latest_receipt_id,
+            Some(ServerPhysicalDesignMutationReceiptId(1))
+        );
+        let scoped = scoped_receipts(&mut fixture.database, &mut runtime, None, 1).unwrap();
+        assert_eq!(scoped.journal_incarnation, journal_incarnation);
+        assert_eq!(
+            scoped.receipts[0].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::Pending
+        );
+        assert_eq!(fs::read(receipt_config.path()).unwrap(), bytes_before_reads);
         assert!(matches!(
             apply(
                 &mut fixture.database,
@@ -3520,6 +3777,9 @@ mod tests {
         )
         .unwrap();
         let page = receipts(&mut fixture.database, &mut reopened, None, 1).unwrap();
+        let reopened_status = receipt_status(&mut fixture.database, &mut reopened).unwrap();
+        assert_eq!(reopened_status.journal_incarnation, journal_incarnation);
+        assert!(!reopened_status.recovery_required);
         assert_eq!(
             page.receipts[0].outcome,
             ServerPhysicalDesignMutationReceiptOutcome::RecoveredAppliedIndex { index_id }

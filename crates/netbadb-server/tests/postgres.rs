@@ -18,7 +18,7 @@ use netbadb_server::{
     ServerAdaptiveControlError, ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig,
     ServerAdaptiveMode, ServerConfig, ServerOperatorClient, ServerPhysicalColumnarApplyConfig,
     ServerPhysicalColumnarApplyStartupError, ServerPhysicalColumnarPlacementKey,
-    ServerPhysicalDesignControlError,
+    ServerPhysicalDesignControlError, ServerPhysicalDesignMutationReceiptConfig,
 };
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 
@@ -322,9 +322,26 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
     let operator_config = config.operator_config().unwrap().clone();
-    let server = PostgresTcpServer::new(config).start().unwrap();
+    let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+        directory.join("physical-design.nbmr"),
+        1_000_000,
+    )
+    .unwrap();
+    let server = PostgresTcpServer::new(config)
+        .with_physical_design_mutation_receipts(receipt_config)
+        .start()
+        .unwrap();
     let operator = ServerOperatorClient::new(&operator_config);
     let design = server.physical_design_control();
+    let receipt_status = design.mutation_receipt_status().unwrap();
+    assert_eq!(receipt_status.latest_receipt_id, None);
+    assert!(
+        design
+            .mutation_receipts_scoped(None, 1)
+            .unwrap()
+            .receipts
+            .is_empty()
+    );
     assert!(matches!(
         design.recommendations(),
         Err(ServerPhysicalDesignControlError::Advisor(

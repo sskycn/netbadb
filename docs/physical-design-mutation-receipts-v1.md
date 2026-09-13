@@ -1,5 +1,9 @@
 # Physical Design Mutation Receipts — NBMR v1
 
+> Historical format. Current binaries migrate valid v1 journals atomically to
+> [NBMR v2](physical-design-mutation-receipts-v2.md) before reconciliation and
+> write only v2.
+
 NBMR v1 is an optional, bounded, Server-owned receipt journal for explicit
 physical-design mutation controls. It observes the existing programmatic and
 local-operator Index and Columnar apply paths; it is not a database transaction

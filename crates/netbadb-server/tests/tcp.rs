@@ -1297,10 +1297,27 @@ fn native_physical_design_proposal_is_bound_to_one_worker_runtime() {
         table_id: TableId(1),
         column_id: ColumnId(2),
     };
+    let receipt_config = netbadb_server::ServerPhysicalDesignMutationReceiptConfig::new(
+        directory.join("physical-design.nbmr"),
+        1_000_000,
+    )
+    .unwrap();
 
-    let first_server = TcpServer::new(config.clone()).start().unwrap();
+    let first_server = TcpServer::new(config.clone())
+        .with_physical_design_mutation_receipts(receipt_config.clone())
+        .start()
+        .unwrap();
     let first_control = first_server.physical_design_control();
     let first_control_clone = first_control.clone();
+    let first_receipt_status = first_control.mutation_receipt_status().unwrap();
+    assert_eq!(first_receipt_status.latest_receipt_id, None);
+    assert!(
+        first_control
+            .mutation_receipts_scoped(None, 1)
+            .unwrap()
+            .receipts
+            .is_empty()
+    );
     let mut first_client = Client::connect(first_server.local_addr());
     first_client.hello();
     first_client.request(
@@ -1318,9 +1335,19 @@ fn native_physical_design_proposal_is_bound_to_one_worker_runtime() {
         Err(ServerPhysicalDesignControlError::ServerStopped)
     ));
 
-    let second_server = TcpServer::new(config).start().unwrap();
+    let second_server = TcpServer::new(config)
+        .with_physical_design_mutation_receipts(receipt_config)
+        .start()
+        .unwrap();
     let second_control = second_server.physical_design_control();
     let second_control_clone = second_control.clone();
+    assert_eq!(
+        second_control
+            .mutation_receipt_status()
+            .unwrap()
+            .journal_incarnation,
+        first_receipt_status.journal_incarnation
+    );
     let mut second_client = Client::connect(second_server.local_addr());
     second_client.hello();
     second_client.request(
