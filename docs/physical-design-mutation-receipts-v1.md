@@ -1,8 +1,8 @@
 # Physical Design Mutation Receipts — NBMR v1
 
-> Historical format. Current binaries migrate valid v1 journals atomically to
-> [NBMR v2](physical-design-mutation-receipts-v2.md) before reconciliation and
-> write only v2.
+> Historical format. Current binaries migrate only complete, valid v1 journals
+> atomically to [NBMR v3](physical-design-mutation-receipts-v3.md) before
+> reconciliation and write only v3.
 
 NBMR v1 is an optional, bounded, Server-owned receipt journal for explicit
 physical-design mutation controls. It observes the existing programmatic and
@@ -19,11 +19,9 @@ object (including a symlink), validates capacity, and creates no file.
 
 The final server configuration must also enable the Physical Design runtime.
 At worker startup, after Database and managed-Columnar recovery, the sole
-Database worker creates or opens the journal, repairs an incomplete final
-record, reconciles one pending receipt, and durably appends its recovered
-outcome before readiness. There is no audit thread, mutex, asynchronous buffer,
-or shutdown flush. A new Unix journal is created with mode `0600` where the
-standard library supports it.
+Database worker migrates a fully valid legacy journal, reconciles one pending
+receipt, and durably appends its recovered outcome before readiness. There is
+no audit thread, mutex, asynchronous buffer, or shutdown flush.
 
 ## File header
 
@@ -66,6 +64,11 @@ applied Index/Columnar, recovered not applied, or recovered conflict. Error
 strings, Rust discriminants, SQL, principals, sessions, network addresses,
 runtime tokens, proposals, and timestamps are never persisted.
 
+Outcome tag 7 (`Failed`) remains reserved/historically decodable. The current
+runtime does not emit it because Core has no sufficiently narrow
+definitely-not-applied execution-failure class; errors are not broadly coerced
+to `Failed`.
+
 ## Durability and recovery
 
 Before an apply path performs provenance, policy, current-state, or Core
@@ -79,13 +82,15 @@ occurred, the caller receives a typed receipt failure and the journal gates all
 later receipt-controlled applies. Server never rolls back physical design to
 compensate. Ordinary SQL and sessions remain available.
 
-On restart, a single unresolved Index target is classified with the exact
-named-index inspection API. A Columnar target is classified with its original
-absolute path, ordered columns, and mode after NBPC recovery. Reconciliation is
-read-only and appends one of the recovered outcome tags. An incomplete final
-record is truncated to the last complete checksum-valid boundary and synced;
-a complete checksum-invalid or structurally invalid record fails closed and is
-not truncated.
+On restart after successful v3 migration, a single unresolved Index target is
+classified with the exact named-index inspection API. A Columnar target is
+classified with its original absolute path, ordered columns, and mode after
+NBPC recovery. Reconciliation is read-only and appends one of the recovered
+outcome tags. Because v1 does not protect its length prefix before that length
+is trusted, a legacy tail shorter than its claimed record length is ambiguous
+between a torn write and length corruption. Current binaries fail closed and
+leave the v1 bytes unchanged; they do not silently omit the tail. Complete
+checksum-invalid or structurally invalid records likewise fail closed.
 
 ## Inspection and compatibility
 

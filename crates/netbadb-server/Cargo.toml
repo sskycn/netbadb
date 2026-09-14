@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 crc32c.workspace = true
 getrandom.workspace = true
+libc.workspace = true
 netbadb-core = { path = "../netbadb-core" }
 netbadb-pgwire = { path = "../netbadb-pgwire" }
 netbadb-protocol = { path = "../netbadb-protocol" }

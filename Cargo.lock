@@ -383,6 +383,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "getrandom",
+ "libc",
  "netbadb-compiler",
  "netbadb-core",
  "netbadb-parser",

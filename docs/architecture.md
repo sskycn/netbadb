@@ -427,18 +427,19 @@ Paths, proposals, automatic stream enablement, maintenance, scheduling,
 retry, evidence rotation, and persistent operator audit remain outside the
 contract.
 
-[Adaptive Operations Phase 31](adaptive-operations-phase31.md) upgrades the
-receipt layer to [NBMR v2](physical-design-mutation-receipts-v2.md). Its
-44-byte header keeps the durable database incarnation and adds a separate
-nonzero OS-random journal incarnation. A durable receipt identity is therefore
-the pair `(journal incarnation, receipt ID)`: reopening preserves the namespace
-while offline replacement creates another namespace. Valid v1 history migrates
-through the exact reserved `<journal>.next` shadow with sync, atomic rename,
-and parent sync before unresolved-receipt reconciliation. Scoped pagination
-rejects cursors from another journal; read-only status and receipt inspection
-remain available during recovery gating. The existing record framing,
-mutation/reconciliation authority, and all external and Database persistent
-contracts remain unchanged; receipt wire externalization is still deferred.
+[Adaptive Operations Phase 31](adaptive-operations-phase31.md) introduced the
+NBMR v2 journal incarnation. The final closeout keeps that stable namespace and
+uses [NBMR v3](physical-design-mutation-receipts-v3.md) for current writes. Its
+protected fixed record header validates length, tag, reserved bytes, receipt
+ID, and header CRC before bounded body allocation; a second CRC covers the full
+header and body. Complete valid v1/v2 histories migrate through unpredictable
+same-directory `create_new` temporaries, v2 keeps its incarnation, unresolved
+Begin recovery space is admitted before publication, and ambiguous legacy
+tails fail closed. Historical `.next` objects are untouched. Scoped pagination
+still rejects another journal namespace, and read-only status/receipt
+inspection remain available during recovery gating. Mutation/reconciliation
+authority and all Database persistent contracts remain unchanged; receipt wire
+externalization is still deferred.
 
 [Adaptive Operations Phase 30](adaptive-operations-phase30.md) added the
 optional Server-owned [NBMR v1](physical-design-mutation-receipts-v1.md)

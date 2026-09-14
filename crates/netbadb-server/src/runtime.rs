@@ -243,7 +243,7 @@ impl TcpServer {
         self
     }
 
-    /// Enables the bounded Server-owned NBMR v2 journal for explicit
+    /// Enables the bounded Server-owned NBMR v3 journal for explicit
     /// physical-design mutations. This does not add a wire operation.
     #[must_use]
     pub fn with_physical_design_mutation_receipts(

@@ -1,9 +1,9 @@
 # Physical Design Mutation Receipts — NBMR v2
 
-NBMR v2 is the current, bounded Server-owned journal for explicit Physical
-Design mutation receipts. It adds a stable journal namespace while retaining
-the v1 Begin/Outcome record contract exactly. NBMR remains operational evidence
-about Database truth, not a transaction participant or mutation authority.
+NBMR v2 is the historical namespace format. It added the stable journal
+incarnation while retaining v1 record framing. Current binaries read complete,
+valid v2 histories, preserve their incarnation while migrating to
+[NBMR v3](physical-design-mutation-receipts-v3.md), and write only v3.
 
 ## Identity and header
 
@@ -50,42 +50,44 @@ u8  body[payload_bytes - 12]
 u32 crc32c           // length prefix through final body byte
 ```
 
-Records remain capped at 64 KiB. The configured minimum now accounts for the
-44-byte v2 header plus one maximum Begin and one maximum Outcome. Migration
-also requires the complete valid v1 history plus the 16-byte header expansion
-to fit `max_file_bytes`; otherwise startup returns a typed migration-capacity
-error without changing the v1 file. Valid history is never compacted, rotated,
-or discarded to satisfy capacity.
+Records remain capped at 64 KiB. The historical configured minimum accounted
+for the 44-byte v2 header plus one maximum Begin and one maximum Outcome.
+Current v3 migration re-encodes the complete valid history and also reserves a
+maximum recovered Outcome when the final Begin is unresolved. Valid history is
+never compacted, rotated, or discarded to satisfy capacity.
 
-## Atomic v1 migration
+Outcome tag 7 (`Failed`) remains reserved/historically decodable. The current
+runtime does not emit it and does not map arbitrary `DatabaseError` values to a
+definitive failure.
 
-Current binaries read v1 and v2 but write only v2. A valid v1 journal is fully
-decoded before publication. The migration preserves every complete record and
-receipt ID byte-for-byte, including one unresolved Begin, generates one
-candidate journal incarnation, and builds a complete v2 image at the reserved
-same-directory sidecar:
+## Historical migration behavior and current handling
+
+Phase 31 originally migrated v1 to v2 through the fixed sidecar:
 
 ```text
 <journal-path>.next
 ```
 
-Only that exact sidecar is owned by NBMR migration. A stale regular sidecar may
-be truncated and rebuilt; a symlink, directory, or other non-regular object
-fails closed. Publication writes and syncs the shadow, atomically renames it
-over the v1 primary, then syncs the parent directory. The v1 primary is never
-rewritten or pre-truncated.
+Current code no longer treats that name as owned: pre-existing regular files,
+other NBMR files, hard links, symlinks, dangling symlinks, and directories at
+`.next` are ignored and never truncated, deleted, chmodded, or overwritten.
+Current v1/v2 migration uses an unpredictable same-directory `create_new`
+temporary and publishes a complete v3 image atomically.
 
-A crash before rename leaves v1 authoritative and a later startup rebuilds the
-reserved shadow. A crash after rename but before parent sync may recover either
-the old valid v1 or new valid v2 filesystem state; both reopen safely. A
-candidate incarnation from an unpublished shadow may be replaced on retry, but
-the incarnation in a published v2 file never changes.
+A failure before publication leaves the legacy primary authoritative and
+byte-for-byte unchanged. After atomic publication the complete v3 image is the
+only final-path history; parent-directory sync completes its durable name
+transition. A v1 candidate incarnation from an unpublished temporary has no
+public effect, while v2 migration always carries the published v2 incarnation
+forward.
 
-An incomplete final v1 record is omitted from the v2 image under the existing
-valid-prefix theorem. A complete checksum-invalid or structurally invalid
-record fails closed and leaves the v1 primary unchanged. Migration happens
-after Database/NBPC recovery and before unresolved-receipt reconciliation, so a
-recovered Outcome is appended under the newly published v2 namespace.
+The old framing cannot validate its length before using that length to locate
+the checksum. Consequently a tail shorter than its claimed length is
+ambiguous, not a proven torn record. Current migration fails closed and leaves
+the source byte-for-byte unchanged rather than omitting it. A complete invalid
+record also fails closed. Admission reserves enough v3 capacity for a recovered
+Outcome before publication when the legacy history ends in an unresolved
+Begin.
 
 ## Scoped inspection
 
@@ -115,7 +117,8 @@ Phase 30 Begin-before-apply and Outcome-after-result ordering is unchanged, as
 are Index and Columnar restart reconciliation. Outcome ambiguity still gates
 later receipt-controlled mutation without rolling back Database truth.
 
-NBMR v2 is crash-recoverable, checksummed, and namespace-stable. It is not
+NBMR v2 is checksummed and namespace-stable, but its unprotected length prefix
+does not permit unambiguous repair of every damaged tail. It is not
 tamper-proof, rollback-proof, hash-chained, signed, or cryptographically
 authenticated against an administrator who can replace files. A byte-for-byte
 copy intentionally retains the same receipt-history identity.

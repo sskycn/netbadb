@@ -163,13 +163,12 @@ fn run_operator_apply<T>(
 
 fn classify_operator_apply_error(error: OperatorClientError) -> OperationalError {
     match &error {
-        OperatorClientError::Protocol(_)
+        OperatorClientError::MutationOutcomeUncertain { .. }
+        | OperatorClientError::Protocol(_)
         | OperatorClientError::RequestIdMismatch { .. }
-        | OperatorClientError::UnexpectedResult
-        | OperatorClientError::Remote(OperatorRemoteErrorV4 {
-            code: OperatorErrorCodeV4::MutationOutcomeUncertain,
-            ..
-        }) => OperationalError::OperatorApplyOutcomeUncertain(error),
+        | OperatorClientError::UnexpectedResult => {
+            OperationalError::OperatorApplyOutcomeUncertain(error)
+        }
         _ => OperationalError::Operator(error),
     }
 }
@@ -263,21 +262,12 @@ fn render_physical_design_recommendations(
 ) -> String {
     let report = &recommendations.report;
     let mut output = format!(
-        "Physical index apply: {}\nPhysical Columnar apply: {}\nAllowed Columnar modes: {}\nRuntime token: {}\nEvidence epoch: {}\nphysical-design evidence epoch: {}\nschema generation: {}\nG range: {}..={}\nrecorded reports: {}\ndiscarded incomplete reports: {}\noverflowed: {}\nincomplete: {}\n",
-        if recommendations.physical_index_apply.enabled {
-            "enabled"
+        "Physical-design approval token: {}\nRuntime token: {}\nEvidence epoch: {}\nphysical-design evidence epoch: {}\nschema generation: {}\nG range: {}..={}\nrecorded reports: {}\ndiscarded incomplete reports: {}\noverflowed: {}\nincomplete: {}\n",
+        if recommendations.runtime_token.is_some() {
+            "present"
         } else {
-            "disabled"
+            "absent"
         },
-        if recommendations.physical_columnar_apply.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        render_columnar_modes(
-            recommendations.physical_columnar_apply.allow_snapshot,
-            recommendations.physical_columnar_apply.allow_incremental,
-        ),
         recommendations.runtime_token.as_deref().unwrap_or("none"),
         report.evidence_epoch,
         report.evidence_epoch,
@@ -1076,6 +1066,15 @@ impl fmt::Display for OperationalError {
                 "recommendation approval belonged to a previous daemon/operator runtime; fetch fresh recommendations before authorizing a new mutation",
             ),
             Self::Operator(error) => error.fmt(formatter),
+            Self::OperatorApplyOutcomeUncertain(
+                error @ OperatorClientError::MutationOutcomeUncertain {
+                    recovery_required: true,
+                    ..
+                },
+            ) => write!(
+                formatter,
+                "operator apply outcome is uncertain ({error}); the CLI did not retry or refresh its token or evidence epoch"
+            ),
             Self::OperatorApplyOutcomeUncertain(error) => write!(
                 formatter,
                 "operator apply outcome is uncertain because no definitive NBOP result was received ({error}); re-run the same exact approval; the CLI did not retry or refresh its token or evidence epoch"
@@ -1270,8 +1269,7 @@ impl From<OperationalError> for CliError {
 mod tests {
     use super::*;
     use netbadb_server::{
-        OperatorPhysicalColumnarApplyCapabilityV4, OperatorPhysicalDesignAdvisorReportV4,
-        OperatorPhysicalDesignEvidenceSummaryV4, OperatorPhysicalIndexApplyCapabilityV4,
+        OperatorPhysicalDesignAdvisorReportV4, OperatorPhysicalDesignEvidenceSummaryV4,
         OperatorPhysicalIndexCandidateV4,
     };
 
@@ -1520,12 +1518,6 @@ mod tests {
         let output =
             render_physical_design_recommendations(&OperatorPhysicalDesignRecommendationsV4 {
                 runtime_token: Some("00".repeat(16)),
-                physical_index_apply: OperatorPhysicalIndexApplyCapabilityV4 { enabled: true },
-                physical_columnar_apply: OperatorPhysicalColumnarApplyCapabilityV4 {
-                    enabled: false,
-                    allow_snapshot: false,
-                    allow_incremental: false,
-                },
                 report: OperatorPhysicalDesignAdvisorReportV4 {
                     evidence_epoch: 7,
                     schema_generation: 8,
@@ -1565,18 +1557,10 @@ mod tests {
     }
 
     #[test]
-    fn recommendation_permissions_render_all_independent_combinations() {
-        let render = |index_enabled, columnar_enabled| {
+    fn recommendation_output_reports_only_token_presence() {
+        let render = |token_present: bool| {
             render_physical_design_recommendations(&OperatorPhysicalDesignRecommendationsV4 {
-                runtime_token: (index_enabled || columnar_enabled).then(|| "11".repeat(16)),
-                physical_index_apply: OperatorPhysicalIndexApplyCapabilityV4 {
-                    enabled: index_enabled,
-                },
-                physical_columnar_apply: OperatorPhysicalColumnarApplyCapabilityV4 {
-                    enabled: columnar_enabled,
-                    allow_snapshot: columnar_enabled,
-                    allow_incremental: false,
-                },
+                runtime_token: token_present.then(|| "11".repeat(16)),
                 report: OperatorPhysicalDesignAdvisorReportV4 {
                     evidence_epoch: 1,
                     schema_generation: 1,
@@ -1592,26 +1576,21 @@ mod tests {
             })
         };
 
-        for (index, columnar, expected_index, expected_columnar) in [
-            (true, false, "enabled", "disabled"),
-            (false, true, "disabled", "enabled"),
-            (true, true, "enabled", "enabled"),
-            (false, false, "disabled", "disabled"),
-        ] {
-            let output = render(index, columnar);
-            assert!(output.contains(&format!("Physical index apply: {expected_index}\n")));
-            assert!(output.contains(&format!("Physical Columnar apply: {expected_columnar}\n")));
-            assert_eq!(output.contains("Runtime token: none"), !index && !columnar);
+        for (present, expected) in [(true, "present"), (false, "absent")] {
+            let output = render(present);
+            assert!(output.contains(&format!("Physical-design approval token: {expected}\n")));
+            assert!(!output.contains("Physical index apply:"));
+            assert!(!output.contains("Physical Columnar apply:"));
+            assert_eq!(output.contains("Runtime token: none"), !present);
         }
     }
 
     #[test]
     fn apply_error_classification_is_conservative_after_dispatch() {
-        let uncertain =
-            classify_operator_apply_error(OperatorClientError::Remote(OperatorRemoteErrorV4 {
-                code: OperatorErrorCodeV4::MutationOutcomeUncertain,
-                message: "reply lost".into(),
-            }));
+        let uncertain = classify_operator_apply_error(OperatorClientError::RequestIdMismatch {
+            expected: 1,
+            received: 2,
+        });
         assert!(matches!(
             uncertain,
             OperationalError::OperatorApplyOutcomeUncertain(_)

@@ -967,8 +967,14 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
             2,
             index_name.as_str().to_owned(),
         ),
-        Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV4::PhysicalIndexApplyFailed
+        Err(OperatorClientError::MutationOutcomeUncertain {
+            recovery_required: false,
+            source,
+        }) if matches!(
+            &*source,
+            OperatorClientError::Remote(error)
+                if error.code == OperatorErrorCodeV4::PhysicalIndexApplyFailed
+        )
     ));
     client.request(7, ClientMessage::Rollback);
 

@@ -632,6 +632,7 @@ pub enum ServerPhysicalColumnarDesignControlError {
     Proposal(Box<PhysicalColumnarDesignProposalError>),
     Apply(Box<PhysicalColumnarDesignApplyError>),
     MutationReceipt(ServerPhysicalDesignMutationReceiptControlError),
+    MutationRecoveryRequired(ServerPhysicalDesignMutationReceiptControlError),
     EvidenceEpochChanged {
         expected: PhysicalDesignEvidenceEpoch,
         actual: PhysicalDesignEvidenceEpoch,
@@ -673,6 +674,7 @@ impl fmt::Display for ServerPhysicalColumnarDesignControlError {
             Self::Proposal(error) => error.fmt(formatter),
             Self::Apply(error) => error.fmt(formatter),
             Self::MutationReceipt(error) => error.fmt(formatter),
+            Self::MutationRecoveryRequired(error) => error.fmt(formatter),
             Self::EvidenceEpochChanged { expected, actual } => write!(
                 formatter,
                 "physical-design evidence epoch changed from expected {} to {}",
@@ -705,6 +707,7 @@ impl Error for ServerPhysicalColumnarDesignControlError {
             Self::Proposal(error) => Some(error.as_ref()),
             Self::Apply(error) => Some(error.as_ref()),
             Self::MutationReceipt(error) => Some(error),
+            Self::MutationRecoveryRequired(error) => Some(error),
             Self::PhysicalDesignNotEnabled
             | Self::ColumnarApplyNotEnabled
             | Self::ModeNotAllowed(_)
@@ -732,6 +735,7 @@ pub enum ServerPhysicalDesignControlError {
     Proposal(Box<PhysicalIndexDesignProposalError>),
     Apply(Box<PhysicalIndexDesignApplyError>),
     MutationReceipt(ServerPhysicalDesignMutationReceiptControlError),
+    MutationRecoveryRequired(ServerPhysicalDesignMutationReceiptControlError),
     ProposalRuntimeChanged,
     PhysicalDesignRuntimeChanged,
     PhysicalIndexNameConflict(IndexName),
@@ -755,6 +759,7 @@ impl fmt::Display for ServerPhysicalDesignControlError {
             Self::Proposal(error) => error.fmt(formatter),
             Self::Apply(error) => error.fmt(formatter),
             Self::MutationReceipt(error) => error.fmt(formatter),
+            Self::MutationRecoveryRequired(error) => error.fmt(formatter),
             Self::ProposalRuntimeChanged => formatter.write_str(
                 "physical-index proposal belongs to another server physical-design runtime",
             ),
@@ -779,6 +784,7 @@ impl Error for ServerPhysicalDesignControlError {
             Self::Proposal(error) => Some(error),
             Self::Apply(error) => Some(error),
             Self::MutationReceipt(error) => Some(error),
+            Self::MutationRecoveryRequired(error) => Some(error),
             Self::PhysicalDesignNotEnabled
             | Self::EvidenceEpochChanged { .. }
             | Self::ProposalRuntimeChanged
@@ -1548,7 +1554,7 @@ impl ServerPhysicalDesignRuntime {
                     .as_mut()
                     .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
                     .and_then(|journal| journal.finish(receipt_id, outcome))
-                    .map_err(ServerPhysicalDesignControlError::MutationReceipt)?;
+                    .map_err(ServerPhysicalDesignControlError::MutationRecoveryRequired)?;
                 Ok(report)
             }
             Err(error) => {
@@ -1562,7 +1568,7 @@ impl ServerPhysicalDesignRuntime {
                     .as_mut()
                     .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
                     .and_then(|journal| journal.finish(receipt_id, outcome))
-                    .map_err(ServerPhysicalDesignControlError::MutationReceipt)?;
+                    .map_err(ServerPhysicalDesignControlError::MutationRecoveryRequired)?;
                 Err(error)
             }
         }
@@ -1614,7 +1620,7 @@ impl ServerPhysicalDesignRuntime {
                     .as_mut()
                     .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
                     .and_then(|journal| journal.finish(receipt_id, outcome))
-                    .map_err(ServerPhysicalColumnarDesignControlError::MutationReceipt)?;
+                    .map_err(ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired)?;
                 Ok(report)
             }
             Err(error) => {
@@ -1628,7 +1634,7 @@ impl ServerPhysicalDesignRuntime {
                     .as_mut()
                     .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
                     .and_then(|journal| journal.finish(receipt_id, outcome))
-                    .map_err(ServerPhysicalColumnarDesignControlError::MutationReceipt)?;
+                    .map_err(ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired)?;
                 Err(error)
             }
         }
@@ -2028,7 +2034,8 @@ fn index_error_receipt_outcome(
         ServerPhysicalDesignControlError::Apply(_) => {
             Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected)
         }
-        ServerPhysicalDesignControlError::MutationReceipt(_) => None,
+        ServerPhysicalDesignControlError::MutationReceipt(_)
+        | ServerPhysicalDesignControlError::MutationRecoveryRequired(_) => None,
         _ => Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected),
     }
 }
@@ -2051,7 +2058,8 @@ fn columnar_error_receipt_outcome(
         ServerPhysicalColumnarDesignControlError::Apply(_) => {
             Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected)
         }
-        ServerPhysicalColumnarDesignControlError::MutationReceipt(_) => None,
+        ServerPhysicalColumnarDesignControlError::MutationReceipt(_)
+        | ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(_) => None,
         _ => Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected),
     }
 }
@@ -3723,7 +3731,7 @@ mod tests {
                 proposal.clone(),
                 "events_category_idx"
             ),
-            Err(ServerPhysicalDesignControlError::MutationReceipt(
+            Err(ServerPhysicalDesignControlError::MutationRecoveryRequired(
                 ServerPhysicalDesignMutationReceiptControlError::Journal(_)
             ))
         ));
@@ -3787,6 +3795,116 @@ mod tests {
         fixture.close();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn nbop_outcome_sync_failure_runs_listener_control_worker_core_and_returns_restart_guidance() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (design_tx, design_rx) = std::sync::mpsc::channel();
+        let design_control = ServerPhysicalDesignControlHandle::new(design_tx);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut fixture = Fixture::create("nbop-receipt-outcome-failure");
+            let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+                fixture.root.join("physical-design.nbmr"),
+                1_000_000,
+            )
+            .unwrap();
+            let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+                config(),
+                None,
+                Some(receipt_config),
+                &fixture.database,
+            )
+            .unwrap();
+            record_candidate(&mut fixture.database, &mut runtime);
+            runtime.fail_next_receipt_outcome_append();
+            ready_tx.send(runtime.evidence.epoch().0).unwrap();
+            let request = design_rx.recv().unwrap();
+            let ServerPhysicalDesignControlRequest::ApplyApprovedIndex {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate,
+                index_name,
+                reply,
+            } = request
+            else {
+                panic!("expected one approved Index command");
+            };
+            runtime.handle(
+                &mut fixture.database,
+                ServerPhysicalDesignWorkerCommand::ApplyApprovedIndex {
+                    runtime_token_matches,
+                    expected_evidence_epoch,
+                    candidate,
+                    index_name: index_name.clone(),
+                    reply,
+                },
+            );
+            assert!(matches!(
+                fixture
+                    .database
+                    .inspect_physical_index_design_name(candidate, &index_name),
+                PhysicalIndexDesignNameState::AlreadyApplied { .. }
+            ));
+            assert!(
+                runtime
+                    .mutation_receipts
+                    .as_ref()
+                    .unwrap()
+                    .status()
+                    .recovery_required
+            );
+            fixture.close();
+        });
+        let evidence_epoch = ready_rx.recv().unwrap();
+
+        let (adaptive_tx, _adaptive_rx) = std::sync::mpsc::channel();
+        let adaptive = crate::ServerAdaptiveControlHandle::new(adaptive_tx);
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let listener = std::thread::spawn(move || {
+            crate::operator::serve_operator_connection_with_capabilities(
+                &mut server,
+                &adaptive,
+                &design_control,
+                true,
+                false,
+                None,
+                Some(crate::operator::OperatorPhysicalDesignRuntimeToken::from_bytes([0x11; 16])),
+            )
+            .unwrap();
+        });
+        let payload = format!(
+            "{{\"request_id\":1,\"operation\":{{\"type\":\"apply_physical_index\",\"expected_runtime_token\":\"{}\",\"expected_evidence_epoch\":{},\"table_id\":{},\"column_id\":2,\"index_name\":\"events_category_idx\"}}}}",
+            "11".repeat(16),
+            evidence_epoch,
+            TABLE_ID.0
+        );
+        let mut frame = b"NBOP\0\x04\0\0".to_vec();
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload.as_bytes());
+        client.write_all(&frame).unwrap();
+        let mut header = [0_u8; 12];
+        client.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..8], b"NBOP\0\x04\0\0");
+        let length = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
+        let mut response = vec![0_u8; length];
+        client.read_exact(&mut response).unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["outcome"], "error");
+        assert_eq!(response["error"]["code"], "internal");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("restart/reopen")
+        );
+        assert!(!response.to_string().contains("physical-design.nbmr"));
+        listener.join().unwrap();
+        worker.join().unwrap();
+    }
+
     #[test]
     fn columnar_outcome_failure_reconciles_after_database_reopen() {
         let mut fixture = Fixture::create("columnar-receipt-outcome-failure");
@@ -3816,9 +3934,11 @@ mod tests {
         runtime.fail_next_receipt_outcome_append();
         assert!(matches!(
             apply_columnar(&mut fixture.database, &mut runtime, proposal),
-            Err(ServerPhysicalColumnarDesignControlError::MutationReceipt(
-                ServerPhysicalDesignMutationReceiptControlError::Journal(_)
-            ))
+            Err(
+                ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(
+                    ServerPhysicalDesignMutationReceiptControlError::Journal(_)
+                )
+            )
         ));
         let projection_id = fixture.database.inspect_columnar_projections()[0]
             .projection_id

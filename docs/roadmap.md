@@ -1,12 +1,17 @@
 # NetbaDB roadmap
 
-## Stable receipt namespaces (Adaptive Operations Phase 31 complete)
+## Stable receipt namespaces and protected framing (Adaptive Operations Phase 31 complete)
 
-- upgraded current receipt writes to NBMR v2 with a separate nonzero,
-  OS-random, durable journal incarnation in the checksummed 44-byte header;
-- added an atomic v1 migration reader that preserves complete record bytes and
-  receipt IDs through the reserved `<journal>.next` shadow, repairs only an
-  incomplete final tail, and reconciles pending work after v2 publication;
+- retained the NBMR v2 nonzero durable journal incarnation and upgraded current
+  writes to NBMR v3 with a checksummed fixed header protecting every record
+  length before it is trusted;
+- added complete-valid v1/v2 migration through unpredictable same-directory
+  `create_new` temporaries, preserved v2 incarnation and receipt semantics,
+  left every historical `.next` object untouched, and failed closed on
+  ambiguous legacy tails;
+- reserved recovered-Outcome capacity before publishing unresolved legacy
+  history, validated Begin/Outcome domain compatibility in runtime and every
+  decoder, and atomically published complete fresh v3 headers;
 - added scoped receipt cursors/pages that bind journal incarnation and receipt
   ID, reject replacement-journal cursors, and retain the Phase 30 unscoped API
   as a current-journal-local convenience;
@@ -18,7 +23,7 @@
 
 Receipt externalization and its exact wire encoding remain deferred to the
 next phase. See [`adaptive-operations-phase31.md`](adaptive-operations-phase31.md)
-and [`physical-design-mutation-receipts-v2.md`](physical-design-mutation-receipts-v2.md).
+and [`physical-design-mutation-receipts-v3.md`](physical-design-mutation-receipts-v3.md).
 
 ## Durable Server mutation receipts (Adaptive Operations Phase 30 complete)
 

@@ -41,9 +41,14 @@ const OPERATOR_MAGIC: [u8; 4] = *b"NBOP";
 const OPERATOR_HEADER_BYTES: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OperatorPhysicalDesignRuntimeToken([u8; 16]);
+pub(crate) struct OperatorPhysicalDesignRuntimeToken([u8; 16]);
 
 impl OperatorPhysicalDesignRuntimeToken {
+    #[cfg(test)]
+    pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
     fn generate() -> Result<Self, getrandom::Error> {
         let mut bytes = [0_u8; 16];
         getrandom::getrandom(&mut bytes)?;
@@ -472,8 +477,6 @@ pub struct OperatorPhysicalDesignAdvisorReportV4 {
 #[serde(deny_unknown_fields)]
 pub struct OperatorPhysicalDesignRecommendationsV4 {
     pub runtime_token: Option<String>,
-    pub physical_index_apply: OperatorPhysicalIndexApplyCapabilityV4,
-    pub physical_columnar_apply: OperatorPhysicalColumnarApplyCapabilityV4,
     pub report: OperatorPhysicalDesignAdvisorReportV4,
 }
 
@@ -582,7 +585,6 @@ pub enum OperatorErrorCodeV4 {
     PhysicalColumnarChangeStreamChanged,
     PhysicalColumnarRecoveryRequired,
     PhysicalColumnarApplyFailed,
-    MutationOutcomeUncertain,
     ResponseTooLarge,
     ServerStopped,
     MalformedRequest,
@@ -684,8 +686,6 @@ enum OperatorResultV4 {
     SchedulerReset {},
     PhysicalDesignRecommendations {
         runtime_token: Option<String>,
-        physical_index_apply: OperatorPhysicalIndexApplyCapabilityV4,
-        physical_columnar_apply: OperatorPhysicalColumnarApplyCapabilityV4,
         report: OperatorPhysicalDesignAdvisorReportV4,
     },
     PhysicalDesignEvidenceRotated {
@@ -818,12 +818,22 @@ fn write_frame<T: Serialize>(
 pub enum OperatorClientError {
     OperatorNotConfigured,
     UnsupportedPlatform,
-    Connect { path: PathBuf, source: io::Error },
+    Connect {
+        path: PathBuf,
+        source: io::Error,
+    },
     Configure(io::Error),
     Protocol(OperatorProtocolError),
-    RequestIdMismatch { expected: u64, received: u64 },
+    RequestIdMismatch {
+        expected: u64,
+        received: u64,
+    },
     UnexpectedResult,
     Remote(OperatorRemoteErrorV4),
+    MutationOutcomeUncertain {
+        recovery_required: bool,
+        source: Box<OperatorClientError>,
+    },
 }
 
 impl fmt::Display for OperatorClientError {
@@ -850,6 +860,15 @@ impl fmt::Display for OperatorClientError {
             ),
             Self::UnexpectedResult => formatter.write_str("operator returned an unexpected result"),
             Self::Remote(error) => write!(formatter, "operator request failed: {}", error.message),
+            Self::MutationOutcomeUncertain {
+                recovery_required, ..
+            } => {
+                if *recovery_required {
+                    formatter.write_str("operator mutation outcome is uncertain because its receipt Outcome may not be durable; restart/reopen the daemon, wait for startup reconciliation, then inspect or retry the same exact logical approval if still needed")
+                } else {
+                    formatter.write_str("operator mutation outcome is uncertain after command dispatch; the same exact approval may be retried to discover the idempotent outcome")
+                }
+            }
         }
     }
 }
@@ -859,6 +878,7 @@ impl Error for OperatorClientError {
         match self {
             Self::Connect { source, .. } | Self::Configure(source) => Some(source),
             Self::Protocol(error) => Some(error),
+            Self::MutationOutcomeUncertain { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -906,13 +926,9 @@ impl<'a> ServerOperatorClient<'a> {
         match self.exchange(OperatorOperationV4::PhysicalDesignRecommendations {})? {
             OperatorResultV4::PhysicalDesignRecommendations {
                 runtime_token,
-                physical_index_apply,
-                physical_columnar_apply,
                 report,
             } => Ok(OperatorPhysicalDesignRecommendationsV4 {
                 runtime_token,
-                physical_index_apply,
-                physical_columnar_apply,
                 report,
             }),
             _ => Err(OperatorClientError::UnexpectedResult),
@@ -939,13 +955,16 @@ impl<'a> ServerOperatorClient<'a> {
         column_id: u32,
         index_name: impl Into<String>,
     ) -> Result<OperatorPhysicalIndexApplyResultV4, OperatorClientError> {
-        match self.exchange(OperatorOperationV4::ApplyPhysicalIndex {
-            expected_runtime_token: expected_runtime_token.into(),
-            expected_evidence_epoch,
-            table_id,
-            column_id,
-            index_name: index_name.into(),
-        })? {
+        let result = self
+            .exchange(OperatorOperationV4::ApplyPhysicalIndex {
+                expected_runtime_token: expected_runtime_token.into(),
+                expected_evidence_epoch,
+                table_id,
+                column_id,
+                index_name: index_name.into(),
+            })
+            .map_err(classify_mutating_client_error)?;
+        match result {
             OperatorResultV4::PhysicalIndexApplied { apply } => Ok(apply),
             _ => Err(OperatorClientError::UnexpectedResult),
         }
@@ -960,14 +979,17 @@ impl<'a> ServerOperatorClient<'a> {
         mode: OperatorPhysicalColumnarDesignModeV4,
         placement_key: impl Into<String>,
     ) -> Result<OperatorPhysicalColumnarApplyResultV4, OperatorClientError> {
-        match self.exchange(OperatorOperationV4::ApplyPhysicalColumnar {
-            expected_runtime_token: expected_runtime_token.into(),
-            expected_evidence_epoch,
-            table_id,
-            columns,
-            mode,
-            placement_key: placement_key.into(),
-        })? {
+        let result = self
+            .exchange(OperatorOperationV4::ApplyPhysicalColumnar {
+                expected_runtime_token: expected_runtime_token.into(),
+                expected_evidence_epoch,
+                table_id,
+                columns,
+                mode,
+                placement_key: placement_key.into(),
+            })
+            .map_err(classify_mutating_client_error)?;
+        match result {
             OperatorResultV4::PhysicalColumnarApplied { apply } => Ok(apply),
             _ => Err(OperatorClientError::UnexpectedResult),
         }
@@ -1027,6 +1049,29 @@ impl<'a> ServerOperatorClient<'a> {
         _operation: OperatorOperationV4,
     ) -> Result<OperatorResultV4, OperatorClientError> {
         Err(OperatorClientError::UnsupportedPlatform)
+    }
+}
+
+fn classify_mutating_client_error(error: OperatorClientError) -> OperatorClientError {
+    let recovery_required = match &error {
+        OperatorClientError::Remote(remote) if remote.code == OperatorErrorCodeV4::Internal => true,
+        OperatorClientError::Remote(remote)
+            if matches!(
+                remote.code,
+                OperatorErrorCodeV4::PhysicalIndexApplyFailed
+                    | OperatorErrorCodeV4::PhysicalColumnarApplyFailed
+            ) =>
+        {
+            remote.message.contains("restart/reopen")
+        }
+        OperatorClientError::Protocol(_)
+        | OperatorClientError::RequestIdMismatch { .. }
+        | OperatorClientError::UnexpectedResult => false,
+        _ => return error,
+    };
+    OperatorClientError::MutationOutcomeUncertain {
+        recovery_required,
+        source: Box::new(error),
     }
 }
 
@@ -1432,7 +1477,7 @@ fn serve_operator_connection(
 }
 
 #[cfg(unix)]
-fn serve_operator_connection_with_capabilities(
+pub(crate) fn serve_operator_connection_with_capabilities(
     stream: &mut std::os::unix::net::UnixStream,
     adaptive_control: &ServerAdaptiveControlHandle,
     physical_design_control: &ServerPhysicalDesignControlHandle,
@@ -1537,13 +1582,6 @@ fn execute_operator_request_with_capabilities(
             .map(operator_physical_design_report)
             .map(|report| OperatorResultV4::PhysicalDesignRecommendations {
                 runtime_token: runtime_token.map(OperatorPhysicalDesignRuntimeToken::encode),
-                physical_index_apply: OperatorPhysicalIndexApplyCapabilityV4 {
-                    enabled: allow_physical_index_apply,
-                },
-                physical_columnar_apply: operator_physical_columnar_apply_capability(
-                    allow_physical_columnar_apply,
-                    columnar_capabilities,
-                ),
                 report,
             })
             .map_err(physical_design_remote_error),
@@ -2282,6 +2320,24 @@ fn control_remote_error(error: ServerAdaptiveControlError) -> OperatorRemoteErro
 fn physical_columnar_remote_error(
     error: ServerPhysicalColumnarDesignControlError,
 ) -> OperatorRemoteErrorV4 {
+    if matches!(
+        &error,
+        ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(_)
+    ) {
+        return OperatorRemoteErrorV4 {
+            code: OperatorErrorCodeV4::Internal,
+            message: "physical-columnar receipt outcome is not durable; restart/reopen the daemon, allow startup reconciliation to finish, then inspect or retry the same exact logical approval if still needed".into(),
+        };
+    }
+    if matches!(
+        &error,
+        ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain
+    ) {
+        return OperatorRemoteErrorV4 {
+            code: OperatorErrorCodeV4::PhysicalColumnarApplyFailed,
+            message: "physical-columnar apply reply was lost after command acceptance; the same exact approval may be retried to discover the idempotent outcome".into(),
+        };
+    }
     let code = match error {
         ServerPhysicalColumnarDesignControlError::PhysicalDesignNotEnabled => {
             OperatorErrorCodeV4::PhysicalDesignNotEnabled
@@ -2317,8 +2373,12 @@ fn physical_columnar_remote_error(
         ServerPhysicalColumnarDesignControlError::Apply(error) => {
             physical_columnar_apply_code(*error)
         }
+        ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(_)
+        | ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain => {
+            OperatorErrorCodeV4::PhysicalColumnarApplyFailed
+        }
         ServerPhysicalColumnarDesignControlError::MutationReceipt(_) => {
-            OperatorErrorCodeV4::MutationOutcomeUncertain
+            OperatorErrorCodeV4::PhysicalColumnarApplyFailed
         }
         ServerPhysicalColumnarDesignControlError::ProposalRuntimeChanged => {
             OperatorErrorCodeV4::PhysicalDesignRuntimeChanged
@@ -2328,9 +2388,6 @@ fn physical_columnar_remote_error(
         }
         ServerPhysicalColumnarDesignControlError::ServerStopped => {
             OperatorErrorCodeV4::ServerStopped
-        }
-        ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain => {
-            OperatorErrorCodeV4::MutationOutcomeUncertain
         }
     };
     let message = match code {
@@ -2378,9 +2435,6 @@ fn physical_columnar_remote_error(
             "physical-design approval belongs to a previous daemon/operator runtime"
         }
         OperatorErrorCodeV4::ServerStopped => "server physical-design control is stopped",
-        OperatorErrorCodeV4::MutationOutcomeUncertain => {
-            "physical-columnar apply outcome is uncertain; retry the same exact approval"
-        }
         _ => "operator request failed",
     };
     OperatorRemoteErrorV4 {
@@ -2473,6 +2527,24 @@ fn physical_columnar_apply_code(error: PhysicalColumnarDesignApplyError) -> Oper
 }
 
 fn physical_design_remote_error(error: ServerPhysicalDesignControlError) -> OperatorRemoteErrorV4 {
+    if matches!(
+        &error,
+        ServerPhysicalDesignControlError::MutationRecoveryRequired(_)
+    ) {
+        return OperatorRemoteErrorV4 {
+            code: OperatorErrorCodeV4::Internal,
+            message: "physical-index receipt outcome is not durable; restart/reopen the daemon, allow startup reconciliation to finish, then inspect or retry the same exact logical approval if still needed".into(),
+        };
+    }
+    if matches!(
+        &error,
+        ServerPhysicalDesignControlError::MutationOutcomeUncertain
+    ) {
+        return OperatorRemoteErrorV4 {
+            code: OperatorErrorCodeV4::PhysicalIndexApplyFailed,
+            message: "physical-index apply reply was lost after command acceptance; the same exact approval may be retried to discover the idempotent outcome".into(),
+        };
+    }
     let code = match error {
         ServerPhysicalDesignControlError::PhysicalDesignNotEnabled => {
             OperatorErrorCodeV4::PhysicalDesignNotEnabled
@@ -2556,11 +2628,10 @@ fn physical_design_remote_error(error: ServerPhysicalDesignControlError) -> Oper
             OperatorErrorCodeV4::PhysicalIndexNameConflict
         }
         ServerPhysicalDesignControlError::ServerStopped => OperatorErrorCodeV4::ServerStopped,
-        ServerPhysicalDesignControlError::MutationOutcomeUncertain => {
-            OperatorErrorCodeV4::MutationOutcomeUncertain
-        }
-        ServerPhysicalDesignControlError::MutationReceipt(_) => {
-            OperatorErrorCodeV4::MutationOutcomeUncertain
+        ServerPhysicalDesignControlError::MutationOutcomeUncertain
+        | ServerPhysicalDesignControlError::MutationRecoveryRequired(_)
+        | ServerPhysicalDesignControlError::MutationReceipt(_) => {
+            OperatorErrorCodeV4::PhysicalIndexApplyFailed
         }
     };
     let message = match code {
@@ -2594,9 +2665,6 @@ fn physical_design_remote_error(error: ServerPhysicalDesignControlError) -> Oper
             "physical-index apply failed without creating a new index"
         }
         OperatorErrorCodeV4::ServerStopped => "server physical-design control is stopped",
-        OperatorErrorCodeV4::MutationOutcomeUncertain => {
-            "physical-index apply outcome is uncertain; retry the same exact approval"
-        }
         _ => "operator request failed",
     };
     OperatorRemoteErrorV4 {
@@ -2723,6 +2791,229 @@ mod tests {
         assert_eq!(&bytes[4..8], &[0, 4, 0, 0]);
         assert_eq!(&bytes[8..12], &(payload.len() as u32).to_be_bytes());
         assert_eq!(&bytes[12..], payload);
+    }
+
+    #[test]
+    fn frozen_phase30_v4_recommendations_are_bidirectionally_compatible() {
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+        enum FrozenResponse {
+            Ok {
+                request_id: u64,
+                result: FrozenResult,
+            },
+            Error {
+                request_id: u64,
+                error: OperatorRemoteErrorV4,
+            },
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum FrozenResult {
+            PhysicalDesignRecommendations {
+                runtime_token: Option<String>,
+                report: OperatorPhysicalDesignAdvisorReportV4,
+            },
+        }
+
+        let payload = br#"{"outcome":"ok","request_id":30,"result":{"type":"physical_design_recommendations","runtime_token":"00112233445566778899aabbccddeeff","report":{"evidence_epoch":1,"schema_generation":2,"first_global_commit_seq":3,"last_global_commit_seq":4,"recorded_reports":5,"discarded_incomplete_reports":0,"overflowed":false,"incomplete":false,"index_candidates":[],"columnar_candidates":[]}}}"#;
+        let mut frozen_frame = Vec::new();
+        frozen_frame.extend_from_slice(b"NBOP");
+        frozen_frame.extend_from_slice(&OPERATOR_PROTOCOL_VERSION.to_be_bytes());
+        frozen_frame.extend_from_slice(&0_u16.to_be_bytes());
+        frozen_frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frozen_frame.extend_from_slice(payload);
+        assert!(matches!(
+            read_frame::<OperatorResponseV4>(&mut frozen_frame.as_slice()).unwrap(),
+            OperatorResponseV4::Ok {
+                request_id: 30,
+                result: OperatorResultV4::PhysicalDesignRecommendations {
+                    runtime_token: Some(_),
+                    ..
+                }
+            }
+        ));
+
+        let response = OperatorResponseV4::Ok {
+            request_id: 31,
+            result: OperatorResultV4::PhysicalDesignRecommendations {
+                runtime_token: None,
+                report: OperatorPhysicalDesignAdvisorReportV4 {
+                    evidence_epoch: 1,
+                    schema_generation: 2,
+                    first_global_commit_seq: 3,
+                    last_global_commit_seq: 4,
+                    recorded_reports: 5,
+                    discarded_incomplete_reports: 0,
+                    overflowed: false,
+                    incomplete: false,
+                    index_candidates: Vec::new(),
+                    columnar_candidates: Vec::new(),
+                },
+            },
+        };
+        let mut current_frame = Vec::new();
+        write_frame(&mut current_frame, &response).unwrap();
+        let frozen: FrozenResponse = read_frame(&mut current_frame.as_slice()).unwrap();
+        match frozen {
+            FrozenResponse::Ok {
+                request_id,
+                result:
+                    FrozenResult::PhysicalDesignRecommendations {
+                        runtime_token,
+                        report,
+                    },
+            } => {
+                assert_eq!(request_id, 31);
+                assert_eq!(runtime_token, None);
+                assert_eq!(report.evidence_epoch, 1);
+            }
+            FrozenResponse::Error { request_id, error } => {
+                panic!("unexpected frozen error {request_id}: {error:?}")
+            }
+        }
+        assert!(
+            serde_json::from_str::<OperatorErrorCodeV4>("\"mutation_outcome_uncertain\"").is_err()
+        );
+        assert_eq!(
+            serde_json::from_str::<OperatorErrorCodeV4>("\"internal\"").unwrap(),
+            OperatorErrorCodeV4::Internal
+        );
+    }
+
+    #[test]
+    fn frozen_phase30_v4_error_set_is_exact() {
+        fn frozen_wire_name(code: OperatorErrorCodeV4) -> &'static str {
+            match code {
+                OperatorErrorCodeV4::AdaptiveNotEnabled => "adaptive_not_enabled",
+                OperatorErrorCodeV4::DriverNotEnabled => "driver_not_enabled",
+                OperatorErrorCodeV4::SchedulerNotFaulted => "scheduler_not_faulted",
+                OperatorErrorCodeV4::EvidenceWindowChanged => "evidence_window_changed",
+                OperatorErrorCodeV4::EvidenceWindowEpochExhausted => {
+                    "evidence_window_epoch_exhausted"
+                }
+                OperatorErrorCodeV4::PhysicalDesignNotEnabled => "physical_design_not_enabled",
+                OperatorErrorCodeV4::PhysicalDesignEvidenceEpochChanged => {
+                    "physical_design_evidence_epoch_changed"
+                }
+                OperatorErrorCodeV4::PhysicalDesignEvidenceEpochExhausted => {
+                    "physical_design_evidence_epoch_exhausted"
+                }
+                OperatorErrorCodeV4::PhysicalDesignNoEvidence => "physical_design_no_evidence",
+                OperatorErrorCodeV4::PhysicalDesignStaleSchema => "physical_design_stale_schema",
+                OperatorErrorCodeV4::PhysicalDesignInconclusiveCapacity => {
+                    "physical_design_inconclusive_capacity"
+                }
+                OperatorErrorCodeV4::PhysicalIndexApplyNotEnabled => {
+                    "physical_index_apply_not_enabled"
+                }
+                OperatorErrorCodeV4::PhysicalDesignRuntimeChanged => {
+                    "physical_design_runtime_changed"
+                }
+                OperatorErrorCodeV4::InvalidIndexName => "invalid_index_name",
+                OperatorErrorCodeV4::PhysicalIndexCandidateNotObserved => {
+                    "physical_index_candidate_not_observed"
+                }
+                OperatorErrorCodeV4::PhysicalIndexNotRecommended => {
+                    "physical_index_not_recommended"
+                }
+                OperatorErrorCodeV4::PhysicalIndexNameConflict => "physical_index_name_conflict",
+                OperatorErrorCodeV4::PhysicalIndexApplyFailed => "physical_index_apply_failed",
+                OperatorErrorCodeV4::PhysicalColumnarApplyNotEnabled => {
+                    "physical_columnar_apply_not_enabled"
+                }
+                OperatorErrorCodeV4::InvalidPhysicalColumnarPlacementKey => {
+                    "invalid_physical_columnar_placement_key"
+                }
+                OperatorErrorCodeV4::PhysicalColumnarModeNotAllowed => {
+                    "physical_columnar_mode_not_allowed"
+                }
+                OperatorErrorCodeV4::PhysicalColumnarPlacementUnavailable => {
+                    "physical_columnar_placement_unavailable"
+                }
+                OperatorErrorCodeV4::PhysicalColumnarPlacementOccupied => {
+                    "physical_columnar_placement_occupied"
+                }
+                OperatorErrorCodeV4::PhysicalColumnarLocationConflict => {
+                    "physical_columnar_location_conflict"
+                }
+                OperatorErrorCodeV4::PhysicalColumnarCandidateNotObserved => {
+                    "physical_columnar_candidate_not_observed"
+                }
+                OperatorErrorCodeV4::PhysicalColumnarNotRecommended => {
+                    "physical_columnar_not_recommended"
+                }
+                OperatorErrorCodeV4::PhysicalColumnarChangeStreamNotEnabled => {
+                    "physical_columnar_change_stream_not_enabled"
+                }
+                OperatorErrorCodeV4::PhysicalColumnarChangeStreamUnavailable => {
+                    "physical_columnar_change_stream_unavailable"
+                }
+                OperatorErrorCodeV4::PhysicalColumnarChangeStreamChanged => {
+                    "physical_columnar_change_stream_changed"
+                }
+                OperatorErrorCodeV4::PhysicalColumnarRecoveryRequired => {
+                    "physical_columnar_recovery_required"
+                }
+                OperatorErrorCodeV4::PhysicalColumnarApplyFailed => {
+                    "physical_columnar_apply_failed"
+                }
+                OperatorErrorCodeV4::ResponseTooLarge => "response_too_large",
+                OperatorErrorCodeV4::ServerStopped => "server_stopped",
+                OperatorErrorCodeV4::MalformedRequest => "malformed_request",
+                OperatorErrorCodeV4::UnsupportedProtocolVersion => "unsupported_protocol_version",
+                OperatorErrorCodeV4::RequestTooLarge => "request_too_large",
+                OperatorErrorCodeV4::Internal => "internal",
+            }
+        }
+
+        let frozen_codes = [
+            OperatorErrorCodeV4::AdaptiveNotEnabled,
+            OperatorErrorCodeV4::DriverNotEnabled,
+            OperatorErrorCodeV4::SchedulerNotFaulted,
+            OperatorErrorCodeV4::EvidenceWindowChanged,
+            OperatorErrorCodeV4::EvidenceWindowEpochExhausted,
+            OperatorErrorCodeV4::PhysicalDesignNotEnabled,
+            OperatorErrorCodeV4::PhysicalDesignEvidenceEpochChanged,
+            OperatorErrorCodeV4::PhysicalDesignEvidenceEpochExhausted,
+            OperatorErrorCodeV4::PhysicalDesignNoEvidence,
+            OperatorErrorCodeV4::PhysicalDesignStaleSchema,
+            OperatorErrorCodeV4::PhysicalDesignInconclusiveCapacity,
+            OperatorErrorCodeV4::PhysicalIndexApplyNotEnabled,
+            OperatorErrorCodeV4::PhysicalDesignRuntimeChanged,
+            OperatorErrorCodeV4::InvalidIndexName,
+            OperatorErrorCodeV4::PhysicalIndexCandidateNotObserved,
+            OperatorErrorCodeV4::PhysicalIndexNotRecommended,
+            OperatorErrorCodeV4::PhysicalIndexNameConflict,
+            OperatorErrorCodeV4::PhysicalIndexApplyFailed,
+            OperatorErrorCodeV4::PhysicalColumnarApplyNotEnabled,
+            OperatorErrorCodeV4::InvalidPhysicalColumnarPlacementKey,
+            OperatorErrorCodeV4::PhysicalColumnarModeNotAllowed,
+            OperatorErrorCodeV4::PhysicalColumnarPlacementUnavailable,
+            OperatorErrorCodeV4::PhysicalColumnarPlacementOccupied,
+            OperatorErrorCodeV4::PhysicalColumnarLocationConflict,
+            OperatorErrorCodeV4::PhysicalColumnarCandidateNotObserved,
+            OperatorErrorCodeV4::PhysicalColumnarNotRecommended,
+            OperatorErrorCodeV4::PhysicalColumnarChangeStreamNotEnabled,
+            OperatorErrorCodeV4::PhysicalColumnarChangeStreamUnavailable,
+            OperatorErrorCodeV4::PhysicalColumnarChangeStreamChanged,
+            OperatorErrorCodeV4::PhysicalColumnarRecoveryRequired,
+            OperatorErrorCodeV4::PhysicalColumnarApplyFailed,
+            OperatorErrorCodeV4::ResponseTooLarge,
+            OperatorErrorCodeV4::ServerStopped,
+            OperatorErrorCodeV4::MalformedRequest,
+            OperatorErrorCodeV4::UnsupportedProtocolVersion,
+            OperatorErrorCodeV4::RequestTooLarge,
+            OperatorErrorCodeV4::Internal,
+        ];
+        assert_eq!(frozen_codes.len(), 37);
+        for code in frozen_codes {
+            assert_eq!(
+                serde_json::to_string(&code).unwrap(),
+                format!("\"{}\"", frozen_wire_name(code))
+            );
+        }
     }
 
     #[test]
@@ -3075,28 +3366,54 @@ mod tests {
         );
         assert_eq!(
             uncertain.code,
-            OperatorErrorCodeV4::MutationOutcomeUncertain
+            OperatorErrorCodeV4::PhysicalColumnarApplyFailed
         );
         assert!(uncertain.message.contains("same exact approval"));
         assert!(!uncertain.message.contains("without creating"));
 
         let receipt_uncertain = physical_columnar_remote_error(
-            ServerPhysicalColumnarDesignControlError::MutationReceipt(
+            ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(
                 crate::ServerPhysicalDesignMutationReceiptControlError::RecoveryRequired,
             ),
         );
-        assert_eq!(
-            receipt_uncertain.code,
-            OperatorErrorCodeV4::MutationOutcomeUncertain
-        );
-        let index_receipt_uncertain =
-            physical_design_remote_error(ServerPhysicalDesignControlError::MutationReceipt(
+        assert_eq!(receipt_uncertain.code, OperatorErrorCodeV4::Internal);
+        assert!(receipt_uncertain.message.contains("restart/reopen"));
+        let index_receipt_uncertain = physical_design_remote_error(
+            ServerPhysicalDesignControlError::MutationRecoveryRequired(
                 crate::ServerPhysicalDesignMutationReceiptControlError::RecoveryRequired,
-            ));
-        assert_eq!(
-            index_receipt_uncertain.code,
-            OperatorErrorCodeV4::MutationOutcomeUncertain
+            ),
         );
+        assert_eq!(index_receipt_uncertain.code, OperatorErrorCodeV4::Internal);
+        assert!(index_receipt_uncertain.message.contains("restart/reopen"));
+
+        let reply_loss = classify_mutating_client_error(OperatorClientError::Protocol(
+            OperatorProtocolError::TruncatedPayload,
+        ));
+        assert!(matches!(
+            &reply_loss,
+            OperatorClientError::MutationOutcomeUncertain {
+                recovery_required: false,
+                ..
+            }
+        ));
+        assert!(reply_loss.to_string().contains("same exact approval"));
+        let recovery =
+            classify_mutating_client_error(OperatorClientError::Remote(receipt_uncertain));
+        assert!(matches!(
+            &recovery,
+            OperatorClientError::MutationOutcomeUncertain {
+                recovery_required: true,
+                ..
+            }
+        ));
+        assert!(recovery.to_string().contains("restart/reopen"));
+        assert!(matches!(
+            classify_mutating_client_error(OperatorClientError::Remote(stopped)),
+            OperatorClientError::Remote(OperatorRemoteErrorV4 {
+                code: OperatorErrorCodeV4::ServerStopped,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3121,12 +3438,6 @@ mod tests {
             request_id: 77,
             result: OperatorResultV4::PhysicalDesignRecommendations {
                 runtime_token: None,
-                physical_index_apply: OperatorPhysicalIndexApplyCapabilityV4 { enabled: false },
-                physical_columnar_apply: OperatorPhysicalColumnarApplyCapabilityV4 {
-                    enabled: false,
-                    allow_snapshot: false,
-                    allow_incremental: false,
-                },
                 report: OperatorPhysicalDesignAdvisorReportV4 {
                     evidence_epoch: 1,
                     schema_generation: 2,

@@ -30,10 +30,12 @@ const MAX_PATH_BYTES: usize = 4_096;
 const MAX_PLACEMENT_BYTES: usize = 128;
 const V1_HEADER_BYTES: usize = 28;
 const V2_HEADER_BYTES: usize = 44;
-const RECORD_FIXED_BYTES: usize = 4 + 1 + 3 + 8 + 4;
+const V3_HEADER_BYTES: usize = 44;
+const LEGACY_RECORD_FIXED_BYTES: usize = 4 + 1 + 3 + 8 + 4;
+const V3_RECORD_HEADER_BYTES: usize = 24;
+const V3_RECORD_TRAILER_BYTES: usize = 4;
 const BEGIN_COMMON_BYTES: usize = 1 + 1 + 2 + 8;
-const MAX_COLUMNAR_BEGIN_BYTES: usize = RECORD_FIXED_BYTES
-    + BEGIN_COMMON_BYTES
+const MAX_COLUMNAR_BEGIN_BODY_BYTES: usize = BEGIN_COMMON_BYTES
     + 8
     + 1
     + 3
@@ -43,14 +45,20 @@ const MAX_COLUMNAR_BEGIN_BYTES: usize = RECORD_FIXED_BYTES
     + MAX_PLACEMENT_BYTES
     + 2
     + MAX_PATH_BYTES;
-const MAX_OUTCOME_BYTES: usize = RECORD_FIXED_BYTES + 1 + 3 + 8;
-const MIN_FILE_BYTES: u64 = (V2_HEADER_BYTES + MAX_COLUMNAR_BEGIN_BYTES + MAX_OUTCOME_BYTES) as u64;
+const MAX_COLUMNAR_BEGIN_BYTES: usize =
+    V3_RECORD_HEADER_BYTES + MAX_COLUMNAR_BEGIN_BODY_BYTES + V3_RECORD_TRAILER_BYTES;
+const MAX_OUTCOME_BODY_BYTES: usize = 1 + 3 + 8;
+const MAX_RECOVERED_OUTCOME_BYTES: usize =
+    V3_RECORD_HEADER_BYTES + MAX_OUTCOME_BODY_BYTES + V3_RECORD_TRAILER_BYTES;
+const MIN_FILE_BYTES: u64 =
+    (V3_HEADER_BYTES + MAX_COLUMNAR_BEGIN_BYTES + MAX_RECOVERED_OUTCOME_BYTES) as u64;
 const V1_VERSION: u16 = 1;
-const CURRENT_VERSION: u16 = 2;
+const V2_VERSION: u16 = 2;
+const CURRENT_VERSION: u16 = 3;
 const BEGIN_TAG: u8 = 1;
 const OUTCOME_TAG: u8 = 2;
 
-/// Programmatic-only configuration for one bounded NBMR v2 journal.
+/// Programmatic-only configuration for one bounded NBMR v3 journal.
 ///
 /// Construction freezes an absolute path through its canonical existing
 /// parent, but deliberately does not create or open the final file.
@@ -230,12 +238,6 @@ fn validate_final_path(path: &Path) -> Result<(), ServerPhysicalDesignMutationRe
     }
 }
 
-fn journal_shadow_path(path: &Path) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(".next");
-    value.into()
-}
-
 fn generate_journal_incarnation() -> Result<
     ServerPhysicalDesignMutationReceiptJournalIncarnation,
     ServerPhysicalDesignMutationReceiptJournalError,
@@ -271,37 +273,65 @@ fn nonzero_journal_incarnation(
     Ok(ServerPhysicalDesignMutationReceiptJournalIncarnation(bytes))
 }
 
-fn create_v2_journal(
+fn create_v3_journal(
     config: &ServerPhysicalDesignMutationReceiptConfig,
     database_incarnation: [u8; 16],
 ) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
     let journal_incarnation = generate_journal_incarnation()?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    let mut temp = create_owned_temp(config.path())?;
+    let header = encode_v3_header(database_incarnation, journal_incarnation);
+    #[cfg(test)]
+    inject_publication_failure(TestPublicationFailure::TemporaryCreated, &temp.path)?;
+    #[cfg(test)]
+    if take_publication_failure(TestPublicationFailure::PartialHeaderWritten) {
+        temp.file
+            .write_all(&header[..header.len() / 2])
+            .map_err(|source| io_error("partial fresh header write", &temp.path, source))?;
+        return Err(io_error(
+            "injected fresh publication failure",
+            &temp.path,
+            io::Error::other("injected fresh publication failure"),
+        ));
+    }
+    temp.file
+        .write_all(&header)
+        .map_err(|source| io_error("fresh header write", &temp.path, source))?;
+    #[cfg(test)]
+    inject_publication_failure(TestPublicationFailure::FullHeaderWritten, &temp.path)?;
+    temp.file
+        .sync_all()
+        .map_err(|source| io_error("fresh header sync", &temp.path, source))?;
+    #[cfg(test)]
+    inject_publication_failure(TestPublicationFailure::TemporarySynced, &temp.path)?;
+    publish_new(&mut temp, config.path())
+}
+
+fn secure_open_existing(
+    config: &ServerPhysicalDesignMutationReceiptConfig,
+    write: bool,
+) -> Result<File, ServerPhysicalDesignMutationReceiptJournalError> {
+    validate_final_path(config.path())
+        .map_err(ServerPhysicalDesignMutationReceiptJournalError::Path)?;
+    #[cfg(test)]
+    inject_existing_open_replacement(config.path())?;
+    #[cfg(not(unix))]
+    {
+        let _ = write;
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::FilesystemSafetyUnavailable);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(config.path())
-        .map_err(|source| io_error("create", config.path(), source))?;
-    let header = encode_v2_header(database_incarnation, journal_incarnation);
-    file.write_all(&header)
-        .map_err(|source| io_error("header write", config.path(), source))?;
-    file.sync_all()
-        .map_err(|source| io_error("header sync", config.path(), source))?;
-    sync_parent(config.path())
-}
 
-fn read_journal_bytes(
-    config: &ServerPhysicalDesignMutationReceiptConfig,
-) -> Result<Vec<u8>, ServerPhysicalDesignMutationReceiptJournalError> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .open(config.path())
-        .map_err(|source| io_error("open", config.path(), source))?;
-    read_open_file(&mut file, config)
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(write)
+            .custom_flags(libc::O_NOFOLLOW);
+        options
+            .open(config.path())
+            .map_err(|source| io_error("secure open", config.path(), source))
+    }
 }
 
 fn read_open_file(
@@ -363,58 +393,153 @@ fn journal_version(bytes: &[u8]) -> Result<u16, ServerPhysicalDesignMutationRece
     Ok(u16::from_le_bytes([bytes[4], bytes[5]]))
 }
 
-fn migrate_v1(
+struct OwnedTemp {
+    file: File,
+    path: PathBuf,
+    published: bool,
+}
+
+impl Drop for OwnedTemp {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn create_owned_temp(
+    final_path: &Path,
+) -> Result<OwnedTemp, ServerPhysicalDesignMutationReceiptJournalError> {
+    let parent =
+        final_path
+            .parent()
+            .ok_or(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "journal path has no parent",
+            ))?;
+    let name =
+        final_path
+            .file_name()
+            .ok_or(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "journal path has no file name",
+            ))?;
+    for _ in 0..16 {
+        let mut random = [0_u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(ServerPhysicalDesignMutationReceiptJournalError::Randomness)?;
+        let mut suffix = String::with_capacity(32);
+        for byte in random {
+            use fmt::Write as _;
+            write!(&mut suffix, "{byte:02x}").map_err(|_| {
+                ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                    "temporary name formatting failed",
+                )
+            })?;
+        }
+        let mut temp_name = name.to_os_string();
+        temp_name.push(format!(".tmp-{suffix}"));
+        let path = parent.join(temp_name);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => {
+                return Ok(OwnedTemp {
+                    file,
+                    path,
+                    published: false,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(io_error("create owned temporary journal", &path, source)),
+        }
+    }
+    Err(ServerPhysicalDesignMutationReceiptJournalError::TemporaryNameExhausted)
+}
+
+fn publish_new(
+    temp: &mut OwnedTemp,
+    final_path: &Path,
+) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    fs::hard_link(&temp.path, final_path)
+        .map_err(|source| io_error("publish fresh journal", final_path, source))?;
+    #[cfg(test)]
+    inject_publication_failure(
+        TestPublicationFailure::PublishedBeforeParentSync,
+        final_path,
+    )?;
+    sync_parent(final_path)?;
+    fs::remove_file(&temp.path)
+        .map_err(|source| io_error("remove published journal temporary", &temp.path, source))?;
+    temp.published = true;
+    sync_parent(final_path)
+}
+
+fn migrate_legacy(
     config: &ServerPhysicalDesignMutationReceiptConfig,
     database_incarnation: [u8; 16],
-    v1_bytes: &[u8],
+    version: u16,
+    legacy_bytes: &[u8],
 ) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
-    validate_v1_header(v1_bytes, database_incarnation)?;
-    let decoded = decode_records(v1_bytes, V1_HEADER_BYTES)?;
-    let record_bytes = &v1_bytes[V1_HEADER_BYTES..decoded.valid_bytes];
-    let migrated_bytes = V2_HEADER_BYTES
-        .checked_add(record_bytes.len())
+    let (header_bytes, journal_incarnation) = match version {
+        V1_VERSION => {
+            validate_v1_header(legacy_bytes, database_incarnation)?;
+            (V1_HEADER_BYTES, generate_journal_incarnation()?)
+        }
+        V2_VERSION => (
+            V2_HEADER_BYTES,
+            validate_v2_header(legacy_bytes, database_incarnation)?,
+        ),
+        _ => {
+            return Err(
+                ServerPhysicalDesignMutationReceiptJournalError::UnsupportedVersion(version),
+            );
+        }
+    };
+    let decoded = decode_legacy_records(legacy_bytes, header_bytes)?;
+    if decoded.valid_bytes != legacy_bytes.len() {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "ambiguous legacy partial tail",
+        ));
+    }
+    let mut bytes = encode_v3_header(database_incarnation, journal_incarnation).to_vec();
+    for record in &decoded.records {
+        bytes.extend_from_slice(&encode_parsed_v3(record)?);
+    }
+    let required = bytes
+        .len()
+        .checked_add(
+            decoded
+                .unresolved
+                .as_ref()
+                .map_or(0, |_| MAX_RECOVERED_OUTCOME_BYTES),
+        )
         .ok_or(ServerPhysicalDesignMutationReceiptJournalError::CapacityExceeded)?;
-    let migrated_bytes_u64 = migrated_bytes as u64;
-    if migrated_bytes_u64 > config.max_file_bytes() {
+    let required = u64::try_from(required)
+        .map_err(|_| ServerPhysicalDesignMutationReceiptJournalError::CapacityExceeded)?;
+    if required > config.max_file_bytes() {
         return Err(
             ServerPhysicalDesignMutationReceiptJournalError::MigrationCapacityExceeded {
-                migrated_bytes: migrated_bytes_u64,
+                migrated_bytes: required,
                 maximum: config.max_file_bytes(),
             },
         );
     }
-    let shadow = journal_shadow_path(config.path());
-    validate_final_path(&shadow).map_err(ServerPhysicalDesignMutationReceiptJournalError::Path)?;
-    let journal_incarnation = generate_journal_incarnation()?;
-    let mut bytes = Vec::with_capacity(migrated_bytes);
-    bytes.extend_from_slice(&encode_v2_header(database_incarnation, journal_incarnation));
-    bytes.extend_from_slice(record_bytes);
-
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&shadow)
-        .map_err(|source| io_error("create migration shadow", &shadow, source))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|source| io_error("secure migration shadow", &shadow, source))?;
-    }
-    file.write_all(&bytes)
-        .map_err(|source| io_error("write migration shadow", &shadow, source))?;
-    file.sync_all()
-        .map_err(|source| io_error("sync migration shadow", &shadow, source))?;
-    drop(file);
+    let mut temp = create_owned_temp(config.path())?;
+    temp.file
+        .write_all(&bytes)
+        .map_err(|source| io_error("write migration temporary", &temp.path, source))?;
+    temp.file
+        .sync_all()
+        .map_err(|source| io_error("sync migration temporary", &temp.path, source))?;
     #[cfg(test)]
-    inject_migration_failure(TestMigrationFailure::AfterShadowSync, &shadow)?;
-    fs::rename(&shadow, config.path())
-        .map_err(|source| io_error("publish v2 migration", config.path(), source))?;
+    inject_migration_failure(TestMigrationFailure::AfterTemporarySync, &temp.path)?;
+    fs::rename(&temp.path, config.path())
+        .map_err(|source| io_error("publish v3 migration", config.path(), source))?;
+    temp.published = true;
     #[cfg(test)]
     inject_migration_failure(TestMigrationFailure::AfterRename, config.path())?;
     sync_parent(config.path())
@@ -423,8 +548,24 @@ fn migrate_v1(
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TestMigrationFailure {
-    AfterShadowSync,
+    AfterTemporarySync,
     AfterRename,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestPublicationFailure {
+    TemporaryCreated,
+    PartialHeaderWritten,
+    FullHeaderWritten,
+    TemporarySynced,
+    PublishedBeforeParentSync,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone)]
+struct TestExistingOpenReplacement {
+    target: PathBuf,
 }
 
 #[cfg(test)]
@@ -432,6 +573,56 @@ thread_local! {
     static TEST_JOURNAL_INCARNATIONS: RefCell<VecDeque<[u8; 16]>> = const { RefCell::new(VecDeque::new()) };
     static TEST_MIGRATION_FAILURE: RefCell<Option<TestMigrationFailure>> = const { RefCell::new(None) };
     static TEST_RANDOMNESS_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static TEST_PUBLICATION_FAILURE: RefCell<Option<TestPublicationFailure>> = const { RefCell::new(None) };
+    #[cfg(unix)]
+    static TEST_EXISTING_OPEN_REPLACEMENT: RefCell<Option<TestExistingOpenReplacement>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn take_publication_failure(point: TestPublicationFailure) -> bool {
+    TEST_PUBLICATION_FAILURE.with(|value| {
+        let mut value = value.borrow_mut();
+        if *value == Some(point) {
+            value.take();
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+fn inject_publication_failure(
+    point: TestPublicationFailure,
+    path: &Path,
+) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    if take_publication_failure(point) {
+        Err(io_error(
+            "injected fresh publication failure",
+            path,
+            io::Error::other("injected fresh publication failure"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn inject_existing_open_replacement(
+    path: &Path,
+) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    #[cfg(unix)]
+    if let Some(replacement) =
+        TEST_EXISTING_OPEN_REPLACEMENT.with(|value| value.borrow_mut().take())
+    {
+        use std::os::unix::fs::symlink;
+
+        fs::remove_file(path)
+            .map_err(|source| io_error("injected path replacement", path, source))?;
+        symlink(&replacement.target, path)
+            .map_err(|source| io_error("injected symlink replacement", path, source))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -464,7 +655,7 @@ pub struct ServerPhysicalDesignMutationReceiptId(pub u64);
 
 /// Stable namespace of one durable NBMR receipt history.
 ///
-/// The value is generated from OS randomness when a v2 journal is first
+/// The value is generated from OS randomness when a current journal is first
 /// created or a v1 journal is migrated. It is neither authentication nor a
 /// database or runtime identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -678,6 +869,8 @@ pub enum ServerPhysicalDesignMutationReceiptJournalError {
     DatabaseIdentityMismatch,
     Randomness(getrandom::Error),
     GeneratedZeroJournalIncarnation,
+    TemporaryNameExhausted,
+    FilesystemSafetyUnavailable,
     FileTooLarge {
         bytes: u64,
         maximum: u64,
@@ -765,6 +958,11 @@ impl fmt::Display for ServerPhysicalDesignMutationReceiptJournalError {
             Self::GeneratedZeroJournalIncarnation => {
                 formatter.write_str("generated NBMR journal incarnation was zero")
             }
+            Self::TemporaryNameExhausted => {
+                formatter.write_str("failed to allocate a unique NBMR temporary name")
+            }
+            Self::FilesystemSafetyUnavailable => formatter
+                .write_str("secure no-follow receipt journal open is unavailable on this platform"),
             Self::FileTooLarge { bytes, maximum } => write!(
                 formatter,
                 "NBMR journal is {bytes} bytes, exceeding configured maximum {maximum}"
@@ -775,7 +973,7 @@ impl fmt::Display for ServerPhysicalDesignMutationReceiptJournalError {
                 maximum,
             } => write!(
                 formatter,
-                "migrated NBMR v2 journal would be {migrated_bytes} bytes, exceeding configured maximum {maximum}"
+                "migrated NBMR v3 journal plus required recovery reserve would be {migrated_bytes} bytes, exceeding configured maximum {maximum}"
             ),
             Self::ReceiptIdExhausted => formatter.write_str("NBMR receipt IDs are exhausted"),
             Self::ColumnCountExceeded { count, maximum } => write!(
@@ -856,10 +1054,15 @@ impl ServerPhysicalDesignMutationReceiptJournal {
         identity: PhysicalDesignDatabaseIdentity,
         database: &Database,
     ) -> Result<Self, ServerPhysicalDesignMutationReceiptJournalError> {
-        validate_final_path(config.path())
-            .map_err(ServerPhysicalDesignMutationReceiptJournalError::Path)?;
         let exists = match fs::symlink_metadata(config.path()) {
-            Ok(_) => true,
+            Ok(metadata) if metadata.file_type().is_file() => true,
+            Ok(_) => {
+                return Err(ServerPhysicalDesignMutationReceiptJournalError::Path(
+                    ServerPhysicalDesignMutationReceiptPathError::ExistingObjectNotRegular(
+                        config.path().to_path_buf(),
+                    ),
+                ));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(source) => {
                 return Err(ServerPhysicalDesignMutationReceiptJournalError::Path(
@@ -871,12 +1074,18 @@ impl ServerPhysicalDesignMutationReceiptJournal {
             }
         };
         if !exists {
-            create_v2_journal(&config, *identity.as_bytes())?;
+            create_v3_journal(&config, *identity.as_bytes())?;
         } else {
-            let bytes = read_journal_bytes(&config)?;
-            match journal_version(&bytes)? {
-                V1_VERSION => migrate_v1(&config, *identity.as_bytes(), &bytes)?,
-                CURRENT_VERSION => {}
+            let mut source = secure_open_existing(&config, false)?;
+            let bytes = read_open_file(&mut source, &config)?;
+            let version = journal_version(&bytes)?;
+            match version {
+                V1_VERSION | V2_VERSION => {
+                    migrate_legacy(&config, *identity.as_bytes(), version, &bytes)?;
+                }
+                CURRENT_VERSION => {
+                    validate_v3_header(&bytes, *identity.as_bytes())?;
+                }
                 version => {
                     return Err(
                         ServerPhysicalDesignMutationReceiptJournalError::UnsupportedVersion(
@@ -887,14 +1096,10 @@ impl ServerPhysicalDesignMutationReceiptJournal {
             }
         }
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(config.path())
-            .map_err(|source| io_error("open", config.path(), source))?;
+        let mut file = secure_open_existing(&config, true)?;
         let bytes = read_open_file(&mut file, &config)?;
-        let journal_incarnation = validate_v2_header(&bytes, *identity.as_bytes())?;
-        let decoded = decode_records(&bytes, V2_HEADER_BYTES)?;
+        let journal_incarnation = validate_v3_header(&bytes, *identity.as_bytes())?;
+        let decoded = decode_v3_records(&bytes, V3_HEADER_BYTES)?;
         if decoded.valid_bytes < bytes.len() {
             file.set_len(decoded.valid_bytes as u64)
                 .map_err(|source| io_error("tail truncate", config.path(), source))?;
@@ -953,7 +1158,7 @@ impl ServerPhysicalDesignMutationReceiptJournal {
         let required = self
             .file_len
             .checked_add(bytes.len() as u64)
-            .and_then(|length| length.checked_add(MAX_OUTCOME_BYTES as u64));
+            .and_then(|length| length.checked_add(MAX_RECOVERED_OUTCOME_BYTES as u64));
         if required.is_none_or(|length| length > self.config.max_file_bytes()) {
             return Err(ServerPhysicalDesignMutationReceiptControlError::Journal(
                 ServerPhysicalDesignMutationReceiptJournalError::CapacityExceeded,
@@ -1008,6 +1213,8 @@ impl ServerPhysicalDesignMutationReceiptJournal {
                 ),
             ));
         }
+        validate_outcome_for_target(&unresolved.target, outcome)
+            .map_err(ServerPhysicalDesignMutationReceiptControlError::Journal)?;
         let bytes = encode_outcome(id, outcome)
             .map_err(ServerPhysicalDesignMutationReceiptControlError::Journal)?;
         if self
@@ -1258,7 +1465,7 @@ fn encode_v2_header(
 ) -> [u8; V2_HEADER_BYTES] {
     let mut bytes = [0_u8; V2_HEADER_BYTES];
     bytes[..4].copy_from_slice(b"NBMR");
-    bytes[4..6].copy_from_slice(&CURRENT_VERSION.to_le_bytes());
+    bytes[4..6].copy_from_slice(&V2_VERSION.to_le_bytes());
     bytes[8..24].copy_from_slice(&database_incarnation);
     bytes[24..40].copy_from_slice(journal_incarnation.as_bytes());
     let checksum = crc32c::crc32c(&bytes[..40]).to_le_bytes();
@@ -1310,7 +1517,7 @@ fn validate_v2_header(
         ));
     }
     let version = journal_version(bytes)?;
-    if version != CURRENT_VERSION {
+    if version != V2_VERSION {
         return Err(ServerPhysicalDesignMutationReceiptJournalError::UnsupportedVersion(version));
     }
     if bytes[6..8] != [0, 0] {
@@ -1321,6 +1528,59 @@ fn validate_v2_header(
     let mut checksum_bytes = [0_u8; 4];
     checksum_bytes.copy_from_slice(&bytes[40..44]);
     if crc32c::crc32c(&bytes[..40]) != u32::from_le_bytes(checksum_bytes) {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "header checksum mismatch",
+        ));
+    }
+    if bytes[8..24] != identity {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::DatabaseIdentityMismatch);
+    }
+    let mut journal_incarnation = [0_u8; 16];
+    journal_incarnation.copy_from_slice(&bytes[24..40]);
+    if journal_incarnation == [0; 16] {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "zero journal incarnation",
+        ));
+    }
+    Ok(ServerPhysicalDesignMutationReceiptJournalIncarnation(
+        journal_incarnation,
+    ))
+}
+
+fn encode_v3_header(
+    database_incarnation: [u8; 16],
+    journal_incarnation: ServerPhysicalDesignMutationReceiptJournalIncarnation,
+) -> [u8; V3_HEADER_BYTES] {
+    let mut bytes = encode_v2_header(database_incarnation, journal_incarnation);
+    bytes[4..6].copy_from_slice(&CURRENT_VERSION.to_le_bytes());
+    let checksum = crc32c::crc32c(&bytes[..40]).to_le_bytes();
+    bytes[40..44].copy_from_slice(&checksum);
+    bytes
+}
+
+fn validate_v3_header(
+    bytes: &[u8],
+    identity: [u8; 16],
+) -> Result<
+    ServerPhysicalDesignMutationReceiptJournalIncarnation,
+    ServerPhysicalDesignMutationReceiptJournalError,
+> {
+    if bytes.len() < V3_HEADER_BYTES {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "truncated header",
+        ));
+    }
+    let version = journal_version(bytes)?;
+    if version != CURRENT_VERSION {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::UnsupportedVersion(version));
+    }
+    if bytes[6..8] != [0, 0] {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "nonzero header reserved bytes",
+        ));
+    }
+    let expected = read_u32(&bytes[40..44]);
+    if crc32c::crc32c(&bytes[..40]) != expected {
         return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
             "header checksum mismatch",
         ));
@@ -1448,6 +1708,40 @@ fn encode_record(
             "zero receipt ID",
         ));
     }
+    let total = V3_RECORD_HEADER_BYTES
+        .checked_add(body.len())
+        .and_then(|length| length.checked_add(V3_RECORD_TRAILER_BYTES))
+        .ok_or(ServerPhysicalDesignMutationReceiptJournalError::CapacityExceeded)?;
+    if total > MAX_MUTATION_RECEIPT_RECORD_BYTES {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "record exceeds NBMR cap",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(total);
+    let body_len = u32::try_from(body.len())
+        .map_err(|_| ServerPhysicalDesignMutationReceiptJournalError::CapacityExceeded)?;
+    bytes.extend_from_slice(&body_len.to_le_bytes());
+    bytes.extend_from_slice(&(!body_len).to_le_bytes());
+    bytes.push(tag);
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.extend_from_slice(&id.0.to_le_bytes());
+    bytes.extend_from_slice(&crc32c::crc32c(&bytes).to_le_bytes());
+    bytes.extend_from_slice(body);
+    bytes.extend_from_slice(&crc32c::crc32c(&bytes).to_le_bytes());
+    Ok(bytes)
+}
+
+#[cfg(test)]
+fn encode_legacy_record(
+    tag: u8,
+    id: ServerPhysicalDesignMutationReceiptId,
+    body: &[u8],
+) -> Result<Vec<u8>, ServerPhysicalDesignMutationReceiptJournalError> {
+    if id.0 == 0 {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "zero receipt ID",
+        ));
+    }
     let payload_len = 12_usize
         .checked_add(body.len())
         .ok_or(ServerPhysicalDesignMutationReceiptJournalError::CapacityExceeded)?;
@@ -1475,8 +1769,10 @@ struct DecodedRecords {
     highest_begin: u64,
     receipts: Vec<ServerPhysicalDesignMutationReceipt>,
     unresolved: Option<MutationReceiptBegin>,
+    records: Vec<ParsedRecord>,
 }
 
+#[derive(Clone)]
 enum ParsedRecord {
     Begin(MutationReceiptBegin),
     Outcome(
@@ -1485,7 +1781,7 @@ enum ParsedRecord {
     ),
 }
 
-fn decode_records(
+fn decode_legacy_records(
     bytes: &[u8],
     header_bytes: usize,
 ) -> Result<DecodedRecords, ServerPhysicalDesignMutationReceiptJournalError> {
@@ -1493,6 +1789,7 @@ fn decode_records(
     let mut highest = 0_u64;
     let mut receipts = Vec::new();
     let mut unresolved: Option<MutationReceiptBegin> = None;
+    let mut records = Vec::new();
     while offset < bytes.len() {
         if bytes.len() - offset < 4 {
             break;
@@ -1504,7 +1801,9 @@ fn decode_records(
             .ok_or(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
                 "record length overflow",
             ))?;
-        if total > MAX_MUTATION_RECEIPT_RECORD_BYTES || payload_len < 12 {
+        if !(LEGACY_RECORD_FIXED_BYTES..=MAX_MUTATION_RECEIPT_RECORD_BYTES).contains(&total)
+            || payload_len < 12
+        {
             return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
                 "invalid record length",
             ));
@@ -1519,41 +1818,9 @@ fn decode_records(
                 "record checksum mismatch",
             ));
         }
-        match decode_record(record)? {
-            ParsedRecord::Begin(begin) => {
-                if unresolved.is_some() {
-                    return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
-                        "multiple unresolved Begin records",
-                    ));
-                }
-                if begin.id.0 <= highest {
-                    return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
-                        "non-monotonic Begin receipt ID",
-                    ));
-                }
-                highest = begin.id.0;
-                receipts.push(public_receipt(&begin));
-                unresolved = Some(begin);
-            }
-            ParsedRecord::Outcome(id, outcome) => {
-                let Some(begin) = unresolved.take() else {
-                    return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
-                        "Outcome without Begin",
-                    ));
-                };
-                if begin.id != id {
-                    return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
-                        "Outcome does not reference current Begin",
-                    ));
-                }
-                receipts
-                    .last_mut()
-                    .ok_or(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
-                        "Outcome receipt missing",
-                    ))?
-                    .outcome = outcome;
-            }
-        }
+        let parsed = decode_legacy_record(record)?;
+        accept_record(&parsed, &mut highest, &mut receipts, &mut unresolved)?;
+        records.push(parsed);
         offset += total;
     }
     Ok(DecodedRecords {
@@ -1561,10 +1828,11 @@ fn decode_records(
         highest_begin: highest,
         receipts,
         unresolved,
+        records,
     })
 }
 
-fn decode_record(
+fn decode_legacy_record(
     record: &[u8],
 ) -> Result<ParsedRecord, ServerPhysicalDesignMutationReceiptJournalError> {
     let payload_len = read_u32(&record[..4]) as usize;
@@ -1581,7 +1849,15 @@ fn decode_record(
             "zero receipt ID",
         ));
     }
-    let mut reader = Reader(&payload[12..]);
+    decode_record_body(tag, id, &payload[12..])
+}
+
+fn decode_record_body(
+    tag: u8,
+    id: ServerPhysicalDesignMutationReceiptId,
+    body: &[u8],
+) -> Result<ParsedRecord, ServerPhysicalDesignMutationReceiptJournalError> {
+    let mut reader = Reader(body);
     match tag {
         BEGIN_TAG => {
             let source = match reader.u8()? {
@@ -1706,6 +1982,236 @@ fn decode_record(
             "unknown record tag",
         )),
     }
+}
+
+fn decode_record(
+    record: &[u8],
+) -> Result<ParsedRecord, ServerPhysicalDesignMutationReceiptJournalError> {
+    if record.len() < V3_RECORD_HEADER_BYTES + V3_RECORD_TRAILER_BYTES {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "truncated v3 record",
+        ));
+    }
+    let body_len = read_u32(&record[..4]);
+    if read_u32(&record[4..8]) != !body_len {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "record length complement mismatch",
+        ));
+    }
+    if record[9..12] != [0, 0, 0] {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "nonzero record reserved bytes",
+        ));
+    }
+    let expected_header_crc = read_u32(&record[20..24]);
+    if crc32c::crc32c(&record[..20]) != expected_header_crc {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "record header checksum mismatch",
+        ));
+    }
+    let body_len = body_len as usize;
+    let total = V3_RECORD_HEADER_BYTES
+        .checked_add(body_len)
+        .and_then(|length| length.checked_add(V3_RECORD_TRAILER_BYTES))
+        .ok_or(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "record length overflow",
+        ))?;
+    if total != record.len() || total > MAX_MUTATION_RECEIPT_RECORD_BYTES {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "invalid record length",
+        ));
+    }
+    let expected_body_crc = read_u32(&record[total - V3_RECORD_TRAILER_BYTES..]);
+    if crc32c::crc32c(&record[..total - V3_RECORD_TRAILER_BYTES]) != expected_body_crc {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "record body checksum mismatch",
+        ));
+    }
+    let id = ServerPhysicalDesignMutationReceiptId(read_u64(&record[12..20]));
+    if id.0 == 0 {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "zero receipt ID",
+        ));
+    }
+    decode_record_body(
+        record[8],
+        id,
+        &record[V3_RECORD_HEADER_BYTES..total - V3_RECORD_TRAILER_BYTES],
+    )
+}
+
+fn decode_v3_records(
+    bytes: &[u8],
+    header_bytes: usize,
+) -> Result<DecodedRecords, ServerPhysicalDesignMutationReceiptJournalError> {
+    let mut offset = header_bytes;
+    let mut highest = 0_u64;
+    let mut receipts = Vec::new();
+    let mut unresolved = None;
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        let remaining = bytes.len() - offset;
+        if remaining < V3_RECORD_HEADER_BYTES {
+            break;
+        }
+        let header = &bytes[offset..offset + V3_RECORD_HEADER_BYTES];
+        let body_len = read_u32(&header[..4]);
+        if read_u32(&header[4..8]) != !body_len {
+            return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "record length complement mismatch",
+            ));
+        }
+        if header[9..12] != [0, 0, 0] {
+            return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "nonzero record reserved bytes",
+            ));
+        }
+        if crc32c::crc32c(&header[..20]) != read_u32(&header[20..24]) {
+            return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "record header checksum mismatch",
+            ));
+        }
+        if header[8] != BEGIN_TAG && header[8] != OUTCOME_TAG {
+            return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "unknown record tag",
+            ));
+        }
+        if read_u64(&header[12..20]) == 0 {
+            return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "zero receipt ID",
+            ));
+        }
+        let total = V3_RECORD_HEADER_BYTES
+            .checked_add(body_len as usize)
+            .and_then(|length| length.checked_add(V3_RECORD_TRAILER_BYTES))
+            .ok_or(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "record length overflow",
+            ))?;
+        if total > MAX_MUTATION_RECEIPT_RECORD_BYTES {
+            return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "invalid record length",
+            ));
+        }
+        if remaining < total {
+            break;
+        }
+        let parsed = decode_record(&bytes[offset..offset + total])?;
+        accept_record(&parsed, &mut highest, &mut receipts, &mut unresolved)?;
+        records.push(parsed);
+        offset += total;
+    }
+    Ok(DecodedRecords {
+        valid_bytes: offset,
+        highest_begin: highest,
+        receipts,
+        unresolved,
+        records,
+    })
+}
+
+fn accept_record(
+    parsed: &ParsedRecord,
+    highest: &mut u64,
+    receipts: &mut Vec<ServerPhysicalDesignMutationReceipt>,
+    unresolved: &mut Option<MutationReceiptBegin>,
+) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    match parsed {
+        ParsedRecord::Begin(begin) => {
+            if unresolved.is_some() {
+                return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                    "multiple unresolved Begin records",
+                ));
+            }
+            if begin.id.0 <= *highest {
+                return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                    "non-monotonic Begin receipt ID",
+                ));
+            }
+            *highest = begin.id.0;
+            receipts.push(public_receipt(begin));
+            *unresolved = Some(begin.clone());
+        }
+        ParsedRecord::Outcome(id, outcome) => {
+            let begin = unresolved.as_ref().ok_or(
+                ServerPhysicalDesignMutationReceiptJournalError::Corrupt("Outcome without Begin"),
+            )?;
+            if begin.id != *id {
+                return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                    "Outcome does not reference current Begin",
+                ));
+            }
+            validate_outcome_for_target(&begin.target, *outcome)?;
+            receipts
+                .last_mut()
+                .ok_or(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                    "Outcome receipt missing",
+                ))?
+                .outcome = *outcome;
+            *unresolved = None;
+        }
+    }
+    Ok(())
+}
+
+fn validate_outcome_for_target(
+    target: &MutationReceiptTarget,
+    outcome: ServerPhysicalDesignMutationReceiptOutcome,
+) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    let incompatible = matches!(
+        (target, outcome),
+        (
+            MutationReceiptTarget::Index { .. },
+            ServerPhysicalDesignMutationReceiptOutcome::CreatedColumnar { .. }
+                | ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedColumnar { .. }
+                | ServerPhysicalDesignMutationReceiptOutcome::RecoveredAppliedColumnar { .. }
+        ) | (
+            MutationReceiptTarget::Columnar { .. },
+            ServerPhysicalDesignMutationReceiptOutcome::CreatedIndex { .. }
+                | ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedIndex { .. }
+                | ServerPhysicalDesignMutationReceiptOutcome::RecoveredAppliedIndex { .. }
+        )
+    );
+    if incompatible || matches!(outcome, ServerPhysicalDesignMutationReceiptOutcome::Pending) {
+        Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+            "Outcome is incompatible with Begin target",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn encode_parsed_v3(
+    record: &ParsedRecord,
+) -> Result<Vec<u8>, ServerPhysicalDesignMutationReceiptJournalError> {
+    match record {
+        ParsedRecord::Begin(begin) => encode_begin(begin),
+        ParsedRecord::Outcome(id, outcome) => encode_outcome(*id, *outcome),
+    }
+}
+
+#[cfg(test)]
+fn encode_legacy_begin(
+    begin: &MutationReceiptBegin,
+) -> Result<Vec<u8>, ServerPhysicalDesignMutationReceiptJournalError> {
+    let current = encode_begin(begin)?;
+    encode_legacy_record(
+        BEGIN_TAG,
+        begin.id,
+        &current[V3_RECORD_HEADER_BYTES..current.len() - V3_RECORD_TRAILER_BYTES],
+    )
+}
+
+#[cfg(test)]
+fn encode_legacy_outcome(
+    id: ServerPhysicalDesignMutationReceiptId,
+    outcome: ServerPhysicalDesignMutationReceiptOutcome,
+) -> Result<Vec<u8>, ServerPhysicalDesignMutationReceiptJournalError> {
+    let current = encode_outcome(id, outcome)?;
+    encode_legacy_record(
+        OUTCOME_TAG,
+        id,
+        &current[V3_RECORD_HEADER_BYTES..current.len() - V3_RECORD_TRAILER_BYTES],
+    )
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -1851,7 +2357,7 @@ mod tests {
     }
 
     fn bytes_with(records: &[Vec<u8>]) -> Vec<u8> {
-        let mut bytes = encode_v2_header(
+        let mut bytes = encode_v3_header(
             [7; 16],
             ServerPhysicalDesignMutationReceiptJournalIncarnation([9; 16]),
         )
@@ -1865,9 +2371,20 @@ mod tests {
     fn v1_bytes_with(identity: [u8; 16], records: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = encode_v1_header(identity).to_vec();
         for record in records {
-            bytes.extend_from_slice(record);
+            let legacy = match decode_record(record).unwrap() {
+                ParsedRecord::Begin(begin) => encode_legacy_begin(&begin).unwrap(),
+                ParsedRecord::Outcome(id, outcome) => encode_legacy_outcome(id, outcome).unwrap(),
+            };
+            bytes.extend_from_slice(&legacy);
         }
         bytes
+    }
+
+    fn decode_records(
+        bytes: &[u8],
+        header_bytes: usize,
+    ) -> Result<DecodedRecords, ServerPhysicalDesignMutationReceiptJournalError> {
+        decode_v3_records(bytes, header_bytes)
     }
 
     fn queue_journal_incarnations(values: impl IntoIterator<Item = [u8; 16]>) {
@@ -1878,10 +2395,24 @@ mod tests {
         TEST_MIGRATION_FAILURE.with(|failure| *failure.borrow_mut() = Some(point));
     }
 
+    fn fail_publication_at(point: TestPublicationFailure) {
+        TEST_PUBLICATION_FAILURE.with(|failure| *failure.borrow_mut() = Some(point));
+    }
+
     fn replace_record_crc(record: &mut [u8]) {
         let crc_offset = record.len() - 4;
         let checksum = crc32c::crc32c(&record[..crc_offset]).to_le_bytes();
         record[crc_offset..].copy_from_slice(&checksum);
+    }
+
+    fn replace_record_header_crc(record: &mut [u8]) {
+        let checksum = crc32c::crc32c(&record[..20]).to_le_bytes();
+        record[20..24].copy_from_slice(&checksum);
+        replace_record_crc(record);
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     fn fixture_root(name: &str) -> PathBuf {
@@ -1934,6 +2465,59 @@ mod tests {
 
         let begin = index_begin(1);
         let record = encode_begin(&begin).unwrap();
+        let legacy_begin = encode_legacy_begin(&begin).unwrap();
+        let legacy_outcome = encode_legacy_outcome(
+            begin.id,
+            ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+        )
+        .unwrap();
+        let v3_outcome = encode_outcome(
+            begin.id,
+            ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+        )
+        .unwrap();
+        assert_eq!(
+            hex(&encode_v1_header(identity)),
+            "4e424d5201000000070707070707070707070707070707076317a410"
+        );
+        assert_eq!(
+            hex(&legacy_begin),
+            "350000000100000001000000000000000101000004000000000000000200000000000000030000000f006974656d735f76616c75655f6964786ede42bc"
+        );
+        assert_eq!(
+            hex(&legacy_outcome),
+            "1000000002000000010000000000000006000000b21d0ed2"
+        );
+        assert_eq!(
+            hex(&encode_v3_header(identity, journal_incarnation)),
+            "4e424d5203000000070707070707070707070707070707070909090909090909090909090909090901baa045"
+        );
+        assert_eq!(
+            hex(&record),
+            "29000000d6ffffff010000000100000000000000b91405520101000004000000000000000200000000000000030000000f006974656d735f76616c75655f696478d09ab990"
+        );
+        assert_eq!(
+            hex(&v3_outcome),
+            "04000000fbffffff02000000010000000000000073949e3106000000f8a06d48"
+        );
+        let v1 = v1_bytes_with(identity, &[record.clone(), v3_outcome.clone()]);
+        assert_eq!(
+            decode_legacy_records(&v1, V1_HEADER_BYTES)
+                .unwrap()
+                .receipts
+                .len(),
+            1
+        );
+        let mut v2 = header.to_vec();
+        v2.extend_from_slice(&legacy_begin);
+        v2.extend_from_slice(&legacy_outcome);
+        assert_eq!(
+            decode_legacy_records(&v2, V2_HEADER_BYTES)
+                .unwrap()
+                .receipts
+                .len(),
+            1
+        );
         assert_eq!(decode_record(&record).unwrap().unwrap_begin(), begin);
         for outcome in [
             ServerPhysicalDesignMutationReceiptOutcome::CreatedIndex {
@@ -2060,20 +2644,20 @@ mod tests {
         )
         .unwrap();
         let complete = bytes_with(&[begin.clone(), outcome.clone()]);
-        for length in 0..V2_HEADER_BYTES {
-            assert!(validate_v2_header(&complete[..length], [7; 16]).is_err());
+        for length in 0..V3_HEADER_BYTES {
+            assert!(validate_v3_header(&complete[..length], [7; 16]).is_err());
         }
-        for length in V2_HEADER_BYTES..complete.len() {
-            let decoded = decode_records(&complete[..length], V2_HEADER_BYTES).unwrap();
-            let expected = if length < V2_HEADER_BYTES + begin.len() {
-                V2_HEADER_BYTES
+        for length in V3_HEADER_BYTES..complete.len() {
+            let decoded = decode_records(&complete[..length], V3_HEADER_BYTES).unwrap();
+            let expected = if length < V3_HEADER_BYTES + begin.len() {
+                V3_HEADER_BYTES
             } else {
-                V2_HEADER_BYTES + begin.len()
+                V3_HEADER_BYTES + begin.len()
             };
             assert_eq!(decoded.valid_bytes, expected);
         }
         assert_eq!(
-            decode_records(&complete, V2_HEADER_BYTES)
+            decode_records(&complete, V3_HEADER_BYTES)
                 .unwrap()
                 .valid_bytes,
             complete.len()
@@ -2161,27 +2745,34 @@ mod tests {
         );
 
         let mut record_reserved = begin.clone();
-        record_reserved[5] = 1;
-        replace_record_crc(&mut record_reserved);
+        record_reserved[9] = 1;
+        replace_record_header_crc(&mut record_reserved);
         assert!(decode_records(&bytes_with(&[record_reserved]), V2_HEADER_BYTES).is_err());
 
         let mut body_reserved = begin.clone();
-        body_reserved[18] = 1;
+        body_reserved[V3_RECORD_HEADER_BYTES + 2] = 1;
         replace_record_crc(&mut body_reserved);
         assert!(decode_records(&bytes_with(&[body_reserved]), V2_HEADER_BYTES).is_err());
 
         let mut zero_id = begin.clone();
-        zero_id[8..16].fill(0);
-        replace_record_crc(&mut zero_id);
+        zero_id[12..20].fill(0);
+        replace_record_header_crc(&mut zero_id);
         assert!(decode_records(&bytes_with(&[zero_id]), V2_HEADER_BYTES).is_err());
 
-        let mut oversized = encode_v2_header(
+        let mut oversized = encode_v3_header(
             [7; 16],
             ServerPhysicalDesignMutationReceiptJournalIncarnation([9; 16]),
         )
         .to_vec();
-        oversized
-            .extend_from_slice(&((MAX_MUTATION_RECEIPT_RECORD_BYTES as u32) + 1).to_le_bytes());
+        let body_len = MAX_MUTATION_RECEIPT_RECORD_BYTES as u32;
+        let mut header = [0_u8; V3_RECORD_HEADER_BYTES];
+        header[..4].copy_from_slice(&body_len.to_le_bytes());
+        header[4..8].copy_from_slice(&(!body_len).to_le_bytes());
+        header[8] = BEGIN_TAG;
+        header[12..20].copy_from_slice(&1_u64.to_le_bytes());
+        let checksum = crc32c::crc32c(&header[..20]).to_le_bytes();
+        header[20..24].copy_from_slice(&checksum);
+        oversized.extend_from_slice(&header);
         assert!(decode_records(&oversized, V2_HEADER_BYTES).is_err());
     }
 
@@ -2221,6 +2812,174 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn v3_protected_lengths_headers_bodies_and_middle_records_fail_closed() {
+        let root = fixture_root("v3-corruption");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let path = root.join("receipts.nbmr");
+        let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
+        let begin = encode_begin(&index_begin(1)).unwrap();
+        let outcome = encode_outcome(
+            ServerPhysicalDesignMutationReceiptId(1),
+            ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+        )
+        .unwrap();
+        let second_begin = encode_begin(&index_begin(2)).unwrap();
+        let second_outcome = encode_outcome(
+            ServerPhysicalDesignMutationReceiptId(2),
+            ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+        )
+        .unwrap();
+        let mut cases = Vec::new();
+        for delta in [1_u32, 8] {
+            let mut record = begin.clone();
+            let length = read_u32(&record[..4]).saturating_add(delta);
+            record[..4].copy_from_slice(&length.to_le_bytes());
+            cases.push(bytes_with(&[record]));
+        }
+        let mut one_bit_length = begin.clone();
+        one_bit_length[0] ^= 1;
+        cases.push(bytes_with(&[one_bit_length]));
+        let mut outcome_length = outcome.clone();
+        outcome_length[0] ^= 8;
+        cases.push(bytes_with(&[begin.clone(), outcome_length]));
+        let mut header_crc = begin.clone();
+        header_crc[20] ^= 1;
+        cases.push(bytes_with(&[header_crc]));
+        let mut body_crc = begin.clone();
+        let body_crc_offset = body_crc.len() - 1;
+        body_crc[body_crc_offset] ^= 1;
+        cases.push(bytes_with(&[body_crc]));
+        let mut tag = begin.clone();
+        tag[8] = 99;
+        replace_record_header_crc(&mut tag);
+        cases.push(bytes_with(&[tag]));
+        let mut reserved = begin.clone();
+        reserved[9] = 1;
+        replace_record_header_crc(&mut reserved);
+        cases.push(bytes_with(&[reserved]));
+        let mut corrupt_middle = outcome.clone();
+        let last = corrupt_middle.len() - 1;
+        corrupt_middle[last] ^= 1;
+        cases.push(bytes_with(&[
+            begin.clone(),
+            corrupt_middle,
+            second_begin,
+            second_outcome,
+        ]));
+
+        for bytes in cases {
+            fs::write(&path, &bytes).unwrap();
+            assert!(
+                ServerPhysicalDesignMutationReceiptJournal::open(
+                    config.clone(),
+                    identity,
+                    &database
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn outcome_target_domain_is_shared_by_decode_migration_and_finish() {
+        let root = fixture_root("domain-mismatch");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let path = root.join("receipts.nbmr");
+        let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
+        let begin = index_begin(1);
+        let incompatible = [
+            ServerPhysicalDesignMutationReceiptOutcome::CreatedColumnar {
+                projection_id: ColumnarProjectionId(7),
+            },
+            ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedColumnar {
+                projection_id: ColumnarProjectionId(7),
+            },
+            ServerPhysicalDesignMutationReceiptOutcome::RecoveredAppliedColumnar {
+                projection_id: ColumnarProjectionId(7),
+            },
+        ];
+        let columnar_target = MutationReceiptTarget::Columnar {
+            candidate: PhysicalColumnarCandidate {
+                table_id: TableId(2),
+                columns: vec![ColumnId(3)],
+            },
+            mode: PhysicalColumnarDesignMode::Snapshot,
+            placement: ServerPhysicalColumnarPlacementKey::new("domain").unwrap(),
+            directory: root.join("domain"),
+        };
+        for outcome in [
+            ServerPhysicalDesignMutationReceiptOutcome::CreatedIndex {
+                index_id: IndexId(7),
+            },
+            ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedIndex {
+                index_id: IndexId(7),
+            },
+            ServerPhysicalDesignMutationReceiptOutcome::RecoveredAppliedIndex {
+                index_id: IndexId(7),
+            },
+        ] {
+            assert!(validate_outcome_for_target(&columnar_target, outcome).is_err());
+        }
+        for outcome in incompatible {
+            assert!(validate_outcome_for_target(&begin.target, outcome).is_err());
+            let current = bytes_with(&[
+                encode_begin(&begin).unwrap(),
+                encode_outcome(begin.id, outcome).unwrap(),
+            ]);
+            assert!(decode_v3_records(&current, V3_HEADER_BYTES).is_err());
+            let legacy = v1_bytes_with(
+                *identity.as_bytes(),
+                &[
+                    encode_begin(&begin).unwrap(),
+                    encode_outcome(begin.id, outcome).unwrap(),
+                ],
+            );
+            fs::write(&path, &legacy).unwrap();
+            assert!(
+                ServerPhysicalDesignMutationReceiptJournal::open(
+                    config.clone(),
+                    identity,
+                    &database
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), legacy);
+        }
+
+        fs::remove_file(&path).unwrap();
+        let mut journal =
+            ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database)
+                .unwrap();
+        let id = journal
+            .begin(
+                ServerPhysicalDesignMutationSource::Programmatic,
+                PhysicalDesignEvidenceEpoch(1),
+                begin.target,
+            )
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(
+            journal
+                .finish(
+                    id,
+                    ServerPhysicalDesignMutationReceiptOutcome::CreatedColumnar {
+                        projection_id: ColumnarProjectionId(8),
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(journal);
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2542,8 +3301,8 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v2_journals_have_stable_distinct_nonzero_namespaces() {
-        let root = fixture_root("v2-identities");
+    fn fresh_v3_journals_have_stable_distinct_nonzero_namespaces() {
+        let root = fixture_root("v3-identities");
         let database = create_database(&root);
         let identity = database.physical_design_database_identity().unwrap();
         let first_config =
@@ -2600,7 +3359,7 @@ mod tests {
             ServerPhysicalDesignMutationReceiptCursor::new(first_incarnation, first_id).unwrap();
         assert_eq!(
             journal_version(&fs::read(first_config.path()).unwrap()).unwrap(),
-            2
+            3
         );
         drop(first);
         let reopened = ServerPhysicalDesignMutationReceiptJournal::open(
@@ -2799,7 +3558,7 @@ mod tests {
         assert_eq!(journal.status().journal_incarnation.as_bytes(), &[5; 16]);
         assert_eq!(
             journal_version(&fs::read(config.path()).unwrap()).unwrap(),
-            2
+            3
         );
         let page = journal.page(None, 1).unwrap();
         let mut expected = public_receipt(&begin);
@@ -2829,7 +3588,126 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_and_partial_v1_history_migrates_before_reconciliation() {
+    fn v2_migration_preserves_incarnation_cursor_and_reconciles_pending_begin() {
+        let root = fixture_root("v2-migration");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let incarnation = ServerPhysicalDesignMutationReceiptJournalIncarnation([12; 16]);
+        let first = index_begin(7);
+        let pending = index_begin(8);
+        let mut legacy = encode_v2_header(*identity.as_bytes(), incarnation).to_vec();
+        legacy.extend_from_slice(&encode_legacy_begin(&first).unwrap());
+        legacy.extend_from_slice(
+            &encode_legacy_outcome(
+                first.id,
+                ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+            )
+            .unwrap(),
+        );
+        legacy.extend_from_slice(&encode_legacy_begin(&pending).unwrap());
+        let path = root.join("receipts.nbmr");
+        fs::write(&path, legacy).unwrap();
+        let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
+        let old_cursor =
+            ServerPhysicalDesignMutationReceiptCursor::new(incarnation, first.id).unwrap();
+
+        let journal =
+            ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database).unwrap();
+        assert_eq!(journal.status().journal_incarnation, incarnation);
+        assert_eq!(
+            journal_version(&fs::read(&path).unwrap()).unwrap(),
+            CURRENT_VERSION
+        );
+        let page = journal.scoped_page(Some(old_cursor), 2).unwrap();
+        assert_eq!(page.receipts.len(), 1);
+        assert_eq!(page.receipts[0].id, pending.id);
+        assert_eq!(
+            page.receipts[0].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::RecoveredNotApplied
+        );
+        drop(journal);
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_migration_reserves_recovered_outcome_before_publication() {
+        let root = fixture_root("migration-recovery-capacity");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let incarnation = ServerPhysicalDesignMutationReceiptJournalIncarnation([13; 16]);
+        let mut parsed = Vec::new();
+        let mut id = 1_u64;
+        let image_len = loop {
+            let begin = index_begin(id);
+            parsed.push(ParsedRecord::Begin(begin.clone()));
+            if id > 1 {
+                parsed.push(ParsedRecord::Outcome(
+                    begin.id,
+                    ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+                ));
+            }
+            let mut length = V3_HEADER_BYTES;
+            for record in &parsed {
+                length += encode_parsed_v3(record).unwrap().len();
+            }
+            if length >= MIN_FILE_BYTES as usize {
+                break length;
+            }
+            if matches!(parsed.last(), Some(ParsedRecord::Outcome(_, _))) {
+                id += 1;
+            } else {
+                parsed.push(ParsedRecord::Outcome(
+                    begin.id,
+                    ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+                ));
+                id += 1;
+            }
+        };
+        if matches!(parsed.last(), Some(ParsedRecord::Outcome(_, _))) {
+            id += 1;
+            parsed.push(ParsedRecord::Begin(index_begin(id)));
+        }
+        let mut legacy = encode_v2_header(*identity.as_bytes(), incarnation).to_vec();
+        for record in &parsed {
+            let bytes = match record {
+                ParsedRecord::Begin(begin) => encode_legacy_begin(begin).unwrap(),
+                ParsedRecord::Outcome(id, outcome) => encode_legacy_outcome(*id, *outcome).unwrap(),
+            };
+            legacy.extend_from_slice(&bytes);
+        }
+        let path = root.join("receipts.nbmr");
+        fs::write(&path, &legacy).unwrap();
+        let mut v3_image = encode_v3_header(*identity.as_bytes(), incarnation).to_vec();
+        for record in &parsed {
+            v3_image.extend_from_slice(&encode_parsed_v3(record).unwrap());
+        }
+        let one_short = (v3_image.len() + MAX_RECOVERED_OUTCOME_BYTES - 1) as u64;
+        assert!(one_short >= MIN_FILE_BYTES);
+        let tight = ServerPhysicalDesignMutationReceiptConfig::new(&path, one_short).unwrap();
+        assert!(matches!(
+            ServerPhysicalDesignMutationReceiptJournal::open(tight, identity, &database),
+            Err(ServerPhysicalDesignMutationReceiptJournalError::MigrationCapacityExceeded { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+
+        let exact = ServerPhysicalDesignMutationReceiptConfig::new(
+            &path,
+            (v3_image.len() + MAX_RECOVERED_OUTCOME_BYTES) as u64,
+        )
+        .unwrap();
+        let journal =
+            ServerPhysicalDesignMutationReceiptJournal::open(exact, identity, &database).unwrap();
+        assert_eq!(journal.status().journal_incarnation, incarnation);
+        assert!(!journal.status().recovery_required);
+        drop(journal);
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
+        let _ = image_len;
+    }
+
+    #[test]
+    fn ambiguous_partial_v1_tail_fails_closed_without_losing_pending_begin() {
         let root = fixture_root("v1-unresolved");
         let database = create_database(&root);
         let identity = database.physical_design_database_identity().unwrap();
@@ -2838,31 +3716,74 @@ mod tests {
                 .unwrap();
         let begin = index_begin(1);
         let mut legacy = v1_bytes_with(*identity.as_bytes(), &[encode_begin(&begin).unwrap()]);
-        let partial = encode_outcome(
+        let partial = encode_legacy_outcome(
             begin.id,
             ServerPhysicalDesignMutationReceiptOutcome::Rejected,
         )
         .unwrap();
         legacy.extend_from_slice(&partial[..partial.len() - 1]);
-        fs::write(config.path(), legacy).unwrap();
+        fs::write(config.path(), &legacy).unwrap();
         queue_journal_incarnations([[6; 16]]);
 
-        let journal =
-            ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database)
-                .unwrap();
-        let scoped = journal.scoped_page(None, 1).unwrap();
-        assert_eq!(scoped.journal_incarnation.as_bytes(), &[6; 16]);
-        assert_eq!(
-            scoped.receipts[0].outcome,
-            ServerPhysicalDesignMutationReceiptOutcome::RecoveredNotApplied
-        );
-        let bytes = fs::read(config.path()).unwrap();
-        assert_eq!(journal_version(&bytes).unwrap(), 2);
-        assert_eq!(
-            decode_records(&bytes, V2_HEADER_BYTES).unwrap().valid_bytes,
-            bytes.len()
-        );
-        drop(journal);
+        assert!(matches!(
+            ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database),
+            Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "ambiguous legacy partial tail"
+            ))
+        ));
+        assert_eq!(fs::read(config.path()).unwrap(), legacy);
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_length_corruption_never_silently_omits_begin_or_outcome() {
+        let root = fixture_root("legacy-length-corruption");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let path = root.join("receipts.nbmr");
+        let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
+        let begin = index_begin(1);
+        let legacy_begin = encode_legacy_begin(&begin).unwrap();
+        let legacy_outcome = encode_legacy_outcome(
+            begin.id,
+            ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+        )
+        .unwrap();
+        let begin_offset = V2_HEADER_BYTES;
+        let outcome_offset = begin_offset + legacy_begin.len();
+        let mut base = encode_v2_header(
+            *identity.as_bytes(),
+            ServerPhysicalDesignMutationReceiptJournalIncarnation([17; 16]),
+        )
+        .to_vec();
+        base.extend_from_slice(&legacy_begin);
+        base.extend_from_slice(&legacy_outcome);
+        let mut cases = Vec::new();
+        for delta in [1_u32, 8] {
+            let mut bytes = base.clone();
+            let length = read_u32(&bytes[begin_offset..begin_offset + 4]) + delta;
+            bytes[begin_offset..begin_offset + 4].copy_from_slice(&length.to_le_bytes());
+            cases.push(bytes);
+        }
+        let mut one_bit = base.clone();
+        one_bit[begin_offset] ^= 1;
+        cases.push(one_bit);
+        let mut outcome_length = base;
+        outcome_length[outcome_offset] ^= 1;
+        cases.push(outcome_length);
+        for bytes in cases {
+            fs::write(&path, &bytes).unwrap();
+            assert!(
+                ServerPhysicalDesignMutationReceiptJournal::open(
+                    config.clone(),
+                    identity,
+                    &database
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
         database.close().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
@@ -2873,10 +3794,11 @@ mod tests {
         let database = create_database(&root);
         let identity = database.physical_design_database_identity().unwrap();
         let path = root.join("receipts.nbmr");
-        let mut bad_record = encode_begin(&index_begin(1)).unwrap();
+        let mut bad_record = encode_legacy_begin(&index_begin(1)).unwrap();
         let last = bad_record.len() - 1;
         bad_record[last] ^= 1;
-        let corrupt = v1_bytes_with(*identity.as_bytes(), &[bad_record]);
+        let mut corrupt = encode_v1_header(*identity.as_bytes()).to_vec();
+        corrupt.extend_from_slice(&bad_record);
         fs::write(&path, &corrupt).unwrap();
         let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
         assert!(
@@ -2906,17 +3828,23 @@ mod tests {
             Err(ServerPhysicalDesignMutationReceiptJournalError::MigrationCapacityExceeded { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), legacy);
-        let sufficient = ServerPhysicalDesignMutationReceiptConfig::new(
-            &path,
-            legacy.len() as u64 + (V2_HEADER_BYTES - V1_HEADER_BYTES) as u64,
+        let decoded = decode_legacy_records(&legacy, V1_HEADER_BYTES).unwrap();
+        let mut migrated = encode_v3_header(
+            *identity.as_bytes(),
+            ServerPhysicalDesignMutationReceiptJournalIncarnation([7; 16]),
         )
-        .unwrap();
+        .to_vec();
+        for record in &decoded.records {
+            migrated.extend_from_slice(&encode_parsed_v3(record).unwrap());
+        }
+        let sufficient =
+            ServerPhysicalDesignMutationReceiptConfig::new(&path, migrated.len() as u64).unwrap();
         queue_journal_incarnations([[7; 16]]);
         drop(
             ServerPhysicalDesignMutationReceiptJournal::open(sufficient, identity, &database)
                 .unwrap(),
         );
-        assert_eq!(journal_version(&fs::read(&path).unwrap()).unwrap(), 2);
+        assert_eq!(journal_version(&fs::read(&path).unwrap()).unwrap(), 3);
         database.close().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
@@ -2942,13 +3870,12 @@ mod tests {
         fs::write(&path, &legacy).unwrap();
         let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
         queue_journal_incarnations([[8; 16]]);
-        fail_migration_at(TestMigrationFailure::AfterShadowSync);
+        fail_migration_at(TestMigrationFailure::AfterTemporarySync);
         assert!(
             ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database)
                 .is_err()
         );
         assert_eq!(fs::read(&path).unwrap(), legacy);
-        assert!(journal_shadow_path(&path).is_file());
 
         queue_journal_incarnations([[9; 16]]);
         let migrated =
@@ -2965,7 +3892,7 @@ mod tests {
             ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database)
                 .is_err()
         );
-        assert_eq!(journal_version(&fs::read(&path).unwrap()).unwrap(), 2);
+        assert_eq!(journal_version(&fs::read(&path).unwrap()).unwrap(), 3);
         let reopened =
             ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database).unwrap();
         assert_eq!(reopened.status().journal_incarnation.as_bytes(), &[10; 16]);
@@ -2976,7 +3903,7 @@ mod tests {
     }
 
     #[test]
-    fn non_regular_reserved_migration_shadow_fails_closed() {
+    fn legacy_next_collision_is_ignored_and_unchanged() {
         let root = fixture_root("v1-shadow-conflict");
         let database = create_database(&root);
         let identity = database.physical_design_database_identity().unwrap();
@@ -2984,18 +3911,172 @@ mod tests {
         let legacy = v1_bytes_with(*identity.as_bytes(), &[]);
         fs::write(&path, &legacy).unwrap();
         let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
-        let shadow = journal_shadow_path(config.path());
+        let mut shadow_name = config.path().as_os_str().to_os_string();
+        shadow_name.push(".next");
+        let shadow = PathBuf::from(shadow_name);
         fs::create_dir(&shadow).unwrap();
-        assert!(matches!(
-            ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database),
-            Err(ServerPhysicalDesignMutationReceiptJournalError::Path(
-                ServerPhysicalDesignMutationReceiptPathError::ExistingObjectNotRegular(path)
-            )) if path == shadow
-        ));
-        assert_eq!(fs::read(&path).unwrap(), legacy);
+        drop(
+            ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database).unwrap(),
+        );
+        assert!(shadow.is_dir());
+        assert_eq!(journal_version(&fs::read(&path).unwrap()).unwrap(), 3);
         fs::remove_dir(&shadow).unwrap();
         database.close().unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_legacy_next_collision_kind_is_ignored_without_overwrite() {
+        use std::os::unix::fs::symlink;
+
+        for kind in [
+            "regular",
+            "other-journal",
+            "hardlink",
+            "symlink",
+            "dangling",
+            "directory",
+        ] {
+            let root = fixture_root(kind);
+            let database = create_database(&root);
+            let identity = database.physical_design_database_identity().unwrap();
+            let path = root.join("receipts.nbmr");
+            let legacy = v1_bytes_with(*identity.as_bytes(), &[]);
+            fs::write(&path, &legacy).unwrap();
+            let next = root.join("receipts.nbmr.next");
+            let unrelated = root.join("unrelated-target");
+            let expected = match kind {
+                "regular" => {
+                    fs::write(&next, b"ordinary user bytes").unwrap();
+                    Some(b"ordinary user bytes".to_vec())
+                }
+                "other-journal" => {
+                    let bytes = encode_v2_header(
+                        *identity.as_bytes(),
+                        ServerPhysicalDesignMutationReceiptJournalIncarnation([22; 16]),
+                    );
+                    fs::write(&next, bytes).unwrap();
+                    Some(bytes.to_vec())
+                }
+                "hardlink" => {
+                    fs::write(&unrelated, b"hard-linked truth").unwrap();
+                    fs::hard_link(&unrelated, &next).unwrap();
+                    Some(b"hard-linked truth".to_vec())
+                }
+                "symlink" => {
+                    fs::write(&unrelated, b"symlink truth").unwrap();
+                    symlink(&unrelated, &next).unwrap();
+                    None
+                }
+                "dangling" => {
+                    symlink(root.join("missing"), &next).unwrap();
+                    None
+                }
+                "directory" => {
+                    fs::create_dir(&next).unwrap();
+                    None
+                }
+                _ => unreachable!(),
+            };
+            let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
+            drop(
+                ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database)
+                    .unwrap(),
+            );
+            assert_eq!(
+                journal_version(&fs::read(&path).unwrap()).unwrap(),
+                CURRENT_VERSION
+            );
+            match kind {
+                "symlink" => assert_eq!(fs::read(&unrelated).unwrap(), b"symlink truth"),
+                "dangling" => assert!(
+                    fs::symlink_metadata(&next)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                ),
+                "directory" => assert!(next.is_dir()),
+                _ => assert_eq!(fs::read(&next).unwrap(), expected.unwrap()),
+            }
+            if kind == "hardlink" {
+                assert_eq!(fs::read(&unrelated).unwrap(), b"hard-linked truth");
+            }
+            database.close().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_open_rejects_deterministic_final_component_symlink_swap() {
+        let root = fixture_root("nofollow-swap");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let path = root.join("receipts.nbmr");
+        let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
+        drop(
+            ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database)
+                .unwrap(),
+        );
+        let target = root.join("unrelated-target");
+        fs::write(&target, b"must remain untouched").unwrap();
+        TEST_EXISTING_OPEN_REPLACEMENT.with(|replacement| {
+            *replacement.borrow_mut() = Some(TestExistingOpenReplacement {
+                target: target.clone(),
+            });
+        });
+        assert!(
+            ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database).is_err()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"must remain untouched");
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_v3_publication_crash_points_leave_at_most_one_ready_history() {
+        for point in [
+            TestPublicationFailure::TemporaryCreated,
+            TestPublicationFailure::PartialHeaderWritten,
+            TestPublicationFailure::FullHeaderWritten,
+            TestPublicationFailure::TemporarySynced,
+            TestPublicationFailure::PublishedBeforeParentSync,
+        ] {
+            let root = fixture_root("fresh-crash");
+            let database = create_database(&root);
+            let identity = database.physical_design_database_identity().unwrap();
+            let path = root.join("receipts.nbmr");
+            let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
+            fail_publication_at(point);
+            assert!(
+                ServerPhysicalDesignMutationReceiptJournal::open(
+                    config.clone(),
+                    identity,
+                    &database
+                )
+                .is_err()
+            );
+            let final_was_published = point == TestPublicationFailure::PublishedBeforeParentSync;
+            assert_eq!(path.exists(), final_was_published);
+            let journal =
+                ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database)
+                    .unwrap();
+            assert_eq!(
+                journal_version(&fs::read(&path).unwrap()).unwrap(),
+                CURRENT_VERSION
+            );
+            assert!(journal.page(None, 1).unwrap().receipts.is_empty());
+            drop(journal);
+            database.close().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     impl ParsedRecord {

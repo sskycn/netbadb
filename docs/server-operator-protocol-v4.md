@@ -13,11 +13,12 @@ and `physical_columnar_apply` objects. The Columnar object reports `enabled`,
 `allow_snapshot`, `allow_incremental`, and an optional ephemeral
 `runtime_token`. The token is shared with index approval when both permissions
 are enabled; it is absent when neither permission is enabled. The root path is
-never returned. Recommendations expose the same shared token, independent
-`physical_index_apply.enabled` and `physical_columnar_apply` capability objects,
-and the exact evidence epoch needed for a subsequent approval. The Columnar
-capability includes `enabled`, `allow_snapshot`, and `allow_incremental`;
-clients must not infer either permission from token presence.
+never returned. The frozen recommendations result contains only
+`runtime_token` and `report`, exactly as shipped by Phase 30. Token presence
+means only that an approval token is present; clients must not infer Index or
+Columnar permission from it. Independent capabilities remain available through
+the existing status operation, and recommendations do not implicitly fetch
+status.
 
 ## Explicit Columnar approval
 
@@ -59,9 +60,18 @@ invalid keys, disallowed modes, unavailable or occupied placements, registered
 conflicts, stale evidence/runtime, missing recommendations, Change Stream
 state, recovery-required publication, and bounded apply failure. Error text
 does not expose filesystem paths. `server_stopped` means the mutation command
-was not accepted by the worker path. If the worker accepted the command but its
-reply was lost, the response uses `mutation_outcome_uncertain`; the operator
-must retry the same exact approval to obtain the idempotent durable outcome.
+was not accepted by the worker path. The frozen v4 error enum does not contain
+`mutation_outcome_uncertain`. A mutating v4 client conservatively upgrades an
+applicable existing apply/internal error, response mismatch, or protocol
+failure after dispatch into a local outcome-uncertain error.
+
+Two local instructions are distinct. If the worker accepted the command but
+the reply was lost, the same exact approval may be retried to discover the
+idempotent outcome. If receipt Outcome durability failed, restart/reopen the
+daemon first and let startup reconciliation finish, then inspect or retry the
+same exact logical approval only if still needed. Neither case triggers an
+automatic retry, token/epoch refresh, name or placement change, or Change
+Stream enablement.
 
 ## CLI
 
@@ -80,8 +90,9 @@ netbadb operator physical-design apply-columnar \
 
 The CLI requires every approval input, preserves repeated column order, and
 does not infer a token or epoch, accept a path, run recommendations, or retry.
-After an uncertain transport/control outcome it instructs the operator to
-manually retry the same exact approval without refreshing the token or epoch.
+After an uncertain transport/control outcome it gives the matching reply-loss
+or restart/reconciliation instruction without changing or automatically
+resubmitting the approval.
 
 NBOP v3 is documented at [server-operator-protocol-v3.md](server-operator-protocol-v3.md)
 for historical reference only.

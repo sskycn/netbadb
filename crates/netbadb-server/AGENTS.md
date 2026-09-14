@@ -96,7 +96,7 @@
   NBMR journal incarnation. Persisted or external cursors MUST bind both the
   journal incarnation and nonzero receipt ID. Replacing a journal creates a new
   receipt namespace, and numeric IDs MUST NOT be silently reinterpreted across
-  namespaces; reopening the same v2 journal preserves its namespace.
+  namespaces; reopening or migrating the same v2/v3 journal preserves its namespace.
 - Programmatic Server Columnar apply MUST use a configured Server-owned
   placement namespace. The control caller supplies only a validated logical
   placement key, never an arbitrary filesystem path, and the resolved

@@ -13,6 +13,10 @@ to an explicitly operator-approved local control path.
 - NBOP v4 retains the v3 frame and size limits, rejects v3, and exposes
   independent Index and Columnar apply status while sharing one ephemeral
   runtime token when either domain is authorized.
+- The frozen recommendations result remains the Phase 30 `runtime_token` plus
+  `report` shape. Capability objects belong to status and the v4 error set does
+  not gain an outcome-uncertain variant; mutating clients classify ambiguity
+  locally.
 - `apply_physical_columnar` accepts only explicit typed approval inputs: the
   current runtime token, evidence epoch, table, ordered columns, mode, and
   logical placement key. Paths and proposal objects never cross the wire.
