@@ -439,6 +439,10 @@ tails fail closed. Historical `.next` objects are untouched. Scoped pagination
 still rejects another journal namespace, and read-only status/receipt
 inspection remain available during recovery gating. Mutation/reconciliation
 authority and all Database persistent contracts remain unchanged.
+One cooperative Unix runtime owns the safely opened journal inode with a
+nonblocking exclusive advisory lock for its entire active lifetime. Fresh and
+legacy-migrated v3 publication exposes an inode that is already locked, and
+migration retains both old and new ownership until the new history is active.
 
 [Adaptive Operations Phase 32](adaptive-operations-phase32.md) externalizes
 that operational memory through strict Manifest v10 and local NBOP v5.
@@ -448,9 +452,12 @@ uses only journal incarnation plus nonzero receipt ID for references and
 continuation, rejects replacement-journal cursors, and correlates one worker
 apply command with its durable Begin identity. Reads are pure during recovery
 gating, Outcome-durability ambiguity is explicit, response loss invents no
-identity, and no receipt becomes replay or mutation authority. NBMR stays v3;
-Core, SQL, Database formats, Native Protocol v2, PostgreSQL wire, and Inspection
-JSON v7 are unchanged.
+identity, and no receipt becomes replay or mutation authority. Uncertainty with
+a receipt means a durable Begin is known and reconciliation is required;
+reply/response loss has no observed receipt and does not assert recovery.
+Begin failures and recovery-gated new requests do not enter Core. NBMR stays
+v3; Core, SQL, Database formats, Native Protocol v2, PostgreSQL wire, and
+Inspection JSON v7 are unchanged.
 
 [Adaptive Operations Phase 30](adaptive-operations-phase30.md) added the
 optional Server-owned [NBMR v1](physical-design-mutation-receipts-v1.md)

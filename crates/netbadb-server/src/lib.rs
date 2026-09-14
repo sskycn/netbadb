@@ -8,6 +8,7 @@ mod manifest;
 mod metrics;
 mod operator;
 mod operator_v3;
+mod operator_v4;
 mod physical_design;
 mod physical_design_receipts;
 mod postgres;
@@ -82,6 +83,25 @@ pub use operator_v3::{
     OperatorPhysicalIndexApplyStatusV3, OperatorPhysicalIndexCandidateV3, OperatorRemoteErrorV3,
     OperatorSchedulerDelayClassV3, OperatorSchedulerFaultV3, OperatorSchedulerGateV3,
     OperatorStatusV3,
+};
+pub use operator_v4::{
+    OperatorAdaptiveModeV4, OperatorAdaptiveStatusV4, OperatorDriverStatusV4, OperatorErrorCodeV4,
+    OperatorEvidencePoolHealthV4, OperatorEvidenceRecordErrorV4, OperatorEvidenceRecordOutcomeV4,
+    OperatorEvidenceRenewalReasonV4, OperatorEvidenceRotationV4, OperatorFeedbackStatusV4,
+    OperatorOrchestrationStopReasonV4, OperatorPhysicalColumnarApplyCapabilityV4,
+    OperatorPhysicalColumnarApplyOutcomeV4, OperatorPhysicalColumnarApplyResultV4,
+    OperatorPhysicalColumnarApplyStatusV4, OperatorPhysicalColumnarCandidateV4,
+    OperatorPhysicalColumnarDesignModeV4, OperatorPhysicalDesignAdvisorReportV4,
+    OperatorPhysicalDesignDecisionV4, OperatorPhysicalDesignDiagnosticsV4,
+    OperatorPhysicalDesignEvidenceLimitsV4, OperatorPhysicalDesignEvidenceStatusV4,
+    OperatorPhysicalDesignEvidenceSummaryV4, OperatorPhysicalDesignNoActionReasonV4,
+    OperatorPhysicalDesignRecommendationsV4, OperatorPhysicalDesignRecordErrorV4,
+    OperatorPhysicalDesignRecordOutcomeV4, OperatorPhysicalDesignRotationV4,
+    OperatorPhysicalDesignStatusV4, OperatorPhysicalIndexApplyCapabilityV4,
+    OperatorPhysicalIndexApplyOutcomeV4, OperatorPhysicalIndexApplyResultV4,
+    OperatorPhysicalIndexApplyStatusV4, OperatorPhysicalIndexCandidateV4, OperatorRemoteErrorV4,
+    OperatorSchedulerDelayClassV4, OperatorSchedulerFaultV4, OperatorSchedulerGateV4,
+    OperatorStatusV4,
 };
 pub use physical_design::{
     ServerPhysicalColumnarApplyConfig, ServerPhysicalColumnarApplyConfigError,

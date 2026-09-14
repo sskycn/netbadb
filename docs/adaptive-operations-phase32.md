@@ -38,6 +38,16 @@ Protocol v2, PostgreSQL wire, Inspection JSON v7, SQL, SDK Schema Spec, and Core
 mutation APIs are unchanged. NBMR is crash-recoverable and checksummed, not a
 signed, administrator-tamper-evident, or anti-rollback audit log.
 
+Final hardening gives every active Unix journal inode one cooperative owner via
+a nonblocking exclusive advisory lock. Existing v3 is locked before decode;
+fresh publication exposes an already locked inode; legacy migration holds the
+old and new inode locks across publication and rejects final-path inode
+replacement. Post-Begin ambiguous Core errors and Outcome durability failures
+are v5 uncertainty with a receipt, while worker/response loss is uncertainty
+without a receipt. Begin failure and an existing recovery gate remain
+definite-not-started receipt-unavailable failures. Frozen V3 and V4 Rust DTOs
+remain exported while only NBOP v5 is accepted on the wire.
+
 See [Manifest v10](server-manifest-v10.md),
 [NBOP v5](server-operator-protocol-v5.md), and
 [NBMR v3](physical-design-mutation-receipts-v3.md).

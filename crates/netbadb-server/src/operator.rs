@@ -948,6 +948,14 @@ fn write_frame<T: Serialize>(
     writer: &mut impl Write,
     value: &T,
 ) -> Result<(), OperatorProtocolError> {
+    let frame = encode_frame(value)?;
+    writer
+        .write_all(&frame)
+        .and_then(|()| writer.flush())
+        .map_err(OperatorProtocolError::Io)
+}
+
+fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, OperatorProtocolError> {
     let payload = serde_json::to_vec(value).map_err(OperatorProtocolError::InvalidJson)?;
     if payload.len() > MAX_OPERATOR_PAYLOAD_BYTES as usize {
         return Err(OperatorProtocolError::PayloadTooLarge(payload.len()));
@@ -958,11 +966,10 @@ fn write_frame<T: Serialize>(
     header[..4].copy_from_slice(&OPERATOR_MAGIC);
     header[4..6].copy_from_slice(&OPERATOR_PROTOCOL_VERSION.to_be_bytes());
     header[8..12].copy_from_slice(&length.to_be_bytes());
-    writer
-        .write_all(&header)
-        .and_then(|()| writer.write_all(&payload))
-        .and_then(|()| writer.flush())
-        .map_err(OperatorProtocolError::Io)
+    let mut frame = Vec::with_capacity(OPERATOR_HEADER_BYTES + payload.len());
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(&payload);
+    Ok(frame)
 }
 
 #[derive(Debug)]
@@ -1127,18 +1134,18 @@ impl<'a> ServerOperatorClient<'a> {
         column_id: u32,
         index_name: impl Into<String>,
     ) -> Result<OperatorPhysicalIndexApplyResultV5, OperatorClientError> {
-        let result = self
-            .exchange(OperatorOperationV5::ApplyPhysicalIndex {
-                expected_runtime_token: expected_runtime_token.into(),
-                expected_evidence_epoch,
-                table_id,
-                column_id,
-                index_name: index_name.into(),
-            })
-            .map_err(classify_mutating_client_error)?;
+        let result = self.exchange_mutating(OperatorOperationV5::ApplyPhysicalIndex {
+            expected_runtime_token: expected_runtime_token.into(),
+            expected_evidence_epoch,
+            table_id,
+            column_id,
+            index_name: index_name.into(),
+        })?;
         match result {
             OperatorResultV5::PhysicalIndexApplied { apply } => Ok(apply),
-            _ => Err(OperatorClientError::UnexpectedResult),
+            _ => Err(classify_mutating_client_error(
+                OperatorClientError::UnexpectedResult,
+            )),
         }
     }
 
@@ -1151,20 +1158,84 @@ impl<'a> ServerOperatorClient<'a> {
         mode: OperatorPhysicalColumnarDesignModeV5,
         placement_key: impl Into<String>,
     ) -> Result<OperatorPhysicalColumnarApplyResultV5, OperatorClientError> {
-        let result = self
-            .exchange(OperatorOperationV5::ApplyPhysicalColumnar {
-                expected_runtime_token: expected_runtime_token.into(),
-                expected_evidence_epoch,
-                table_id,
-                columns,
-                mode,
-                placement_key: placement_key.into(),
-            })
-            .map_err(classify_mutating_client_error)?;
+        let result = self.exchange_mutating(OperatorOperationV5::ApplyPhysicalColumnar {
+            expected_runtime_token: expected_runtime_token.into(),
+            expected_evidence_epoch,
+            table_id,
+            columns,
+            mode,
+            placement_key: placement_key.into(),
+        })?;
         match result {
             OperatorResultV5::PhysicalColumnarApplied { apply } => Ok(apply),
-            _ => Err(OperatorClientError::UnexpectedResult),
+            _ => Err(classify_mutating_client_error(
+                OperatorClientError::UnexpectedResult,
+            )),
         }
+    }
+
+    #[cfg(unix)]
+    fn exchange_mutating(
+        &self,
+        operation: OperatorOperationV5,
+    ) -> Result<OperatorResultV5, OperatorClientError> {
+        use std::os::unix::net::UnixStream;
+
+        let request_id = 1;
+        let frame = encode_frame(&OperatorRequestV5 {
+            request_id,
+            operation,
+        })
+        .map_err(OperatorClientError::Protocol)?;
+        let mut stream = UnixStream::connect(self.config.unix_socket()).map_err(|source| {
+            OperatorClientError::Connect {
+                path: self.config.unix_socket().to_path_buf(),
+                source,
+            }
+        })?;
+        stream
+            .set_read_timeout(Some(self.config.io_timeout()))
+            .and_then(|()| stream.set_write_timeout(Some(self.config.io_timeout())))
+            .map_err(OperatorClientError::Configure)?;
+        stream
+            .write_all(&frame)
+            .and_then(|()| stream.flush())
+            .map_err(|error| {
+                classify_mutating_client_error(OperatorClientError::Protocol(
+                    OperatorProtocolError::Io(error),
+                ))
+            })?;
+        let response: OperatorResponseV5 = read_frame(&mut stream)
+            .map_err(OperatorClientError::Protocol)
+            .map_err(classify_mutating_client_error)?;
+        let result = match response {
+            OperatorResponseV5::Ok {
+                request_id: received,
+                result,
+            } => {
+                verify_request_id(request_id, received).map_err(classify_mutating_client_error)?;
+                Ok(result)
+            }
+            OperatorResponseV5::Error {
+                request_id: received,
+                error,
+            } => {
+                if received != 0 {
+                    verify_request_id(request_id, received)
+                        .map_err(classify_mutating_client_error)?;
+                }
+                Err(OperatorClientError::Remote(error))
+            }
+        };
+        result.map_err(classify_mutating_client_error)
+    }
+
+    #[cfg(not(unix))]
+    fn exchange_mutating(
+        &self,
+        _operation: OperatorOperationV5,
+    ) -> Result<OperatorResultV5, OperatorClientError> {
+        Err(OperatorClientError::UnsupportedPlatform)
     }
 
     #[cfg(unix)]
@@ -1229,7 +1300,7 @@ fn classify_mutating_client_error(error: OperatorClientError) -> OperatorClientE
         OperatorClientError::Remote(remote)
             if remote.code == OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain =>
         {
-            (true, remote.receipt.clone())
+            (remote.receipt.is_some(), remote.receipt.clone())
         }
         OperatorClientError::Protocol(_)
         | OperatorClientError::RequestIdMismatch { .. }
@@ -2785,18 +2856,15 @@ fn physical_columnar_remote_error_with_receipt(
     if matches!(
         &error,
         ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(_)
+            | ServerPhysicalColumnarDesignControlError::PostBeginMutationOutcomeUncertain(_)
     ) {
-        return OperatorRemoteErrorV5 {
-            code: OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain,
-            message: "physical-design mutation outcome is uncertain; restart/reopen the daemon, allow NBMR startup reconciliation to complete, then inspect the referenced receipt before deciding whether any retry is needed".into(),
-            receipt,
-        };
+        return mutation_outcome_uncertain_remote_error(receipt);
     }
     if let ServerPhysicalColumnarDesignControlError::MutationReceipt(ref error) = error {
         let code = mutation_receipt_begin_error_code(error);
         return OperatorRemoteErrorV5 {
             code,
-            message: mutation_receipt_begin_error_message(code).into(),
+            message: mutation_receipt_begin_error_message(error).into(),
             receipt: None,
         };
     }
@@ -2804,11 +2872,7 @@ fn physical_columnar_remote_error_with_receipt(
         &error,
         ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain
     ) {
-        return OperatorRemoteErrorV5 {
-            code: OperatorErrorCodeV5::PhysicalColumnarApplyFailed,
-            message: "physical-columnar apply reply was lost after command acceptance; the same exact approval may be retried to discover the idempotent outcome".into(),
-            receipt: None,
-        };
+        return mutation_outcome_uncertain_remote_error(None);
     }
     let code = match error {
         ServerPhysicalColumnarDesignControlError::PhysicalDesignNotEnabled => {
@@ -2846,7 +2910,8 @@ fn physical_columnar_remote_error_with_receipt(
             physical_columnar_apply_code(*error)
         }
         ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(_)
-        | ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain => {
+        | ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain
+        | ServerPhysicalColumnarDesignControlError::PostBeginMutationOutcomeUncertain(_) => {
             OperatorErrorCodeV5::PhysicalColumnarApplyFailed
         }
         ServerPhysicalColumnarDesignControlError::MutationReceipt(_) => {
@@ -3010,18 +3075,15 @@ fn physical_design_remote_error_with_receipt(
     if matches!(
         &error,
         ServerPhysicalDesignControlError::MutationRecoveryRequired(_)
+            | ServerPhysicalDesignControlError::PostBeginMutationOutcomeUncertain(_)
     ) {
-        return OperatorRemoteErrorV5 {
-            code: OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain,
-            message: "physical-design mutation outcome is uncertain; restart/reopen the daemon, allow NBMR startup reconciliation to complete, then inspect the referenced receipt before deciding whether any retry is needed".into(),
-            receipt,
-        };
+        return mutation_outcome_uncertain_remote_error(receipt);
     }
     if let ServerPhysicalDesignControlError::MutationReceipt(ref error) = error {
         let code = mutation_receipt_begin_error_code(error);
         return OperatorRemoteErrorV5 {
             code,
-            message: mutation_receipt_begin_error_message(code).into(),
+            message: mutation_receipt_begin_error_message(error).into(),
             receipt: None,
         };
     }
@@ -3029,11 +3091,7 @@ fn physical_design_remote_error_with_receipt(
         &error,
         ServerPhysicalDesignControlError::MutationOutcomeUncertain
     ) {
-        return OperatorRemoteErrorV5 {
-            code: OperatorErrorCodeV5::PhysicalIndexApplyFailed,
-            message: "physical-index apply reply was lost after command acceptance; the same exact approval may be retried to discover the idempotent outcome".into(),
-            receipt: None,
-        };
+        return mutation_outcome_uncertain_remote_error(None);
     }
     let code = match error {
         ServerPhysicalDesignControlError::PhysicalDesignNotEnabled => {
@@ -3120,6 +3178,7 @@ fn physical_design_remote_error_with_receipt(
         ServerPhysicalDesignControlError::ServerStopped => OperatorErrorCodeV5::ServerStopped,
         ServerPhysicalDesignControlError::MutationOutcomeUncertain
         | ServerPhysicalDesignControlError::MutationRecoveryRequired(_)
+        | ServerPhysicalDesignControlError::PostBeginMutationOutcomeUncertain(_)
         | ServerPhysicalDesignControlError::MutationReceipt(_) => {
             OperatorErrorCodeV5::PhysicalIndexApplyFailed
         }
@@ -3175,12 +3234,35 @@ fn mutation_receipt_begin_error_code(
     }
 }
 
-const fn mutation_receipt_begin_error_message(code: OperatorErrorCodeV5) -> &'static str {
-    match code {
-        OperatorErrorCodeV5::PhysicalDesignMutationReceiptCapacityExceeded => {
-            "physical-design mutation receipt journal capacity is exhausted; no mutation occurred"
+const fn mutation_receipt_begin_error_message(
+    error: &ServerPhysicalDesignMutationReceiptControlError,
+) -> &'static str {
+    match error {
+        ServerPhysicalDesignMutationReceiptControlError::Journal(
+            ServerPhysicalDesignMutationReceiptJournalError::CapacityExceeded,
+        ) => "physical-design mutation receipt journal capacity is exhausted; no mutation occurred",
+        ServerPhysicalDesignMutationReceiptControlError::RecoveryRequired
+        | ServerPhysicalDesignMutationReceiptControlError::Journal(
+            ServerPhysicalDesignMutationReceiptJournalError::Io { .. },
+        ) => {
+            "physical-design mutation receipt journal is unavailable; no mutation occurred for this request; restart/reopen is required before another receipted mutation"
         }
         _ => "physical-design mutation receipt journal is unavailable; no mutation occurred",
+    }
+}
+
+fn mutation_outcome_uncertain_remote_error(
+    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV5>,
+) -> OperatorRemoteErrorV5 {
+    let message = if receipt.is_some() {
+        "physical-design mutation outcome is uncertain; restart/reopen the daemon, allow NBMR startup reconciliation to complete, then inspect the referenced receipt before deciding whether any retry is needed"
+    } else {
+        "physical-design mutation result was lost after command dispatch; no receipt reference was observed; the same exact approval may be used for idempotent discovery"
+    };
+    OperatorRemoteErrorV5 {
+        code: OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain,
+        message: message.into(),
+        receipt,
     }
 }
 
@@ -3243,10 +3325,8 @@ mod tests {
     #[cfg(unix)]
     fn socket_fixture(name: &str) -> (PathBuf, ServerOperatorConfig) {
         let sequence = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
-        let directory = std::env::temp_dir().join(format!(
-            "netbadb-operator-{name}-{}-{sequence}",
-            std::process::id()
-        ));
+        let directory =
+            PathBuf::from("/tmp").join(format!("nbop-{name}-{}-{sequence}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let config = ServerOperatorConfig::new(
             directory.join("operator.sock"),
@@ -3255,6 +3335,120 @@ mod tests {
         )
         .unwrap();
         (directory, config)
+    }
+
+    #[cfg(unix)]
+    fn serve_one_wrong_mutation_result(path: PathBuf) -> std::thread::JoinHandle<()> {
+        use std::os::unix::net::UnixListener;
+
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: OperatorRequestV5 = read_frame(&mut stream).unwrap();
+            write_frame(
+                &mut stream,
+                &OperatorResponseV5::Ok {
+                    request_id: request.request_id,
+                    result: OperatorResultV5::SchedulerReset {},
+                },
+            )
+            .unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    fn serve_one_lost_mutation_response(path: PathBuf) -> std::thread::JoinHandle<()> {
+        use std::os::unix::net::UnixListener;
+
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _: OperatorRequestV5 = read_frame(&mut stream).unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_unexpected_result_is_uncertain() {
+        let (directory, config) = socket_fixture("index-unexpected-result");
+        let server = serve_one_wrong_mutation_result(config.unix_socket().to_path_buf());
+        let error = ServerOperatorClient::new(&config)
+            .apply_physical_index("11".repeat(16), 1, 2, 3, "events_idx")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OperatorClientError::MutationOutcomeUncertain {
+                recovery_required: false,
+                receipt: None,
+                source,
+            } if matches!(*source, OperatorClientError::UnexpectedResult)
+        ));
+        server.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn columnar_unexpected_result_is_uncertain() {
+        let (directory, config) = socket_fixture("columnar-unexpected-result");
+        let server = serve_one_wrong_mutation_result(config.unix_socket().to_path_buf());
+        let error = ServerOperatorClient::new(&config)
+            .apply_physical_columnar(
+                "11".repeat(16),
+                1,
+                2,
+                vec![3],
+                OperatorPhysicalColumnarDesignModeV5::Snapshot,
+                "events",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OperatorClientError::MutationOutcomeUncertain {
+                recovery_required: false,
+                receipt: None,
+                source,
+            } if matches!(*source, OperatorClientError::UnexpectedResult)
+        ));
+        server.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_lost_response_after_dispatch_is_uncertain_without_receipt() {
+        let (directory, config) = socket_fixture("index-lost-response");
+        let server = serve_one_lost_mutation_response(config.unix_socket().to_path_buf());
+        let error = ServerOperatorClient::new(&config)
+            .apply_physical_index("11".repeat(16), 1, 2, 3, "events_idx")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OperatorClientError::MutationOutcomeUncertain {
+                recovery_required: false,
+                receipt: None,
+                source,
+            } if matches!(
+                *source,
+                OperatorClientError::Protocol(OperatorProtocolError::TruncatedHeader)
+            )
+        ));
+        server.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutating_request_encoding_failure_is_definitely_pre_dispatch() {
+        let (directory, config) = socket_fixture("predispatch-size");
+        let error = ServerOperatorClient::new(&config)
+            .apply_physical_index("11".repeat(16), 1, 2, 3, "x".repeat(70_000))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OperatorClientError::Protocol(OperatorProtocolError::PayloadTooLarge(_))
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
@@ -4475,7 +4669,7 @@ mod tests {
         );
         assert_eq!(
             uncertain.code,
-            OperatorErrorCodeV5::PhysicalColumnarApplyFailed
+            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
         );
         assert!(uncertain.message.contains("same exact approval"));
         assert!(!uncertain.message.contains("without creating"));
@@ -4499,6 +4693,23 @@ mod tests {
         );
         assert!(receipt_uncertain.message.contains("restart/reopen"));
         assert_eq!(receipt_uncertain.receipt, Some(reference.clone()));
+        let ambiguous_columnar = physical_columnar_remote_error_with_receipt(
+            ServerPhysicalColumnarDesignControlError::PostBeginMutationOutcomeUncertain(Box::new(
+                ServerPhysicalColumnarDesignControlError::Apply(Box::new(
+                    PhysicalColumnarDesignApplyError::Database(
+                        DatabaseError::ColumnarProjectionNotFound(
+                            netbadb_types::ColumnarProjectionId(77),
+                        ),
+                    ),
+                )),
+            )),
+            Some(reference.clone()),
+        );
+        assert_eq!(
+            ambiguous_columnar.code,
+            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
+        );
+        assert_eq!(ambiguous_columnar.receipt, Some(reference.clone()));
         let index_receipt_uncertain = physical_design_remote_error_with_receipt(
             ServerPhysicalDesignControlError::MutationRecoveryRequired(
                 crate::ServerPhysicalDesignMutationReceiptControlError::RecoveryRequired,
@@ -4510,6 +4721,32 @@ mod tests {
             OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
         );
         assert!(index_receipt_uncertain.message.contains("restart/reopen"));
+        let ambiguous_index = physical_design_remote_error_with_receipt(
+            ServerPhysicalDesignControlError::PostBeginMutationOutcomeUncertain(Box::new(
+                ServerPhysicalDesignControlError::Apply(Box::new(
+                    PhysicalIndexDesignApplyError::Database(DatabaseError::UndefinedIndex),
+                )),
+            )),
+            Some(reference.clone()),
+        );
+        assert_eq!(
+            ambiguous_index.code,
+            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
+        );
+        assert_eq!(ambiguous_index.receipt, Some(reference.clone()));
+        let gated_request = physical_design_remote_error_with_receipt(
+            ServerPhysicalDesignControlError::MutationReceipt(
+                ServerPhysicalDesignMutationReceiptControlError::RecoveryRequired,
+            ),
+            None,
+        );
+        assert_eq!(
+            gated_request.code,
+            OperatorErrorCodeV5::PhysicalDesignMutationReceiptUnavailable
+        );
+        assert_eq!(gated_request.receipt, None);
+        assert!(gated_request.message.contains("no mutation occurred"));
+        assert!(gated_request.message.contains("restart/reopen"));
 
         let reply_loss = classify_mutating_client_error(OperatorClientError::Protocol(
             OperatorProtocolError::TruncatedPayload,
@@ -4534,12 +4771,98 @@ mod tests {
             } if receipt == &reference
         ));
         assert!(recovery.to_string().contains("restart/reopen"));
+        let no_receipt_remote = mutation_outcome_uncertain_remote_error(None);
+        assert!(matches!(
+            classify_mutating_client_error(OperatorClientError::Remote(no_receipt_remote)),
+            OperatorClientError::MutationOutcomeUncertain {
+                recovery_required: false,
+                receipt: None,
+                ..
+            }
+        ));
         assert!(matches!(
             classify_mutating_client_error(OperatorClientError::Remote(stopped)),
             OperatorClientError::Remote(OperatorRemoteErrorV5 {
                 code: OperatorErrorCodeV5::ServerStopped,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn v5_worker_reply_loss_is_uncertain_without_a_receipt() {
+        let token = OperatorPhysicalDesignRuntimeToken::from_bytes([0x51; 16]);
+        let encoded_token = token.encode();
+        let (adaptive_tx, _adaptive_rx) = std::sync::mpsc::channel();
+
+        let (index_tx, index_rx) = std::sync::mpsc::channel();
+        let index_worker = std::thread::spawn(move || drop(index_rx.recv().unwrap()));
+        let index = execute_operator_request_with_capabilities(
+            OperatorRequestV5 {
+                request_id: 1,
+                operation: OperatorOperationV5::ApplyPhysicalIndex {
+                    expected_runtime_token: encoded_token.clone(),
+                    expected_evidence_epoch: 1,
+                    table_id: 2,
+                    column_id: 3,
+                    index_name: "events_idx".into(),
+                },
+            },
+            &ServerAdaptiveControlHandle::new(adaptive_tx.clone()),
+            &ServerPhysicalDesignControlHandle::new(index_tx),
+            OperatorListenerPolicy::new(true, false, false, None, Some(token)),
+        );
+        index_worker.join().unwrap();
+        assert!(matches!(
+            index,
+            OperatorResponseV5::Error {
+                error: OperatorRemoteErrorV5 {
+                    code: OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain,
+                    receipt: None,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let (columnar_tx, columnar_rx) = std::sync::mpsc::channel();
+        let columnar_worker = std::thread::spawn(move || drop(columnar_rx.recv().unwrap()));
+        let columnar = execute_operator_request_with_capabilities(
+            OperatorRequestV5 {
+                request_id: 2,
+                operation: OperatorOperationV5::ApplyPhysicalColumnar {
+                    expected_runtime_token: encoded_token,
+                    expected_evidence_epoch: 1,
+                    table_id: 2,
+                    columns: vec![3],
+                    mode: OperatorPhysicalColumnarDesignModeV5::Snapshot,
+                    placement_key: "events".into(),
+                },
+            },
+            &ServerAdaptiveControlHandle::new(adaptive_tx),
+            &ServerPhysicalDesignControlHandle::new(columnar_tx),
+            OperatorListenerPolicy::new(
+                false,
+                true,
+                false,
+                Some(ServerPhysicalColumnarApplyCapabilities {
+                    allow_snapshot: true,
+                    allow_incremental: false,
+                }),
+                Some(token),
+            ),
+        );
+        columnar_worker.join().unwrap();
+        assert!(matches!(
+            columnar,
+            OperatorResponseV5::Error {
+                error: OperatorRemoteErrorV5 {
+                    code: OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain,
+                    receipt: None,
+                    ..
+                },
+                ..
+            }
         ));
     }
 

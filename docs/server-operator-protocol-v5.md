@@ -21,6 +21,8 @@ capacity rejection maps to
 `physical_design_mutation_receipt_capacity_exceeded`; other Begin/journal
 failure maps to `physical_design_mutation_receipt_unavailable`. Neither case
 executes the mutation and neither fabricates a receipt.
+An existing receipt recovery gate uses the same unavailable code, states that
+restart/reopen is required, and still means the new request did not enter Core.
 
 ## Scoped identity
 
@@ -122,6 +124,15 @@ gate is active. Whole-response loss is distinct: the client has no observed
 reference, reports local uncertainty with `recovery_required = false`, and may
 retain exact-approval retry guidance. No receipt lookup heuristic or automatic
 retry is performed.
+
+The same uncertainty code with `receipt: null` covers an accepted worker
+command whose reply was lost: no durable reference was observed and
+`recovery_required` is not asserted by the client. With `receipt` present, the
+Server knows a durable Begin exists and startup reconciliation is required.
+Client classification uses the code and nullable receipt, never message text.
+Connect/configuration and request encoding failures before dispatch remain
+ordinary definite local failures; protocol, request-ID, response-shape, or
+response-loss failures after dispatch are local mutation uncertainty.
 
 The remaining v5 operations retain v4 semantics: `status`, `rotate_evidence`,
 `reset_faulted_scheduler`, `physical_design_recommendations`,

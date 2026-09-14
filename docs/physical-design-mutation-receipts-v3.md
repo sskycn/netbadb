@@ -78,13 +78,39 @@ the existing canonical Server-owned namespace from configuration. Platforms
 without an equivalent no-follow guarantee fail conservatively instead of
 following a symlink while claiming Unix-equivalent safety.
 
+## Active journal ownership
+
+On Unix, one cooperative active runtime owns one journal inode. After the
+final component is opened with `O_NOFOLLOW` and verified as a regular file,
+the Server takes a nonblocking `LOCK_EX` advisory lock before reading the
+header or history. `EWOULDBLOCK`/`EAGAIN` is the typed `AlreadyInUse` startup
+failure. The exact locked handle remains the writer until the journal runtime
+is dropped; there is no decode/reopen ownership gap.
+
+A fresh v3 temporary is locked before its no-replace hard-link publication,
+and the published inode retains that same handle and lock. Legacy migration
+locks the opened v1/v2 source before decoding, locks the new v3 temporary
+before writing or publication, verifies immediately before rename that the
+final path still has the source file's device and inode, and retains the new
+locked handle before releasing the legacy handle. A replaced final path fails
+closed and is not overwritten.
+
+These are cooperative advisory locks in a trusted Server-owned parent
+namespace. They do not defend against a privileged administrator, a process
+that ignores advisory locks, a continually racing namespace attacker, or
+filesystem rollback. Network filesystem implementations may also provide
+different `flock` semantics and must be qualified by the deployer.
+
 ## Mutation and operator semantics
 
 A synced Begin still precedes Core mutation. If Begin durability fails, the
-mutation does not start. If Core may have mutated truth but Outcome durability
-fails, Server does not compensate; later receipt-controlled mutations are
-gated until restart/reopen reconciliation. Status and scoped/unscoped receipt
-reads stay pure and available during that gate. They expose no journal path,
+mutation does not start; a complete unsynced Begin that remains visible is
+reconciled as not applied after reopen. An already recovery-gated journal also
+rejects a new request before Core. If a durable Begin exists and Core returns
+an error that cannot prove the mutation did not occur, or if Outcome durability
+fails, the result is typed mutation uncertainty with the known receipt and the
+journal gates later mutations. Server does not compensate. Status and
+scoped/unscoped receipt reads stay pure and available during that gate. They expose no journal path,
 private Columnar recovery path, database incarnation, runtime token, SQL,
 principal, session, address, or timestamp.
 
@@ -96,3 +122,8 @@ invented receipt and retains exact idempotent-retry guidance. Outcome failure
 instead instructs restart/reopen, reconciliation, then inspection of the known
 receipt. Neither path retries, refreshes a token/epoch, changes placement/name,
 or enables Change Stream automatically.
+
+Tests inject failures at explicit journal I/O stages: before write, after a
+partial write, and after a full write but before the sync call can succeed.
+Those unit seams validate conservative runtime and reopen behavior; they are
+not evidence of real hardware power-loss durability.

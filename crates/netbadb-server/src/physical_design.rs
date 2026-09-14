@@ -26,6 +26,8 @@ use netbadb_types::{
 };
 
 use crate::adaptive_driver::ServerAdaptiveHostConfig;
+#[cfg(test)]
+use crate::physical_design_receipts::TestJournalIoFailure;
 use crate::physical_design_receipts::{
     MutationReceiptTarget, ServerPhysicalDesignMutationReceiptConfig,
     ServerPhysicalDesignMutationReceiptControlError, ServerPhysicalDesignMutationReceiptCursor,
@@ -658,6 +660,7 @@ pub enum ServerPhysicalColumnarDesignControlError {
     PlacementInvariantViolated,
     ServerStopped,
     MutationOutcomeUncertain,
+    PostBeginMutationOutcomeUncertain(Box<ServerPhysicalColumnarDesignControlError>),
 }
 
 impl fmt::Display for ServerPhysicalColumnarDesignControlError {
@@ -710,6 +713,9 @@ impl fmt::Display for ServerPhysicalColumnarDesignControlError {
             Self::MutationOutcomeUncertain => formatter.write_str(
                 "server physical-columnar control stopped after accepting the mutation command",
             ),
+            Self::PostBeginMutationOutcomeUncertain(_) => formatter.write_str(
+                "physical-columnar mutation outcome is uncertain after its durable receipt Begin",
+            ),
         }
     }
 }
@@ -724,6 +730,7 @@ impl Error for ServerPhysicalColumnarDesignControlError {
             Self::Apply(error) => Some(error.as_ref()),
             Self::MutationReceipt(error) => Some(error),
             Self::MutationRecoveryRequired(error) => Some(error),
+            Self::PostBeginMutationOutcomeUncertain(source) => Some(source.as_ref()),
             Self::PhysicalDesignNotEnabled
             | Self::ColumnarApplyNotEnabled
             | Self::ModeNotAllowed(_)
@@ -757,6 +764,7 @@ pub enum ServerPhysicalDesignControlError {
     PhysicalIndexNameConflict(IndexName),
     ServerStopped,
     MutationOutcomeUncertain,
+    PostBeginMutationOutcomeUncertain(Box<ServerPhysicalDesignControlError>),
 }
 
 impl fmt::Display for ServerPhysicalDesignControlError {
@@ -788,6 +796,9 @@ impl fmt::Display for ServerPhysicalDesignControlError {
             Self::MutationOutcomeUncertain => formatter.write_str(
                 "server physical-design control stopped after accepting the mutation command",
             ),
+            Self::PostBeginMutationOutcomeUncertain(_) => formatter.write_str(
+                "physical-index mutation outcome is uncertain after its durable receipt Begin",
+            ),
         }
     }
 }
@@ -801,6 +812,7 @@ impl Error for ServerPhysicalDesignControlError {
             Self::Apply(error) => Some(error),
             Self::MutationReceipt(error) => Some(error),
             Self::MutationRecoveryRequired(error) => Some(error),
+            Self::PostBeginMutationOutcomeUncertain(source) => Some(source.as_ref()),
             Self::PhysicalDesignNotEnabled
             | Self::EvidenceEpochChanged { .. }
             | Self::ProposalRuntimeChanged
@@ -938,7 +950,7 @@ impl ServerPhysicalDesignControlHandle {
             .map_err(|_| ServerPhysicalDesignControlError::ServerStopped)?;
         response
             .recv()
-            .map_err(|_| ServerPhysicalDesignControlError::ServerStopped)?
+            .map_err(|_| ServerPhysicalDesignControlError::MutationOutcomeUncertain)?
     }
 
     /// Proposes one current Columnar candidate at one host-approved logical
@@ -980,7 +992,7 @@ impl ServerPhysicalDesignControlHandle {
             .map_err(|_| ServerPhysicalColumnarDesignControlError::ServerStopped)?;
         response
             .recv()
-            .map_err(|_| ServerPhysicalColumnarDesignControlError::ServerStopped)?
+            .map_err(|_| ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain)?
     }
 
     /// Forwards one externally approved logical candidate as one atomic worker
@@ -1326,19 +1338,27 @@ impl ServerPhysicalDesignRuntime {
     }
 
     #[cfg(test)]
-    fn fail_next_receipt_begin_append(&mut self) {
+    fn fail_next_receipt_begin_before_write(&mut self) {
         self.mutation_receipts
             .as_mut()
             .expect("test runtime has mutation receipts")
-            .fail_next_begin_append();
+            .fail_next_begin_before_write();
     }
 
     #[cfg(test)]
-    fn fail_next_receipt_outcome_append(&mut self) {
+    fn fail_next_receipt_outcome_before_write(&mut self) {
         self.mutation_receipts
             .as_mut()
             .expect("test runtime has mutation receipts")
-            .fail_next_outcome_append();
+            .fail_next_outcome_before_write();
+    }
+
+    #[cfg(test)]
+    fn fail_receipt_io_at(&mut self, failure: TestJournalIoFailure) {
+        self.mutation_receipts
+            .as_mut()
+            .expect("test runtime has mutation receipts")
+            .fail_io_at(failure);
     }
 
     pub(crate) fn status(&self) -> ServerPhysicalDesignStatus {
@@ -1605,7 +1625,11 @@ impl ServerPhysicalDesignRuntime {
                     if let Some(journal) = self.mutation_receipts.as_mut() {
                         journal.mark_recovery_required();
                     }
-                    return Err(error);
+                    return Err(
+                        ServerPhysicalDesignControlError::PostBeginMutationOutcomeUncertain(
+                            Box::new(error),
+                        ),
+                    );
                 };
                 self.mutation_receipts
                     .as_mut()
@@ -1671,7 +1695,11 @@ impl ServerPhysicalDesignRuntime {
                     if let Some(journal) = self.mutation_receipts.as_mut() {
                         journal.mark_recovery_required();
                     }
-                    return Err(error);
+                    return Err(
+                        ServerPhysicalColumnarDesignControlError::PostBeginMutationOutcomeUncertain(
+                            Box::new(error),
+                        ),
+                    );
                 };
                 self.mutation_receipts
                     .as_mut()
@@ -2108,7 +2136,9 @@ fn index_error_receipt_outcome(
             Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected)
         }
         ServerPhysicalDesignControlError::MutationReceipt(_)
-        | ServerPhysicalDesignControlError::MutationRecoveryRequired(_) => None,
+        | ServerPhysicalDesignControlError::MutationRecoveryRequired(_)
+        | ServerPhysicalDesignControlError::PostBeginMutationOutcomeUncertain(_)
+        | ServerPhysicalDesignControlError::MutationOutcomeUncertain => None,
         _ => Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected),
     }
 }
@@ -2132,7 +2162,9 @@ fn columnar_error_receipt_outcome(
             Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected)
         }
         ServerPhysicalColumnarDesignControlError::MutationReceipt(_)
-        | ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(_) => None,
+        | ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(_)
+        | ServerPhysicalColumnarDesignControlError::PostBeginMutationOutcomeUncertain(_)
+        | ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain => None,
         _ => Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected),
     }
 }
@@ -2438,6 +2470,112 @@ mod tests {
             table_id: TABLE_ID,
             columns: vec![ColumnId(1)],
         }
+    }
+
+    fn assert_programmatic_index_channel_result(
+        proposal: &ServerPhysicalIndexDesignProposal,
+        drop_receiver_before_send: bool,
+    ) -> ServerPhysicalDesignControlError {
+        let (requests, receiver) = std::sync::mpsc::channel();
+        if drop_receiver_before_send {
+            drop(receiver);
+            return ServerPhysicalDesignControlHandle::new(requests)
+                .apply_index(proposal, IndexName::new("programmatic_idx").unwrap())
+                .unwrap_err();
+        }
+        let worker = std::thread::spawn(move || drop(receiver.recv().unwrap()));
+        let result = ServerPhysicalDesignControlHandle::new(requests)
+            .apply_index(proposal, IndexName::new("programmatic_idx").unwrap())
+            .unwrap_err();
+        worker.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn programmatic_index_send_failure_is_definite() {
+        let mut fixture = Fixture::create("programmatic-index-send-failure");
+        let mut runtime = ServerPhysicalDesignRuntime::new(config());
+        record_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
+        assert!(matches!(
+            assert_programmatic_index_channel_result(&proposal, true),
+            ServerPhysicalDesignControlError::ServerStopped
+        ));
+        fixture.close();
+    }
+
+    #[test]
+    fn programmatic_index_reply_loss_is_uncertain() {
+        let mut fixture = Fixture::create("programmatic-index-reply-loss");
+        let mut runtime = ServerPhysicalDesignRuntime::new(config());
+        record_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
+        assert!(matches!(
+            assert_programmatic_index_channel_result(&proposal, false),
+            ServerPhysicalDesignControlError::MutationOutcomeUncertain
+        ));
+        fixture.close();
+    }
+
+    fn assert_programmatic_columnar_channel_result(
+        proposal: &ServerPhysicalColumnarDesignProposal,
+        drop_receiver_before_send: bool,
+    ) -> ServerPhysicalColumnarDesignControlError {
+        let (requests, receiver) = std::sync::mpsc::channel();
+        if drop_receiver_before_send {
+            drop(receiver);
+            return ServerPhysicalDesignControlHandle::new(requests)
+                .apply_columnar(proposal)
+                .unwrap_err();
+        }
+        let worker = std::thread::spawn(move || drop(receiver.recv().unwrap()));
+        let result = ServerPhysicalDesignControlHandle::new(requests)
+            .apply_columnar(proposal)
+            .unwrap_err();
+        worker.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn programmatic_columnar_send_failure_is_definite() {
+        let mut fixture = Fixture::create("programmatic-columnar-send-failure");
+        let placements = fixture.root.join("placements");
+        fs::create_dir(&placements).unwrap();
+        let mut runtime = columnar_runtime(&placements);
+        record_columnar_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose_columnar(
+            &mut fixture.database,
+            &mut runtime,
+            PhysicalColumnarDesignMode::Snapshot,
+            "programmatic-columnar",
+        )
+        .unwrap();
+        assert!(matches!(
+            assert_programmatic_columnar_channel_result(&proposal, true),
+            ServerPhysicalColumnarDesignControlError::ServerStopped
+        ));
+        fixture.close();
+    }
+
+    #[test]
+    fn programmatic_columnar_reply_loss_is_uncertain() {
+        let mut fixture = Fixture::create("programmatic-columnar-reply-loss");
+        let placements = fixture.root.join("placements");
+        fs::create_dir(&placements).unwrap();
+        let mut runtime = columnar_runtime(&placements);
+        record_columnar_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose_columnar(
+            &mut fixture.database,
+            &mut runtime,
+            PhysicalColumnarDesignMode::Snapshot,
+            "programmatic-columnar",
+        )
+        .unwrap();
+        assert!(matches!(
+            assert_programmatic_columnar_channel_result(&proposal, false),
+            ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain
+        ));
+        fixture.close();
     }
 
     #[test]
@@ -3752,12 +3890,12 @@ mod tests {
         record_candidate(&mut fixture.database, &mut runtime);
         let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
         let before = current_commit_seq(&fixture.database);
-        runtime.fail_next_receipt_begin_append();
+        runtime.fail_next_receipt_begin_before_write();
         assert!(matches!(
             apply(
                 &mut fixture.database,
                 &mut runtime,
-                proposal,
+                proposal.clone(),
                 "events_category_idx"
             ),
             Err(ServerPhysicalDesignControlError::MutationReceipt(
@@ -3777,6 +3915,285 @@ mod tests {
                 .unwrap()
                 .receipts
                 .is_empty()
+        );
+        assert!(matches!(
+            apply(
+                &mut fixture.database,
+                &mut runtime,
+                proposal,
+                "events_category_idx"
+            ),
+            Err(ServerPhysicalDesignControlError::MutationReceipt(
+                ServerPhysicalDesignMutationReceiptControlError::RecoveryRequired
+            ))
+        ));
+        assert_eq!(current_commit_seq(&fixture.database), before);
+        fixture.close();
+    }
+
+    #[test]
+    fn ambiguous_index_database_error_after_begin_is_typed_uncertainty() {
+        let mut fixture = Fixture::create("ambiguous-index-database-error");
+        let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+            fixture.root.join("physical-design.nbmr"),
+            1_000_000,
+        )
+        .unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config),
+            &fixture.database,
+        )
+        .unwrap();
+        let receipt_id = runtime
+            .begin_index_receipt(
+                ServerPhysicalDesignMutationSource::LocalOperator,
+                PhysicalDesignEvidenceEpoch(1),
+                CANDIDATE,
+                IndexName::new("events_category_idx").unwrap(),
+            )
+            .unwrap();
+        let result: Result<(), _> = runtime.finish_index_result(
+            receipt_id,
+            Err(ServerPhysicalDesignControlError::Apply(Box::new(
+                PhysicalIndexDesignApplyError::Database(DatabaseError::UndefinedIndex),
+            ))),
+            |_| ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+        );
+        assert!(matches!(
+            result,
+            Err(ServerPhysicalDesignControlError::PostBeginMutationOutcomeUncertain(source))
+                if matches!(
+                    *source,
+                    ServerPhysicalDesignControlError::Apply(ref error)
+                        if matches!(error.as_ref(), PhysicalIndexDesignApplyError::Database(DatabaseError::UndefinedIndex))
+                )
+        ));
+        assert!(
+            receipt_status(&mut fixture.database, &mut runtime)
+                .unwrap()
+                .recovery_required
+        );
+        fixture.close();
+    }
+
+    #[test]
+    fn ambiguous_columnar_database_error_after_begin_is_typed_uncertainty() {
+        let mut fixture = Fixture::create("ambiguous-columnar-database-error");
+        let placements = fixture.root.join("placements");
+        fs::create_dir(&placements).unwrap();
+        let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+            fixture.root.join("physical-design.nbmr"),
+            1_000_000,
+        )
+        .unwrap();
+        let columnar = ServerPhysicalColumnarApplyConfig::new(&placements, true, false).unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            Some(columnar),
+            Some(receipt_config),
+            &fixture.database,
+        )
+        .unwrap();
+        let candidate = columnar_candidate();
+        let receipt_id = runtime
+            .begin_columnar_receipt(
+                ServerPhysicalDesignMutationSource::LocalOperator,
+                PhysicalDesignEvidenceEpoch(1),
+                candidate,
+                PhysicalColumnarDesignMode::Snapshot,
+                ServerPhysicalColumnarPlacementKey::new("events").unwrap(),
+                placements.join("events"),
+            )
+            .unwrap();
+        let result: Result<(), _> = runtime.finish_columnar_result(
+            receipt_id,
+            Err(ServerPhysicalColumnarDesignControlError::Apply(Box::new(
+                PhysicalColumnarDesignApplyError::Database(
+                    DatabaseError::ColumnarProjectionNotFound(ColumnarProjectionId(99)),
+                ),
+            ))),
+            |_| ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+        );
+        assert!(matches!(
+            result,
+            Err(ServerPhysicalColumnarDesignControlError::PostBeginMutationOutcomeUncertain(source))
+                if matches!(
+                    *source,
+                    ServerPhysicalColumnarDesignControlError::Apply(ref error)
+                        if matches!(error.as_ref(), PhysicalColumnarDesignApplyError::Database(DatabaseError::ColumnarProjectionNotFound(ColumnarProjectionId(99))))
+                )
+        ));
+        assert!(
+            receipt_status(&mut fixture.database, &mut runtime)
+                .unwrap()
+                .recovery_required
+        );
+        fixture.close();
+    }
+
+    #[test]
+    fn begin_full_write_sync_failure_never_calls_core_and_reconciles_not_applied() {
+        let mut fixture = Fixture::create("receipt-begin-full-write-sync-failure");
+        let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+            fixture.root.join("physical-design.nbmr"),
+            1_000_000,
+        )
+        .unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config.clone()),
+            &fixture.database,
+        )
+        .unwrap();
+        record_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
+        let commit_before = current_commit_seq(&fixture.database);
+        runtime.fail_receipt_io_at(TestJournalIoFailure::BeginAfterFullWriteBeforeSync);
+        assert!(matches!(
+            apply(
+                &mut fixture.database,
+                &mut runtime,
+                proposal,
+                "events_category_idx"
+            ),
+            Err(ServerPhysicalDesignControlError::MutationReceipt(
+                ServerPhysicalDesignMutationReceiptControlError::Journal(_)
+            ))
+        ));
+        assert_eq!(current_commit_seq(&fixture.database), commit_before);
+        assert!(
+            receipt_status(&mut fixture.database, &mut runtime)
+                .unwrap()
+                .recovery_required
+        );
+        drop(runtime);
+
+        let mut reopened = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config),
+            &fixture.database,
+        )
+        .unwrap();
+        let page = receipts(&mut fixture.database, &mut reopened, None, 1).unwrap();
+        assert_eq!(page.receipts.len(), 1);
+        assert_eq!(
+            page.receipts[0].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::RecoveredNotApplied
+        );
+        fixture.close();
+    }
+
+    #[test]
+    fn outcome_partial_write_failure_truncates_tail_and_reconciles_without_reapply() {
+        let mut fixture = Fixture::create("receipt-outcome-partial-write");
+        let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+            fixture.root.join("physical-design.nbmr"),
+            1_000_000,
+        )
+        .unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config.clone()),
+            &fixture.database,
+        )
+        .unwrap();
+        record_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
+        runtime.fail_receipt_io_at(TestJournalIoFailure::OutcomeAfterPartialWrite);
+        assert!(matches!(
+            apply(
+                &mut fixture.database,
+                &mut runtime,
+                proposal,
+                "events_category_idx"
+            ),
+            Err(ServerPhysicalDesignControlError::MutationRecoveryRequired(
+                _
+            ))
+        ));
+        let index_id = match fixture.database.inspect_physical_index_design_name(
+            CANDIDATE,
+            &IndexName::new("events_category_idx").unwrap(),
+        ) {
+            PhysicalIndexDesignNameState::AlreadyApplied { index_id } => index_id,
+            state => panic!("expected applied index, got {state:?}"),
+        };
+        let commit_after_apply = current_commit_seq(&fixture.database);
+        drop(runtime);
+        let mut reopened = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config),
+            &fixture.database,
+        )
+        .unwrap();
+        assert_eq!(current_commit_seq(&fixture.database), commit_after_apply);
+        let page = receipts(&mut fixture.database, &mut reopened, None, 2).unwrap();
+        assert_eq!(page.receipts.len(), 1);
+        assert_eq!(
+            page.receipts[0].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::RecoveredAppliedIndex { index_id }
+        );
+        fixture.close();
+    }
+
+    #[test]
+    fn outcome_full_write_sync_failure_reopens_existing_outcome_without_duplicate() {
+        let mut fixture = Fixture::create("receipt-outcome-full-write-sync-failure");
+        let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+            fixture.root.join("physical-design.nbmr"),
+            1_000_000,
+        )
+        .unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config.clone()),
+            &fixture.database,
+        )
+        .unwrap();
+        record_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
+        runtime.fail_receipt_io_at(TestJournalIoFailure::OutcomeAfterFullWriteBeforeSync);
+        assert!(matches!(
+            apply(
+                &mut fixture.database,
+                &mut runtime,
+                proposal,
+                "events_category_idx"
+            ),
+            Err(ServerPhysicalDesignControlError::MutationRecoveryRequired(
+                _
+            ))
+        ));
+        assert!(
+            receipt_status(&mut fixture.database, &mut runtime)
+                .unwrap()
+                .recovery_required
+        );
+        let bytes_after_failure = fs::read(receipt_config.path()).unwrap();
+        drop(runtime);
+        let mut reopened = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            None,
+            Some(receipt_config.clone()),
+            &fixture.database,
+        )
+        .unwrap();
+        let page = receipts(&mut fixture.database, &mut reopened, None, 2).unwrap();
+        assert_eq!(page.receipts.len(), 1);
+        assert!(matches!(
+            page.receipts[0].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::CreatedIndex { .. }
+        ));
+        assert_eq!(
+            fs::read(receipt_config.path()).unwrap(),
+            bytes_after_failure
         );
         fixture.close();
     }
@@ -3801,7 +4218,7 @@ mod tests {
             .journal_incarnation;
         record_candidate(&mut fixture.database, &mut runtime);
         let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
-        runtime.fail_next_receipt_outcome_append();
+        runtime.fail_next_receipt_outcome_before_write();
         assert!(matches!(
             apply(
                 &mut fixture.database,
@@ -3875,7 +4292,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn nbop_outcome_sync_failure_runs_listener_control_worker_core_and_returns_restart_guidance() {
+    fn nbop_outcome_before_write_failure_returns_uncertainty_and_restart_guidance() {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
@@ -3897,7 +4314,7 @@ mod tests {
             )
             .unwrap();
             record_candidate(&mut fixture.database, &mut runtime);
-            runtime.fail_next_receipt_outcome_append();
+            runtime.fail_next_receipt_outcome_before_write();
             ready_tx.send(runtime.evidence.epoch().0).unwrap();
             let request = design_rx.recv().unwrap();
             let ServerPhysicalDesignControlRequest::ApplyApprovedIndex {
@@ -4018,7 +4435,7 @@ mod tests {
             "events-reporting",
         )
         .unwrap();
-        runtime.fail_next_receipt_outcome_append();
+        runtime.fail_next_receipt_outcome_before_write();
         assert!(matches!(
             apply_columnar(&mut fixture.database, &mut runtime, proposal),
             Err(

@@ -86,6 +86,11 @@
   Server-owned NBMR journal in the sole Database worker. Manifest and
   programmatic configuration select deployment/runtime ownership but never
   create another mutation authority.
+  On Unix the safely opened journal inode MUST hold one nonblocking exclusive
+  advisory lock for the entire active runtime. Existing v3 MUST be locked
+  before decode; fresh and migrated v3 publication MUST expose an already
+  locked inode; migration MUST retain the locked legacy source until the new
+  locked inode is active and MUST reject final-path inode replacement.
   A durable Begin precedes every Server Index or Columnar apply control, and a
   durable coarse Outcome follows each definitive result. Receipt failure MUST
   NOT roll back Database truth, mutate evidence, poison client protocol state,

@@ -276,7 +276,7 @@ fn nonzero_journal_incarnation(
 fn create_v3_journal(
     config: &ServerPhysicalDesignMutationReceiptConfig,
     database_incarnation: [u8; 16],
-) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+) -> Result<File, ServerPhysicalDesignMutationReceiptJournalError> {
     let journal_incarnation = generate_journal_incarnation()?;
     let mut temp = create_owned_temp(config.path())?;
     let header = encode_v3_header(database_incarnation, journal_incarnation);
@@ -284,7 +284,7 @@ fn create_v3_journal(
     inject_publication_failure(TestPublicationFailure::TemporaryCreated, &temp.path)?;
     #[cfg(test)]
     if take_publication_failure(TestPublicationFailure::PartialHeaderWritten) {
-        temp.file
+        temp.file_mut()
             .write_all(&header[..header.len() / 2])
             .map_err(|source| io_error("partial fresh header write", &temp.path, source))?;
         return Err(io_error(
@@ -293,17 +293,50 @@ fn create_v3_journal(
             io::Error::other("injected fresh publication failure"),
         ));
     }
-    temp.file
+    temp.file_mut()
         .write_all(&header)
         .map_err(|source| io_error("fresh header write", &temp.path, source))?;
     #[cfg(test)]
     inject_publication_failure(TestPublicationFailure::FullHeaderWritten, &temp.path)?;
-    temp.file
+    temp.file_mut()
         .sync_all()
         .map_err(|source| io_error("fresh header sync", &temp.path, source))?;
     #[cfg(test)]
     inject_publication_failure(TestPublicationFailure::TemporarySynced, &temp.path)?;
-    publish_new(&mut temp, config.path())
+    publish_new(&mut temp, config.path())?;
+    temp.into_published_file()
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn lock_journal_exclusive(
+    file: &File,
+) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        // SAFETY: `file` owns a live descriptor for the journal inode for the
+        // duration of this call. `flock` neither retains the pointer nor
+        // accesses Rust memory.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        let raw = source.raw_os_error();
+        if source.kind() == io::ErrorKind::WouldBlock
+            || raw == Some(libc::EAGAIN)
+            || raw == Some(libc::EWOULDBLOCK)
+        {
+            return Err(ServerPhysicalDesignMutationReceiptJournalError::AlreadyInUse);
+        }
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Lock(
+            source,
+        ));
+    }
 }
 
 fn secure_open_existing(
@@ -379,6 +412,24 @@ fn read_open_file(
     Ok(bytes)
 }
 
+fn verify_opened_regular(
+    file: &File,
+    config: &ServerPhysicalDesignMutationReceiptConfig,
+) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_error("metadata", config.path(), source))?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(ServerPhysicalDesignMutationReceiptJournalError::Path(
+            ServerPhysicalDesignMutationReceiptPathError::ExistingObjectNotRegular(
+                config.path().to_path_buf(),
+            ),
+        ))
+    }
+}
+
 fn journal_version(bytes: &[u8]) -> Result<u16, ServerPhysicalDesignMutationReceiptJournalError> {
     if bytes.len() < 8 {
         return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
@@ -394,9 +445,32 @@ fn journal_version(bytes: &[u8]) -> Result<u16, ServerPhysicalDesignMutationRece
 }
 
 struct OwnedTemp {
-    file: File,
+    file: Option<File>,
     path: PathBuf,
     published: bool,
+}
+
+impl OwnedTemp {
+    fn file_mut(&mut self) -> &mut File {
+        self.file
+            .as_mut()
+            .expect("owned temporary retains its file")
+    }
+
+    fn into_published_file(
+        mut self,
+    ) -> Result<File, ServerPhysicalDesignMutationReceiptJournalError> {
+        if !self.published {
+            return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "temporary journal was not published",
+            ));
+        }
+        self.file
+            .take()
+            .ok_or(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "published temporary journal lost its file",
+            ))
+    }
 }
 
 impl Drop for OwnedTemp {
@@ -447,8 +521,10 @@ fn create_owned_temp(
         }
         match options.open(&path) {
             Ok(file) => {
+                #[cfg(unix)]
+                lock_journal_exclusive(&file)?;
                 return Ok(OwnedTemp {
-                    file,
+                    file: Some(file),
                     path,
                     published: false,
                 });
@@ -483,7 +559,8 @@ fn migrate_legacy(
     database_incarnation: [u8; 16],
     version: u16,
     legacy_bytes: &[u8],
-) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    source: &File,
+) -> Result<File, ServerPhysicalDesignMutationReceiptJournalError> {
     let (header_bytes, journal_incarnation) = match version {
         V1_VERSION => {
             validate_v1_header(legacy_bytes, database_incarnation)?;
@@ -529,20 +606,55 @@ fn migrate_legacy(
         );
     }
     let mut temp = create_owned_temp(config.path())?;
-    temp.file
+    temp.file_mut()
         .write_all(&bytes)
         .map_err(|source| io_error("write migration temporary", &temp.path, source))?;
-    temp.file
+    temp.file_mut()
         .sync_all()
         .map_err(|source| io_error("sync migration temporary", &temp.path, source))?;
     #[cfg(test)]
     inject_migration_failure(TestMigrationFailure::AfterTemporarySync, &temp.path)?;
+    #[cfg(test)]
+    migration_checkpoint();
+    #[cfg(test)]
+    inject_migration_final_replacement(config.path())?;
+    verify_final_path_is_opened_inode(source, config.path())?;
     fs::rename(&temp.path, config.path())
         .map_err(|source| io_error("publish v3 migration", config.path(), source))?;
     temp.published = true;
     #[cfg(test)]
     inject_migration_failure(TestMigrationFailure::AfterRename, config.path())?;
-    sync_parent(config.path())
+    sync_parent(config.path())?;
+    temp.into_published_file()
+}
+
+#[cfg(unix)]
+fn verify_final_path_is_opened_inode(
+    source: &File,
+    final_path: &Path,
+) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = source
+        .metadata()
+        .map_err(|error| io_error("migration source metadata", final_path, error))?;
+    let current = fs::symlink_metadata(final_path)
+        .map_err(|error| io_error("migration final metadata", final_path, error))?;
+    if !current.file_type().is_file()
+        || opened.dev() != current.dev()
+        || opened.ino() != current.ino()
+    {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::FinalPathChanged);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_final_path_is_opened_inode(
+    _source: &File,
+    _final_path: &Path,
+) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    Err(ServerPhysicalDesignMutationReceiptJournalError::FilesystemSafetyUnavailable)
 }
 
 #[cfg(test)]
@@ -553,6 +665,12 @@ enum TestMigrationFailure {
 }
 
 #[cfg(test)]
+struct TestMigrationCheckpoint {
+    reached: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TestPublicationFailure {
     TemporaryCreated,
@@ -560,6 +678,20 @@ enum TestPublicationFailure {
     FullHeaderWritten,
     TemporarySynced,
     PublishedBeforeParentSync,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestJournalIoFailure {
+    BeginAfterFullWriteBeforeSync,
+    OutcomeAfterPartialWrite,
+    OutcomeAfterFullWriteBeforeSync,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JournalRecordKind {
+    Begin,
+    Outcome,
 }
 
 #[cfg(all(test, unix))]
@@ -574,8 +706,35 @@ thread_local! {
     static TEST_MIGRATION_FAILURE: RefCell<Option<TestMigrationFailure>> = const { RefCell::new(None) };
     static TEST_RANDOMNESS_FAILURE: Cell<bool> = const { Cell::new(false) };
     static TEST_PUBLICATION_FAILURE: RefCell<Option<TestPublicationFailure>> = const { RefCell::new(None) };
+    static TEST_MIGRATION_FINAL_REPLACEMENT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    static TEST_MIGRATION_CHECKPOINT: RefCell<Option<TestMigrationCheckpoint>> = const { RefCell::new(None) };
     #[cfg(unix)]
     static TEST_EXISTING_OPEN_REPLACEMENT: RefCell<Option<TestExistingOpenReplacement>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn migration_checkpoint() {
+    TEST_MIGRATION_CHECKPOINT.with(|value| {
+        if let Some(checkpoint) = value.borrow_mut().take() {
+            checkpoint.reached.send(()).unwrap();
+            checkpoint.resume.recv().unwrap();
+        }
+    });
+}
+
+#[cfg(test)]
+fn inject_migration_final_replacement(
+    final_path: &Path,
+) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    let replacement = TEST_MIGRATION_FINAL_REPLACEMENT.with(|value| value.borrow_mut().take());
+    if let Some(replacement) = replacement {
+        fs::remove_file(final_path)
+            .map_err(|source| io_error("injected migration path removal", final_path, source))?;
+        fs::write(final_path, replacement).map_err(|source| {
+            io_error("injected migration path replacement", final_path, source)
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -916,6 +1075,9 @@ pub enum ServerPhysicalDesignMutationReceiptJournalError {
     GeneratedZeroJournalIncarnation,
     TemporaryNameExhausted,
     FilesystemSafetyUnavailable,
+    AlreadyInUse,
+    Lock(io::Error),
+    FinalPathChanged,
     FileTooLarge {
         bytes: u64,
         maximum: u64,
@@ -1012,6 +1174,15 @@ impl fmt::Display for ServerPhysicalDesignMutationReceiptJournalError {
             }
             Self::FilesystemSafetyUnavailable => formatter
                 .write_str("secure no-follow receipt journal open is unavailable on this platform"),
+            Self::AlreadyInUse => formatter.write_str(
+                "physical-design mutation receipt journal is already owned by another active runtime",
+            ),
+            Self::Lock(source) => {
+                write!(formatter, "failed to acquire exclusive NBMR journal ownership: {source}")
+            }
+            Self::FinalPathChanged => formatter.write_str(
+                "NBMR journal final path changed while legacy migration was in progress",
+            ),
             Self::FileTooLarge { bytes, maximum } => write!(
                 formatter,
                 "NBMR journal is {bytes} bytes, exceeding configured maximum {maximum}"
@@ -1053,6 +1224,7 @@ impl Error for ServerPhysicalDesignMutationReceiptJournalError {
         match self {
             Self::Path(error) => Some(error),
             Self::Io { source, .. } => Some(source),
+            Self::Lock(source) => Some(source),
             Self::InvalidPlacement(error) => Some(error),
             Self::Reconciliation(error) => Some(error),
             _ => None,
@@ -1092,9 +1264,11 @@ pub(crate) struct ServerPhysicalDesignMutationReceiptJournal {
     unresolved: Option<MutationReceiptBegin>,
     recovery_required: bool,
     #[cfg(test)]
-    fail_next_begin_append: bool,
+    fail_next_begin_before_write: bool,
     #[cfg(test)]
-    fail_next_outcome_append: bool,
+    fail_next_outcome_before_write: bool,
+    #[cfg(test)]
+    test_io_failure: Option<TestJournalIoFailure>,
 }
 
 impl ServerPhysicalDesignMutationReceiptJournal {
@@ -1113,80 +1287,90 @@ impl ServerPhysicalDesignMutationReceiptJournal {
         identity: PhysicalDesignDatabaseIdentity,
         database: &Database,
     ) -> Result<Self, ServerPhysicalDesignMutationReceiptJournalError> {
-        let exists = match fs::symlink_metadata(config.path()) {
-            Ok(metadata) if metadata.file_type().is_file() => true,
-            Ok(_) => {
-                return Err(ServerPhysicalDesignMutationReceiptJournalError::Path(
-                    ServerPhysicalDesignMutationReceiptPathError::ExistingObjectNotRegular(
-                        config.path().to_path_buf(),
-                    ),
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-            Err(source) => {
-                return Err(ServerPhysicalDesignMutationReceiptJournalError::Path(
-                    ServerPhysicalDesignMutationReceiptPathError::Metadata {
-                        path: config.path().to_path_buf(),
-                        source,
-                    },
-                ));
-            }
-        };
-        if !exists {
-            create_v3_journal(&config, *identity.as_bytes())?;
-        } else {
-            let mut source = secure_open_existing(&config, false)?;
-            let bytes = read_open_file(&mut source, &config)?;
-            let version = journal_version(&bytes)?;
-            match version {
-                V1_VERSION | V2_VERSION => {
-                    migrate_legacy(&config, *identity.as_bytes(), version, &bytes)?;
-                }
-                CURRENT_VERSION => {
-                    validate_v3_header(&bytes, *identity.as_bytes())?;
-                }
-                version => {
-                    return Err(
-                        ServerPhysicalDesignMutationReceiptJournalError::UnsupportedVersion(
-                            version,
-                        ),
-                    );
-                }
-            }
-        }
+        #[cfg(not(unix))]
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::FilesystemSafetyUnavailable);
 
-        let mut file = secure_open_existing(&config, true)?;
-        let bytes = read_open_file(&mut file, &config)?;
-        let journal_incarnation = validate_v3_header(&bytes, *identity.as_bytes())?;
-        let decoded = decode_v3_records(&bytes, V3_HEADER_BYTES)?;
-        if decoded.valid_bytes < bytes.len() {
-            file.set_len(decoded.valid_bytes as u64)
-                .map_err(|source| io_error("tail truncate", config.path(), source))?;
-            file.sync_all()
-                .map_err(|source| io_error("tail truncate sync", config.path(), source))?;
+        #[cfg(unix)]
+        {
+            let exists = match fs::symlink_metadata(config.path()) {
+                Ok(metadata) if metadata.file_type().is_file() => true,
+                Ok(_) => {
+                    return Err(ServerPhysicalDesignMutationReceiptJournalError::Path(
+                        ServerPhysicalDesignMutationReceiptPathError::ExistingObjectNotRegular(
+                            config.path().to_path_buf(),
+                        ),
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(source) => {
+                    return Err(ServerPhysicalDesignMutationReceiptJournalError::Path(
+                        ServerPhysicalDesignMutationReceiptPathError::Metadata {
+                            path: config.path().to_path_buf(),
+                            source,
+                        },
+                    ));
+                }
+            };
+            let mut file = if !exists {
+                create_v3_journal(&config, *identity.as_bytes())?
+            } else {
+                let mut source = secure_open_existing(&config, true)?;
+                verify_opened_regular(&source, &config)?;
+                lock_journal_exclusive(&source)?;
+                let bytes = read_open_file(&mut source, &config)?;
+                let version = journal_version(&bytes)?;
+                match version {
+                    V1_VERSION | V2_VERSION => {
+                        migrate_legacy(&config, *identity.as_bytes(), version, &bytes, &source)?
+                    }
+                    CURRENT_VERSION => {
+                        validate_v3_header(&bytes, *identity.as_bytes())?;
+                        source
+                    }
+                    version => {
+                        return Err(
+                            ServerPhysicalDesignMutationReceiptJournalError::UnsupportedVersion(
+                                version,
+                            ),
+                        );
+                    }
+                }
+            };
+
+            let bytes = read_open_file(&mut file, &config)?;
+            let journal_incarnation = validate_v3_header(&bytes, *identity.as_bytes())?;
+            let decoded = decode_v3_records(&bytes, V3_HEADER_BYTES)?;
+            if decoded.valid_bytes < bytes.len() {
+                file.set_len(decoded.valid_bytes as u64)
+                    .map_err(|source| io_error("tail truncate", config.path(), source))?;
+                file.sync_all()
+                    .map_err(|source| io_error("tail truncate sync", config.path(), source))?;
+            }
+            file.seek(SeekFrom::End(0))
+                .map_err(|source| io_error("seek", config.path(), source))?;
+            let next_id = decoded
+                .highest_begin
+                .checked_add(1)
+                .ok_or(ServerPhysicalDesignMutationReceiptJournalError::ReceiptIdExhausted)?;
+            let mut journal = Self {
+                config,
+                journal_incarnation,
+                file,
+                file_len: decoded.valid_bytes as u64,
+                next_id,
+                receipts: decoded.receipts,
+                unresolved: decoded.unresolved,
+                recovery_required: false,
+                #[cfg(test)]
+                fail_next_begin_before_write: false,
+                #[cfg(test)]
+                fail_next_outcome_before_write: false,
+                #[cfg(test)]
+                test_io_failure: None,
+            };
+            journal.reconcile(database)?;
+            Ok(journal)
         }
-        file.seek(SeekFrom::End(0))
-            .map_err(|source| io_error("seek", config.path(), source))?;
-        let next_id = decoded
-            .highest_begin
-            .checked_add(1)
-            .ok_or(ServerPhysicalDesignMutationReceiptJournalError::ReceiptIdExhausted)?;
-        let mut journal = Self {
-            config,
-            journal_incarnation,
-            file,
-            file_len: decoded.valid_bytes as u64,
-            next_id,
-            receipts: decoded.receipts,
-            unresolved: decoded.unresolved,
-            recovery_required: false,
-            #[cfg(test)]
-            fail_next_begin_append: false,
-            #[cfg(test)]
-            fail_next_outcome_append: false,
-        };
-        journal.reconcile(database)?;
-        Ok(journal)
     }
 
     pub(crate) fn begin(
@@ -1224,7 +1408,7 @@ impl ServerPhysicalDesignMutationReceiptJournal {
             ));
         }
         #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_begin_append) {
+        if std::mem::take(&mut self.fail_next_begin_before_write) {
             self.recovery_required = true;
             return Err(ServerPhysicalDesignMutationReceiptControlError::Journal(
                 io_error(
@@ -1234,7 +1418,7 @@ impl ServerPhysicalDesignMutationReceiptJournal {
                 ),
             ));
         }
-        if let Err(error) = self.append_synced(&bytes, "Begin append") {
+        if let Err(error) = self.append_synced(&bytes, "Begin append", JournalRecordKind::Begin) {
             self.recovery_required = true;
             return Err(ServerPhysicalDesignMutationReceiptControlError::Journal(
                 error,
@@ -1287,7 +1471,7 @@ impl ServerPhysicalDesignMutationReceiptJournal {
             ));
         }
         #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_outcome_append) {
+        if std::mem::take(&mut self.fail_next_outcome_before_write) {
             self.recovery_required = true;
             return Err(ServerPhysicalDesignMutationReceiptControlError::Journal(
                 io_error(
@@ -1297,7 +1481,8 @@ impl ServerPhysicalDesignMutationReceiptJournal {
                 ),
             ));
         }
-        if let Err(error) = self.append_synced(&bytes, "Outcome append") {
+        if let Err(error) = self.append_synced(&bytes, "Outcome append", JournalRecordKind::Outcome)
+        {
             self.recovery_required = true;
             return Err(ServerPhysicalDesignMutationReceiptControlError::Journal(
                 error,
@@ -1315,13 +1500,18 @@ impl ServerPhysicalDesignMutationReceiptJournal {
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_next_begin_append(&mut self) {
-        self.fail_next_begin_append = true;
+    pub(crate) fn fail_next_begin_before_write(&mut self) {
+        self.fail_next_begin_before_write = true;
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_next_outcome_append(&mut self) {
-        self.fail_next_outcome_append = true;
+    pub(crate) fn fail_next_outcome_before_write(&mut self) {
+        self.fail_next_outcome_before_write = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_io_at(&mut self, failure: TestJournalIoFailure) {
+        self.test_io_failure = Some(failure);
     }
 
     pub(crate) fn page(
@@ -1461,10 +1651,49 @@ impl ServerPhysicalDesignMutationReceiptJournal {
         &mut self,
         bytes: &[u8],
         operation: &'static str,
+        record_kind: JournalRecordKind,
     ) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+        #[cfg(not(test))]
+        let _ = record_kind;
+        #[cfg(test)]
+        if record_kind == JournalRecordKind::Outcome
+            && self.test_io_failure == Some(TestJournalIoFailure::OutcomeAfterPartialWrite)
+        {
+            self.test_io_failure = None;
+            let partial = bytes.len().max(2) / 2;
+            self.file
+                .write_all(&bytes[..partial])
+                .map_err(|source| io_error(operation, self.config.path(), source))?;
+            return Err(io_error(
+                operation,
+                self.config.path(),
+                io::Error::other("injected Outcome failure after partial write"),
+            ));
+        }
         self.file
             .write_all(bytes)
             .map_err(|source| io_error(operation, self.config.path(), source))?;
+        #[cfg(test)]
+        {
+            let injected = matches!(
+                (record_kind, self.test_io_failure),
+                (
+                    JournalRecordKind::Begin,
+                    Some(TestJournalIoFailure::BeginAfterFullWriteBeforeSync)
+                ) | (
+                    JournalRecordKind::Outcome,
+                    Some(TestJournalIoFailure::OutcomeAfterFullWriteBeforeSync)
+                )
+            );
+            if injected {
+                self.test_io_failure = None;
+                return Err(io_error(
+                    "record sync",
+                    self.config.path(),
+                    io::Error::other("injected failure after full write before sync"),
+                ));
+            }
+        }
         self.file
             .sync_all()
             .map_err(|source| io_error("record sync", self.config.path(), source))?;
@@ -2390,6 +2619,8 @@ fn sync_parent(path: &Path) -> Result<(), ServerPhysicalDesignMutationReceiptJou
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use netbadb_core::{DatabaseCoordinatorConfig, TableStorageCreateSpec};
@@ -2503,6 +2734,265 @@ mod tests {
             Some(DatabaseCoordinatorConfig::new(root.join("coordinator")).with_global_visibility()),
         )
         .unwrap()
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_platform_rejects_before_any_journal_side_effect() {
+        let root = fixture_root("unsupported-platform");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let config =
+            ServerPhysicalDesignMutationReceiptConfig::new(root.join("receipts.nbmr"), 1_000_000)
+                .unwrap();
+        assert!(matches!(
+            ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database),
+            Err(ServerPhysicalDesignMutationReceiptJournalError::FilesystemSafetyUnavailable)
+        ));
+        assert!(!config.path().exists());
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("receipts.nbmr")
+        }));
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_process_double_open_is_rejected_and_lock_releases_on_drop() {
+        let root = fixture_root("same-process-lock");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let config =
+            ServerPhysicalDesignMutationReceiptConfig::new(root.join("receipts.nbmr"), 1_000_000)
+                .unwrap();
+        let mut owner =
+            ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database)
+                .unwrap();
+        assert!(matches!(
+            ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database),
+            Err(ServerPhysicalDesignMutationReceiptJournalError::AlreadyInUse)
+        ));
+        let id = owner
+            .begin(
+                ServerPhysicalDesignMutationSource::Programmatic,
+                PhysicalDesignEvidenceEpoch(4),
+                index_begin(1).target,
+            )
+            .unwrap();
+        owner
+            .finish(id, ServerPhysicalDesignMutationReceiptOutcome::Rejected)
+            .unwrap();
+        drop(owner);
+
+        let reopened =
+            ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database).unwrap();
+        let page = reopened.page(None, 2).unwrap();
+        assert_eq!(page.receipts.len(), 1);
+        assert_eq!(
+            page.receipts[0].id,
+            ServerPhysicalDesignMutationReceiptId(1)
+        );
+        drop(reopened);
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_child() {
+        let Ok(path) = std::env::var("NETBADB_NBMR_LOCK_CHILD") else {
+            return;
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        lock_journal_exclusive(&file).unwrap();
+        println!("NBMR_LOCKED");
+        let mut byte = [0_u8; 1];
+        std::io::stdin().read_exact(&mut byte).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_process_journal_lock_is_exclusive_and_releases_after_owner_exit() {
+        let root = fixture_root("cross-process-lock");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let config =
+            ServerPhysicalDesignMutationReceiptConfig::new(root.join("receipts.nbmr"), 1_000_000)
+                .unwrap();
+        drop(
+            ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database)
+                .unwrap(),
+        );
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "physical_design_receipts::tests::journal_lock_child",
+                "--nocapture",
+            ])
+            .env("NETBADB_NBMR_LOCK_CHILD", config.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(output.read_line(&mut line).unwrap(), 0);
+            if line.contains("NBMR_LOCKED") {
+                break;
+            }
+        }
+        assert!(matches!(
+            ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database),
+            Err(ServerPhysicalDesignMutationReceiptJournalError::AlreadyInUse)
+        ));
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert!(child.wait().unwrap().success());
+        drop(
+            ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database).unwrap(),
+        );
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_publication_is_locked_before_visibility() {
+        let root = fixture_root("fresh-publication-lock");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let config =
+            ServerPhysicalDesignMutationReceiptConfig::new(root.join("receipts.nbmr"), 1_000_000)
+                .unwrap();
+        let mut temp = create_owned_temp(config.path()).unwrap();
+        temp.file_mut()
+            .write_all(&encode_v3_header(
+                *identity.as_bytes(),
+                ServerPhysicalDesignMutationReceiptJournalIncarnation([0x31; 16]),
+            ))
+            .unwrap();
+        temp.file_mut().sync_all().unwrap();
+        publish_new(&mut temp, config.path()).unwrap();
+        assert!(config.path().is_file());
+        assert!(matches!(
+            ServerPhysicalDesignMutationReceiptJournal::open(config.clone(), identity, &database),
+            Err(ServerPhysicalDesignMutationReceiptJournalError::AlreadyInUse)
+        ));
+        drop(temp.into_published_file().unwrap());
+        drop(
+            ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database).unwrap(),
+        );
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_rejects_replaced_final_inode() {
+        let root = fixture_root("migration-path-replaced");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let path = root.join("receipts.nbmr");
+        fs::write(&path, encode_v1_header(*identity.as_bytes())).unwrap();
+        let replacement = b"replacement must survive".to_vec();
+        TEST_MIGRATION_FINAL_REPLACEMENT
+            .with(|value| *value.borrow_mut() = Some(replacement.clone()));
+        let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
+        assert!(matches!(
+            ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database),
+            Err(ServerPhysicalDesignMutationReceiptJournalError::FinalPathChanged)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), replacement);
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_migration_holds_old_and_new_ownership_without_gap() {
+        let root = fixture_root("migration-lock-handoff");
+        let database = create_database(&root);
+        let identity = database.physical_design_database_identity().unwrap();
+        let incarnation = ServerPhysicalDesignMutationReceiptJournalIncarnation([0x41; 16]);
+        let begin = index_begin(1);
+        let mut legacy = encode_v2_header(*identity.as_bytes(), incarnation).to_vec();
+        legacy.extend_from_slice(&encode_legacy_begin(&begin).unwrap());
+        legacy.extend_from_slice(
+            &encode_legacy_outcome(
+                begin.id,
+                ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+            )
+            .unwrap(),
+        );
+        let path = root.join("receipts.nbmr");
+        fs::write(&path, legacy).unwrap();
+        let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
+        database.close().unwrap();
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (drop_tx, drop_rx) = std::sync::mpsc::sync_channel(1);
+        let owner_config = config.clone();
+        let owner_root = root.clone();
+        let owner = std::thread::spawn(move || {
+            let database = Database::open_catalog(owner_root.join("catalog")).unwrap();
+            TEST_MIGRATION_CHECKPOINT.with(|value| {
+                *value.borrow_mut() = Some(TestMigrationCheckpoint {
+                    reached: reached_tx,
+                    resume: resume_rx,
+                });
+            });
+            let journal =
+                ServerPhysicalDesignMutationReceiptJournal::open(owner_config, identity, &database)
+                    .unwrap();
+            ready_tx.send(()).unwrap();
+            drop_rx.recv().unwrap();
+            drop(journal);
+            database.close().unwrap();
+        });
+
+        reached_rx.recv().unwrap();
+        let legacy_contender = secure_open_existing(&config, true).unwrap();
+        assert!(matches!(
+            lock_journal_exclusive(&legacy_contender),
+            Err(ServerPhysicalDesignMutationReceiptJournalError::AlreadyInUse)
+        ));
+        drop(legacy_contender);
+        resume_tx.send(()).unwrap();
+        ready_rx.recv().unwrap();
+        assert_eq!(
+            journal_version(&fs::read(&path).unwrap()).unwrap(),
+            CURRENT_VERSION
+        );
+        let v3_contender = secure_open_existing(&config, true).unwrap();
+        assert!(matches!(
+            lock_journal_exclusive(&v3_contender),
+            Err(ServerPhysicalDesignMutationReceiptJournalError::AlreadyInUse)
+        ));
+        drop(v3_contender);
+        drop_tx.send(()).unwrap();
+        owner.join().unwrap();
+
+        let reopened_database = Database::open_catalog(root.join("catalog")).unwrap();
+        let reopened =
+            ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &reopened_database)
+                .unwrap();
+        assert_eq!(reopened.status().journal_incarnation, incarnation);
+        assert_eq!(reopened.page(None, 2).unwrap().receipts.len(), 1);
+        drop(reopened);
+        reopened_database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
