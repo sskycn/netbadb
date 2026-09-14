@@ -2,7 +2,7 @@
 
 Deployment Manifest v8 is a historical contract retained for migration
 reference only. It is rejected by the current daemon, which accepts only
-Manifest v9. Versions 1 through 8 and future versions are rejected explicitly;
+Manifest v10. Versions 1 through 9 and future versions are rejected explicitly;
 there is no dual decoder. This version is independent of Native Protocol v2,
 PostgreSQL wire, Inspection JSON v7, SDK Schema Spec, Canonical Schema, and all
 database persistent formats.

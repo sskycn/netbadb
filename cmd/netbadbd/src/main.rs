@@ -72,6 +72,11 @@ fn run_server(
     } else {
         "disabled"
     };
+    let physical_design_receipts = if config.physical_design_mutation_receipt_config().is_some() {
+        "enabled"
+    } else {
+        "disabled"
+    };
     let server = if postgres {
         RunningServer::Postgres(PostgresTcpServer::new(config).start()?)
     } else {
@@ -90,6 +95,7 @@ fn run_server(
         adaptive,
         physical_design,
         physical_index_apply,
+        physical_design_receipts,
     ) {
         return match server.shutdown() {
             Ok(()) => Err(Box::new(ReadinessError::Publish(readiness_error))),
@@ -132,11 +138,12 @@ impl RunningServer {
         adaptive: &str,
         physical_design: &str,
         physical_index_apply: &str,
+        physical_design_receipts: &str,
     ) -> io::Result<()> {
         match self {
             Self::Native(server) => writeln!(
                 writer,
-                "netbadbd ready: native listener on {}, {} table(s), max {} connections, transport {}, adaptive {adaptive}, physical-design {physical_design}, physical-index-apply {physical_index_apply}",
+                "netbadbd ready: native listener on {}, {} table(s), max {} connections, transport {}, adaptive {adaptive}, physical-design {physical_design}, physical-index-apply {physical_index_apply}, physical-design-receipts {physical_design_receipts}",
                 server.local_addr(),
                 server.table_count(),
                 max_connections,
@@ -144,7 +151,7 @@ impl RunningServer {
             )?,
             Self::Postgres(server) => writeln!(
                 writer,
-                "netbadbd ready: PostgreSQL listener on {}, max {} connections, transport plaintext-loopback, adaptive {adaptive}, physical-design {physical_design}, physical-index-apply {physical_index_apply}",
+                "netbadbd ready: PostgreSQL listener on {}, max {} connections, transport plaintext-loopback, adaptive {adaptive}, physical-design {physical_design}, physical-index-apply {physical_index_apply}, physical-design-receipts {physical_design_receipts}",
                 server.local_addr(),
                 max_connections,
             )?,

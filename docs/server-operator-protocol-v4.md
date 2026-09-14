@@ -1,5 +1,9 @@
 # NetbaDB local operator protocol v4
 
+> Historical operator contract. The current local operator plane requires
+> NBOP v5; v4 is explicitly rejected. The remainder of this document preserves
+> the v4 contract as shipped.
+
 NBOP v4 is the current local Unix-domain operator protocol. It is independent
 of Native Protocol v2, PostgreSQL wire, Inspection JSON, and all persistent
 formats. The frame remains exactly 12 bytes: `NBOP`, big-endian protocol

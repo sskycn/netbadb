@@ -59,7 +59,7 @@ fn manifest_fixture(
 ) -> Fixture {
     let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
-        "netbadbd-v9-{transport}-{}-{sequence}",
+        "netbadbd-v10-{transport}-{}-{sequence}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&directory);
@@ -77,12 +77,12 @@ fn manifest_fixture(
         std::process::id()
     ));
     let _ = std::fs::remove_file(&socket);
-    let document = include_str!("../../../docs/server-manifest-v9.md");
+    let document = include_str!("../../../docs/server-manifest-v10.md");
     let example = document
         .split_once("```json\n")
         .and_then(|(_, remainder)| remainder.split_once("\n```"))
         .map(|(example, _)| example)
-        .expect("v9 documentation contains a JSON example");
+        .expect("v10 documentation contains a JSON example");
     let mut source: serde_json::Value = serde_json::from_str(example).unwrap();
     source["listen"] = "127.0.0.1:0".into();
     source["tables"][0]["path"] = "data/users.ndb".into();
@@ -375,7 +375,7 @@ fn native_design_only_daemon_exposes_status_and_conditional_rotation() {
 }
 
 #[test]
-fn postgres_design_only_daemon_exposes_nbop_v4_status() {
+fn postgres_design_only_daemon_exposes_nbop_v5_status() {
     let fixture = manifest_fixture("postgres-design-only", false, true, true);
     let mut daemon = DaemonProcess::spawn(&fixture.manifest, true);
     let ready = daemon.wait_for_readiness();

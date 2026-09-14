@@ -407,7 +407,7 @@ The current code genuinely supports:
   explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
 - a blocking TCP runtime with loopback plaintext or mandatory mutual TLS whose
   dedicated synchronous worker owns the Database and every SessionState, plus
-  strict deployment manifest v9 bootstrap, authenticated certificate identity,
+  strict deployment manifest v10 bootstrap, authenticated certificate identity,
   per-certificate and local-plaintext table/operation authorization, secure
   remote listen, bounded connections/socket inactivity, response-row policy,
   in-process metrics, and the standalone `netbadbd` executable;
@@ -415,15 +415,16 @@ The current code genuinely supports:
 - stable, read-only embedded catalog and chosen-plan inspection DTOs with an
   explicit deterministic text renderer that exposes no planner objects or
   storage internals and never drives execution;
-- an offline `netbadb inspect` CLI that reuses deployment manifest v9 and the
+- an offline `netbadb inspect` CLI that reuses deployment manifest v10 and the
   embedded inspection API, with deterministic human text and explicit
   current versioned Inspection JSON v7 output (with v1-v6 retained
   historically);
-- a local Unix-only NBOP v4 operator plane, configured by manifest v9, whose
+- a local Unix-only NBOP v5 operator plane, configured by manifest v10, whose
   `0600` socket exposes bounded multi-domain status, Adaptive controls,
   current-inventory physical-design recommendations, conditional design-evidence
-  rotation, and manifest-authorized explicit physical-index or Columnar approval
-  through typed Server control paths;
+  rotation, manifest-authorized explicit physical-index or Columnar approval,
+  and permission-gated scoped NBMR v3 receipt status/history through typed
+  Server control paths;
 - an embedded-host-only Server physical-index proposal/apply control that binds
   proposals to one worker evidence-window lifetime and delegates explicit
   caller-named single-column Heap index creation to the existing Core

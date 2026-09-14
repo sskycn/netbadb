@@ -1,6 +1,6 @@
 # NetBaDB Operator Protocol v2
 
-> Historical protocol contract. The current operator plane requires NBOP v4;
+> Historical protocol contract. The current operator plane requires NBOP v5;
 > NBOP v2 is explicitly rejected.
 
 NBOP v2 is a historical local operator contract. NBOP v1 is also historical

@@ -88,10 +88,11 @@ reads stay pure and available during that gate. They expose no journal path,
 private Columnar recovery path, database incarnation, runtime token, SQL,
 principal, session, address, or timestamp.
 
-NBOP v4 remains frozen and has no `mutation_outcome_uncertain` wire error.
-Reply loss is locally classified as outcome-uncertain and permits an exact
-idempotent retry. Receipt Outcome durability failure instead instructs the
-operator to restart/reopen, let reconciliation finish, and only then inspect or
-retry the same exact logical approval if still needed. Neither path retries,
-refreshes a token/epoch, changes placement/name, or enables Change Stream
-automatically.
+Manifest v10 may now provision this same NBMR v3 journal and independently
+authorize local NBOP v5 reads. NBOP v5 exposes only journal incarnation plus
+nonzero receipt ID, and adds an explicit receipt-bearing Outcome-durability
+uncertainty error. Whole-response loss remains locally uncertain without an
+invented receipt and retains exact idempotent-retry guidance. Outcome failure
+instead instructs restart/reopen, reconciliation, then inspection of the known
+receipt. Neither path retries, refreshes a token/epoch, changes placement/name,
+or enables Change Stream automatically.

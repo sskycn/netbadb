@@ -677,6 +677,51 @@ impl ServerPhysicalDesignMutationReceiptJournalIncarnation {
     }
 }
 
+/// Stable identity of one receipt in one durable NBMR journal namespace.
+///
+/// A reference identifies one receipt. Unlike a cursor, it does not imply
+/// continuation semantics and never authorizes replay or mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ServerPhysicalDesignMutationReceiptReference {
+    journal_incarnation: ServerPhysicalDesignMutationReceiptJournalIncarnation,
+    receipt_id: ServerPhysicalDesignMutationReceiptId,
+}
+
+impl ServerPhysicalDesignMutationReceiptReference {
+    pub fn new(
+        journal_incarnation: ServerPhysicalDesignMutationReceiptJournalIncarnation,
+        receipt_id: ServerPhysicalDesignMutationReceiptId,
+    ) -> Result<Self, ServerPhysicalDesignMutationReceiptCursorError> {
+        if receipt_id.0 == 0 {
+            return Err(ServerPhysicalDesignMutationReceiptCursorError::ZeroReceiptId);
+        }
+        Ok(Self {
+            journal_incarnation,
+            receipt_id,
+        })
+    }
+
+    #[must_use]
+    pub const fn journal_incarnation(
+        &self,
+    ) -> ServerPhysicalDesignMutationReceiptJournalIncarnation {
+        self.journal_incarnation
+    }
+
+    #[must_use]
+    pub const fn receipt_id(&self) -> ServerPhysicalDesignMutationReceiptId {
+        self.receipt_id
+    }
+
+    #[must_use]
+    pub const fn to_cursor(self) -> ServerPhysicalDesignMutationReceiptCursor {
+        ServerPhysicalDesignMutationReceiptCursor {
+            journal_incarnation: self.journal_incarnation,
+            receipt_id: self.receipt_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerPhysicalDesignMutationReceiptJournalIncarnationError {
     Zero,
@@ -898,6 +943,7 @@ pub enum ServerPhysicalDesignMutationReceiptJournalError {
 #[derive(Debug)]
 pub enum ServerPhysicalDesignMutationReceiptStartupError {
     PhysicalDesignRequired,
+    OperatorPolicyMismatch,
     DatabaseIdentity(DatabaseError),
     Journal(ServerPhysicalDesignMutationReceiptJournalError),
 }
@@ -907,6 +953,9 @@ impl fmt::Display for ServerPhysicalDesignMutationReceiptStartupError {
         match self {
             Self::PhysicalDesignRequired => formatter.write_str(
                 "physical-design mutation receipts require a configured physical-design advisor",
+            ),
+            Self::OperatorPolicyMismatch => formatter.write_str(
+                "operator receipt-read permission pins the manifest mutation_receipts journal",
             ),
             Self::DatabaseIdentity(error) => {
                 write!(
@@ -922,7 +971,7 @@ impl fmt::Display for ServerPhysicalDesignMutationReceiptStartupError {
 impl Error for ServerPhysicalDesignMutationReceiptStartupError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::PhysicalDesignRequired => None,
+            Self::PhysicalDesignRequired | Self::OperatorPolicyMismatch => None,
             Self::DatabaseIdentity(error) => Some(error),
             Self::Journal(error) => Some(error),
         }
@@ -1049,6 +1098,16 @@ pub(crate) struct ServerPhysicalDesignMutationReceiptJournal {
 }
 
 impl ServerPhysicalDesignMutationReceiptJournal {
+    pub(crate) const fn reference(
+        &self,
+        receipt_id: ServerPhysicalDesignMutationReceiptId,
+    ) -> ServerPhysicalDesignMutationReceiptReference {
+        ServerPhysicalDesignMutationReceiptReference {
+            journal_incarnation: self.journal_incarnation,
+            receipt_id,
+        }
+    }
+
     pub(crate) fn open(
         config: ServerPhysicalDesignMutationReceiptConfig,
         identity: PhysicalDesignDatabaseIdentity,

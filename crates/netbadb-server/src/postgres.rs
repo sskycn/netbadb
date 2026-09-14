@@ -136,11 +136,37 @@ impl PostgresTcpServer {
             manifest_adaptive_mode,
             manifest_physical_design,
             manifest_physical_columnar_apply,
+            manifest_physical_design_mutation_receipts,
             operator_config,
         ) = self.config.into_parts();
         let adaptive_mode = self.adaptive_override.unwrap_or(manifest_adaptive_mode);
         let physical_design = self.physical_design_override.or(manifest_physical_design);
-        if self.physical_design_mutation_receipts.is_some() && physical_design.is_none() {
+        let physical_design_mutation_receipts =
+            if operator_config
+                .as_ref()
+                .is_some_and(|operator| operator.allow_physical_design_receipt_read())
+            {
+                match (
+                    manifest_physical_design_mutation_receipts,
+                    self.physical_design_mutation_receipts,
+                ) {
+                    (Some(manifest), Some(builder)) if manifest != builder => {
+                        return Err(PostgresTcpServerError::PhysicalDesignMutationReceipts(Box::new(
+                        ServerPhysicalDesignMutationReceiptStartupError::OperatorPolicyMismatch,
+                    )));
+                    }
+                    (Some(manifest), _) => Some(manifest),
+                    (None, _) => {
+                        return Err(PostgresTcpServerError::PhysicalDesignMutationReceipts(Box::new(
+                        ServerPhysicalDesignMutationReceiptStartupError::OperatorPolicyMismatch,
+                    )));
+                    }
+                }
+            } else {
+                self.physical_design_mutation_receipts
+                    .or(manifest_physical_design_mutation_receipts)
+            };
+        if physical_design_mutation_receipts.is_some() && physical_design.is_none() {
             return Err(PostgresTcpServerError::PhysicalDesignMutationReceipts(
                 Box::new(ServerPhysicalDesignMutationReceiptStartupError::PhysicalDesignRequired),
             ));
@@ -195,7 +221,7 @@ impl PostgresTcpServer {
             adaptive_mode,
             physical_design,
             physical_columnar_apply,
-            self.physical_design_mutation_receipts,
+            physical_design_mutation_receipts,
         )?;
         let listener = match TcpListener::bind(listen) {
             Ok(listener) => listener,

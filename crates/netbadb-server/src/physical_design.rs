@@ -31,8 +31,9 @@ use crate::physical_design_receipts::{
     ServerPhysicalDesignMutationReceiptControlError, ServerPhysicalDesignMutationReceiptCursor,
     ServerPhysicalDesignMutationReceiptId, ServerPhysicalDesignMutationReceiptJournal,
     ServerPhysicalDesignMutationReceiptOutcome, ServerPhysicalDesignMutationReceiptPage,
-    ServerPhysicalDesignMutationReceiptScopedPage, ServerPhysicalDesignMutationReceiptStartupError,
-    ServerPhysicalDesignMutationReceiptStatus, ServerPhysicalDesignMutationSource,
+    ServerPhysicalDesignMutationReceiptReference, ServerPhysicalDesignMutationReceiptScopedPage,
+    ServerPhysicalDesignMutationReceiptStartupError, ServerPhysicalDesignMutationReceiptStatus,
+    ServerPhysicalDesignMutationSource,
 };
 
 pub(crate) struct ServerHostObservationConfig {
@@ -395,6 +396,21 @@ pub(crate) struct ServerApprovedPhysicalIndexApplyReport {
     pub(crate) candidate: PhysicalIndexCandidate,
     pub(crate) index_name: IndexName,
     pub(crate) outcome: ServerApprovedPhysicalIndexApplyOutcome,
+}
+
+#[derive(Debug)]
+pub(crate) struct ServerPhysicalDesignMutationControlReply<T, E> {
+    pub(crate) receipt: Option<ServerPhysicalDesignMutationReceiptReference>,
+    pub(crate) result: Result<T, E>,
+}
+
+impl<T, E> ServerPhysicalDesignMutationControlReply<T, E> {
+    fn without_receipt(result: Result<T, E>) -> Self {
+        Self {
+            receipt: None,
+            result,
+        }
+    }
 }
 
 struct ServerPhysicalDesignRuntimeIdentity;
@@ -976,9 +992,13 @@ impl ServerPhysicalDesignControlHandle {
         expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
         candidate: PhysicalIndexCandidate,
         index_name: IndexName,
-    ) -> Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError> {
+    ) -> ServerPhysicalDesignMutationControlReply<
+        ServerApprovedPhysicalIndexApplyReport,
+        ServerPhysicalDesignControlError,
+    > {
         let (reply, response) = mpsc::sync_channel(1);
-        self.requests
+        if self
+            .requests
             .send(ServerPhysicalDesignControlRequest::ApplyApprovedIndex {
                 runtime_token_matches,
                 expected_evidence_epoch,
@@ -986,10 +1006,17 @@ impl ServerPhysicalDesignControlHandle {
                 index_name,
                 reply,
             })
-            .map_err(|_| ServerPhysicalDesignControlError::ServerStopped)?;
-        response
-            .recv()
-            .map_err(|_| ServerPhysicalDesignControlError::MutationOutcomeUncertain)?
+            .is_err()
+        {
+            return ServerPhysicalDesignMutationControlReply::without_receipt(Err(
+                ServerPhysicalDesignControlError::ServerStopped,
+            ));
+        }
+        response.recv().unwrap_or_else(|_| {
+            ServerPhysicalDesignMutationControlReply::without_receipt(Err(
+                ServerPhysicalDesignControlError::MutationOutcomeUncertain,
+            ))
+        })
     }
 
     pub(crate) fn apply_approved_columnar(
@@ -999,10 +1026,13 @@ impl ServerPhysicalDesignControlHandle {
         candidate: PhysicalColumnarCandidate,
         mode: PhysicalColumnarDesignMode,
         placement: ServerPhysicalColumnarPlacementKey,
-    ) -> Result<ServerApprovedPhysicalColumnarApplyReport, ServerPhysicalColumnarDesignControlError>
-    {
+    ) -> ServerPhysicalDesignMutationControlReply<
+        ServerApprovedPhysicalColumnarApplyReport,
+        ServerPhysicalColumnarDesignControlError,
+    > {
         let (reply, response) = mpsc::sync_channel(1);
-        self.requests
+        if self
+            .requests
             .send(ServerPhysicalDesignControlRequest::ApplyApprovedColumnar {
                 runtime_token_matches,
                 expected_evidence_epoch,
@@ -1011,10 +1041,17 @@ impl ServerPhysicalDesignControlHandle {
                 placement,
                 reply,
             })
-            .map_err(|_| ServerPhysicalColumnarDesignControlError::ServerStopped)?;
-        response
-            .recv()
-            .map_err(|_| ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain)?
+            .is_err()
+        {
+            return ServerPhysicalDesignMutationControlReply::without_receipt(Err(
+                ServerPhysicalColumnarDesignControlError::ServerStopped,
+            ));
+        }
+        response.recv().unwrap_or_else(|_| {
+            ServerPhysicalDesignMutationControlReply::without_receipt(Err(
+                ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain,
+            ))
+        })
     }
 
     /// Compares and rotates as one command in the sole Database worker.
@@ -1100,7 +1137,10 @@ pub(crate) enum ServerPhysicalDesignControlRequest {
         candidate: PhysicalIndexCandidate,
         index_name: IndexName,
         reply: SyncSender<
-            Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError>,
+            ServerPhysicalDesignMutationControlReply<
+                ServerApprovedPhysicalIndexApplyReport,
+                ServerPhysicalDesignControlError,
+            >,
         >,
     },
     ApplyApprovedColumnar {
@@ -1110,7 +1150,7 @@ pub(crate) enum ServerPhysicalDesignControlRequest {
         mode: PhysicalColumnarDesignMode,
         placement: ServerPhysicalColumnarPlacementKey,
         reply: SyncSender<
-            Result<
+            ServerPhysicalDesignMutationControlReply<
                 ServerApprovedPhysicalColumnarApplyReport,
                 ServerPhysicalColumnarDesignControlError,
             >,
@@ -1192,7 +1232,10 @@ pub(crate) enum ServerPhysicalDesignWorkerCommand {
         candidate: PhysicalIndexCandidate,
         index_name: IndexName,
         reply: SyncSender<
-            Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError>,
+            ServerPhysicalDesignMutationControlReply<
+                ServerApprovedPhysicalIndexApplyReport,
+                ServerPhysicalDesignControlError,
+            >,
         >,
     },
     ApplyApprovedColumnar {
@@ -1202,7 +1245,7 @@ pub(crate) enum ServerPhysicalDesignWorkerCommand {
         mode: PhysicalColumnarDesignMode,
         placement: ServerPhysicalColumnarPlacementKey,
         reply: SyncSender<
-            Result<
+            ServerPhysicalDesignMutationControlReply<
                 ServerApprovedPhysicalColumnarApplyReport,
                 ServerPhysicalColumnarDesignControlError,
             >,
@@ -1768,13 +1811,26 @@ impl ServerPhysicalDesignRuntime {
         expected_evidence_epoch: PhysicalDesignEvidenceEpoch,
         candidate: PhysicalIndexCandidate,
         index_name: IndexName,
-    ) -> Result<ServerApprovedPhysicalIndexApplyReport, ServerPhysicalDesignControlError> {
-        let receipt_id = self.begin_index_receipt(
+    ) -> ServerPhysicalDesignMutationControlReply<
+        ServerApprovedPhysicalIndexApplyReport,
+        ServerPhysicalDesignControlError,
+    > {
+        let receipt_id = match self.begin_index_receipt(
             ServerPhysicalDesignMutationSource::LocalOperator,
             expected_evidence_epoch,
             candidate,
             index_name.clone(),
-        )?;
+        ) {
+            Ok(receipt_id) => receipt_id,
+            Err(error) => {
+                return ServerPhysicalDesignMutationControlReply::without_receipt(Err(error));
+            }
+        };
+        let receipt = receipt_id.and_then(|receipt_id| {
+            self.mutation_receipts
+                .as_ref()
+                .map(|journal| journal.reference(receipt_id))
+        });
         let result = self.apply_approved_index_unreceipted(
             database,
             runtime_token_matches,
@@ -1782,7 +1838,7 @@ impl ServerPhysicalDesignRuntime {
             candidate,
             index_name,
         );
-        self.finish_index_result(receipt_id, result, |report| match report.outcome {
+        let result = self.finish_index_result(receipt_id, result, |report| match report.outcome {
             ServerApprovedPhysicalIndexApplyOutcome::Created { index_id } => {
                 ServerPhysicalDesignMutationReceiptOutcome::CreatedIndex { index_id }
             }
@@ -1792,7 +1848,8 @@ impl ServerPhysicalDesignRuntime {
             ServerApprovedPhysicalIndexApplyOutcome::AlreadyCovered => {
                 ServerPhysicalDesignMutationReceiptOutcome::AlreadyCovered
             }
-        })
+        });
+        ServerPhysicalDesignMutationControlReply { receipt, result }
     }
 
     fn apply_approved_index_unreceipted(
@@ -1875,22 +1932,34 @@ impl ServerPhysicalDesignRuntime {
         candidate: PhysicalColumnarCandidate,
         mode: PhysicalColumnarDesignMode,
         placement: ServerPhysicalColumnarPlacementKey,
-    ) -> Result<ServerApprovedPhysicalColumnarApplyReport, ServerPhysicalColumnarDesignControlError>
-    {
-        let directory = self
-            .columnar_apply
-            .as_ref()
-            .ok_or(ServerPhysicalColumnarDesignControlError::ColumnarApplyNotEnabled)?
-            .root()
-            .join(placement.as_str());
-        let receipt_id = self.begin_columnar_receipt(
+    ) -> ServerPhysicalDesignMutationControlReply<
+        ServerApprovedPhysicalColumnarApplyReport,
+        ServerPhysicalColumnarDesignControlError,
+    > {
+        let Some(columnar_apply) = self.columnar_apply.as_ref() else {
+            return ServerPhysicalDesignMutationControlReply::without_receipt(Err(
+                ServerPhysicalColumnarDesignControlError::ColumnarApplyNotEnabled,
+            ));
+        };
+        let directory = columnar_apply.root().join(placement.as_str());
+        let receipt_id = match self.begin_columnar_receipt(
             ServerPhysicalDesignMutationSource::LocalOperator,
             expected_evidence_epoch,
             candidate.clone(),
             mode,
             placement.clone(),
             directory,
-        )?;
+        ) {
+            Ok(receipt_id) => receipt_id,
+            Err(error) => {
+                return ServerPhysicalDesignMutationControlReply::without_receipt(Err(error));
+            }
+        };
+        let receipt = receipt_id.and_then(|receipt_id| {
+            self.mutation_receipts
+                .as_ref()
+                .map(|journal| journal.reference(receipt_id))
+        });
         let result = self.apply_approved_columnar_unreceipted(
             database,
             runtime_token_matches,
@@ -1899,17 +1968,21 @@ impl ServerPhysicalDesignRuntime {
             mode,
             placement,
         );
-        self.finish_columnar_result(receipt_id, result, |report| match report.outcome {
-            ServerApprovedPhysicalColumnarApplyOutcome::Created { projection_id } => {
-                ServerPhysicalDesignMutationReceiptOutcome::CreatedColumnar { projection_id }
-            }
-            ServerApprovedPhysicalColumnarApplyOutcome::AlreadyApplied { projection_id } => {
-                ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedColumnar { projection_id }
-            }
-            ServerApprovedPhysicalColumnarApplyOutcome::AlreadyCovered => {
-                ServerPhysicalDesignMutationReceiptOutcome::AlreadyCovered
-            }
-        })
+        let result =
+            self.finish_columnar_result(receipt_id, result, |report| match report.outcome {
+                ServerApprovedPhysicalColumnarApplyOutcome::Created { projection_id } => {
+                    ServerPhysicalDesignMutationReceiptOutcome::CreatedColumnar { projection_id }
+                }
+                ServerApprovedPhysicalColumnarApplyOutcome::AlreadyApplied { projection_id } => {
+                    ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedColumnar {
+                        projection_id,
+                    }
+                }
+                ServerApprovedPhysicalColumnarApplyOutcome::AlreadyCovered => {
+                    ServerPhysicalDesignMutationReceiptOutcome::AlreadyCovered
+                }
+            });
+        ServerPhysicalDesignMutationControlReply { receipt, result }
     }
 
     fn apply_approved_columnar_unreceipted(
@@ -2223,7 +2296,10 @@ pub(crate) fn forward_physical_design_control_requests<F>(
                 })
                 .is_err()
                 {
-                    let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
+                    let _ =
+                        fallback.send(ServerPhysicalDesignMutationControlReply::without_receipt(
+                            Err(ServerPhysicalDesignControlError::ServerStopped),
+                        ));
                 }
             }
             ServerPhysicalDesignControlRequest::ApplyApprovedColumnar {
@@ -2246,7 +2322,9 @@ pub(crate) fn forward_physical_design_control_requests<F>(
                 .is_err()
                 {
                     let _ =
-                        fallback.send(Err(ServerPhysicalColumnarDesignControlError::ServerStopped));
+                        fallback.send(ServerPhysicalDesignMutationControlReply::without_receipt(
+                            Err(ServerPhysicalColumnarDesignControlError::ServerStopped),
+                        ));
                 }
             }
             ServerPhysicalDesignControlRequest::RotateEvidenceIfEpoch { expected, reply } => {
@@ -2314,13 +2392,13 @@ pub(crate) fn handle_disabled_physical_design_worker_command(
             ));
         }
         ServerPhysicalDesignWorkerCommand::ApplyApprovedIndex { reply, .. } => {
-            let _ = reply.send(Err(
-                ServerPhysicalDesignControlError::PhysicalDesignNotEnabled,
+            let _ = reply.send(ServerPhysicalDesignMutationControlReply::without_receipt(
+                Err(ServerPhysicalDesignControlError::PhysicalDesignNotEnabled),
             ));
         }
         ServerPhysicalDesignWorkerCommand::ApplyApprovedColumnar { reply, .. } => {
-            let _ = reply.send(Err(
-                ServerPhysicalColumnarDesignControlError::PhysicalDesignNotEnabled,
+            let _ = reply.send(ServerPhysicalDesignMutationControlReply::without_receipt(
+                Err(ServerPhysicalColumnarDesignControlError::PhysicalDesignNotEnabled),
             ));
         }
         ServerPhysicalDesignWorkerCommand::RotateEvidenceIfEpoch { reply, .. } => {
@@ -2374,7 +2452,7 @@ mod tests {
             ServerPhysicalColumnarPlacementKey::new("not-sent").unwrap(),
         );
         assert!(matches!(
-            stopped,
+            stopped.result,
             Err(ServerPhysicalColumnarDesignControlError::ServerStopped)
         ));
 
@@ -2397,7 +2475,7 @@ mod tests {
         );
         worker.join().unwrap();
         assert!(matches!(
-            uncertain,
+            uncertain.result,
             Err(ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain)
         ));
     }
@@ -2599,7 +2677,7 @@ mod tests {
                 reply,
             },
         );
-        response.recv().expect("approved apply response")
+        response.recv().expect("approved apply response").result
     }
 
     fn receipts(
@@ -3868,10 +3946,15 @@ mod tests {
                 &mut server,
                 &adaptive,
                 &design_control,
-                true,
-                false,
-                None,
-                Some(crate::operator::OperatorPhysicalDesignRuntimeToken::from_bytes([0x11; 16])),
+                crate::operator::OperatorListenerPolicy::new(
+                    true,
+                    false,
+                    false,
+                    None,
+                    Some(
+                        crate::operator::OperatorPhysicalDesignRuntimeToken::from_bytes([0x11; 16]),
+                    ),
+                ),
             )
             .unwrap();
         });
@@ -3881,19 +3964,23 @@ mod tests {
             evidence_epoch,
             TABLE_ID.0
         );
-        let mut frame = b"NBOP\0\x04\0\0".to_vec();
+        let mut frame = b"NBOP\0\x05\0\0".to_vec();
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload.as_bytes());
         client.write_all(&frame).unwrap();
         let mut header = [0_u8; 12];
         client.read_exact(&mut header).unwrap();
-        assert_eq!(&header[..8], b"NBOP\0\x04\0\0");
+        assert_eq!(&header[..8], b"NBOP\0\x05\0\0");
         let length = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
         let mut response = vec![0_u8; length];
         client.read_exact(&mut response).unwrap();
         let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["outcome"], "error");
-        assert_eq!(response["error"]["code"], "internal");
+        assert_eq!(
+            response["error"]["code"],
+            "physical_design_mutation_outcome_uncertain"
+        );
+        assert!(response["error"]["receipt"].is_object());
         assert!(
             response["error"]["message"]
                 .as_str()

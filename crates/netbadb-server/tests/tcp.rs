@@ -17,8 +17,8 @@ use netbadb_protocol::{
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
-    AuthorizationConfigError, ManifestError, OperatorAdaptiveModeV4, OperatorClientError,
-    OperatorErrorCodeV4, OperatorPhysicalDesignDecisionV4, OperatorPhysicalDesignNoActionReasonV4,
+    AuthorizationConfigError, ManifestError, OperatorAdaptiveModeV5, OperatorClientError,
+    OperatorErrorCodeV5, OperatorPhysicalDesignDecisionV5, OperatorPhysicalDesignNoActionReasonV5,
     ServerAdaptiveControlError, ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig,
     ServerAdaptiveMode, ServerConfig, ServerHandle, ServerOperatorClient,
     ServerPhysicalColumnarApplyConfig, ServerPhysicalColumnarApplyStartupError,
@@ -48,7 +48,7 @@ fn cleanup(directory: &Path) {
 fn raw_operator_request(socket: &Path, request: serde_json::Value) -> serde_json::Value {
     let payload = serde_json::to_vec(&request).unwrap();
     let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
-    let mut frame = b"NBOP\0\x04\0\0".to_vec();
+    let mut frame = b"NBOP\0\x05\0\0".to_vec();
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     frame.extend_from_slice(&payload);
     stream.write_all(&frame).unwrap();
@@ -56,7 +56,7 @@ fn raw_operator_request(socket: &Path, request: serde_json::Value) -> serde_json
     let mut header = [0_u8; 12];
     stream.read_exact(&mut header).unwrap();
     assert_eq!(&header[..4], b"NBOP");
-    assert_eq!(&header[4..6], &[0, 4]);
+    assert_eq!(&header[4..6], &[0, 5]);
     assert_eq!(&header[6..8], &[0, 0]);
     let length = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
     let mut response = vec![0_u8; length];
@@ -187,7 +187,7 @@ fn manifest_json_with_transport(
     let tls = tls.map_or_else(String::new, |tls| format!("\"tls\": {tls},"));
     format!(
         r#"{{
-            "version": 9,
+            "version": 10,
             "listen": "127.0.0.1:0",
             {limits}
             {tls}
@@ -285,7 +285,7 @@ fn create_two_table_server(name: &str, authorization: &str) -> (PathBuf, ServerH
         &manifest,
         format!(
             r#"{{
-                "version":9,
+                "version":10,
                 "listen":"127.0.0.1:0",
                 "authorization":{authorization},
                 "tables":[
@@ -527,7 +527,7 @@ fn native_programmatic_columnar_apply_uses_manifest_advisor_and_approved_root() 
 
 #[cfg(unix)]
 #[test]
-fn nbop_v4_columnar_apply_end_to_end_preserves_retry_and_guard_invariants() {
+fn nbop_v5_columnar_apply_end_to_end_preserves_retry_and_guard_invariants() {
     let directory = test_directory("operator-columnar-e2e");
     cleanup(&directory);
     std::fs::create_dir_all(&directory).unwrap();
@@ -563,11 +563,16 @@ fn nbop_v4_columnar_apply_end_to_end_preserves_retry_and_guard_invariants() {
         "allow_snapshot": true,
         "allow_incremental": false
     });
+    value["physical_design"]["mutation_receipts"] = serde_json::json!({
+        "path": "physical-design-receipts.nbmr",
+        "max_file_bytes": 67_108_864
+    });
     value["operator"] = serde_json::json!({
         "unix_socket": socket,
         "io_timeout_ms": 1000,
         "allow_physical_index_apply": false,
-        "allow_physical_columnar_apply": true
+        "allow_physical_columnar_apply": true,
+            "allow_physical_design_receipt_read": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
 
@@ -624,12 +629,18 @@ fn nbop_v4_columnar_apply_end_to_end_preserves_retry_and_guard_invariants() {
         serde_json::json!("created")
     );
     assert!(placements.join("created").is_dir());
+    assert!(created["result"]["apply"]["receipt"].is_object());
     assert_private(&created);
 
     let retry = apply(11, &token, epoch, vec![1], "snapshot", "created");
     assert_eq!(
         retry["result"]["apply"]["outcome"]["kind"],
         serde_json::json!("already_applied")
+    );
+    assert!(retry["result"]["apply"]["receipt"].is_object());
+    assert_ne!(
+        created["result"]["apply"]["receipt"]["receipt_id"],
+        retry["result"]["apply"]["receipt"]["receipt_id"]
     );
     let stale_retry = apply(
         12,
@@ -656,6 +667,7 @@ fn nbop_v4_columnar_apply_end_to_end_preserves_retry_and_guard_invariants() {
         stale_runtime["error"]["code"],
         serde_json::json!("physical_design_runtime_changed")
     );
+    assert!(stale_runtime["error"]["receipt"].is_object());
     assert!(!placements.join("stale-runtime").exists());
     assert_private(&stale_runtime);
 
@@ -697,6 +709,7 @@ fn nbop_v4_columnar_apply_end_to_end_preserves_retry_and_guard_invariants() {
         empty["error"]["message"],
         serde_json::json!("columns must contain at least one column")
     );
+    assert!(empty["error"]["receipt"].is_null());
     assert!(!placements.join("empty").exists());
     for response in [
         &retry,
@@ -818,7 +831,8 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         "unix_socket": socket,
         "io_timeout_ms": 1000,
         "allow_physical_index_apply": true,
-        "allow_physical_columnar_apply": false
+        "allow_physical_columnar_apply": false,
+            "allow_physical_design_receipt_read": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&manifest_value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -858,12 +872,12 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     assert!(matches!(
         operator.rotate_evidence(0),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV4::AdaptiveNotEnabled
+            if error.code == OperatorErrorCodeV5::AdaptiveNotEnabled
     ));
     assert!(matches!(
         operator.physical_design_recommendations(),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV4::PhysicalDesignNoEvidence
+            if error.code == OperatorErrorCodeV5::PhysicalDesignNoEvidence
     ));
 
     let mut client = Client::connect(server.local_addr());
@@ -899,7 +913,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         .unwrap();
     assert_eq!(
         name_candidate.decision,
-        OperatorPhysicalDesignDecisionV4::Recommend {}
+        OperatorPhysicalDesignDecisionV5::Recommend {}
     );
 
     client.request(
@@ -916,7 +930,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     );
     let columnar = operator.physical_design_recommendations().unwrap();
     assert!(columnar.columnar_candidates.iter().any(|entry| {
-        entry.columns == vec![1] && entry.decision == OperatorPhysicalDesignDecisionV4::Recommend {}
+        entry.columns == vec![1] && entry.decision == OperatorPhysicalDesignDecisionV5::Recommend {}
     }));
     assert!(
         columnar
@@ -967,14 +981,9 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
             2,
             index_name.as_str().to_owned(),
         ),
-        Err(OperatorClientError::MutationOutcomeUncertain {
-            recovery_required: false,
-            source,
-        }) if matches!(
-            &*source,
-            OperatorClientError::Remote(error)
-                if error.code == OperatorErrorCodeV4::PhysicalIndexApplyFailed
-        )
+        Err(OperatorClientError::Remote(error))
+            if error.code == OperatorErrorCodeV5::PhysicalIndexApplyFailed
+                && error.receipt.is_none()
     ));
     client.request(7, ClientMessage::Rollback);
 
@@ -990,7 +999,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         }
     }))
     .unwrap();
-    let mut lost_response_frame = b"NBOP\0\x04\0\0".to_vec();
+    let mut lost_response_frame = b"NBOP\0\x05\0\0".to_vec();
     lost_response_frame.extend_from_slice(&(lost_response_payload.len() as u32).to_be_bytes());
     lost_response_frame.extend_from_slice(&lost_response_payload);
     let mut lost_response =
@@ -1012,7 +1021,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         .unwrap();
     assert!(matches!(
         operator_retry.outcome,
-        netbadb_server::OperatorPhysicalIndexApplyOutcomeV4::AlreadyApplied { .. }
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV5::AlreadyApplied { .. }
     ));
     let operator_covered = operator
         .apply_physical_index(
@@ -1025,7 +1034,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
         .unwrap();
     assert_eq!(
         operator_covered.outcome,
-        netbadb_server::OperatorPhysicalIndexApplyOutcomeV4::AlreadyCovered
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV5::AlreadyCovered
     );
     let created = design.apply_index(&proposal, index_name.clone()).unwrap();
     assert!(matches!(
@@ -1054,8 +1063,8 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
             .find(|entry| entry.column_id == 2)
             .unwrap()
             .decision,
-        OperatorPhysicalDesignDecisionV4::NoAction {
-            reason: OperatorPhysicalDesignNoActionReasonV4::ExistingDesignCovers
+        OperatorPhysicalDesignDecisionV5::NoAction {
+            reason: OperatorPhysicalDesignNoActionReasonV5::ExistingDesignCovers
         }
     );
 
@@ -1067,7 +1076,7 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
     assert!(matches!(
         operator.rotate_physical_design_evidence(epoch.0),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV4::PhysicalDesignEvidenceEpochChanged
+            if error.code == OperatorErrorCodeV5::PhysicalDesignEvidenceEpochChanged
     ));
     assert_eq!(design.status().unwrap().evidence.epoch.0, rotated.new_epoch);
     assert_eq!(
@@ -1168,7 +1177,8 @@ fn old_operator_approval_only_recognizes_exact_durable_truth_after_restart() {
         "unix_socket": socket,
         "io_timeout_ms": 1000,
         "allow_physical_index_apply": true,
-        "allow_physical_columnar_apply": false
+        "allow_physical_columnar_apply": false,
+            "allow_physical_design_receipt_read": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -1192,7 +1202,7 @@ fn old_operator_approval_only_recognizes_exact_durable_truth_after_restart() {
         .unwrap();
     assert!(matches!(
         created.outcome,
-        netbadb_server::OperatorPhysicalIndexApplyOutcomeV4::Created { .. }
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV5::Created { .. }
     ));
     drop(first_client);
     first_server.shutdown().unwrap();
@@ -1227,7 +1237,7 @@ fn old_operator_approval_only_recognizes_exact_durable_truth_after_restart() {
         .unwrap();
     assert!(matches!(
         recovered.outcome,
-        netbadb_server::OperatorPhysicalIndexApplyOutcomeV4::AlreadyApplied { .. }
+        netbadb_server::OperatorPhysicalIndexApplyOutcomeV5::AlreadyApplied { .. }
     ));
     second_server.shutdown().unwrap();
     assert!(!socket.exists());
@@ -1289,7 +1299,8 @@ fn native_physical_design_proposal_is_bound_to_one_worker_runtime() {
         "unix_socket": socket,
         "io_timeout_ms": 1000,
         "allow_physical_index_apply": false,
-        "allow_physical_columnar_apply": false
+        "allow_physical_columnar_apply": false,
+            "allow_physical_design_receipt_read": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&manifest_value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -1475,7 +1486,8 @@ fn native_adaptive_and_physical_design_share_one_successful_query_report() {
         "unix_socket": socket,
         "io_timeout_ms": 1000,
         "allow_physical_index_apply": false,
-        "allow_physical_columnar_apply": false
+        "allow_physical_columnar_apply": false,
+            "allow_physical_design_receipt_read": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -1656,7 +1668,8 @@ fn native_query_continues_across_live_operator_status_and_rotation() {
         "unix_socket": socket,
         "io_timeout_ms": 1000,
         "allow_physical_index_apply": false,
-        "allow_physical_columnar_apply": false
+        "allow_physical_columnar_apply": false,
+            "allow_physical_design_receipt_read": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -1666,13 +1679,13 @@ fn native_query_continues_across_live_operator_status_and_rotation() {
     let status = operator.status().unwrap();
     assert_eq!(
         status.adaptive.unwrap().mode,
-        OperatorAdaptiveModeV4::FeedbackOnly
+        OperatorAdaptiveModeV5::FeedbackOnly
     );
     assert!(status.physical_design.is_none());
     assert!(matches!(
         operator.physical_design_recommendations(),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV4::PhysicalDesignNotEnabled
+            if error.code == OperatorErrorCodeV5::PhysicalDesignNotEnabled
     ));
 
     let mut client = Client::connect(server.local_addr());

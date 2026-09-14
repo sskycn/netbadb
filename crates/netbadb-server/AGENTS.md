@@ -83,7 +83,9 @@
   recovery authority. It MUST NOT create an automatic apply path; an operator
   wire path must satisfy the explicit approval rules below.
 - Optional Physical Design mutation receipts MUST remain a bounded,
-  programmatic-only, Server-owned NBMR journal in the sole Database worker.
+  Server-owned NBMR journal in the sole Database worker. Manifest and
+  programmatic configuration select deployment/runtime ownership but never
+  create another mutation authority.
   A durable Begin precedes every Server Index or Columnar apply control, and a
   durable coarse Outcome follows each definitive result. Receipt failure MUST
   NOT roll back Database truth, mutate evidence, poison client protocol state,
@@ -97,6 +99,14 @@
   journal incarnation and nonzero receipt ID. Replacing a journal creates a new
   receipt namespace, and numeric IDs MUST NOT be silently reinterpreted across
   namespaces; reopening or migrating the same v2/v3 journal preserves its namespace.
+- External Physical Design receipt identity MUST contain both the durable NBMR
+  journal incarnation and nonzero receipt ID. Operator reads MUST remain scoped
+  to the currently configured journal and MUST reject a cursor from another
+  namespace rather than restart or scan old journals.
+- Receipt references correlate mutation results; they MUST NOT become replay,
+  retry, or mutation capabilities. No NBOP receipt surface may expose an NBMR
+  filesystem path, private Columnar recovery path, database incarnation,
+  runtime token inside a receipt, SQL, principal, session, or network address.
 - Programmatic Server Columnar apply MUST use a configured Server-owned
   placement namespace. The control caller supplies only a validated logical
   placement key, never an arbitrary filesystem path, and the resolved
@@ -108,11 +118,11 @@
 - Durable physical-index mutation from the local operator plane MUST require
   explicit deployment authorization in addition to filesystem access.
 - Durable physical-Columnar mutation from the local operator plane MUST require
-  both the explicit Manifest v9 `allow_physical_columnar_apply` permission and
+  both the explicit Manifest v10 `allow_physical_columnar_apply` permission and
   the complete `physical_design.columnar_apply` placement policy. The policy
   root MUST already exist, MUST be revalidated before each worker command, and
   MUST never cross the operator wire as a path.
-- NBOP v4 Columnar approval MUST contain an exact runtime token and evidence
+- NBOP v5 Columnar approval MUST contain an exact runtime token and evidence
   epoch, table ID, ordered columns, explicit mode, and logical placement key.
   The listener MUST check permission before forwarding, while the sole
   Database worker MUST perform exact-location retry recognition, mode/token/

@@ -1,5 +1,9 @@
 # NetbaDB deployment manifest v9
 
+> Historical deployment contract. Current `netbadbd` requires Manifest v10;
+> v9 is explicitly rejected. The remainder of this document preserves the v9
+> contract as shipped.
+
 Deployment Manifest v9 is the only current `netbadbd` startup configuration.
 Versions 1 through 8 are not decoded by compatibility shims: versions 1 through
 8 and future versions are rejected explicitly. The manifest is strict, loaded

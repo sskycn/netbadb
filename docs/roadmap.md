@@ -1,5 +1,30 @@
 # NetbaDB roadmap
 
+## Durable receipt exposure (Adaptive Operations Phase 32 complete)
+
+- upgraded the strict deployment contract to Manifest v10 with optional
+  manifest-owned NBMR v3 configuration and an independent required operator
+  receipt-read permission;
+- pinned an externally readable journal to the exact manifest-derived canonical
+  path and capacity while retaining builder override authority when reads are
+  disabled, identically for Native and PostgreSQL startup;
+- upgraded the local operator contract to NBOP v5 with scoped receipt status
+  and pagination, complete logical source/target/outcome presentation, and no
+  path or private recovery identity on the wire;
+- correlated one-command Index/Columnar apply success and post-Begin semantic
+  errors to the durable journal-incarnation/receipt-ID reference, with null
+  references for listener rejection, Begin failure, and unjournaled apply;
+- added explicit receipt capacity/unavailable/read/cursor/journal-change errors
+  and Outcome-durability uncertainty distinct from whole-response loss;
+- added CLI status/list/scoped continuation and receipt-aware apply/error
+  rendering without automatic query, retry, replay, or recovery;
+- retained NBMR v3, every Database format, Native Protocol v2, PostgreSQL wire,
+  Inspection JSON v7, SQL, SDK contracts, and Core mutation authority.
+
+See [`adaptive-operations-phase32.md`](adaptive-operations-phase32.md),
+[`server-manifest-v10.md`](server-manifest-v10.md), and
+[`server-operator-protocol-v5.md`](server-operator-protocol-v5.md).
+
 ## Stable receipt namespaces and protected framing (Adaptive Operations Phase 31 complete)
 
 - retained the NBMR v2 nonzero durable journal incarnation and upgraded current
@@ -21,8 +46,8 @@
   Database persistent format, Manifest v9, NBOP v4, Native Protocol v2,
   PostgreSQL wire behavior, Inspection JSON v7, SDK and CLI contracts.
 
-Receipt externalization and its exact wire encoding remain deferred to the
-next phase. See [`adaptive-operations-phase31.md`](adaptive-operations-phase31.md)
+Phase 32 now externalizes this state without changing the Phase 31 persistent
+format. See [`adaptive-operations-phase31.md`](adaptive-operations-phase31.md)
 and [`physical-design-mutation-receipts-v3.md`](physical-design-mutation-receipts-v3.md).
 
 ## Durable Server mutation receipts (Adaptive Operations Phase 30 complete)

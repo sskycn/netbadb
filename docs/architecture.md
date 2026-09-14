@@ -438,8 +438,19 @@ Begin recovery space is admitted before publication, and ambiguous legacy
 tails fail closed. Historical `.next` objects are untouched. Scoped pagination
 still rejects another journal namespace, and read-only status/receipt
 inspection remain available during recovery gating. Mutation/reconciliation
-authority and all Database persistent contracts remain unchanged; receipt wire
-externalization is still deferred.
+authority and all Database persistent contracts remain unchanged.
+
+[Adaptive Operations Phase 32](adaptive-operations-phase32.md) externalizes
+that operational memory through strict Manifest v10 and local NBOP v5.
+Manifest receipt ownership and operator read authorization remain independent;
+read authorization pins the current journal's canonical configuration. NBOP
+uses only journal incarnation plus nonzero receipt ID for references and
+continuation, rejects replacement-journal cursors, and correlates one worker
+apply command with its durable Begin identity. Reads are pure during recovery
+gating, Outcome-durability ambiguity is explicit, response loss invents no
+identity, and no receipt becomes replay or mutation authority. NBMR stays v3;
+Core, SQL, Database formats, Native Protocol v2, PostgreSQL wire, and Inspection
+JSON v7 are unchanged.
 
 [Adaptive Operations Phase 30](adaptive-operations-phase30.md) added the
 optional Server-owned [NBMR v1](physical-design-mutation-receipts-v1.md)
@@ -468,7 +479,7 @@ defer retirement until the last reader is gone. See [Columnar Phase
 The `netbadb` CLI is an offline adapter, not a new compiler or planner layer:
 
 ```text
-deployment manifest v9
+deployment manifest v10
           ↓
 netbadb-server ServerConfig bootstrap
           ↓

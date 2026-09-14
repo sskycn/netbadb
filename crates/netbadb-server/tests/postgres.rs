@@ -12,9 +12,9 @@ use netbadb_core::{
 use netbadb_pgwire::{CANCEL_REQUEST_CODE, PROTOCOL_VERSION_3, SSL_REQUEST_CODE};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_server::{
-    OperatorAdaptiveModeV4, OperatorClientError, OperatorErrorCodeV4,
-    OperatorPhysicalDesignDecisionV4, OperatorPhysicalDesignRecordErrorV4,
-    OperatorPhysicalIndexApplyOutcomeV4, PostgresTcpServer, PostgresTcpServerError,
+    OperatorAdaptiveModeV5, OperatorClientError, OperatorErrorCodeV5,
+    OperatorPhysicalDesignDecisionV5, OperatorPhysicalDesignRecordErrorV5,
+    OperatorPhysicalIndexApplyOutcomeV5, PostgresTcpServer, PostgresTcpServerError,
     ServerAdaptiveControlError, ServerAdaptiveDriverConfig, ServerAdaptiveFeedbackConfig,
     ServerAdaptiveMode, ServerConfig, ServerOperatorClient, ServerPhysicalColumnarApplyConfig,
     ServerPhysicalColumnarApplyStartupError, ServerPhysicalColumnarPlacementKey,
@@ -103,7 +103,7 @@ fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
     std::fs::write(
         &manifest,
         r#"{
-            "version": 9,
+            "version": 10,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -163,7 +163,7 @@ fn postgres_programmatic_columnar_apply_has_native_builder_parity() {
     let manifest = directory.join("server.json");
     let mut value: serde_json::Value = serde_json::from_str(
         r#"{
-            "version": 9,
+            "version": 10,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": false,
@@ -265,7 +265,7 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
     std::fs::write(
         &manifest,
         r#"{
-            "version": 9,
+            "version": 10,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -317,7 +317,8 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
         "unix_socket": socket,
         "io_timeout_ms": 1000,
         "allow_physical_index_apply": false,
-        "allow_physical_columnar_apply": false
+        "allow_physical_columnar_apply": false,
+        "allow_physical_design_receipt_read": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -358,7 +359,7 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
     assert!(matches!(
         operator.physical_design_recommendations(),
         Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV4::PhysicalDesignNoEvidence
+            if error.code == OperatorErrorCodeV5::PhysicalDesignNoEvidence
     ));
 
     let mut stream = TcpStream::connect(server.local_addr()).unwrap();
@@ -382,7 +383,7 @@ fn postgres_physical_design_control_is_independent_and_telemetry_errors_are_nonf
             .unwrap()
             .diagnostics
             .last_record_error,
-        Some(OperatorPhysicalDesignRecordErrorV4::GlobalVisibilityRequired)
+        Some(OperatorPhysicalDesignRecordErrorV5::GlobalVisibilityRequired)
     );
 
     stream.write_all(&frontend(b'X', &[])).unwrap();
@@ -428,7 +429,7 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
     let _ = std::fs::remove_file(&socket);
     let mut value: serde_json::Value = serde_json::from_str(
         r#"{
-            "version": 9,
+            "version": 10,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": false,
@@ -473,7 +474,8 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
         "unix_socket": socket,
         "io_timeout_ms": 1000,
         "allow_physical_index_apply": true,
-        "allow_physical_columnar_apply": false
+        "allow_physical_columnar_apply": false,
+        "allow_physical_design_receipt_read": false
     });
     std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = ServerConfig::from_manifest_path(&manifest).unwrap();
@@ -508,7 +510,7 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
     assert_eq!(report.recorded_reports, 1);
     assert!(report.index_candidates.iter().any(|candidate| {
         candidate.column_id == 3
-            && candidate.decision == OperatorPhysicalDesignDecisionV4::Recommend {}
+            && candidate.decision == OperatorPhysicalDesignDecisionV5::Recommend {}
     }));
     let status_before_proposal = design.status().unwrap();
     let applied = operator
@@ -522,7 +524,7 @@ fn postgres_extended_physical_design_capture_records_only_initial_portal_executi
         .unwrap();
     assert!(matches!(
         applied.outcome,
-        OperatorPhysicalIndexApplyOutcomeV4::Created { .. }
+        OperatorPhysicalIndexApplyOutcomeV5::Created { .. }
     ));
     assert_eq!(design.status().unwrap(), status_before_proposal);
 
@@ -564,7 +566,7 @@ fn postgres_adaptive_driver_reaches_worker_without_changing_wire_state() {
     std::fs::write(
         &manifest,
         r#"{
-            "version": 9,
+            "version": 10,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {"schema_admin": true,
@@ -649,7 +651,7 @@ fn postgres_query_and_transaction_status_are_isolated_from_live_operator_request
     let manifest = directory.join("server.json");
     let source = format!(
         r#"{{
-            "version": 9,
+            "version": 10,
             "listen": "127.0.0.1:0",
             "authorization": {{
                 "local_plaintext": {{"schema_admin": true,
@@ -679,7 +681,8 @@ fn postgres_query_and_transaction_status_are_isolated_from_live_operator_request
                 "unix_socket": "{}",
                 "io_timeout_ms": 1000,
                 "allow_physical_index_apply": false,
-                "allow_physical_columnar_apply": false
+                "allow_physical_columnar_apply": false,
+                "allow_physical_design_receipt_read": false
             }}
         }}"#,
         socket.display()
@@ -691,7 +694,7 @@ fn postgres_query_and_transaction_status_are_isolated_from_live_operator_request
     let operator = ServerOperatorClient::new(&operator_config);
     assert_eq!(
         operator.status().unwrap().adaptive.unwrap().mode,
-        OperatorAdaptiveModeV4::FeedbackOnly
+        OperatorAdaptiveModeV5::FeedbackOnly
     );
 
     let mut stream = TcpStream::connect(server.local_addr()).unwrap();

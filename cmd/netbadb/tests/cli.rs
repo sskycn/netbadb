@@ -86,7 +86,7 @@ impl Fixture {
         database.close().unwrap();
 
         let manifest = directory.join("server.json");
-        write_manifest(&manifest, 9, "users");
+        write_manifest(&manifest, 10, "users");
         Self {
             directory,
             manifest,
@@ -293,7 +293,7 @@ fn catalog_text_and_json_are_complete_deterministic_and_ignore_network_acl_filte
 }
 
 #[test]
-fn inspect_accepts_and_validates_v9_adaptive_without_rewriting_the_manifest() {
+fn inspect_accepts_and_validates_v10_adaptive_without_rewriting_the_manifest() {
     let fixture = Fixture::new("adaptive-manifest");
     let mut manifest: Value =
         serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
@@ -521,7 +521,7 @@ fn manifest_and_input_failures_precede_output_and_schema_mismatch_is_rejected() 
     assert!(stderr(&old_manifest).contains("unsupported deployment manifest version 5"));
 
     let mismatch = fixture.directory.join("mismatch.json");
-    write_manifest(&mismatch, 9, "other_users");
+    write_manifest(&mismatch, 10, "other_users");
     let mismatch = netbadb()
         .args(["inspect", "catalog", "--manifest"])
         .arg(&mismatch)
@@ -598,7 +598,8 @@ fn operator_cli_uses_live_nbop_and_never_infers_rotation_epoch() {
         "unix_socket": socket,
         "io_timeout_ms": 1000,
         "allow_physical_index_apply": false,
-        "allow_physical_columnar_apply": false
+        "allow_physical_columnar_apply": false,
+            "allow_physical_design_receipt_read": false
     });
     std::fs::write(
         &fixture.manifest,
@@ -740,6 +741,7 @@ fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation(
             ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64))
                 .primary_key(true),
             ColumnDef::new(ColumnId(2), "name", TypeSpec::Physical(PhysicalType::Text)),
+            ColumnDef::new(ColumnId(3), "email", TypeSpec::Physical(PhysicalType::Text)),
         ],
     );
     let mut database = Database::create_catalog(
@@ -754,7 +756,7 @@ fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation(
     )
     .unwrap();
     database
-        .execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+        .execute("INSERT INTO users (id, name, email) VALUES (1, 'Ada', 'ada@example.test')")
         .unwrap();
     database.close().unwrap();
 
@@ -764,8 +766,8 @@ fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation(
     ));
     let _ = std::fs::remove_file(&socket);
     let manifest_path = directory.join("server.json");
-    let manifest = json!({
-        "version": 9,
+    let mut manifest = json!({
+        "version": 10,
         "listen": "127.0.0.1:0",
         "authorization": {
             "local_plaintext": {
@@ -785,7 +787,8 @@ fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation(
             "name": "users",
             "columns": [
                 {"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false,"primary_key":true},
-                {"id":2,"name":"name","physical_type":"text","semantic_type":null,"nullable":false,"primary_key":false}
+                {"id":2,"name":"name","physical_type":"text","semantic_type":null,"nullable":false,"primary_key":false},
+                {"id":3,"name":"email","physical_type":"text","semantic_type":null,"nullable":false,"primary_key":false}
             ]
         }],
         "physical_design": {
@@ -814,7 +817,8 @@ fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation(
             "unix_socket": socket,
             "io_timeout_ms": 1000,
             "allow_physical_index_apply": true,
-            "allow_physical_columnar_apply": false
+            "allow_physical_columnar_apply": false,
+            "allow_physical_design_receipt_read": false
         }
     });
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -853,7 +857,7 @@ fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation(
         .find_map(|line| line.strip_prefix("Evidence epoch: "))
         .unwrap();
 
-    let apply = |token: &str, epoch: &str| {
+    let apply = |token: &str, epoch: &str, column_id: &str, index_name: &str| {
         netbadb()
             .args(["operator", "physical-design", "apply-index", "--manifest"])
             .arg(&manifest_path)
@@ -865,25 +869,186 @@ fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation(
                 "--table-id",
                 "1",
                 "--column-id",
-                "2",
+                column_id,
                 "--index-name",
-                "users_name_cli_idx",
+                index_name,
             ])
             .output()
             .unwrap()
     };
-    let created = apply(token, epoch);
+    let created = apply(token, epoch, "2", "users_name_cli_idx");
     assert!(created.status.success(), "{}", stderr(&created));
     assert!(stdout(&created).contains("created"));
-    let retried = apply(token, epoch);
+    assert!(!stdout(&created).contains("receipt:"));
+    let retried = apply(token, epoch, "2", "users_name_cli_idx");
     assert!(retried.status.success(), "{}", stderr(&retried));
     assert!(stdout(&retried).contains("already applied"));
+    assert!(!stdout(&retried).contains("receipt:"));
+
+    let read_disabled = netbadb()
+        .args([
+            "operator",
+            "physical-design",
+            "receipts",
+            "status",
+            "--manifest",
+        ])
+        .arg(&manifest_path)
+        .output()
+        .unwrap();
+    assert_eq!(read_disabled.status.code(), Some(1));
+    assert!(stderr(&read_disabled).contains("not allowed by the manifest"));
 
     client
         .query("SELECT id FROM users WHERE name = 'Ada'")
         .unwrap()
         .close()
         .unwrap();
+    drop(client);
+    server.shutdown().unwrap();
+
+    manifest["physical_design"]["mutation_receipts"] = json!({
+        "path": "physical-design-receipts.nbmr",
+        "max_file_bytes": 67_108_864
+    });
+    manifest["operator"]["allow_physical_design_receipt_read"] = json!(true);
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let server = TcpServer::new(ServerConfig::from_manifest_path(&manifest_path).unwrap())
+        .start()
+        .unwrap();
+    let mut client = Client::connect(ClientConfig::new(server.local_addr().to_string())).unwrap();
+    client
+        .query("SELECT id FROM users WHERE email = 'ada@example.test'")
+        .unwrap()
+        .close()
+        .unwrap();
+    let recommendations = netbadb()
+        .args([
+            "operator",
+            "physical-design",
+            "recommendations",
+            "--manifest",
+        ])
+        .arg(&manifest_path)
+        .output()
+        .unwrap();
+    assert!(
+        recommendations.status.success(),
+        "{}",
+        stderr(&recommendations)
+    );
+    let recommendations = stdout(&recommendations);
+    let token = recommendations
+        .lines()
+        .find_map(|line| line.strip_prefix("Runtime token: "))
+        .unwrap();
+    let epoch = recommendations
+        .lines()
+        .find_map(|line| line.strip_prefix("Evidence epoch: "))
+        .unwrap();
+
+    let stale_token = format!(
+        "{}{}",
+        if token.starts_with('0') { '1' } else { '0' },
+        &token[1..]
+    );
+    let stale = apply(&stale_token, epoch, "3", "users_email_cli_idx");
+    assert_eq!(stale.status.code(), Some(1));
+    assert!(stderr(&stale).contains("receipt "), "{}", stderr(&stale));
+    assert!(stderr(&stale).contains("previous daemon/operator runtime"));
+
+    let created = apply(token, epoch, "3", "users_email_cli_idx");
+    assert!(created.status.success(), "{}", stderr(&created));
+    let created_output = stdout(&created);
+    assert!(created_output.contains("created"));
+    assert!(created_output.contains("receipt: "));
+
+    let receipt_status = netbadb()
+        .args([
+            "operator",
+            "physical-design",
+            "receipts",
+            "status",
+            "--manifest",
+        ])
+        .arg(&manifest_path)
+        .output()
+        .unwrap();
+    assert!(
+        receipt_status.status.success(),
+        "{}",
+        stderr(&receipt_status)
+    );
+    let receipt_status = stdout(&receipt_status);
+    assert!(receipt_status.contains("Journal incarnation:"));
+    assert!(receipt_status.contains("Recovery required: false"));
+    assert!(receipt_status.contains("Latest receipt ID: 2"));
+    assert!(receipt_status.contains("Max page size: 128"));
+    assert!(!receipt_status.contains(".nbmr"));
+
+    let first_page = netbadb()
+        .args([
+            "operator",
+            "physical-design",
+            "receipts",
+            "list",
+            "--manifest",
+        ])
+        .arg(&manifest_path)
+        .args(["--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(first_page.status.success(), "{}", stderr(&first_page));
+    let first_page = stdout(&first_page);
+    assert!(first_page.contains("outcome: rejected"));
+    let next = first_page
+        .lines()
+        .find_map(|line| line.strip_prefix("Next after: "))
+        .unwrap();
+    let (journal, receipt_id) = next.split_once('/').unwrap();
+
+    let second_page = netbadb()
+        .args([
+            "operator",
+            "physical-design",
+            "receipts",
+            "list",
+            "--manifest",
+        ])
+        .arg(&manifest_path)
+        .args([
+            "--limit",
+            "1",
+            "--after-journal-incarnation",
+            journal,
+            "--after-receipt-id",
+            receipt_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(second_page.status.success(), "{}", stderr(&second_page));
+    assert!(stdout(&second_page).contains("outcome: created_index"));
+
+    let wrong_journal = netbadb()
+        .args([
+            "operator",
+            "physical-design",
+            "receipts",
+            "list",
+            "--manifest",
+        ])
+        .arg(&manifest_path)
+        .args([
+            "--after-journal-incarnation",
+            "ffffffffffffffffffffffffffffffff",
+            "--after-receipt-id",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(wrong_journal.status.code(), Some(1));
+    assert!(stderr(&wrong_journal).contains("different journal incarnation"));
+
     drop(client);
     server.shutdown().unwrap();
     assert!(!socket.exists());
@@ -944,7 +1109,8 @@ fn operator_cli_reports_unconfigured_and_offline_planes_without_opening_database
         "unix_socket": "offline.sock",
         "io_timeout_ms": 50,
         "allow_physical_index_apply": false,
-        "allow_physical_columnar_apply": false
+        "allow_physical_columnar_apply": false,
+            "allow_physical_design_receipt_read": false
     });
     std::fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let inspected = catalog(&fixture, "text");

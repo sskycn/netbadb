@@ -424,10 +424,10 @@ mod tests {
     }
 
     #[test]
-    fn phase_28_v3_status_shape_is_frozen_and_distinct_from_v4() {
+    fn phase_28_v3_status_shape_is_frozen_and_distinct_from_current() {
         assert_ne!(
             TypeId::of::<OperatorStatusV3>(),
-            TypeId::of::<crate::OperatorStatusV4>()
+            TypeId::of::<crate::OperatorStatusV5>()
         );
         let value = phase_28_physical_design_status();
         let status: OperatorPhysicalDesignStatusV3 =

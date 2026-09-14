@@ -1,6 +1,6 @@
 # `netbadb` inspection and local operator CLI
 
-`netbadb inspect` opens the existing tables declared by deployment manifest v9
+`netbadb inspect` opens the existing tables declared by deployment manifest v10
 and reports catalog metadata or the physical plan chosen for one SQL
 statement. It does not create databases, execute queries or DML, start a
 server, connect remotely, refresh `ANALYZE`, create indexes, or checkpoint.
@@ -26,8 +26,8 @@ before the manifest or database is opened. Success writes only the completed
 inspection to stdout. Usage failures exit 2, operational failures exit 1, and
 all failures write diagnostics only to stderr.
 
-`netbadb operator` does not open a Database. It parses the same manifest v9,
-uses only its configured Unix socket, and exchanges one NBOP v4 request:
+`netbadb operator` does not open a Database. It parses the same manifest v10,
+uses only its configured Unix socket, and exchanges one NBOP v5 request:
 
 ```sh
 netbadb operator status --manifest server.json
@@ -37,6 +37,11 @@ netbadb operator reset-faulted-scheduler --manifest server.json
 netbadb operator physical-design recommendations --manifest server.json
 netbadb operator physical-design rotate-evidence --manifest server.json \
   --expected-evidence-epoch 7
+netbadb operator physical-design receipts status --manifest server.json
+netbadb operator physical-design receipts list --manifest server.json --limit 32
+netbadb operator physical-design receipts list --manifest server.json --limit 32 \
+  --after-journal-incarnation 00112233445566778899aabbccddeeff \
+  --after-receipt-id 41
 netbadb operator physical-design apply-index --manifest server.json \
   --expected-runtime-token 00112233445566778899aabbccddeeff \
   --expected-evidence-epoch 7 --table-id 1 --column-id 3 \
@@ -51,7 +56,10 @@ netbadb operator physical-design apply-columnar --manifest server.json \
 Rotation and mutation preconditions are required and are never inferred by a
 hidden status or recommendations request. Apply never selects a candidate,
 refreshes a token/epoch, or retries automatically. The human output is not a
-stable machine-readable contract; NBOP v4 is the versioned contract.
+stable machine-readable contract; NBOP v5 is the versioned contract. Receipt
+commands never infer a cursor, automatically restart after journal replacement,
+or turn a receipt into replay authority. Apply output prints a receipt only when
+the server returned one, and never automatically queries it.
 
 ## Ownership, recovery, and authorization
 
