@@ -58,7 +58,7 @@ const CURRENT_VERSION: u16 = 3;
 const BEGIN_TAG: u8 = 1;
 const OUTCOME_TAG: u8 = 2;
 
-/// Programmatic-only configuration for one bounded NBMR v3 journal.
+/// Runtime-ready configuration for one bounded NBMR v3 journal.
 ///
 /// Construction freezes an absolute path through its canonical existing
 /// parent, but deliberately does not create or open the final file.
