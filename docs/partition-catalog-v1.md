@@ -76,6 +76,9 @@ Creation validates the full logical placement before creating physical files,
 creates heaps with their final StorageIds, publishes and syncs the immutable
 catalog, then creates the independent coordinator log. Failure removes only
 files confirmed new in that invocation; pre-existing paths are never removed.
+Catalog publication synchronizes both the catalog file and its own parent
+directory before reporting success. The coordinator may live in a different
+directory, so its directory barrier cannot substitute for the catalog's.
 
 Open follows:
 

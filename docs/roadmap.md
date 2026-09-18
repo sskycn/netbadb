@@ -1,5 +1,16 @@
 # NetbaDB roadmap
 
+## Crash consistency and recovery audit
+
+The [audit report](crash-consistency-audit.md) covers Heap status publication,
+LSM partial append and terminal recovery, whole-set prepared-resolution
+validation, recovered-authority sync ordering, and initial LSM/catalog parent
+directory publication. The fixes include deterministic double-failure and
+subprocess recovery-interruption regressions, retaining the prior
+[error/concurrency contracts](error-concurrency-audit.md). No persistent-format,
+planner or writer-concurrency expansion is included. Real power-loss, hardware
+torn-write and network-filesystem validation remain separate work.
+
 ## Durable receipt exposure (Adaptive Operations Phase 32 complete)
 
 - upgraded the strict deployment contract to Manifest v10 with optional

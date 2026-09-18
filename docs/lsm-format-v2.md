@@ -20,6 +20,19 @@ memory. Inputs are deleted only after publication. A post-rename sync failure
 poisons the live handle and requires reopen because either generation may be
 selected after a crash.
 
+Creation synchronizes the LSM root's parent as well as the root's contents.
+Open validates the selected SSTable/WAL graph and prepared resolutions, syncs
+the selected WAL and Manifest, and syncs the root directory before deleting
+orphans. A readable rename alone is not proof that its publication barrier
+completed. A failed recovery barrier returns an error and preserves old inputs.
+
+An append error truncates the WAL to its prior logical end before retry. If
+truncation also fails, the error preserves both failures and the handle refuses
+new mutation and maintenance until reopen. An existing Abort is terminal even
+when preceded by Prepare: repeated recovery neither requires another decision
+nor appends another Abort. These contracts are covered by the
+[crash-consistency audit](crash-consistency-audit.md), without a format change.
+
 ## Manifest v2 (`NBLM`, version 2)
 
 The fixed header retains storage/table/schema identity, generation, active WAL,

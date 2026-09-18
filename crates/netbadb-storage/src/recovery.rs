@@ -138,6 +138,10 @@ pub enum RecoveryError {
         state: PreparedTransactionState,
         decision: PreparedDecision,
     },
+    PreparedCommitAfterAbort {
+        database_txn_id: DatabaseTxnId,
+        physical_txn_id: TxnId,
+    },
     #[cfg(test)]
     InterruptedForTest,
 }
@@ -223,6 +227,14 @@ impl fmt::Display for RecoveryError {
                 "recovery resolution names unknown physical transaction {} for database transaction {}",
                 physical_txn_id.0, database_txn_id.0
             ),
+            Self::PreparedCommitAfterAbort {
+                database_txn_id,
+                physical_txn_id,
+            } => write!(
+                formatter,
+                "prepared physical transaction {} for database transaction {} has started abort and cannot commit",
+                physical_txn_id.0, database_txn_id.0
+            ),
             Self::PreparedResolutionConflictsWithTerminalState {
                 database_txn_id,
                 physical_txn_id,
@@ -265,6 +277,7 @@ impl From<StorageError> for RecoveryError {
 struct TransactionAnalysis {
     last_lsn: Lsn,
     committed: bool,
+    aborting: bool,
     rolled_back: bool,
     prepared_database_txn_id: Option<DatabaseTxnId>,
 }
@@ -315,6 +328,7 @@ impl RecoveryManager {
                 .or_insert(TransactionAnalysis {
                     last_lsn: record.lsn,
                     committed: false,
+                    aborting: false,
                     rolled_back: false,
                     prepared_database_txn_id: None,
                 });
@@ -323,6 +337,9 @@ impl RecoveryManager {
                 transaction.committed = true;
             } else if matches!(record.kind, WalRecordKind::RollbackComplete) {
                 transaction.rolled_back = true;
+                transaction.aborting = false;
+            } else if matches!(record.kind, WalRecordKind::Abort) {
+                transaction.aborting = true;
             } else if let WalRecordKind::Prepare { database_txn_id } = record.kind {
                 transaction.prepared_database_txn_id = Some(database_txn_id);
             }
@@ -668,8 +685,10 @@ impl RecoveryManager {
             }
         }
 
-        let mut commit_lsns = Vec::new();
-        for (physical_txn_id, transaction) in transactions.iter_mut() {
+        // Validate the entire external decision set before appending anything.
+        // A rejected request must never leave a newly durable Commit behind.
+        let mut commits = Vec::new();
+        for (physical_txn_id, transaction) in transactions.iter() {
             let Some(database_txn_id) = transaction.prepared_database_txn_id else {
                 continue;
             };
@@ -720,24 +739,34 @@ impl RecoveryManager {
                 continue;
             }
             if resolution.decision == PreparedDecision::Commit {
-                let commit_lsn = wal.append(
-                    *physical_txn_id,
-                    Some(transaction.last_lsn),
-                    WalRecordKind::Commit,
-                )?;
-                transaction.last_lsn = commit_lsn;
-                transaction.committed = true;
-                commit_lsns.push(commit_lsn);
+                if transaction.aborting {
+                    return Err(RecoveryError::PreparedCommitAfterAbort {
+                        database_txn_id,
+                        physical_txn_id: *physical_txn_id,
+                    });
+                }
+                commits.push((transaction.last_lsn, *physical_txn_id));
             }
-        }
-        if let Some(lsn) = commit_lsns.into_iter().max() {
-            wal.flush_through(lsn)?;
         }
         if let Some((_, resolution)) = by_physical.into_iter().next() {
             return Err(RecoveryError::UnknownPreparedResolution {
                 database_txn_id: resolution.database_txn_id,
                 physical_txn_id: resolution.physical_txn_id,
             });
+        }
+        // Preserve physical prepare order independently of HashMap iteration.
+        commits.sort_unstable();
+        let mut last_commit = None;
+        for (previous, physical_txn_id) in commits {
+            let commit_lsn = wal.append(physical_txn_id, Some(previous), WalRecordKind::Commit)?;
+            if let Some(transaction) = transactions.get_mut(&physical_txn_id) {
+                transaction.last_lsn = commit_lsn;
+                transaction.committed = true;
+            }
+            last_commit = Some(commit_lsn);
+        }
+        if let Some(lsn) = last_commit {
+            wal.flush_through(lsn)?;
         }
         Ok(())
     }
@@ -1025,6 +1054,141 @@ mod tests {
         let wal = wal_path(path);
         let _ = std::fs::remove_file(crate::wal_alternate_path(&wal));
         let _ = std::fs::remove_file(wal);
+    }
+
+    #[test]
+    fn crash_audit_invalid_resolution_set_does_not_commit_a_valid_prefix() {
+        use super::{PreparedDecision, PreparedTxnResolution};
+        use netbadb_types::DatabaseTxnId;
+
+        let (path, original) = create_fixture("invalid-resolution-set");
+        let mut wal = WalManager::open(wal_path(&path)).unwrap();
+        let begin = wal.append(TxnId(1), None, WalRecordKind::Begin).unwrap();
+        let (update, after) = append_update(&mut wal, TxnId(1), begin, &original, b"prepared");
+        let prepare = wal
+            .append(
+                TxnId(1),
+                Some(update),
+                WalRecordKind::Prepare {
+                    database_txn_id: DatabaseTxnId(10),
+                },
+            )
+            .unwrap();
+        wal.flush_through(prepare).unwrap();
+        drop(wal);
+        write_page(&path, &after);
+        let before = std::fs::read(wal_path(&path)).unwrap();
+        let mut pages = PageManager::open(&path).unwrap();
+        let (mut wal, records, tail) = WalManager::open_for_recovery(wal_path(&path)).unwrap();
+        let valid = PreparedTxnResolution {
+            database_txn_id: DatabaseTxnId(10),
+            physical_txn_id: TxnId(1),
+            decision: PreparedDecision::Commit,
+        };
+        let unknown = PreparedTxnResolution {
+            database_txn_id: DatabaseTxnId(20),
+            physical_txn_id: TxnId(2),
+            decision: PreparedDecision::Abort,
+        };
+        assert!(matches!(
+            RecoveryManager::recover_with_resolutions(
+                &mut pages,
+                &mut wal,
+                &records,
+                tail,
+                &[valid, unknown]
+            ),
+            Err(RecoveryError::UnknownPreparedResolution { .. })
+        ));
+        assert_eq!(
+            std::fs::read(wal_path(&path)).unwrap(),
+            before,
+            "rejected input must not publish a durable commit"
+        );
+        let abort = PreparedTxnResolution {
+            decision: PreparedDecision::Abort,
+            ..valid
+        };
+        RecoveryManager::recover_with_resolutions(&mut pages, &mut wal, &records, tail, &[abort])
+            .unwrap();
+        drop(wal);
+        drop(pages);
+        for _ in 0..2 {
+            recover(&path).unwrap();
+            assert_eq!(read_page(&path, PageId(1)), original);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn crash_audit_abort_started_resolution_cannot_commit_other_participants() {
+        use super::{PreparedDecision, PreparedTxnResolution};
+        use netbadb_types::DatabaseTxnId;
+
+        let (path, original) = create_fixture("abort-started-resolution-set");
+        let mut wal = WalManager::open(wal_path(&path)).unwrap();
+        let mut resolutions = Vec::new();
+        for id in 1..=2 {
+            let begin = wal.append(TxnId(id), None, WalRecordKind::Begin).unwrap();
+            let prepare = wal
+                .append(
+                    TxnId(id),
+                    Some(begin),
+                    WalRecordKind::Prepare {
+                        database_txn_id: DatabaseTxnId(id),
+                    },
+                )
+                .unwrap();
+            let last = if id == 2 {
+                wal.append(TxnId(id), Some(prepare), WalRecordKind::Abort)
+                    .unwrap()
+            } else {
+                prepare
+            };
+            wal.flush_through(last).unwrap();
+            resolutions.push(PreparedTxnResolution {
+                database_txn_id: DatabaseTxnId(id),
+                physical_txn_id: TxnId(id),
+                decision: PreparedDecision::Commit,
+            });
+        }
+        drop(wal);
+        let before = std::fs::read(wal_path(&path)).unwrap();
+        let mut pages = PageManager::open(&path).unwrap();
+        let (mut wal, records, tail) = WalManager::open_for_recovery(wal_path(&path)).unwrap();
+        assert!(
+            RecoveryManager::recover_with_resolutions(
+                &mut pages,
+                &mut wal,
+                &records,
+                tail,
+                &resolutions
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(wal_path(&path)).unwrap(),
+            before,
+            "reject an aborting participant before committing any other member"
+        );
+        for resolution in &mut resolutions {
+            resolution.decision = PreparedDecision::Abort;
+        }
+        RecoveryManager::recover_with_resolutions(
+            &mut pages,
+            &mut wal,
+            &records,
+            tail,
+            &resolutions,
+        )
+        .unwrap();
+        drop(wal);
+        drop(pages);
+        for _ in 0..2 {
+            recover(&path).unwrap();
+            assert_eq!(read_page(&path, PageId(1)), original);
+        }
+        cleanup(&path);
     }
 
     #[test]

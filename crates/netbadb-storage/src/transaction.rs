@@ -151,6 +151,7 @@ impl Transaction {
     /// the transaction in `CommitPending`; calling `commit` again retries the
     /// same record without releasing an owned writer.
     pub fn commit(&mut self) -> Result<(), StorageError> {
+        self.ensure_status_writer()?;
         #[cfg(test)]
         if !self.retired_btree_pages.is_empty() {
             crate::crash_test::maybe_crash(
@@ -192,6 +193,7 @@ impl Transaction {
     /// Success retains writer ownership and does not publish committed MVCC
     /// status. A failed flush remains retryable with the same identity.
     pub fn prepare(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
+        self.ensure_status_writer()?;
         if database_txn_id.0 == 0 {
             return Err(TransactionError::InvalidDatabaseTxnId.into());
         }
@@ -273,6 +275,7 @@ impl Transaction {
         database_txn_id: DatabaseTxnId,
         batch_change_stream: bool,
     ) -> Result<(), StorageError> {
+        self.ensure_status_writer()?;
         if database_txn_id.0 == 0 {
             return Err(TransactionError::InvalidDatabaseTxnId.into());
         }
@@ -724,6 +727,7 @@ impl Transaction {
     }
 
     fn rollback_internal(&mut self, allow_prepared: bool) -> Result<(), StorageError> {
+        self.ensure_status_writer()?;
         self.buffer.invalidate_reuse_inventory();
         match self.state {
             TransactionState::Active | TransactionState::RollbackRequired => {
@@ -866,6 +870,7 @@ impl Transaction {
         &self,
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
+        self.ensure_status_writer()?;
         if self.prepared_database_txn_id != Some(database_txn_id) {
             return Err(TransactionError::DatabaseTxnMismatch {
                 txn_id: self.id,
@@ -1152,6 +1157,7 @@ impl Transaction {
 
     pub(crate) fn acquire_writer(&self) -> Result<(), StorageError> {
         self.ensure_active()?;
+        self.ensure_status_writer()?;
         match self.runtime.writer.get() {
             WriterState::Idle => {
                 self.runtime.writer.set(WriterState::Active(self.id));
@@ -1164,6 +1170,7 @@ impl Transaction {
     }
 
     fn acquire_parked_resolution(&self, abort: bool) -> Result<(), StorageError> {
+        self.ensure_status_writer()?;
         let parked = self.runtime.parked_prepared.borrow();
         let expected = if abort { parked.back() } else { parked.front() }
             .copied()
@@ -1190,6 +1197,19 @@ impl Transaction {
             }
         }
         Ok(())
+    }
+
+    fn ensure_status_writer(&self) -> Result<(), StorageError> {
+        if self
+            .statuses
+            .try_borrow()
+            .map_err(|_| TransactionError::StatusBusy)?
+            .is_poisoned()
+        {
+            Err(TransactionError::RecoveryRequired.into())
+        } else {
+            Ok(())
+        }
     }
 
     fn remove_parked_resolution(&self, abort: bool) -> Result<(), StorageError> {
@@ -1613,7 +1633,7 @@ impl TransactionManager {
         &mut self,
         isolation_level: IsolationLevel,
     ) -> Result<Transaction, StorageError> {
-        if self.maintenance_pending {
+        if self.maintenance_pending || self.statuses.borrow().is_poisoned() {
             return Err(TransactionError::RecoveryRequired.into());
         }
         let id = self.next_txn_id;
@@ -1683,6 +1703,9 @@ impl TransactionManager {
     }
 
     pub(crate) fn ensure_checkpoint_safe(&self) -> Result<(), crate::CheckpointError> {
+        if self.statuses.borrow().is_poisoned() {
+            return Err(crate::CheckpointError::RecoveryRequired);
+        }
         match self.runtime.writer.get() {
             WriterState::Active(txn_id) => {
                 return Err(crate::CheckpointError::WriterActive { txn_id });
@@ -1700,7 +1723,10 @@ impl TransactionManager {
     }
 
     pub(crate) fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
-        if self.maintenance_pending || self.runtime.writer.get() == WriterState::RecoveryRequired {
+        if self.maintenance_pending
+            || self.runtime.writer.get() == WriterState::RecoveryRequired
+            || self.statuses.borrow().is_poisoned()
+        {
             Err(TransactionError::RecoveryRequired.into())
         } else {
             Ok(())
@@ -1708,6 +1734,9 @@ impl TransactionManager {
     }
 
     pub(crate) fn ensure_clean_close(&self) -> Result<(), StorageError> {
+        if self.statuses.borrow().is_poisoned() {
+            return Err(TransactionError::RecoveryRequired.into());
+        }
         match self.runtime.writer.get() {
             WriterState::Idle if self.runtime.outstanding.get() == 0 => Ok(()),
             WriterState::Idle => Err(TransactionError::OutstandingTransactions {
@@ -1791,6 +1820,68 @@ mod tests {
         drop(transaction);
         drop(manager);
         drop(wal);
+        cleanup(page_path, wal_path);
+    }
+
+    #[test]
+    fn crash_audit_status_double_failure_blocks_existing_and_new_transactions() {
+        let (page_path, wal_path, wal, mut manager) = test_manager("status-double-failure");
+        let mut first = manager.begin().unwrap();
+        let mut existing = manager.begin().unwrap();
+        {
+            let mut statuses = first.statuses.borrow_mut();
+            statuses.fail_next_append_after = Some(17);
+            statuses.fail_next_truncate = true;
+        }
+        let error = first.commit().unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::TxnStatus(crate::TxnStatusError::AppendCleanup { .. })
+        ));
+        assert!(error.to_string().contains("injected partial status append"));
+        assert!(
+            error
+                .to_string()
+                .contains("injected status truncation failure")
+        );
+        let records = wal.borrow_mut().scan().unwrap();
+        assert!(matches!(
+            first.commit(),
+            Err(StorageError::Transaction(
+                TransactionError::RecoveryRequired
+            ))
+        ));
+        assert!(matches!(
+            existing.commit(),
+            Err(StorageError::Transaction(
+                TransactionError::RecoveryRequired
+            ))
+        ));
+        assert!(matches!(
+            existing.acquire_writer(),
+            Err(StorageError::Transaction(
+                TransactionError::RecoveryRequired
+            ))
+        ));
+        assert!(manager.begin().is_err());
+        assert!(manager.ensure_checkpoint_safe().is_err());
+        assert!(manager.ensure_clean_close().is_err());
+        assert_eq!(wal.borrow_mut().scan().unwrap(), records);
+        drop(first);
+        drop(existing);
+        drop(manager);
+        drop(wal);
+        let mut statuses =
+            TxnStatusStore::open_for_recovery(page_path.with_extension("status"), &records)
+                .unwrap();
+        let commit = records.last().unwrap();
+        statuses
+            .record_committed(commit.txn_id, netbadb_types::CommitSeq(commit.lsn.0))
+            .unwrap();
+        drop(statuses);
+        for _ in 0..2 {
+            assert!(TxnStatusStore::open(page_path.with_extension("status")).is_ok());
+        }
         cleanup(page_path, wal_path);
     }
 

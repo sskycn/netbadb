@@ -461,9 +461,12 @@ impl HeapStorage {
         let (catalog_root, storage_id) =
             validate_heap_metadata(pages.read_page(HEADER_PAGE)?.bytes(), &table, fingerprint)?;
         validate_catalog_root_bounds(catalog_root, pages.page_count())?;
-        let statuses = Rc::new(RefCell::new(TxnStatusStore::open(txn_status_path(path))?));
         let (mut wal_manager, records, truncated_wal_tail) =
             WalManager::open_for_recovery(wal_path(path))?;
+        let statuses = Rc::new(RefCell::new(TxnStatusStore::open_for_recovery(
+            txn_status_path(path),
+            &records,
+        )?));
         let recovery = if let Some(resolutions) = prepared_resolutions {
             RecoveryManager::recover_with_resolutions(
                 &mut pages,
@@ -10469,6 +10472,19 @@ mod tests {
         assert!(matches!(first.as_str(), "before" | "after"));
         assert_eq!(reopen_value(&path), first);
         cleanup(&path);
+    }
+
+    #[test]
+    fn crash_audit_partial_status_publication_recovers_wal_decision() {
+        for (case, expected) in [("commit-boundary", "after"), ("rollback-single", "before")] {
+            let (path, _, _) = prepare_process_crash_baseline(&format!("partial-status-{case}"));
+            spawn_named_crash_child(&path, case, "status-after-partial-record");
+            // The first recovery also exits while rebuilding the status tail.
+            // Neither recovery attempt may lose the already durable decision.
+            spawn_named_crash_child(&path, "recovery-open", "status-after-partial-record");
+            assert_reopens_twice_with(&path, expected);
+            cleanup(&path);
+        }
     }
 
     #[test]

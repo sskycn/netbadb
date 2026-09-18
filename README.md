@@ -733,6 +733,14 @@ remains 40 bytes. Both checksums cover the complete header or
 record with the checksum field treated as zero. A physically complete record
 whose checksum fails is corruption and is never truncated as a crash tail.
 
+The [crash-consistency audit](docs/crash-consistency-audit.md) documents recovery
+and filesystem failure contracts. An incomplete transaction-status tail is
+repaired only when its bytes match a terminal decision retained in validated
+WAL; complete-record corruption remains an error. Failed status/LSM WAL appends
+truncate their suffix before retry, and failed truncation disables mutation
+until reopen. Recovery synchronizes selected WAL, Manifest and Coordinator
+authority before reclaiming old files or returning a writable handle.
+
 Each Page v5 data page stores a little-endian CRC32C in bytes 24..28 of its
 28-byte header. The checksum covers the expected PageId (as a little-endian
 u64) followed by all 4096 page bytes, treating the checksum field as zero. It

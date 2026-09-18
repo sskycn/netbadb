@@ -7871,7 +7871,9 @@ mod tests {
     }
 
     fn assert_mixed_crash_outcome(root: &std::path::Path, committed: bool) {
-        for pass in 0..2 {
+        // A second recovery must not append a duplicate terminal Abort that
+        // would make the third open reject an otherwise valid mixed commit.
+        for pass in 0..3 {
             let (_, _, coordinator) = mixed_crash_paths(root);
             let mut database = Database::open_storages_with_coordinator(
                 mixed_open_specs(root),

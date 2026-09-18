@@ -175,6 +175,13 @@ impl CoordinatorLog {
         // unsynchronized but complete final checkpoint survived a process
         // crash. Startup synchronization is not a foreground commit counter.
         file.sync_data()?;
+        // A compaction rename may have survived without its directory barrier.
+        // Certify the selected inode before granting append authority again.
+        #[cfg(test)]
+        if FAIL_OPEN_DIRECTORY_SYNC.with(|failure| failure.replace(false)) {
+            return Err(injected_io_error("recovery directory sync").into());
+        }
+        sync_parent_directory(&path)?;
         let last_complete = scan
             .decisions
             .values()
@@ -1948,6 +1955,7 @@ fn append_record(authority: &mut Option<File>, bytes: &[u8]) -> Result<(), Coord
 #[cfg(test)]
 thread_local! {
     static FAIL_APPEND_AND_TRUNCATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_OPEN_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn write_append_bytes(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
@@ -2854,6 +2862,38 @@ mod tests {
         );
         CoordinatorLog::open(&path).expect("second open is stable");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn crash_audit_reopen_requires_directory_barrier_after_uncertain_compaction() {
+        let path = path("reopen-directory-authority");
+        let _ = std::fs::remove_file(&path);
+        let mut log = CoordinatorLog::create(&path).unwrap();
+        log.enable_global_visibility().unwrap();
+        let sequence = log
+            .sequenced_commit_decision(DatabaseTxnId(1), &participants(), None)
+            .unwrap();
+        log.complete_sequenced(DatabaseTxnId(1), sequence).unwrap();
+        log.inject_compaction_failure(super::CompactionFailureStage::DirectorySync);
+        assert!(log.compact().is_err());
+        drop(log);
+        let before = std::fs::read(&path).unwrap();
+        super::FAIL_OPEN_DIRECTORY_SYNC.with(|failure| failure.set(true));
+        assert!(CoordinatorLog::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut reopened = CoordinatorLog::open(&path).unwrap();
+        let sequence = reopened
+            .sequenced_commit_decision(DatabaseTxnId(2), &participants(), None)
+            .unwrap();
+        reopened
+            .complete_sequenced(DatabaseTxnId(2), sequence)
+            .unwrap();
+        drop(reopened);
+        for _ in 0..2 {
+            let reopened = CoordinatorLog::open(&path).unwrap();
+            assert_eq!(reopened.published_commit_seq(), DatabaseCommitSeq(2));
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

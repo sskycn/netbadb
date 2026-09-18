@@ -467,8 +467,16 @@ impl WalManager {
         drop(candidates);
         if scan.incomplete_tail {
             file.set_len(scan.valid_end)?;
-            file.sync_data()?;
         }
+        // Reopening readable bytes cannot prove the previous file/directory
+        // barriers completed. Keep the old generation until both succeed,
+        // including when the new generation contains only a checkpoint header.
+        #[cfg(test)]
+        fail_open_authority_sync(false)?;
+        file.sync_all()?;
+        #[cfg(test)]
+        fail_open_authority_sync(true)?;
+        sync_parent_directory(&path)?;
         for superseded in superseded_paths {
             std::fs::remove_file(&superseded)?;
             sync_parent_directory(&superseded)?;
@@ -985,6 +993,23 @@ fn sync_parent_directory(path: &Path) -> Result<(), WalError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static OPEN_AUTHORITY_SYNC_FAILURE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn fail_open_authority_sync(directory: bool) -> Result<(), WalError> {
+    OPEN_AUTHORITY_SYNC_FAILURE.with(|failure| {
+        if failure.get() == Some(directory) {
+            failure.set(None);
+            Err(std::io::Error::other("injected WAL recovery authority sync failure").into())
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn logical_lsn(base_lsn: Lsn, physical_offset: u64) -> Result<Lsn, WalError> {
@@ -2215,6 +2240,38 @@ mod tests {
             let _ = std::fs::remove_file(path);
         }
         let _ = std::fs::remove_file(source);
+    }
+
+    #[test]
+    fn crash_audit_reopen_syncs_new_generation_before_removing_old() {
+        for directory in [false, true] {
+            let path = test_path(&format!("recovery-authority-{directory}"));
+            let alternate = crate::wal_alternate_path(&path);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&alternate);
+            drop(WalManager::create(&path).unwrap());
+            let original = std::fs::read(&path).unwrap();
+            // A complete checkpoint header can survive even if its sync never
+            // returned. Do not certify it from readability alone.
+            let header = super::WalHeader {
+                generation: 2,
+                base_lsn: netbadb_types::Lsn(1),
+                checkpoint_lsn: None,
+                next_txn_id: TxnId(1),
+            };
+            std::fs::write(&alternate, super::encode_header(header).unwrap()).unwrap();
+            super::OPEN_AUTHORITY_SYNC_FAILURE.with(|failure| failure.set(Some(directory)));
+            assert!(WalManager::open_for_recovery(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(alternate.exists());
+            for _ in 0..2 {
+                let (wal, records, _) = WalManager::open_for_recovery(&path).unwrap();
+                assert_eq!(wal.generation(), 2);
+                assert!(records.is_empty());
+            }
+            assert!(!path.exists());
+            std::fs::remove_file(alternate).unwrap();
+        }
     }
 
     #[test]

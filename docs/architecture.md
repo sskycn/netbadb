@@ -1,5 +1,14 @@
 # NetbaDB architecture
 
+The [crash-consistency audit](crash-consistency-audit.md) records the durability
+state machines, reproduced failure windows and recovery regressions. Recovery
+validates complete prepared-resolution sets before publishing new decisions;
+terminal Abort is idempotent. Status-tail repair requires a matching retained
+WAL terminal record. Partial append cleanup failure revokes the affected writer
+until reopen. Reopened WAL/Manifest/Coordinator authority must pass file and
+directory durability barriers before reclamation or renewed writes. These
+contracts preserve existing persistent versions and single-owner mutation.
+
 ## Boundaries
 
 NetbaDB keeps application language concerns at the frontend boundary. A Go,

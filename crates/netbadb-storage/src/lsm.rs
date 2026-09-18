@@ -86,6 +86,11 @@ pub enum LsmError {
     },
     UnsupportedManifestVersion(u16),
     InvalidWal(&'static str),
+    WalAppendCleanup {
+        offset: u64,
+        append: io::Error,
+        cleanup: io::Error,
+    },
     WalChecksum {
         offset: u64,
         stored: u32,
@@ -130,6 +135,14 @@ impl fmt::Display for LsmError {
                 write!(formatter, "unsupported LSM manifest version {version}")
             }
             Self::InvalidWal(reason) => write!(formatter, "invalid LSM WAL: {reason}"),
+            Self::WalAppendCleanup {
+                offset,
+                append,
+                cleanup,
+            } => write!(
+                formatter,
+                "LSM WAL append at {offset} failed: {append}; truncation failed: {cleanup}; reopen required"
+            ),
             Self::WalChecksum {
                 offset,
                 stored,
@@ -184,7 +197,14 @@ impl fmt::Display for LsmError {
     }
 }
 
-impl Error for LsmError {}
+impl Error for LsmError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::WalAppendCleanup { append, .. } => Some(append),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ClusteringKey {
@@ -474,6 +494,9 @@ enum ManifestPublishPoint {
     CandidateSync,
     BeforeInstall,
     AfterInstall,
+    RecoveryFileSync,
+    RecoveryDirectorySync,
+    CreationParentSync,
 }
 
 #[derive(Debug)]
@@ -604,10 +627,15 @@ struct LsmWal {
     path: PathBuf,
     storage_id: StorageId,
     end: u64,
+    poisoned: bool,
     #[cfg(test)]
     fail_next_sync: bool,
     #[cfg(test)]
     fail_append_after_calls: Option<usize>,
+    #[cfg(test)]
+    fail_next_append_after: Option<usize>,
+    #[cfg(test)]
+    fail_next_truncate: bool,
 }
 
 #[derive(Debug)]
@@ -923,6 +951,12 @@ impl LsmStorage {
             write_manifest_initial(&root, &manifest)?;
             let wal = LsmWal::create(&root, storage_id, 1)?;
             sync_directory(&root)?;
+            maybe_fail_manifest_publish(ManifestPublishPoint::CreationParentSync)?;
+            sync_directory(
+                root.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new(".")),
+            )?;
             let runtime = Rc::new(Runtime {
                 writer: Cell::new(None),
                 recovery_required: Cell::new(false),
@@ -986,7 +1020,6 @@ impl LsmStorage {
         let root = root.as_ref().to_path_buf();
         let mut manifest = read_manifest(&root)?;
         validate_manifest_schema(&manifest, &table)?;
-        cleanup_authoritative_orphans(&root, &manifest)?;
         let (clustering_position, key_type) =
             validate_clustering_column(&table, manifest.clustering_column)?;
         if key_type != manifest.key_type {
@@ -1006,12 +1039,23 @@ impl LsmStorage {
         validate_recovered_transactions(&recovered, &manifest, &table)?;
         let prepared = classify_prepared(&recovered)?;
         validate_resolutions(&prepared, resolutions)?;
+        // A surviving rename is not evidence that its directory sync returned.
+        // Pin this authority before deleting either generation's obsolete files.
+        maybe_fail_manifest_publish(ManifestPublishPoint::RecoveryFileSync)?;
+        File::open(manifest_path(&root))?.sync_all()?;
+        maybe_fail_manifest_publish(ManifestPublishPoint::RecoveryDirectorySync)?;
+        sync_directory(&root)?;
+        cleanup_authoritative_orphans(&root, &manifest)?;
         let mut memtable = BTreeMap::new();
         let mut recovery_commit = allocate_recovery_commit(&manifest, &recovered)?;
         let mut change_outcomes = BTreeMap::new();
         for (txn_id, transaction) in &recovered {
             let decision = if let Some(commit) = transaction.commit {
                 Some((PreparedDecision::Commit, commit))
+            } else if transaction.aborted {
+                // An Abort already resolves Prepare. Reopening must neither
+                // request another coordinator decision nor append a second Abort.
+                None
             } else if let Some(database_txn_id) = transaction.prepared {
                 let resolution = resolutions
                     .iter()
@@ -1031,11 +1075,15 @@ impl LsmStorage {
                             commit_seq: commit,
                         })?;
                         wal.sync()?;
+                        #[cfg(test)]
+                        maybe_lsm_crash("recovery-after-commit-sync");
                         Some((PreparedDecision::Commit, commit))
                     }
                     PreparedDecision::Abort => {
                         wal.append(&WalRecord::Abort { txn_id: *txn_id })?;
                         wal.sync()?;
+                        #[cfg(test)]
+                        maybe_lsm_crash("recovery-after-abort-sync");
                         None
                     }
                 }
@@ -1293,7 +1341,8 @@ impl LsmStorage {
     }
 
     pub(crate) fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
-        if self.shared.borrow().runtime.recovery_required.get() {
+        let shared = self.shared.borrow();
+        if shared.runtime.recovery_required.get() || shared.wal.poisoned {
             Err(TransactionError::RecoveryRequired.into())
         } else {
             Ok(())
@@ -1425,6 +1474,7 @@ impl LsmStorage {
         &mut self,
         isolation_level: IsolationLevel,
     ) -> Result<LsmTransaction, StorageError> {
+        self.ensure_recovery_ready()?;
         let mut shared = self.shared.borrow_mut();
         let txn_id = TxnId(shared.allocate_txn_id()?);
         let count = shared
@@ -2840,7 +2890,8 @@ impl LsmTransaction {
     }
 
     fn ensure_recovery_not_required(&self) -> Result<(), StorageError> {
-        if self.shared.borrow().runtime.recovery_required.get() {
+        let shared = self.shared.borrow();
+        if shared.runtime.recovery_required.get() || shared.wal.poisoned {
             return Err(TransactionError::RecoveryRequired.into());
         }
         Ok(())
@@ -3952,7 +4003,7 @@ fn ensure_maintenance_safe(shared: &LsmShared) -> Result<(), StorageError> {
 }
 
 fn maintenance_safety_blocker(shared: &LsmShared) -> Option<LsmMaintenanceSafetyBlocker> {
-    if shared.runtime.recovery_required.get() {
+    if shared.runtime.recovery_required.get() || shared.wal.poisoned {
         Some(LsmMaintenanceSafetyBlocker::RecoveryRequired)
     } else if let Some(txn_id) = shared.runtime.writer.get() {
         Some(LsmMaintenanceSafetyBlocker::WriterActive { txn_id })
@@ -4449,10 +4500,15 @@ impl LsmWal {
             path,
             storage_id,
             end: WAL_HEADER_SIZE as u64,
+            poisoned: false,
             #[cfg(test)]
             fail_next_sync: false,
             #[cfg(test)]
             fail_append_after_calls: None,
+            #[cfg(test)]
+            fail_next_append_after: None,
+            #[cfg(test)]
+            fail_next_truncate: false,
         })
     }
 
@@ -4475,8 +4531,10 @@ impl LsmWal {
         let (records, valid_end) = decode_wal_records(&mut file, storage_id)?;
         if valid_end < file.metadata()?.len() {
             file.set_len(valid_end)?;
-            file.sync_all()?;
         }
+        // Recovery may finalize a coordinator decision from a complete record
+        // whose previous sync did not return; synchronize before publishing it.
+        file.sync_all()?;
         file.seek(SeekFrom::Start(valid_end))?;
         Ok((
             Self {
@@ -4484,10 +4542,15 @@ impl LsmWal {
                 path,
                 storage_id,
                 end: valid_end,
+                poisoned: false,
                 #[cfg(test)]
                 fail_next_sync: false,
                 #[cfg(test)]
                 fail_append_after_calls: None,
+                #[cfg(test)]
+                fail_next_append_after: None,
+                #[cfg(test)]
+                fail_next_truncate: false,
             },
             records,
         ))
@@ -4513,6 +4576,7 @@ impl LsmWal {
     }
 
     fn append(&mut self, record: &WalRecord) -> Result<Lsn, StorageError> {
+        self.ensure_healthy()?;
         #[cfg(test)]
         if let Some(remaining) = self.fail_append_after_calls.as_mut() {
             if *remaining == 0 {
@@ -4522,17 +4586,58 @@ impl LsmWal {
             *remaining -= 1;
         }
         let bytes = encode_wal_record(record, self.storage_id)?;
-        let lsn = Lsn(self.end);
-        self.file.seek(SeekFrom::Start(self.end))?;
-        self.file.write_all(&bytes)?;
-        self.end = self
+        let next_end = self
             .end
             .checked_add(bytes.len() as u64)
             .ok_or(LsmError::InvalidWal("file offset overflows"))?;
+        let lsn = Lsn(self.end);
+        self.file.seek(SeekFrom::Start(self.end))?;
+        let append = self.write_append_bytes(&bytes);
+        if let Err(append) = append {
+            return Err(match self.truncate_failed_append() {
+                Ok(()) => append.into(),
+                Err(cleanup) => {
+                    self.poisoned = true;
+                    LsmError::WalAppendCleanup {
+                        offset: self.end,
+                        append,
+                        cleanup,
+                    }
+                    .into()
+                }
+            });
+        }
+        self.end = next_end;
         Ok(lsn)
     }
 
+    fn write_append_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(count) = self.fail_next_append_after.take() {
+            self.file.write_all(&bytes[..count.min(bytes.len())])?;
+            return Err(io::Error::other("injected partial LSM WAL append"));
+        }
+        self.file.write_all(bytes)
+    }
+
+    fn truncate_failed_append(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_truncate) {
+            return Err(io::Error::other("injected LSM WAL truncation failure"));
+        }
+        self.file.set_len(self.end)
+    }
+
+    fn ensure_healthy(&self) -> Result<(), StorageError> {
+        if self.poisoned {
+            Err(TransactionError::RecoveryRequired.into())
+        } else {
+            Ok(())
+        }
+    }
+
     fn sync(&mut self) -> Result<(), StorageError> {
+        self.ensure_healthy()?;
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_sync) {
             return Err(io::Error::other("injected LSM WAL sync failure").into());
@@ -8042,6 +8147,66 @@ mod tests {
     }
 
     #[test]
+    fn crash_audit_recovery_barriers_precede_orphan_deletion() {
+        for point in [
+            super::ManifestPublishPoint::RecoveryFileSync,
+            super::ManifestPublishPoint::RecoveryDirectorySync,
+        ] {
+            let root = root(&format!("recovery-authority-{point:?}"));
+            cleanup(&root);
+            let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+            storage.insert(&row(1, "winner")).unwrap();
+            super::MANIFEST_PUBLISH_FAILURE
+                .with(|failure| failure.set(Some(super::ManifestPublishPoint::AfterInstall)));
+            assert!(storage.flush().is_err());
+            drop(storage);
+            let old_wal = super::wal_path(&root, 1);
+            let old_bytes = std::fs::read(&old_wal).unwrap();
+            let candidate = super::manifest_next_path(&root);
+            std::fs::write(&candidate, b"unpublished candidate").unwrap();
+            let orphan = root.join(super::SST_DIR_NAME).join("999999.nbls");
+            std::fs::write(&orphan, b"unreferenced artifact").unwrap();
+            super::MANIFEST_PUBLISH_FAILURE.with(|failure| failure.set(Some(point)));
+            assert!(LsmStorage::open(&root, table()).is_err());
+            assert_eq!(std::fs::read(&old_wal).unwrap(), old_bytes);
+            assert!(candidate.exists());
+            assert!(orphan.exists());
+            for _ in 0..2 {
+                let mut storage = LsmStorage::open(&root, table()).unwrap();
+                let view = storage.read_view().unwrap();
+                let rows = storage
+                    .scan_columns_with_view(&[ColumnId(1), ColumnId(2)], &view)
+                    .unwrap();
+                assert_eq!(
+                    rows.into_iter()
+                        .map(|(_, values)| values)
+                        .collect::<Vec<_>>(),
+                    vec![row(1, "winner")]
+                );
+            }
+            assert!(!old_wal.exists());
+            assert!(!candidate.exists());
+            assert!(!orphan.exists());
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn crash_audit_creation_requires_parent_directory_sync() {
+        let root = root("creation-parent-sync");
+        cleanup(&root);
+        super::MANIFEST_PUBLISH_FAILURE
+            .with(|failure| failure.set(Some(super::ManifestPublishPoint::CreationParentSync)));
+        assert!(LsmStorage::create(&root, table(), ColumnId(1)).is_err());
+        assert!(!root.exists());
+        drop(LsmStorage::create(&root, table(), ColumnId(1)).unwrap());
+        for _ in 0..2 {
+            assert!(LsmStorage::open(&root, table()).is_ok());
+        }
+        cleanup(&root);
+    }
+
+    #[test]
     fn uncertain_manifest_install_requires_reopen_and_preserves_rows() {
         let root = root("manifest-uncertain");
         cleanup(&root);
@@ -8110,6 +8275,214 @@ mod tests {
             valid_length
         );
         drop(reopened);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn crash_audit_partial_append_can_retry_a_shorter_record() {
+        let root = root("partial-append-shorter-retry");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let mut transaction = storage.begin_transaction().unwrap();
+        storage
+            .insert_in(&mut transaction, &row(1, &"x".repeat(4096)))
+            .unwrap();
+        transaction.shared.borrow_mut().wal.fail_next_append_after = Some(2048);
+        assert!(transaction.commit().is_err());
+        transaction.rollback().unwrap();
+        drop(transaction);
+        storage.insert(&row(2, "winner")).unwrap();
+        drop(storage);
+        for _ in 0..2 {
+            let mut storage =
+                LsmStorage::open(&root, table()).expect("recover shorter successful retry");
+            let view = storage.read_view().unwrap();
+            assert_eq!(
+                storage
+                    .scan_columns_with_view(&[ColumnId(1), ColumnId(2)], &view)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(_, values)| values)
+                    .collect::<Vec<_>>(),
+                vec![row(2, "winner")]
+            );
+        }
+        cleanup(&root);
+    }
+
+    #[test]
+    fn crash_audit_wal_double_failure_requires_reopen() {
+        let root = root("wal-double-failure");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        storage.insert(&row(1, "durable")).unwrap();
+        let mut transaction = storage.begin_transaction().unwrap();
+        storage
+            .insert_in(&mut transaction, &row(2, &"x".repeat(4096)))
+            .unwrap();
+        {
+            let mut shared = transaction.shared.borrow_mut();
+            shared.wal.fail_next_append_after = Some(2048);
+            shared.wal.fail_next_truncate = true;
+        }
+        let error = transaction.commit().unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::Lsm(super::LsmError::WalAppendCleanup { .. })
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("injected partial LSM WAL append")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("injected LSM WAL truncation failure")
+        );
+        let before = std::fs::read(super::wal_path(&root, 1)).unwrap();
+        assert!(transaction.commit().is_err());
+        assert!(storage.begin_transaction().is_err());
+        assert!(storage.insert(&row(3, "blocked")).is_err());
+        drop(transaction);
+        assert!(storage.flush().is_err());
+        assert!(storage.checkpoint().is_err());
+        assert!(storage.close().is_err());
+        assert_eq!(std::fs::read(super::wal_path(&root, 1)).unwrap(), before);
+        for _ in 0..2 {
+            let mut storage = LsmStorage::open(&root, table()).unwrap();
+            let view = storage.read_view().unwrap();
+            let rows = storage
+                .scan_columns_with_view(&[ColumnId(1), ColumnId(2)], &view)
+                .unwrap();
+            assert_eq!(
+                rows.into_iter()
+                    .map(|(_, values)| values)
+                    .collect::<Vec<_>>(),
+                vec![row(1, "durable")]
+            );
+        }
+        cleanup(&root);
+    }
+
+    #[test]
+    fn crash_audit_lsm_recovery_child() {
+        if std::env::var_os("NETBADB_LSM_RECOVERY_CHILD").is_none() {
+            return;
+        }
+        let root = std::path::PathBuf::from(std::env::var_os("NETBADB_LSM_CRASH_ROOT").unwrap());
+        let decision =
+            if std::env::var("NETBADB_LSM_CRASH_POINT").unwrap() == "recovery-after-commit-sync" {
+                PreparedDecision::Commit
+            } else {
+                PreparedDecision::Abort
+            };
+        let resolutions = LsmStorage::inspect_recovery(&root, &table())
+            .unwrap()
+            .prepared_transactions
+            .into_iter()
+            .map(|prepared| PreparedTxnResolution {
+                database_txn_id: prepared.database_txn_id,
+                physical_txn_id: prepared.physical_txn_id,
+                decision,
+            })
+            .collect::<Vec<_>>();
+        LsmStorage::open_with_prepared_resolutions(&root, table(), &resolutions).unwrap();
+        panic!("recovery did not reach crash point");
+    }
+
+    #[test]
+    fn crash_audit_lsm_recovery_can_crash_after_either_terminal_sync() {
+        for (point, commit) in [
+            ("recovery-after-commit-sync", true),
+            ("recovery-after-abort-sync", false),
+        ] {
+            let root = root(point);
+            cleanup(&root);
+            let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+            let old = storage.insert(&row(1, "before")).unwrap();
+            storage.flush().unwrap();
+            let mut transaction = storage.begin_transaction().unwrap();
+            storage.delete_in(&mut transaction, old).unwrap();
+            storage
+                .insert_in(&mut transaction, &row(2, "after"))
+                .unwrap();
+            transaction.prepare(DatabaseTxnId(101)).unwrap();
+            drop(transaction);
+            drop(storage);
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lsm::tests::crash_audit_lsm_recovery_child",
+                    "--nocapture",
+                ])
+                .env("NETBADB_LSM_RECOVERY_CHILD", "1")
+                .env("NETBADB_LSM_CRASH_CHILD", "1")
+                .env("NETBADB_LSM_CRASH_ROOT", &root)
+                .env("NETBADB_LSM_CRASH_POINT", point)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(86));
+            let recovered_wal =
+                super::wal_path(&root, super::read_manifest(&root).unwrap().wal_generation);
+            let before = std::fs::read(&recovered_wal).unwrap();
+            for _ in 0..3 {
+                let mut storage = LsmStorage::open(&root, table()).unwrap();
+                let view = storage.read_view().unwrap();
+                let rows = storage
+                    .scan_columns_with_view(&[ColumnId(1), ColumnId(2)], &view)
+                    .unwrap();
+                assert_eq!(
+                    rows.into_iter()
+                        .map(|(_, values)| values)
+                        .collect::<Vec<_>>(),
+                    vec![if commit {
+                        row(2, "after")
+                    } else {
+                        row(1, "before")
+                    }]
+                );
+                assert_eq!(std::fs::read(&recovered_wal).unwrap(), before);
+            }
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn crash_audit_prepared_abort_is_terminal_on_every_reopen() {
+        let root = root("prepared-abort-idempotency");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let mut transaction = storage.begin_transaction().unwrap();
+        storage
+            .insert_in(&mut transaction, &row(1, "loser"))
+            .unwrap();
+        transaction.prepare(DatabaseTxnId(100)).unwrap();
+        let resolution = PreparedTxnResolution {
+            database_txn_id: DatabaseTxnId(100),
+            physical_txn_id: transaction.id(),
+            decision: PreparedDecision::Abort,
+        };
+        transaction.rollback_prepared(DatabaseTxnId(100)).unwrap();
+        drop(transaction);
+        drop(storage);
+        let original = std::fs::read(super::wal_path(&root, 1)).unwrap();
+        for pass in 0..4 {
+            let mut storage = if pass % 2 == 0 {
+                LsmStorage::open(&root, table())
+            } else {
+                LsmStorage::open_with_prepared_resolutions(&root, table(), &[resolution])
+            }
+            .expect("terminal abort needs no new record or decision");
+            let view = storage.read_view().unwrap();
+            assert!(
+                storage
+                    .scan_columns_with_view(&[ColumnId(1)], &view)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(std::fs::read(super::wal_path(&root, 1)).unwrap(), original);
+        }
         cleanup(&root);
     }
 
@@ -8645,7 +9018,7 @@ mod tests {
                 .status()
                 .unwrap();
             assert_eq!(status.code(), Some(86), "point {point}");
-            for pass in 0..2 {
+            for pass in 0..3 {
                 let resolutions = LsmStorage::inspect_recovery(&root, &table())
                     .unwrap()
                     .prepared_transactions

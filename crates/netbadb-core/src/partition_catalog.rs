@@ -148,6 +148,17 @@ impl PartitionCatalog {
             path: path.to_owned(),
             source,
         })?;
+        // Catalog and coordinator paths may have different parents. Syncing the
+        // coordinator directory cannot publish this catalog's directory entry.
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_catalog_parent(parent).map_err(|source| PartitionError::Io {
+            operation: "sync partition catalog directory",
+            path: parent.to_owned(),
+            source,
+        })?;
         Ok(catalog)
     }
 
@@ -377,6 +388,21 @@ impl PartitionCatalog {
         }
         Ok(())
     }
+}
+
+fn sync_catalog_parent(parent: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_CATALOG_PARENT_SYNC.with(|failure| failure.replace(false)) {
+        return Err(std::io::Error::other(
+            "injected catalog directory sync failure",
+        ));
+    }
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_CATALOG_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn canonicalize_partitions(
@@ -752,6 +778,31 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[test]
+    fn crash_audit_catalog_creation_requires_its_own_directory_sync() {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-partition-parent-sync-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("partition.catalog");
+        FAIL_CATALOG_PARENT_SYNC.with(|failure| failure.set(true));
+        assert!(matches!(
+            PartitionCatalog::create(&path, catalog().tables),
+            Err(PartitionError::Io {
+                operation: "sync partition catalog directory",
+                ..
+            })
+        ));
+        std::fs::remove_file(&path).unwrap();
+        let expected = PartitionCatalog::create(&path, catalog().tables).unwrap();
+        for _ in 0..2 {
+            assert_eq!(PartitionCatalog::open(&path).unwrap(), expected);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

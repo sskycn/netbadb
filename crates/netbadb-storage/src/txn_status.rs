@@ -28,6 +28,12 @@ pub enum TxnStatus {
 #[derive(Debug)]
 pub enum TxnStatusError {
     Io(std::io::Error),
+    AppendCleanup {
+        offset: u64,
+        append: std::io::Error,
+        cleanup: std::io::Error,
+    },
+    RecoveryRequired,
     InvalidMagic,
     UnsupportedVersion(u16),
     InvalidHeaderSize(u16),
@@ -75,6 +81,17 @@ impl std::fmt::Display for TxnStatusError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "transaction-status I/O error: {error}"),
+            Self::AppendCleanup {
+                offset,
+                append,
+                cleanup,
+            } => write!(
+                formatter,
+                "transaction-status append at {offset} failed: {append}; truncation failed: {cleanup}; reopen required"
+            ),
+            Self::RecoveryRequired => {
+                formatter.write_str("transaction-status writer requires reopen/recovery")
+            }
             Self::InvalidMagic => formatter.write_str("transaction-status magic does not match"),
             Self::UnsupportedVersion(version) => {
                 write!(
@@ -150,6 +167,7 @@ impl std::error::Error for TxnStatusError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::AppendCleanup { append, .. } => Some(append),
             _ => None,
         }
     }
@@ -168,6 +186,11 @@ pub(crate) struct TxnStatusStore {
     active: HashSet<TxnId>,
     snapshots: BTreeMap<CommitSeq, u64>,
     maximum_commit_seq: CommitSeq,
+    poisoned: bool,
+    #[cfg(test)]
+    pub(crate) fail_next_append_after: Option<usize>,
+    #[cfg(test)]
+    pub(crate) fail_next_truncate: bool,
 }
 
 impl TxnStatusStore {
@@ -188,18 +211,28 @@ impl TxnStatusStore {
             active: HashSet::new(),
             snapshots: BTreeMap::new(),
             maximum_commit_seq: CommitSeq(0),
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_append_after: None,
+            #[cfg(test)]
+            fail_next_truncate: false,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, TxnStatusError> {
+        Self::open_for_recovery(path, &[])
+    }
+
+    pub(crate) fn open_for_recovery(
+        path: impl AsRef<Path>,
+        records: &[crate::WalRecord],
+    ) -> Result<Self, TxnStatusError> {
         let path = path.as_ref().to_owned();
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         validate_header(&bytes)?;
-        if (bytes.len() - STATUS_HEADER_SIZE) % RECORD_SIZE != 0 {
-            return Err(TxnStatusError::TruncatedRecord);
-        }
         let mut durable = HashMap::new();
         let mut maximum_commit_seq = CommitSeq(0);
         for (position, record) in bytes[STATUS_HEADER_SIZE..]
@@ -213,12 +246,44 @@ impl TxnStatusStore {
                 maximum_commit_seq = maximum_commit_seq.max(commit_seq);
             }
         }
+        let tail_size = (bytes.len() - STATUS_HEADER_SIZE) % RECORD_SIZE;
+        if tail_size != 0 {
+            let valid_end = bytes.len() - tail_size;
+            let tail = &bytes[valid_end..];
+            // Never discard archived status history by guessing. Only a prefix
+            // of a terminal decision still present in validated WAL is repairable.
+            // Recovery replays that decision before snapshots become available.
+            let certified = records.iter().any(|record| {
+                let status = match record.kind {
+                    crate::WalRecordKind::Commit => TxnStatus::Committed(CommitSeq(record.lsn.0)),
+                    crate::WalRecordKind::RollbackComplete => TxnStatus::Aborted,
+                    _ => return false,
+                };
+                durable
+                    .get(&record.txn_id)
+                    .is_none_or(|existing| *existing == status)
+                    && encode_record(record.txn_id, status)
+                        .is_ok_and(|bytes| bytes.starts_with(tail))
+            });
+            if !certified {
+                return Err(TxnStatusError::TruncatedRecord);
+            }
+            file.set_len(valid_end as u64)?;
+        }
+        // Readable bytes from a previous process are not proof of a completed
+        // sync. Establish durability before an equal-status retry can return OK.
+        file.sync_data()?;
         Ok(Self {
             file,
             durable,
             active: HashSet::new(),
             snapshots: BTreeMap::new(),
             maximum_commit_seq,
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_append_after: None,
+            #[cfg(test)]
+            fail_next_truncate: false,
         })
     }
 
@@ -243,6 +308,9 @@ impl TxnStatusStore {
     }
 
     fn record(&mut self, txn_id: TxnId, status: TxnStatus) -> Result<(), TxnStatusError> {
+        if self.poisoned {
+            return Err(TxnStatusError::RecoveryRequired);
+        }
         if let Some(existing) = self.durable.get(&txn_id).copied() {
             if existing == status {
                 self.active.remove(&txn_id);
@@ -251,15 +319,57 @@ impl TxnStatusStore {
             return Err(TxnStatusError::ConflictingStatus { txn_id });
         }
         let bytes = encode_record(txn_id, status)?;
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&bytes)?;
-        self.file.sync_data()?;
+        let offset = self.file.seek(SeekFrom::End(0))?;
+        let append = (|| {
+            #[cfg(test)]
+            if let Some(count) = self.fail_next_append_after.take() {
+                self.file.write_all(&bytes[..count.min(bytes.len())])?;
+                return Err(std::io::Error::other("injected partial status append"));
+            }
+            #[cfg(test)]
+            {
+                self.file.write_all(&bytes[..17])?;
+                crate::crash_test::maybe_crash_named("status-after-partial-record");
+            }
+            #[cfg(test)]
+            let bytes = &bytes[17..];
+            #[cfg(not(test))]
+            let bytes = &bytes[..];
+            self.file.write_all(bytes)?;
+            self.file.sync_data()
+        })();
+        if let Err(append) = append {
+            let cleanup = self.truncate_failed_append(offset);
+            return Err(match cleanup {
+                Ok(()) => TxnStatusError::Io(append),
+                Err(cleanup) => {
+                    self.poisoned = true;
+                    TxnStatusError::AppendCleanup {
+                        offset,
+                        append,
+                        cleanup,
+                    }
+                }
+            });
+        }
         self.durable.insert(txn_id, status);
         self.active.remove(&txn_id);
         if let TxnStatus::Committed(commit_seq) = status {
             self.maximum_commit_seq = self.maximum_commit_seq.max(commit_seq);
         }
         Ok(())
+    }
+
+    fn truncate_failed_append(&mut self, offset: u64) -> std::io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_truncate) {
+            return Err(std::io::Error::other("injected status truncation failure"));
+        }
+        self.file.set_len(offset)
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     pub(crate) fn status(&self, txn_id: TxnId) -> Result<TxnStatus, TxnStatusError> {
@@ -449,6 +559,71 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    #[test]
+    fn crash_audit_status_partial_append_retry_reopens() {
+        let path = path("partial-append-retry");
+        let _ = std::fs::remove_file(&path);
+        let mut store = TxnStatusStore::create(&path).unwrap();
+        store.fail_next_append_after = Some(17);
+        assert!(store.record_committed(TxnId(7), CommitSeq(91)).is_err());
+        store.record_committed(TxnId(7), CommitSeq(91)).unwrap();
+        drop(store);
+        for _ in 0..2 {
+            let store =
+                TxnStatusStore::open(&path).expect("successful retry leaves a valid status log");
+            assert_eq!(
+                store.status(TxnId(7)).unwrap(),
+                TxnStatus::Committed(CommitSeq(91))
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn crash_audit_status_tail_requires_matching_wal_and_valid_complete_prefix() {
+        use crate::{WalRecord, WalRecordKind};
+        use netbadb_types::Lsn;
+        let path = path("certified-tail");
+        let _ = std::fs::remove_file(&path);
+        let store = TxnStatusStore::create(&path).unwrap();
+        drop(store);
+        let header = std::fs::read(&path).unwrap();
+        let record = super::encode_record(TxnId(7), TxnStatus::Committed(CommitSeq(91))).unwrap();
+        let wal = [WalRecord {
+            lsn: Lsn(91),
+            txn_id: TxnId(7),
+            prev_lsn: Some(Lsn(1)),
+            kind: WalRecordKind::Commit,
+        }];
+        for length in 1..super::RECORD_SIZE {
+            let bytes = [header.as_slice(), &record[..length]].concat();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(matches!(
+                TxnStatusStore::open_for_recovery(&path, &[]),
+                Err(TxnStatusError::TruncatedRecord)
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            let mut store = TxnStatusStore::open_for_recovery(&path, &wal).unwrap();
+            store.record_committed(TxnId(7), CommitSeq(91)).unwrap();
+            drop(store);
+            assert!(TxnStatusStore::open(&path).is_ok());
+        }
+        let mut bad_tail = [header.as_slice(), &record[..17]].concat();
+        bad_tail[super::STATUS_HEADER_SIZE] ^= 1;
+        std::fs::write(&path, &bad_tail).unwrap();
+        assert!(TxnStatusStore::open_for_recovery(&path, &wal).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bad_tail);
+        let mut corrupt_complete = [header.as_slice(), record.as_slice(), &record[..17]].concat();
+        corrupt_complete[super::STATUS_HEADER_SIZE + 24] ^= 1;
+        std::fs::write(&path, &corrupt_complete).unwrap();
+        assert!(matches!(
+            TxnStatusStore::open_for_recovery(&path, &wal),
+            Err(TxnStatusError::RecordChecksumMismatch { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt_complete);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

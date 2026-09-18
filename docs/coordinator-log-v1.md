@@ -82,6 +82,11 @@ The decision tuple must match the Heap metadata StorageId and the prepared WAL
 DatabaseTxnId/physical TxnId exactly. Missing or extra participants fail the
 whole database open.
 
+Open synchronizes the validated log and its parent directory before returning
+append authority. This also finishes the publication barrier for a compaction
+rename whose prior directory sync was uncertain. A failed barrier returns an
+error; a readable replacement file alone does not restore write authority.
+
 ## Round 18 schema participant records (CORD v2)
 
 The NBCO file header stays v1. Existing CORD v1 records are still read and written
