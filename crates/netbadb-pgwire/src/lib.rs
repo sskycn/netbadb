@@ -832,7 +832,7 @@ fn decode_frontend_message(tag: u8, payload: &[u8]) -> Result<FrontendMessage, W
         b'P' => {
             let statement = cursor.read_cstring("prepared statement name")?;
             let query = cursor.read_cstring("prepared query")?;
-            let count = cursor.read_count("parameter type", MAX_PARAMETERS)?;
+            let count = cursor.read_count("parameter type", MAX_PARAMETERS, 4)?;
             let mut parameter_types = Vec::with_capacity(count);
             for _ in 0..count {
                 parameter_types.push(PostgresOid(cursor.read_u32()?));
@@ -846,12 +846,12 @@ fn decode_frontend_message(tag: u8, payload: &[u8]) -> Result<FrontendMessage, W
         b'B' => {
             let portal = cursor.read_cstring("portal name")?;
             let statement = cursor.read_cstring("bound statement name")?;
-            let format_count = cursor.read_count("parameter format", MAX_PARAMETERS)?;
+            let format_count = cursor.read_count("parameter format", MAX_PARAMETERS, 2)?;
             let mut parameter_formats = Vec::with_capacity(format_count);
             for _ in 0..format_count {
                 parameter_formats.push(FormatCode::decode(cursor.read_i16()?)?);
             }
-            let parameter_count = cursor.read_count("parameter", MAX_PARAMETERS)?;
+            let parameter_count = cursor.read_count("parameter", MAX_PARAMETERS, 4)?;
             let mut parameters = Vec::with_capacity(parameter_count);
             for _ in 0..parameter_count {
                 let length = cursor.read_i32()?;
@@ -871,7 +871,7 @@ fn decode_frontend_message(tag: u8, payload: &[u8]) -> Result<FrontendMessage, W
                     parameters.push(Some(cursor.read_bytes(length)?.to_vec()));
                 }
             }
-            let result_count = cursor.read_count("result format", MAX_FIELDS)?;
+            let result_count = cursor.read_count("result format", MAX_FIELDS, 2)?;
             let mut result_formats = Vec::with_capacity(result_count);
             for _ in 0..result_count {
                 result_formats.push(FormatCode::decode(cursor.read_i16()?)?);
@@ -959,6 +959,14 @@ pub fn write_backend_message(
         BackendMessage::RowDescription(fields) => {
             push_count(&mut payload, fields.len(), "row field", MAX_FIELDS)?;
             for field in fields {
+                check_message_growth(
+                    &payload,
+                    field
+                        .name
+                        .len()
+                        .checked_add(19)
+                        .ok_or(WireError::IntegerOverflow)?,
+                )?;
                 push_cstring(&mut payload, &field.name)?;
                 payload.extend_from_slice(&field.table_oid.to_be_bytes());
                 payload.extend_from_slice(&field.column_attribute.to_be_bytes());
@@ -972,6 +980,14 @@ pub fn write_backend_message(
         BackendMessage::DataRow(values) => {
             push_count(&mut payload, values.len(), "data row field", MAX_FIELDS)?;
             for value in values {
+                check_message_growth(
+                    &payload,
+                    value
+                        .as_ref()
+                        .map_or(0, Vec::len)
+                        .checked_add(4)
+                        .ok_or(WireError::IntegerOverflow)?,
+                )?;
                 match value {
                     None => push_i32(&mut payload, -1),
                     Some(value) => {
@@ -1097,18 +1113,47 @@ fn push_count(
     Ok(())
 }
 
+fn check_message_growth(output: &[u8], additional: usize) -> Result<(), WireError> {
+    let length = output
+        .len()
+        .checked_add(additional)
+        .and_then(|n| n.checked_add(4))
+        .ok_or(WireError::IntegerOverflow)?;
+    if length > MAX_MESSAGE_BYTES {
+        return Err(WireError::MessageTooLarge {
+            length,
+            limit: MAX_MESSAGE_BYTES,
+        });
+    }
+    Ok(())
+}
+
 fn push_cstring(output: &mut Vec<u8>, value: &str) -> Result<(), WireError> {
     if value.len() > MAX_STRING_BYTES || value.as_bytes().contains(&0) {
         return Err(WireError::InvalidMessage {
             context: "zero-terminated string",
         });
     }
+    check_message_growth(
+        output,
+        value
+            .len()
+            .checked_add(1)
+            .ok_or(WireError::IntegerOverflow)?,
+    )?;
     output.extend_from_slice(value.as_bytes());
     output.push(0);
     Ok(())
 }
 
 fn push_error_field(output: &mut Vec<u8>, tag: u8, value: &str) -> Result<(), WireError> {
+    check_message_growth(
+        output,
+        value
+            .len()
+            .checked_add(2)
+            .ok_or(WireError::IntegerOverflow)?,
+    )?;
     output.push(tag);
     push_cstring(output, value)
 }
@@ -1166,7 +1211,12 @@ impl<'a> Cursor<'a> {
         Ok(u32::from_be_bytes(bytes))
     }
 
-    fn read_count(&mut self, context: &'static str, limit: usize) -> Result<usize, WireError> {
+    fn read_count(
+        &mut self,
+        context: &'static str,
+        limit: usize,
+        minimum_bytes: usize,
+    ) -> Result<usize, WireError> {
         let count = self.read_i16()?;
         let count = usize::try_from(count).map_err(|_| WireError::InvalidMessage { context })?;
         if count > limit {
@@ -1175,6 +1225,9 @@ impl<'a> Cursor<'a> {
                 count,
                 limit,
             });
+        }
+        if count > (self.bytes.len() - self.position) / minimum_bytes {
+            return Err(WireError::InvalidMessage { context });
         }
         Ok(count)
     }
@@ -1222,6 +1275,33 @@ mod tests {
         bytes.extend_from_slice(&i32::try_from(payload.len() + 4).unwrap().to_be_bytes());
         bytes.extend_from_slice(payload);
         bytes
+    }
+
+    #[test]
+    fn resource_pgwire_rejects_impossible_counts_and_oversized_response_growth() {
+        // Parse: two empty cstrings, then a valid absolute parameter count but no OIDs.
+        assert!(matches!(
+            decode_frontend_message(b'P', &[0, 0, 4, 0]),
+            Err(WireError::InvalidMessage {
+                context: "parameter type"
+            })
+        ));
+        let mut payload = vec![0; MAX_MESSAGE_BYTES - 5];
+        let original = (payload.len(), payload.capacity());
+        assert!(matches!(
+            push_cstring(&mut payload, "ab"),
+            Err(WireError::MessageTooLarge { .. })
+        ));
+        assert_eq!((payload.len(), payload.capacity()), original);
+        let mut wire = Vec::new();
+        assert!(matches!(
+            write_backend_message(
+                &mut wire,
+                &BackendMessage::DataRow(vec![Some(vec![0; MAX_MESSAGE_BYTES])])
+            ),
+            Err(WireError::MessageTooLarge { .. })
+        ));
+        assert!(wire.is_empty());
     }
 
     #[test]

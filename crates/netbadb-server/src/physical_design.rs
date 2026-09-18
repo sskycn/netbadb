@@ -824,17 +824,25 @@ impl Error for ServerPhysicalDesignControlError {
     }
 }
 
+/// Synchronous controls share one outstanding request across all handle clones.
+/// Concurrent callers wait before allocating a reply or copying a proposal;
+/// the permit is released after the reply or a stopped-worker error.
 #[derive(Clone)]
 pub struct ServerPhysicalDesignControlHandle {
     requests: Sender<ServerPhysicalDesignControlRequest>,
+    admission: crate::control_admission::ControlAdmission,
 }
 
 impl ServerPhysicalDesignControlHandle {
-    pub(crate) const fn new(requests: Sender<ServerPhysicalDesignControlRequest>) -> Self {
-        Self { requests }
+    pub(crate) fn new(requests: Sender<ServerPhysicalDesignControlRequest>) -> Self {
+        Self {
+            requests,
+            admission: crate::control_admission::ControlAdmission::default(),
+        }
     }
 
     pub fn status(&self) -> Result<ServerPhysicalDesignStatus, ServerPhysicalDesignControlError> {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerPhysicalDesignControlRequest::Status { reply })
@@ -855,6 +863,7 @@ impl ServerPhysicalDesignControlHandle {
         ServerPhysicalDesignMutationReceiptPage,
         ServerPhysicalDesignMutationReceiptControlError,
     > {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerPhysicalDesignControlRequest::MutationReceipts {
@@ -877,6 +886,7 @@ impl ServerPhysicalDesignControlHandle {
         ServerPhysicalDesignMutationReceiptScopedPage,
         ServerPhysicalDesignMutationReceiptControlError,
     > {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerPhysicalDesignControlRequest::MutationReceiptsScoped {
@@ -897,6 +907,7 @@ impl ServerPhysicalDesignControlHandle {
         ServerPhysicalDesignMutationReceiptStatus,
         ServerPhysicalDesignMutationReceiptControlError,
     > {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerPhysicalDesignControlRequest::MutationReceiptStatus { reply })
@@ -909,6 +920,7 @@ impl ServerPhysicalDesignControlHandle {
     pub fn recommendations(
         &self,
     ) -> Result<PhysicalDesignAdvisorReport, ServerPhysicalDesignControlError> {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerPhysicalDesignControlRequest::Recommendations { reply })
@@ -924,6 +936,7 @@ impl ServerPhysicalDesignControlHandle {
         &self,
         candidate: PhysicalIndexCandidate,
     ) -> Result<ServerPhysicalIndexDesignProposal, ServerPhysicalDesignControlError> {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerPhysicalDesignControlRequest::ProposeIndex { candidate, reply })
@@ -940,6 +953,7 @@ impl ServerPhysicalDesignControlHandle {
         proposal: &ServerPhysicalIndexDesignProposal,
         index_name: IndexName,
     ) -> Result<PhysicalIndexDesignApplyReport, ServerPhysicalDesignControlError> {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerPhysicalDesignControlRequest::ApplyIndex {
@@ -962,6 +976,7 @@ impl ServerPhysicalDesignControlHandle {
         placement: ServerPhysicalColumnarPlacementKey,
     ) -> Result<ServerPhysicalColumnarDesignProposal, ServerPhysicalColumnarDesignControlError>
     {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerPhysicalDesignControlRequest::ProposeColumnar {
@@ -983,6 +998,7 @@ impl ServerPhysicalDesignControlHandle {
         proposal: &ServerPhysicalColumnarDesignProposal,
     ) -> Result<ServerPhysicalColumnarDesignApplyReport, ServerPhysicalColumnarDesignControlError>
     {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerPhysicalDesignControlRequest::ApplyColumnar {
@@ -1008,6 +1024,7 @@ impl ServerPhysicalDesignControlHandle {
         ServerApprovedPhysicalIndexApplyReport,
         ServerPhysicalDesignControlError,
     > {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         if self
             .requests
@@ -1042,6 +1059,7 @@ impl ServerPhysicalDesignControlHandle {
         ServerApprovedPhysicalColumnarApplyReport,
         ServerPhysicalColumnarDesignControlError,
     > {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         if self
             .requests
@@ -1071,6 +1089,7 @@ impl ServerPhysicalDesignControlHandle {
         &self,
         expected: PhysicalDesignEvidenceEpoch,
     ) -> Result<ServerPhysicalDesignRotationReport, ServerPhysicalDesignControlError> {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerPhysicalDesignControlRequest::RotateEvidenceIfEpoch { expected, reply })
@@ -2195,180 +2214,168 @@ pub(crate) fn forward_physical_design_control_requests<F>(
 ) where
     F: FnMut(ServerPhysicalDesignWorkerCommand) -> Result<(), ()>,
 {
-    loop {
-        let request = match requests.try_recv() {
-            Ok(request) => request,
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-        };
-        match request {
-            ServerPhysicalDesignControlRequest::Status { reply } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::Status { reply }).is_err() {
-                    let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
-                }
+    // Bound listener work even when a caller immediately submits its next control.
+    let request = match requests.try_recv() {
+        Ok(request) => request,
+        Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+    };
+    match request {
+        ServerPhysicalDesignControlRequest::Status { reply } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::Status { reply }).is_err() {
+                let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
             }
-            ServerPhysicalDesignControlRequest::MutationReceipts {
+        }
+        ServerPhysicalDesignControlRequest::MutationReceipts {
+            after,
+            limit,
+            reply,
+        } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::MutationReceipts {
                 after,
                 limit,
                 reply,
-            } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::MutationReceipts {
-                    after,
-                    limit,
-                    reply,
-                })
-                .is_err()
-                {
-                    let _ = fallback.send(Err(
-                        ServerPhysicalDesignMutationReceiptControlError::ServerStopped,
-                    ));
-                }
+            })
+            .is_err()
+            {
+                let _ = fallback.send(Err(
+                    ServerPhysicalDesignMutationReceiptControlError::ServerStopped,
+                ));
             }
-            ServerPhysicalDesignControlRequest::MutationReceiptsScoped {
+        }
+        ServerPhysicalDesignControlRequest::MutationReceiptsScoped {
+            after,
+            limit,
+            reply,
+        } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::MutationReceiptsScoped {
                 after,
                 limit,
                 reply,
-            } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::MutationReceiptsScoped {
-                    after,
-                    limit,
-                    reply,
-                })
-                .is_err()
-                {
-                    let _ = fallback.send(Err(
-                        ServerPhysicalDesignMutationReceiptControlError::ServerStopped,
-                    ));
-                }
+            })
+            .is_err()
+            {
+                let _ = fallback.send(Err(
+                    ServerPhysicalDesignMutationReceiptControlError::ServerStopped,
+                ));
             }
-            ServerPhysicalDesignControlRequest::MutationReceiptStatus { reply } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::MutationReceiptStatus { reply })
-                    .is_err()
-                {
-                    let _ = fallback.send(Err(
-                        ServerPhysicalDesignMutationReceiptControlError::ServerStopped,
-                    ));
-                }
+        }
+        ServerPhysicalDesignControlRequest::MutationReceiptStatus { reply } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::MutationReceiptStatus { reply }).is_err() {
+                let _ = fallback.send(Err(
+                    ServerPhysicalDesignMutationReceiptControlError::ServerStopped,
+                ));
             }
-            ServerPhysicalDesignControlRequest::Recommendations { reply } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::Recommendations { reply }).is_err() {
-                    let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
-                }
+        }
+        ServerPhysicalDesignControlRequest::Recommendations { reply } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::Recommendations { reply }).is_err() {
+                let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
             }
-            ServerPhysicalDesignControlRequest::ProposeIndex { candidate, reply } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::ProposeIndex { candidate, reply })
-                    .is_err()
-                {
-                    let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
-                }
+        }
+        ServerPhysicalDesignControlRequest::ProposeIndex { candidate, reply } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::ProposeIndex { candidate, reply }).is_err()
+            {
+                let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
             }
-            ServerPhysicalDesignControlRequest::ApplyIndex {
+        }
+        ServerPhysicalDesignControlRequest::ApplyIndex {
+            proposal,
+            index_name,
+            reply,
+        } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::ApplyIndex {
                 proposal,
                 index_name,
                 reply,
-            } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::ApplyIndex {
-                    proposal,
-                    index_name,
-                    reply,
-                })
-                .is_err()
-                {
-                    let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
-                }
+            })
+            .is_err()
+            {
+                let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
             }
-            ServerPhysicalDesignControlRequest::ProposeColumnar {
+        }
+        ServerPhysicalDesignControlRequest::ProposeColumnar {
+            candidate,
+            mode,
+            placement,
+            reply,
+        } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::ProposeColumnar {
                 candidate,
                 mode,
                 placement,
                 reply,
-            } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::ProposeColumnar {
-                    candidate,
-                    mode,
-                    placement,
-                    reply,
-                })
-                .is_err()
-                {
-                    let _ =
-                        fallback.send(Err(ServerPhysicalColumnarDesignControlError::ServerStopped));
-                }
+            })
+            .is_err()
+            {
+                let _ = fallback.send(Err(ServerPhysicalColumnarDesignControlError::ServerStopped));
             }
-            ServerPhysicalDesignControlRequest::ApplyColumnar { proposal, reply } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::ApplyColumnar { proposal, reply })
-                    .is_err()
-                {
-                    let _ =
-                        fallback.send(Err(ServerPhysicalColumnarDesignControlError::ServerStopped));
-                }
+        }
+        ServerPhysicalDesignControlRequest::ApplyColumnar { proposal, reply } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::ApplyColumnar { proposal, reply }).is_err()
+            {
+                let _ = fallback.send(Err(ServerPhysicalColumnarDesignControlError::ServerStopped));
             }
-            ServerPhysicalDesignControlRequest::ApplyApprovedIndex {
+        }
+        ServerPhysicalDesignControlRequest::ApplyApprovedIndex {
+            runtime_token_matches,
+            expected_evidence_epoch,
+            candidate,
+            index_name,
+            reply,
+        } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::ApplyApprovedIndex {
                 runtime_token_matches,
                 expected_evidence_epoch,
                 candidate,
                 index_name,
                 reply,
-            } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::ApplyApprovedIndex {
-                    runtime_token_matches,
-                    expected_evidence_epoch,
-                    candidate,
-                    index_name,
-                    reply,
-                })
-                .is_err()
-                {
-                    let _ =
-                        fallback.send(ServerPhysicalDesignMutationControlReply::without_receipt(
-                            Err(ServerPhysicalDesignControlError::ServerStopped),
-                        ));
-                }
+            })
+            .is_err()
+            {
+                let _ = fallback.send(ServerPhysicalDesignMutationControlReply::without_receipt(
+                    Err(ServerPhysicalDesignControlError::ServerStopped),
+                ));
             }
-            ServerPhysicalDesignControlRequest::ApplyApprovedColumnar {
+        }
+        ServerPhysicalDesignControlRequest::ApplyApprovedColumnar {
+            runtime_token_matches,
+            expected_evidence_epoch,
+            candidate,
+            mode,
+            placement,
+            reply,
+        } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::ApplyApprovedColumnar {
                 runtime_token_matches,
                 expected_evidence_epoch,
                 candidate,
                 mode,
                 placement,
                 reply,
-            } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::ApplyApprovedColumnar {
-                    runtime_token_matches,
-                    expected_evidence_epoch,
-                    candidate,
-                    mode,
-                    placement,
-                    reply,
-                })
-                .is_err()
-                {
-                    let _ =
-                        fallback.send(ServerPhysicalDesignMutationControlReply::without_receipt(
-                            Err(ServerPhysicalColumnarDesignControlError::ServerStopped),
-                        ));
-                }
+            })
+            .is_err()
+            {
+                let _ = fallback.send(ServerPhysicalDesignMutationControlReply::without_receipt(
+                    Err(ServerPhysicalColumnarDesignControlError::ServerStopped),
+                ));
             }
-            ServerPhysicalDesignControlRequest::RotateEvidenceIfEpoch { expected, reply } => {
-                let fallback = reply.clone();
-                if submit(ServerPhysicalDesignWorkerCommand::RotateEvidenceIfEpoch {
-                    expected,
-                    reply,
-                })
+        }
+        ServerPhysicalDesignControlRequest::RotateEvidenceIfEpoch { expected, reply } => {
+            let fallback = reply.clone();
+            if submit(ServerPhysicalDesignWorkerCommand::RotateEvidenceIfEpoch { expected, reply })
                 .is_err()
-                {
-                    let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
-                }
+            {
+                let _ = fallback.send(Err(ServerPhysicalDesignControlError::ServerStopped));
             }
         }
     }
@@ -2489,6 +2496,29 @@ mod tests {
             .unwrap_err();
         worker.join().unwrap();
         result
+    }
+
+    #[test]
+    fn resource_control_permit_lasts_until_reply_and_shutdown_releases_it() {
+        let (send, receive) = mpsc::channel();
+        let handle = ServerPhysicalDesignControlHandle::new(send);
+        let caller = handle.clone();
+        let join = std::thread::spawn(move || caller.status());
+        let request = receive.recv().unwrap();
+        assert!(handle.admission.is_occupied());
+        assert!(matches!(receive.try_recv(), Err(TryRecvError::Empty)));
+        // A lost worker reply must release admission and preserve the typed error.
+        drop(request);
+        assert!(matches!(
+            join.join().unwrap(),
+            Err(ServerPhysicalDesignControlError::ServerStopped)
+        ));
+        assert!(!handle.admission.is_occupied());
+        drop(receive);
+        assert!(matches!(
+            handle.status(),
+            Err(ServerPhysicalDesignControlError::ServerStopped)
+        ));
     }
 
     #[test]

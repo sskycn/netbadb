@@ -2859,7 +2859,7 @@ fn mutual_tls_disconnect_rolls_back_active_transaction() {
 #[test]
 fn tls_handshake_timeout_connection_cap_and_shutdown_are_bounded() {
     let limits = r#"{
-        "max_connections": 2,
+        "max_connections": 4,
         "idle_timeout_ms": 5000,
         "write_timeout_ms": 5000
     }"#;
@@ -2867,23 +2867,23 @@ fn tls_handshake_timeout_connection_cap_and_shutdown_are_bounded() {
         create_manifest_tls_server_with_limits("tls-cap-shutdown", Some(limits));
     let address = server.local_addr();
     let metrics = server.metrics_handle();
-    let pending_a = TcpStream::connect(address).unwrap();
-    let pending_b = TcpStream::connect(address).unwrap();
-    wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 2);
+    let pending = (0..4)
+        .map(|_| TcpStream::connect(address).unwrap())
+        .collect::<Vec<_>>();
+    wait_for_metrics(&metrics, |snapshot| snapshot.active_connections == 4);
     assert_connection_closes(TcpStream::connect(address).unwrap());
     assert_eq!(
         wait_for_metrics(&metrics, |snapshot| snapshot.rejected_connections_total
             == 1)
         .accepted_connections_total,
-        2
+        4
     );
 
     let started = Instant::now();
     server.shutdown().unwrap();
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(metrics.snapshot().active_connections, 0);
-    drop(pending_a);
-    drop(pending_b);
+    drop(pending);
     cleanup(&directory);
 
     let timeout_limits = r#"{
@@ -3010,6 +3010,91 @@ fn idle_and_partial_frame_timeouts_close_connections_and_rollback_transactions()
     assert_eq!(snapshot.idle_timeouts_total, 3);
     assert_eq!(snapshot.protocol_failures_total, 0);
     server.shutdown().unwrap();
+    cleanup(&directory);
+}
+
+#[test]
+fn resource_slow_response_readers_release_worker_and_timeout_or_shutdown_cleanly() {
+    let directory = test_directory("resource-slow-responses");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let heap = directory.join("users.ndb");
+    let mut database = Database::create(&heap, users_table("UserId")).unwrap();
+    let text = "x".repeat(1024);
+    for id in 0..128 {
+        database
+            .execute(&format!(
+                "INSERT INTO users (id, name) VALUES ({id}, '{text}')"
+            ))
+            .unwrap();
+    }
+    database.close().unwrap();
+    // 16 MiB of result payload per connection, but each frame is only 128 KiB.
+    // Stop after QueryStart: no timing assumption is needed to prove execution
+    // completed, and the peer keeps its socket open without consuming the rows.
+    let query = format!("SELECT {} FROM users", vec!["name"; 128].join(", "));
+    for shutdown_under_pressure in [false, true] {
+        let manifest = directory.join("server.json");
+        let write_timeout = if shutdown_under_pressure { 5_000 } else { 500 };
+        let limits = format!(
+            r#"{{"max_connections": 4, "idle_timeout_ms": 10000, "write_timeout_ms": {write_timeout}}}"#
+        );
+        std::fs::write(
+            &manifest,
+            manifest_json_with_limits("users.ndb", "UserId", Some(&limits)),
+        )
+        .unwrap();
+        let server = TcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+            .start()
+            .unwrap();
+        let metrics = server.metrics_handle();
+        let mut slow = Vec::new();
+        for _ in 0..2 {
+            let mut client = Client::connect(server.local_addr());
+            client
+                .stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            client.hello();
+            write_client_frame(
+                &mut client.stream,
+                &Frame {
+                    request_id: 2,
+                    message: ClientMessage::Execute { sql: query.clone() },
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                read_server_frame(&mut client.stream)
+                    .unwrap()
+                    .unwrap()
+                    .message,
+                ServerMessage::QueryStart { .. }
+            ));
+            slow.push(client);
+        }
+        let mut healthy = Client::connect(server.local_addr());
+        healthy
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        healthy.hello();
+        assert_eq!(
+            healthy.request(2, ClientMessage::Ping),
+            vec![ServerMessage::Pong]
+        );
+        healthy.close_clean();
+        if !shutdown_under_pressure {
+            let snapshot = wait_for_metrics(&metrics, |state| state.active_connections == 0);
+            assert_eq!(snapshot.write_failures_total, 2);
+            assert_eq!(snapshot.idle_timeouts_total, 0);
+        }
+        // The unread peers stay alive across shutdown; shutdown must close and
+        // join their handlers instead of depending on a cooperative client.
+        server.shutdown().unwrap();
+        assert_eq!(metrics.snapshot().active_connections, 0);
+        drop(slow);
+    }
     cleanup(&directory);
 }
 

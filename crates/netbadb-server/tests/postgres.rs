@@ -136,6 +136,77 @@ fn start_server(name: &str) -> (PathBuf, netbadb_server::PostgresServerHandle) {
     (directory, server)
 }
 
+#[test]
+fn resource_postgres_startup_cap_partial_timeout_and_shutdown_release_slots() {
+    let (directory, original) = start_server("resource-startup-cap");
+    original.shutdown().unwrap();
+    let manifest = directory.join("server.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    for shutdown_under_pressure in [false, true] {
+        config["limits"] = serde_json::json!({
+            "max_connections": 4,
+            "idle_timeout_ms": if shutdown_under_pressure { 5_000 } else { 250 },
+            "write_timeout_ms": 5_000
+        });
+        std::fs::write(&manifest, serde_json::to_vec(&config).unwrap()).unwrap();
+        let server = PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+            .start()
+            .unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..4 {
+            let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut ssl = 8_i32.to_be_bytes().to_vec();
+            ssl.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+            stream.write_all(&ssl).unwrap();
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [b'N']); // Handler has occupied an admitted slot.
+            stream.write_all(&[0, 0]).unwrap(); // Incomplete startup length.
+            clients.push(stream);
+        }
+        let mut excess = TcpStream::connect(server.local_addr()).unwrap();
+        excess
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(excess.read(&mut [0]).unwrap(), 0);
+        if shutdown_under_pressure {
+            server.shutdown().unwrap();
+        } else {
+            for stream in &mut clients {
+                assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+            }
+            // EOF precedes reaping: retry SSL negotiation until one slot has
+            // actually been reclaimed, without assuming a sleep duration.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut replacement = TcpStream::connect(server.local_addr()).unwrap();
+                replacement
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut ssl = 8_i32.to_be_bytes().to_vec();
+                ssl.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+                let sent = replacement.write_all(&ssl).is_ok();
+                let mut byte = [0];
+                if sent && matches!(replacement.read(&mut byte), Ok(1)) {
+                    assert_eq!(byte, [b'N']);
+                    break;
+                }
+                assert!(Instant::now() < deadline, "startup slot was not reclaimed");
+                std::thread::yield_now();
+            }
+            server.shutdown().unwrap();
+        }
+        for stream in &mut clients {
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        }
+    }
+    cleanup(&directory);
+}
+
 #[cfg(unix)]
 #[test]
 fn postgres_programmatic_columnar_apply_has_native_builder_parity() {

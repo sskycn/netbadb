@@ -3272,6 +3272,7 @@ fn read_version_block(
         statistics,
     )?;
     let mut reader = Reader::new(&bytes);
+    reader.check_count(u64::from(rows), 24)?;
     let mut keys = Vec::with_capacity(rows as usize);
     for _ in 0..rows {
         keys.push(decode_version_key(&mut reader, storage_id, kind)?);
@@ -3678,6 +3679,7 @@ fn decode_delta(
     if reader.u32()? as usize != metadata.columns.len() {
         return Err(ColumnarError::Corrupt("delta column count mismatch"));
     }
+    reader.check_count(mutation_count, 25)?;
     let mut descriptors = Vec::with_capacity(mutation_count as usize);
     let mut frontier = before;
     for _ in 0..batch_count {
@@ -3686,6 +3688,11 @@ fn decode_delta(
         let count = reader.u32()?;
         if batch_before != frontier || batch_after.0 <= batch_before.0 {
             return Err(ColumnarError::Corrupt("broken delta batch frontier"));
+        }
+        if u64::from(count) > mutation_count.saturating_sub(descriptors.len() as u64) {
+            return Err(ColumnarError::Corrupt(
+                "batch exceeds declared mutation count",
+            ));
         }
         frontier = batch_after;
         for _ in 0..count {
@@ -3730,6 +3737,7 @@ fn decode_delta(
         resource: "delta after rows",
         value: after_count,
     })?;
+    reader.check_count(metadata.columns.len() as u64, 30)?;
     let mut vectors = Vec::with_capacity(metadata.columns.len());
     for column in &metadata.columns {
         vectors.push(decode_column_chunk(&mut reader, column, rows_u32)?.0);
@@ -3844,6 +3852,7 @@ fn decode_lazy_group_directory(
     if usize::try_from(count).ok() != Some(columns.len()) {
         return Err(ColumnarError::Corrupt("indexed column count mismatch"));
     }
+    reader.check_count(columns.len() as u64, 46)?;
     let mut chunks = Vec::with_capacity(columns.len());
     for expected in columns {
         let spec = ColumnarColumnSpec {
@@ -4202,6 +4211,7 @@ fn open_lazy_segment(
             "lazy segment footer context",
         ));
     }
+    reader.check_count(u64::from(group_count), 12)?;
     let mut groups = Vec::with_capacity(group_count as usize);
     let mut decoded_rows = 0_u64;
     for _ in 0..group_count {
@@ -4451,6 +4461,7 @@ fn decode_lazy_delta_descriptors(
     mutation_count: u64,
     after_count: u64,
 ) -> Result<Vec<DeltaDescriptor>, ColumnarError> {
+    reader.check_count(mutation_count, 25)?;
     let mut descriptors = Vec::with_capacity(mutation_count as usize);
     let mut frontier = before;
     let mut used = HashSet::new();
@@ -4460,6 +4471,11 @@ fn decode_lazy_delta_descriptors(
         let count = reader.u32()?;
         if batch_before != frontier || batch_after.0 <= batch_before.0 {
             return Err(ColumnarError::Corrupt("broken lazy delta batch frontier"));
+        }
+        if u64::from(count) > mutation_count.saturating_sub(descriptors.len() as u64) {
+            return Err(ColumnarError::Corrupt(
+                "batch exceeds declared mutation count",
+            ));
         }
         frontier = batch_after;
         for _ in 0..count {
@@ -4634,6 +4650,7 @@ fn open_lazy_delta(
         mutation_count,
         after_count,
     )?;
+    reader.check_count(u64::from(group_count), 12)?;
     let mut groups = Vec::with_capacity(group_count as usize);
     let mut rows = 0_u64;
     for _ in 0..group_count {
@@ -4727,7 +4744,7 @@ fn sync_directory(path: &Path) -> Result<(), ColumnarError> {
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>, ColumnarError> {
-    let mut file = File::open(path).map_err(ColumnarError::Io)?;
+    let file = File::open(path).map_err(ColumnarError::Io)?;
     let length = file.metadata().map_err(ColumnarError::Io)?.len();
     if length > MAX_FILE_BYTES {
         return Err(ColumnarError::ResourceLimit {
@@ -4740,7 +4757,15 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, ColumnarError> {
         value: length,
     })?;
     let mut bytes = Vec::with_capacity(capacity);
-    file.read_to_end(&mut bytes).map_err(ColumnarError::Io)?;
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(ColumnarError::Io)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(ColumnarError::ResourceLimit {
+            resource: "file bytes",
+            value: bytes.len() as u64,
+        });
+    }
     Ok(bytes)
 }
 
@@ -4899,7 +4924,9 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
             value: u64::from(column_count),
         });
     }
+    reader.check_count(u64::from(column_count), 8)?;
     let mut columns = Vec::with_capacity(column_count as usize);
+    let mut column_ids = HashSet::with_capacity(column_count as usize);
     for _ in 0..column_count {
         let column_id = ColumnId(reader.u32()?);
         let physical_type = decode_type_tag(reader.u8()?)?;
@@ -4913,10 +4940,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
                 "manifest column reserved field is nonzero",
             ));
         }
-        if columns
-            .iter()
-            .any(|column: &ColumnarColumnSpec| column.column_id == column_id)
-        {
+        if !column_ids.insert(column_id) {
             return Err(ColumnarError::Corrupt("duplicate manifest column"));
         }
         columns.push(ColumnarColumnSpec {
@@ -4976,7 +5000,9 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
         if stream_generation.0 == 0 || applied_frontier.0 < base_frontier.0 {
             return Err(ColumnarError::Corrupt("invalid incremental frontier"));
         }
+        reader.check_count(u64::from(delta_count), 48)?;
         let mut delta_segments = Vec::with_capacity(delta_count as usize);
+        let mut delta_files = HashSet::with_capacity(delta_count as usize);
         let mut expected = base_frontier;
         let mut accumulated_bytes = 0_u64;
         let mut accumulated_mutations = 0_u64;
@@ -4997,9 +5023,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColumnarError> {
                 || mutation_count > u64::from(crate::CHANGE_LOG_MAX_MUTATIONS)
                 || after_row_count > mutation_count
                 || file == segment_file
-                || delta_segments
-                    .iter()
-                    .any(|existing: &ColumnarDeltaSegmentMetadata| existing.file == file)
+                || !delta_files.insert(file.clone())
             {
                 return Err(ColumnarError::Corrupt("broken delta frontier chain"));
             }
@@ -5211,6 +5235,7 @@ fn decode_segment(
     if group_count > MAX_ROW_GROUPS || u64::from(group_count) != metadata.row_group_count {
         return Err(ColumnarError::Corrupt("segment row-group count mismatch"));
     }
+    reader.check_count(u64::from(group_count), 4)?;
     let mut row_groups = Vec::with_capacity(group_count as usize);
     let mut decoded_rows = 0_u64;
     for _ in 0..group_count {
@@ -5222,6 +5247,7 @@ fn decode_segment(
             .checked_add(u64::from(rows))
             .ok_or(ColumnarError::Corrupt("segment row count overflow"))?;
         let source_versions = if version == INCREMENTAL_FORMAT_VERSION {
+            reader.check_count(u64::from(rows), 24)?;
             let mut keys = Vec::with_capacity(rows as usize);
             for _ in 0..rows {
                 keys.push(decode_version_key(
@@ -5234,6 +5260,7 @@ fn decode_segment(
         } else {
             None
         };
+        reader.check_count(metadata.columns.len() as u64, 30)?;
         let mut chunks = Vec::with_capacity(metadata.columns.len());
         let mut statistics = Vec::with_capacity(metadata.columns.len());
         for column in &metadata.columns {
@@ -5884,6 +5911,17 @@ impl<'a> Reader<'a> {
         Self { bytes, offset: 0 }
     }
 
+    // Format-derived lower bounds prevent forged counts from allocating more
+    // records than the bytes already validated and available to this reader.
+    fn check_count(&self, count: u64, minimum_bytes: usize) -> Result<(), ColumnarError> {
+        if count > ((self.bytes.len() - self.offset) / minimum_bytes) as u64 {
+            return Err(ColumnarError::InvalidFormat(
+                "count exceeds remaining bytes",
+            ));
+        }
+        Ok(())
+    }
+
     fn take(&mut self, length: usize) -> Result<&'a [u8], ColumnarError> {
         let end = self
             .offset
@@ -5988,6 +6026,126 @@ mod tests {
             )
             .and_then(|prepared| prepared.publish())
         };
+    }
+
+    #[test]
+    fn resource_columnar_counts_are_proven_by_bytes_before_allocation() {
+        use super::*;
+        let mut metadata = ColumnarProjectionMetadata {
+            id: ColumnarProjectionId(1),
+            generation: ColumnarGeneration(1),
+            table_id: TableId(1),
+            source_storage_id: StorageId(1),
+            source_token: StorageSnapshotToken::heap(StorageId(1), 0),
+            schema_fingerprint: SchemaFingerprint::from_bytes([0; 32]),
+            columns: vec![ColumnarColumnSpec {
+                column_id: ColumnId(1),
+                physical_type: PhysicalType::Int64,
+                nullable: false,
+            }],
+            row_count: 0,
+            row_group_count: 0,
+            segment_count: 1,
+            segment_bytes: 0,
+            incremental: None,
+        };
+        let mut manifest =
+            encode_manifest(&metadata, ColumnarSegmentId(1), "base.nbcs", 0).unwrap();
+        manifest[128..132].copy_from_slice(&MAX_COLUMNS.to_le_bytes());
+        rewrite_checksum(&mut manifest);
+        assert!(matches!(
+            decode_manifest(&manifest),
+            Err(ColumnarError::InvalidFormat(
+                "count exceeds remaining bytes"
+            ))
+        ));
+        let mut segment = encode_segment(
+            SegmentIdentity {
+                projection_id: metadata.id,
+                generation: metadata.generation,
+                segment_id: ColumnarSegmentId(1),
+                table_id: metadata.table_id,
+                storage_id: metadata.source_storage_id,
+                fingerprint: metadata.schema_fingerprint,
+            },
+            &metadata.columns,
+            &[],
+            SNAPSHOT_FORMAT_VERSION,
+        )
+        .unwrap();
+        // Header: magic/version/reserved, five u64 identities, fingerprint, columns, groups.
+        segment[84..88].copy_from_slice(&MAX_ROW_GROUPS.to_le_bytes());
+        metadata.row_group_count = u64::from(MAX_ROW_GROUPS);
+        rewrite_checksum(&mut segment);
+        assert!(matches!(
+            decode_segment(&segment, &metadata),
+            Err(ColumnarError::InvalidFormat(
+                "count exceeds remaining bytes"
+            ))
+        ));
+        let mut reader = Reader::new(&[]);
+        assert!(matches!(
+            decode_lazy_delta_descriptors(
+                &mut reader,
+                &metadata,
+                StorageDataVersion(0),
+                StorageDataVersion(1),
+                1,
+                u64::from(crate::CHANGE_LOG_MAX_MUTATIONS),
+                0
+            ),
+            Err(ColumnarError::InvalidFormat(
+                "count exceeds remaining bytes"
+            ))
+        ));
+        let mut directory = Vec::new();
+        push_u32(&mut directory, 1);
+        directory.extend_from_slice(&[0; 4]);
+        push_u32(&mut directory, 1);
+        assert!(matches!(
+            decode_lazy_group_directory(&mut Reader::new(&directory), &metadata.columns, false),
+            Err(ColumnarError::InvalidFormat(
+                "count exceeds remaining bytes"
+            ))
+        ));
+    }
+
+    #[test]
+    fn resource_columnar_manifest_many_columns_remains_linear_and_rejects_duplicates() {
+        use super::*;
+        for count in [1_000, 10_000, 100_000] {
+            let mut metadata = ColumnarProjectionMetadata {
+                id: ColumnarProjectionId(1),
+                generation: ColumnarGeneration(1),
+                table_id: TableId(1),
+                source_storage_id: StorageId(1),
+                source_token: StorageSnapshotToken::heap(StorageId(1), 0),
+                schema_fingerprint: SchemaFingerprint::from_bytes([0; 32]),
+                columns: (0..count)
+                    .map(|i| ColumnarColumnSpec {
+                        column_id: ColumnId(i + 1),
+                        physical_type: PhysicalType::Int64,
+                        nullable: false,
+                    })
+                    .collect(),
+                row_count: 0,
+                row_group_count: 0,
+                segment_count: 1,
+                segment_bytes: 0,
+                incremental: None,
+            };
+            let bytes = encode_manifest(&metadata, ColumnarSegmentId(1), "base.nbcs", 0).unwrap();
+            assert_eq!(
+                decode_manifest(&bytes).unwrap().metadata.columns.len(),
+                count as usize
+            );
+            metadata.columns.last_mut().unwrap().column_id = ColumnId(1);
+            let bytes = encode_manifest(&metadata, ColumnarSegmentId(1), "base.nbcs", 0).unwrap();
+            assert!(matches!(
+                decode_manifest(&bytes),
+                Err(ColumnarError::Corrupt("duplicate manifest column"))
+            ));
+        }
     }
 
     #[test]

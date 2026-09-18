@@ -3289,3 +3289,15 @@ append/cleanup failure gating, PostgreSQL worker/session teardown, Native and
 PostgreSQL startup error propagation, Native diagnostic redaction, and active
 NBMR inode checks, and pre-allocation SSTable entry-count validation. Existing synchronous execution and one mutation owner per
 StorageId remain unchanged; general concurrent writers remain future work.
+
+### Resource exhaustion and boundedness audit (2026-09-18)
+
+The [targeted audit](resource-boundedness-audit.md) fixes LSM pending budget
+atomicity, quadratic accounting and SST row representability, cloned-control
+queue admission, PostgreSQL savepoint/portal retention, pre-allocation
+decoder/encoder checks, bounded guard
+reads, Columnar duplicate-validation cost and Change Stream coalescing cost.
+Regression coverage includes
+1k/10k/100k logical memory measurements and connection/session lifecycle stress.
+Whole-result budgets/streaming, Sort spill, statement cancellation, aggregate
+temporary-disk quotas and additional execution owners remain future design work.

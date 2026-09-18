@@ -417,6 +417,7 @@ fn encode_server_payload(message: &ServerMessage) -> Result<(u16, Vec<u8>), Prot
             for column in columns {
                 push_string(&mut payload, &column.name)?;
                 encode_semantic_type(&mut payload, &column.data_type)?;
+                check_payload_growth(&payload, 1)?;
                 payload.push(u8::from(column.nullable));
             }
             SERVER_QUERY_START
@@ -674,17 +675,33 @@ fn validate_payload_length(length: usize) -> Result<u32, ProtocolError> {
     Ok(length)
 }
 
+fn check_payload_growth(output: &[u8], additional: usize) -> Result<(), ProtocolError> {
+    let length = output
+        .len()
+        .checked_add(additional)
+        .ok_or(ProtocolError::LengthOverflow)?;
+    validate_payload_length(length)?;
+    Ok(())
+}
+
 fn push_count(output: &mut Vec<u8>, count: usize) -> Result<(), ProtocolError> {
     let count = u32::try_from(count).map_err(|_| ProtocolError::LengthOverflow)?;
     if count > MAX_COLLECTION_ITEMS {
         return Err(ProtocolError::CollectionTooLarge(count));
     }
+    check_payload_growth(output, 4)?;
     output.extend_from_slice(&count.to_le_bytes());
     Ok(())
 }
 
 fn push_string(output: &mut Vec<u8>, value: &str) -> Result<(), ProtocolError> {
     let length = u32::try_from(value.len()).map_err(|_| ProtocolError::LengthOverflow)?;
+    check_payload_growth(
+        output,
+        4_usize
+            .checked_add(value.len())
+            .ok_or(ProtocolError::LengthOverflow)?,
+    )?;
     output.extend_from_slice(&length.to_le_bytes());
     output.extend_from_slice(value.as_bytes());
     Ok(())
@@ -694,6 +711,7 @@ fn encode_semantic_type(
     output: &mut Vec<u8>,
     data_type: &SemanticType,
 ) -> Result<(), ProtocolError> {
+    check_payload_growth(output, 4)?;
     output.push(physical_type_tag(data_type.physical));
     output.push(u8::from(data_type.name.is_some()));
     output.extend_from_slice(&0_u16.to_le_bytes());
@@ -757,6 +775,28 @@ fn physical_type_from_tag(tag: u8) -> Result<PhysicalType, ProtocolError> {
 }
 
 fn encode_scalar(output: &mut Vec<u8>, value: &ScalarValue) -> Result<(), ProtocolError> {
+    let data_bytes = match value {
+        ScalarValue::Null => 0,
+        ScalarValue::Bool(_) | ScalarValue::Int8(_) | ScalarValue::UInt8(_) => 1,
+        ScalarValue::Int16(_) | ScalarValue::UInt16(_) => 2,
+        ScalarValue::Int32(_) | ScalarValue::UInt32(_) | ScalarValue::Float32(_) => 4,
+        ScalarValue::Int64(_) | ScalarValue::UInt64(_) | ScalarValue::Float64(_) => 8,
+        ScalarValue::Int128(_) | ScalarValue::UInt128(_) => 16,
+        ScalarValue::Text(value) => value
+            .len()
+            .checked_add(4)
+            .ok_or(ProtocolError::LengthOverflow)?,
+        ScalarValue::Bytes(value) => value
+            .len()
+            .checked_add(4)
+            .ok_or(ProtocolError::LengthOverflow)?,
+    };
+    check_payload_growth(
+        output,
+        data_bytes
+            .checked_add(1)
+            .ok_or(ProtocolError::LengthOverflow)?,
+    )?;
     match value {
         ScalarValue::Null => output.push(0),
         ScalarValue::Bool(value) => {
@@ -988,6 +1028,38 @@ mod tests {
         bytes.extend_from_slice(&payload_length.to_le_bytes());
         bytes.extend_from_slice(&request_id.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn resource_encoder_checks_growth_before_copying_large_values() {
+        let mut output = vec![0; MAX_FRAME_PAYLOAD as usize - 2];
+        let length = output.len();
+        let capacity = output.capacity();
+        assert!(matches!(
+            push_string(&mut output, "test"),
+            Err(ProtocolError::FrameTooLarge(_))
+        ));
+        assert_eq!((output.len(), output.capacity()), (length, capacity));
+        assert!(matches!(
+            encode_scalar(&mut output, &ScalarValue::Bytes(vec![1; 32])),
+            Err(ProtocolError::FrameTooLarge(_))
+        ));
+        assert_eq!((output.len(), output.capacity()), (length, capacity));
+        let message = ServerMessage::QueryRow {
+            values: vec![ScalarValue::Bytes(vec![0; MAX_FRAME_PAYLOAD as usize])],
+        };
+        let mut wire = Vec::new();
+        assert!(
+            write_server_frame(
+                &mut wire,
+                &Frame {
+                    request_id: 1,
+                    message
+                }
+            )
+            .is_err()
+        );
+        assert!(wire.is_empty());
     }
 
     #[test]

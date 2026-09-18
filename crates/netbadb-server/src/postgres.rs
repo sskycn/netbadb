@@ -51,6 +51,10 @@ use crate::{
 
 const MAX_PREPARED_STATEMENTS: usize = 1_024;
 const MAX_PORTALS: usize = 1_024;
+// Read-only savepoints use the same per-session named-object budget as Parse.
+// Names are bounded by PostgreSQL's existing identifier byte width; reject
+// oversized names explicitly rather than silently aliasing them by truncation.
+const MAX_SAVEPOINTS: usize = MAX_PREPARED_STATEMENTS;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
 const MAX_COMPATIBILITY_TOKENS: usize = 4_096;
 const MAX_COMPATIBILITY_NESTING: usize = 32;
@@ -1458,8 +1462,8 @@ fn sanitized_index_name_prefix(table_name: &str, column_name: &str) -> String {
 
 enum PortalResult {
     Query {
-        rows: Vec<Vec<Option<Vec<u8>>>>,
-        position: usize,
+        rows: std::vec::IntoIter<Vec<Option<Vec<u8>>>>,
+        row_count: usize,
     },
     Command {
         tag: String,
@@ -2158,8 +2162,9 @@ impl PgWorkerSession {
         };
         match result {
             ExecutionResult::Query(query) => Ok(PortalResult::Query {
-                rows: encode_query_rows(&query, fields, self.execution.policy.max_result_rows())?,
-                position: 0,
+                row_count: query.rows.len(),
+                rows: encode_query_rows(&query, fields, self.execution.policy.max_result_rows())?
+                    .into_iter(),
             }),
             ExecutionResult::AffectedRows(count) => {
                 self.mutation_generation = self.mutation_generation.saturating_add(1);
@@ -2525,6 +2530,9 @@ impl PgWorkerSession {
                 "25P01",
                 "SAVEPOINT can only be used in transaction blocks",
             ));
+        }
+        if self.savepoints.len() >= MAX_SAVEPOINTS || name.len() > POSTGRES_IDENTIFIER_MAX_BYTES {
+            return Err(fixed_error("54000", "savepoint metadata limit exceeded"));
         }
         self.savepoints.push(ReadOnlySavepoint {
             name: name.to_owned(),
@@ -5226,29 +5234,27 @@ fn encode_query_rows(
 fn portal_messages(result: &mut PortalResult, max_rows: u32) -> Vec<BackendMessage> {
     match result {
         PortalResult::Command { tag } => vec![BackendMessage::CommandComplete(tag.clone())],
-        PortalResult::Query { rows, position } => {
-            let remaining = rows.len().saturating_sub(*position);
+        PortalResult::Query { rows, row_count } => {
             let requested = if max_rows == 0 {
-                remaining
+                rows.len()
             } else {
                 usize::try_from(max_rows)
-                    .unwrap_or(remaining)
-                    .min(remaining)
+                    .unwrap_or(rows.len())
+                    .min(rows.len())
             };
-            let end = position.saturating_add(requested);
-            let mut messages = rows[*position..end]
-                .iter()
-                .cloned()
+            // Move encoded payloads out of the portal; sent rows have no second
+            // owner here. Completion also drops the iterator's backing array.
+            let mut messages = rows
+                .by_ref()
+                .take(requested)
                 .map(BackendMessage::DataRow)
                 .collect::<Vec<_>>();
-            *position = end;
-            if *position < rows.len() {
+            if rows.len() != 0 {
                 messages.push(BackendMessage::PortalSuspended);
             } else {
-                messages.push(BackendMessage::CommandComplete(format!(
-                    "SELECT {}",
-                    rows.len()
-                )));
+                let tag = format!("SELECT {row_count}");
+                messages.push(BackendMessage::CommandComplete(tag.clone()));
+                *result = PortalResult::Command { tag };
             }
             messages
         }
@@ -5400,6 +5406,76 @@ mod tests {
 
     use super::*;
     use crate::authorization::TablePermissions;
+
+    #[test]
+    fn resource_portal_moves_sent_payloads_and_releases_completed_storage() {
+        let payload = vec![7_u8; 4096];
+        let pointer = payload.as_ptr();
+        let mut result = PortalResult::Query {
+            row_count: 2,
+            rows: vec![vec![Some(payload)], vec![Some(vec![9; 4096])]].into_iter(),
+        };
+        let first = portal_messages(&mut result, 1);
+        let BackendMessage::DataRow(row) = &first[0] else {
+            panic!("missing row")
+        };
+        assert_eq!(row[0].as_ref().unwrap().as_ptr(), pointer);
+        assert!(matches!(
+            first.last(),
+            Some(BackendMessage::PortalSuspended)
+        ));
+        assert!(matches!(&result, PortalResult::Query { rows, .. } if rows.len() == 1));
+        let second = portal_messages(&mut result, 0);
+        assert!(
+            matches!(&second[0], BackendMessage::DataRow(row) if row[0].as_ref().unwrap() == &vec![9; 4096])
+        );
+        assert!(matches!(&result, PortalResult::Command { tag } if tag == "SELECT 2"));
+        assert_eq!(
+            portal_messages(&mut result, 0),
+            vec![BackendMessage::CommandComplete("SELECT 2".into())]
+        );
+    }
+
+    #[test]
+    fn resource_savepoints_have_bounded_metadata_and_recover_capacity() {
+        let path = test_path("savepoint-budget");
+        let table = catalog_tables().remove(0);
+        let database = Database::create(&path, table.clone()).unwrap();
+        let (mut session, _) = PgWorkerSession::new(
+            &database,
+            SessionPolicy::default(),
+            principal(&[table.id], &[table.id]),
+            StartupMessage {
+                parameters: Default::default(),
+            },
+            1,
+        )
+        .unwrap();
+        session.status = PgTransactionStatus::InTransaction;
+        assert_eq!(
+            session
+                .savepoint(&"x".repeat(POSTGRES_IDENTIFIER_MAX_BYTES + 1))
+                .unwrap_err()
+                .sqlstate,
+            "54000"
+        );
+        for i in 0..MAX_SAVEPOINTS {
+            session.savepoint(&format!("point_{i}")).unwrap();
+        }
+        assert_eq!(session.savepoint("overflow").unwrap_err().sqlstate, "54000");
+        assert_eq!(session.savepoints.len(), MAX_SAVEPOINTS);
+        session.release_savepoint("point_0").unwrap();
+        assert!(session.savepoints.is_empty());
+        session.savepoint("reused").unwrap();
+        session.rollback().unwrap();
+        assert!(session.savepoints.is_empty());
+        database.close().unwrap();
+        cleanup(&[
+            &path,
+            &netbadb_storage::wal_path(&path),
+            &netbadb_storage::txn_status_path(&path),
+        ]);
+    }
 
     #[test]
     fn postgres_handle_is_finished_observes_main_thread_completion() {

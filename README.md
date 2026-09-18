@@ -1314,6 +1314,11 @@ The current LSM persistent formats and recovery rules are specified in
 [`docs/lsm-format-v2.md`](docs/lsm-format-v2.md); the rejected experimental v1
 contract remains documented in [`docs/lsm-format-v1.md`](docs/lsm-format-v1.md).
 
+The [resource exhaustion and boundedness audit](docs/resource-boundedness-audit.md)
+records resource ownership, queue admission, decoder/encoder bounds, LSM pending
+budgets, portal cleanup, and measured 1k/10k/100k-row memory growth. Result-row
+policy remains a post-execution transport check, not an executor memory budget.
+
 ## License
 
 NetbaDB is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE).

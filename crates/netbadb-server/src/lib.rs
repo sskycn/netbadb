@@ -3,6 +3,7 @@
 mod adaptive_driver;
 mod adaptive_feedback;
 mod authorization;
+mod control_admission;
 mod limits;
 mod manifest;
 mod metrics;

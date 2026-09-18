@@ -3656,3 +3656,31 @@ LSM SSTable entry counts are checked against the block payload's minimum 32-byte
 entry envelope before vector allocation, including valid-checksum malformed
 blocks. This bounds allocation by existing block limits without changing NBL SST
 encoding.
+
+## Resource admission and boundedness audit
+
+The [resource audit](resource-boundedness-audit.md) records limits and remaining
+whole-result, recovery and execution-time boundaries. Programmatic adaptive and
+physical-design handles each share one outstanding synchronous command across
+all clones; admission lasts through its reply and occurs before proposal copying.
+The listener forwards at most one command per family per iteration. Connection
+commands remain implicitly bounded by admission and one outstanding reply.
+
+PostgreSQL portals transfer encoded rows to responses and discard completed result
+storage. Read-only savepoint metadata is limited to 1,024 names of at most 63 bytes;
+excess returns SQLSTATE 54000. Suspended portals still own unsent complete results.
+
+LSM pending bytes and mutation counts are validated before each replacement,
+crediting the previous row and accounting for tombstones. Per-write accounting
+is constant work rather than a scan of the pending map. Existing 16 MiB/65,536
+bounds and durable mutation semantics remain unchanged. Writes also check
+SST representability at admission: a canonical encoded row plus its 32-byte
+entry envelope must fit the existing 64 KiB block payload. Persistent decoders prove
+count envelopes against remaining bytes before reserve, and wire encoders check
+frame growth before copying variable fields. These bounds do not make QueryResult,
+Full Sort, aggregation, joins or recovery globally memory-bounded.
+
+Change Stream net-change coalescing indexes current physical versions and defers
+stable removal compaction, preserving publication order and original version
+identities while avoiding quadratic lookup/shifting work. Heap transaction state
+and retained after-images still require an explicit future memory-budget design.

@@ -7335,6 +7335,274 @@ mod tests {
     }
 
     #[test]
+    fn resource_partition_batch_is_shared_across_large_and_empty_partitions() {
+        for count in [1_000, 10_000, 100_000] {
+            let sizes = [0, count / 3, 0, count / 3, count - 2 * (count / 3), 0];
+            let (mut storages, paths) =
+                partitioned_batch_storages("resource-partitions", &sizes, &[true; 6]);
+            let plan = partitioned_batch_scan(
+                batch_columns(),
+                vec![PartitionAccessPlan::SeqScan; sizes.len()],
+            );
+            let mut stats = PartitionedBatchStats::default();
+            let mut output = 0;
+            let _ = visit_partitioned_plan_with_stats(&plan, &mut storages, &mut stats, |batch| {
+                assert!(batch.rows.len() <= EXECUTION_BATCH_CAPACITY);
+                output += batch.rows.len();
+                batch.rows.clear();
+                Ok(ControlFlow::Continue(()))
+            })
+            .unwrap();
+            assert_eq!(output, count);
+            assert_eq!(stats.partitions_visited, sizes.len());
+            assert_eq!(stats.max_batch_rows, EXECUTION_BATCH_CAPACITY);
+            assert_eq!(
+                stats.batches_delivered,
+                count.div_ceil(EXECUTION_BATCH_CAPACITY)
+            );
+            eprintln!(
+                "resource PartitionedSeqScan rows={count} partitions={} max_batch_rows={}",
+                sizes.len(),
+                stats.max_batch_rows
+            );
+            close_partitioned_batch_storages(storages, paths);
+        }
+        let sizes = [0; 64];
+        let (mut storages, paths) =
+            partitioned_batch_storages("resource-empty-partitions", &sizes, &[true; 64]);
+        let plan = partitioned_batch_scan(
+            batch_columns(),
+            vec![PartitionAccessPlan::SeqScan; sizes.len()],
+        );
+        let mut stats = PartitionedBatchStats::default();
+        let _ = visit_partitioned_plan_with_stats(&plan, &mut storages, &mut stats, |_| {
+            panic!("empty batch emitted")
+        })
+        .unwrap();
+        assert_eq!(stats.partitions_visited, sizes.len());
+        assert_eq!(stats.max_batch_rows, 0);
+        close_partitioned_batch_storages(storages, paths);
+    }
+
+    #[test]
+    fn resource_duplicate_hash_join_tracks_output_amplification_separately_from_build_state() {
+        for count in [10, 100, 300] {
+            let (left, left_path) =
+                streaming_join_storage("resource-join", "left", TableId(750), count, true, |_| {
+                    ScalarValue::Int64(1)
+                });
+            let (right, right_path) =
+                streaming_join_storage("resource-join", "right", TableId(751), count, true, |_| {
+                    ScalarValue::Int64(1)
+                });
+            let l = streaming_join_columns(10, TableId(750), "left_rows");
+            let r = streaming_join_columns(20, TableId(751), "right_rows");
+            let predicate = streaming_join_binary(
+                BinaryOp::Eq,
+                streaming_join_expression(&l[1]),
+                streaming_join_expression(&r[1]),
+            );
+            let plan = streaming_join_plan(&l, &r, predicate, vec![l[0].clone(), r[0].clone()]);
+            let mut storages = [left, right];
+            let mut stats = StreamingHashJoinStats::default();
+            let result = execute_streaming_hash_join_with_stats(&plan, &mut storages, &mut stats)
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.rows.len(), count * count);
+            assert_eq!(stats.build_rows_materialized, count);
+            assert_eq!(stats.build_bucket_indices, count);
+            assert_eq!(stats.build_distinct_keys, 1);
+            assert_eq!(stats.build_owned_key_clones, 0);
+            assert!(stats.max_stream_batch_rows <= EXECUTION_BATCH_CAPACITY);
+            assert_eq!(stats.candidate_pairs_checked, count * count);
+            eprintln!(
+                "resource HashJoin build_rows={count} bucket_indices={count} output_rows={}",
+                result.rows.len()
+            );
+            for storage in storages {
+                storage.close().unwrap();
+            }
+            remove_batch_test_path(&left_path, true);
+            remove_batch_test_path(&right_path, true);
+        }
+    }
+
+    #[test]
+    fn resource_query_result_growth_is_owned_output_and_limit_is_not_a_byte_budget() {
+        let path = batch_test_path("resource-wide-results", true);
+        remove_batch_test_path(&path, true);
+        let table = TableDef::new(
+            TableId(55),
+            "batch_items",
+            vec![
+                ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64))
+                    .primary_key(true),
+                ColumnDef::new(ColumnId(2), "text", TypeSpec::Physical(PhysicalType::Text)),
+                ColumnDef::new(
+                    ColumnId(3),
+                    "bytes",
+                    TypeSpec::Physical(PhysicalType::Bytes),
+                ),
+            ],
+        );
+        let columns = [
+            (1, "id", PhysicalType::Int64),
+            (2, "text", PhysicalType::Text),
+            (3, "bytes", PhysicalType::Bytes),
+        ]
+        .into_iter()
+        .map(|(id, name, physical)| ColumnRef {
+            binding_id: RelationBindingId(0),
+            table_id: table.id,
+            column_id: ColumnId(id),
+            relation_name: table.name.clone(),
+            name: name.into(),
+            data_type: SemanticType::physical(physical),
+            nullable: false,
+        })
+        .collect::<Vec<_>>();
+        let mut storage = TableStorage::create_lsm(&path, table, ColumnId(1)).unwrap();
+        let mut inserted = 0;
+        for count in [1_000, 10_000, 100_000] {
+            while inserted < count {
+                let mut txn = storage.begin_transaction().unwrap();
+                let end = (inserted + 1_000).min(count);
+                for i in inserted..end {
+                    storage
+                        .insert_in(
+                            &mut txn,
+                            &[
+                                ScalarValue::Int64(i as i64),
+                                ScalarValue::Text(format!("{i:0>128}")),
+                                ScalarValue::Bytes(vec![7; 128]),
+                            ],
+                        )
+                        .unwrap();
+                }
+                txn.commit().unwrap();
+                inserted = end;
+            }
+            for duplicate in [false, true] {
+                let projection = if duplicate {
+                    vec![
+                        columns[0].clone(),
+                        columns[1].clone(),
+                        columns[2].clone(),
+                        columns[1].clone(),
+                        columns[2].clone(),
+                    ]
+                } else {
+                    columns.clone()
+                };
+                let plan = batch_project(batch_scan(columns.clone()), projection);
+                let result = super::execute(&plan, &mut storage).unwrap();
+                let slots = result.rows.iter().map(Vec::len).sum::<usize>();
+                let payload = result
+                    .rows
+                    .iter()
+                    .flatten()
+                    .map(|v| match v {
+                        ScalarValue::Text(v) => v.len(),
+                        ScalarValue::Bytes(v) => v.len(),
+                        _ => 0,
+                    })
+                    .sum::<usize>();
+                assert_eq!(result.rows.len(), count);
+                assert_eq!(slots, count * if duplicate { 5 } else { 3 });
+                assert_eq!(payload, count * if duplicate { 512 } else { 256 });
+                eprintln!(
+                    "resource QueryResult rows={count} duplicate={duplicate} scalar_slots={slots} owned_payload_bytes={payload}"
+                );
+                drop(result);
+                let limited = super::execute(&batch_limit(plan, 1), &mut storage).unwrap();
+                assert_eq!(limited.rows.len(), 1);
+            }
+        }
+        storage.close().unwrap();
+        remove_batch_test_path(&path, true);
+    }
+
+    #[test]
+    fn resource_aggregate_and_full_sort_growth_1k_10k_100k() {
+        for count in [1_000, 10_000, 100_000] {
+            for text in [false, true] {
+                let mut key = batch_columns()[if text { 3 } else { 0 }].clone();
+                key.nullable = true;
+                let fields = [OutputField::Source(key.clone())];
+                let outputs = [
+                    AggregateOutput::GroupKey(key.clone()),
+                    count_output(),
+                    batch_aggregate_expression(
+                        AggregateFunction::Min,
+                        AggregateInput::Column(key.clone()),
+                        "minimum",
+                        key.data_type.physical,
+                        true,
+                    ),
+                ];
+                let mut accumulator =
+                    AggregateAccumulator::new(&fields, std::slice::from_ref(&key), &outputs)
+                        .unwrap();
+                consume_generated_batches(&mut accumulator, count * 2, |i| {
+                    vec![if i % count == 0 {
+                        ScalarValue::Null
+                    } else if text {
+                        ScalarValue::Text(format!("{:0>128}", i % count))
+                    } else {
+                        ScalarValue::Int64((i % count) as i64)
+                    }]
+                });
+                assert_eq!(accumulator.groups.len(), count);
+                let stats = accumulator.group_lookup.stats();
+                assert_eq!(stats.owned_key_materializations, count);
+                // A non-NULL key is owned both by GROUP BY and MIN(key).
+                assert_eq!(stats.owned_key_clones, count - 1);
+                let result = accumulator.finish().unwrap();
+                assert_eq!(result.rows.len(), count);
+                assert!(
+                    result
+                        .rows
+                        .iter()
+                        .all(|row| row.values[1] == ScalarValue::UInt64(2))
+                );
+                eprintln!(
+                    "resource Aggregate input={} groups={count} key_text={text} owned_keys={count}",
+                    count * 2
+                );
+            }
+            let key = batch_columns()[3].clone();
+            let mut rows = ExecutionRows {
+                fields: vec![OutputField::Source(key.clone())],
+                rows: (0..count)
+                    .rev()
+                    .map(|i| ExecutionRow {
+                        row_id: None,
+                        values: vec![ScalarValue::Text(format!("{i:0>128}"))],
+                    })
+                    .collect(),
+            };
+            let mut stats = FullSortStats::default();
+            sort_execution_rows(
+                &mut rows,
+                &[SortKey {
+                    column: key,
+                    direction: SortDirection::Asc,
+                    null_order: NullOrder::Last,
+                }],
+                Some(&mut stats),
+            )
+            .unwrap();
+            assert_eq!(stats.rows_before_sort, count);
+            assert_eq!(stats.rows_after_sort, count);
+            assert_eq!(stats.logical_text_payload_bytes, count * 128);
+            eprintln!(
+                "resource FullSort rows={count} scalar_slots={} text_bytes={}",
+                stats.input_scalar_slots, stats.logical_text_payload_bytes
+            );
+        }
+    }
+
+    #[test]
     fn production_cast_kernel_is_deterministic_checked_and_shared_by_evaluators() {
         let cases = [
             (
@@ -10337,7 +10605,7 @@ mod tests {
                 direction,
                 null_order: NullOrder::Last,
             }];
-            for limit in [0, 1, 20, 256, 257, 600] {
+            for limit in [0, 1, 20, 256, 257, 600, usize::MAX] {
                 let mut state = TopNState::new(limit, &keys, &[0]);
                 for index in 0..513 {
                     state

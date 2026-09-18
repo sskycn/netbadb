@@ -2203,6 +2203,11 @@ fn decode_record_body(
                             },
                         );
                     }
+                    if count > reader.0.len() / 4 {
+                        return Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                            "column count exceeds remaining bytes",
+                        ));
+                    }
                     let mut columns = Vec::with_capacity(count);
                     for _ in 0..count {
                         columns.push(ColumnId(reader.u32()?));
@@ -2742,6 +2747,23 @@ mod tests {
             Some(DatabaseCoordinatorConfig::new(root.join("coordinator")).with_global_visibility()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn resource_receipt_column_count_cannot_amplify_short_record() {
+        let mut body = vec![1, 2, 0, 0];
+        body.extend_from_slice(&1_u64.to_le_bytes());
+        body.extend_from_slice(&1_u64.to_le_bytes());
+        body.extend_from_slice(&[1, 0, 0, 0]);
+        body.extend_from_slice(&(MAX_COLUMN_IDS as u32).to_le_bytes());
+        let record =
+            encode_record(BEGIN_TAG, ServerPhysicalDesignMutationReceiptId(1), &body).unwrap();
+        assert!(matches!(
+            decode_record(&record),
+            Err(ServerPhysicalDesignMutationReceiptJournalError::Corrupt(
+                "column count exceeds remaining bytes"
+            ))
+        ));
     }
 
     #[cfg(not(unix))]

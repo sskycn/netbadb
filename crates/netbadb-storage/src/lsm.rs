@@ -64,6 +64,7 @@ const SST_INDEX_ENTRY_SIZE: usize = 56;
 const SST_FOOTER_SIZE: usize = 32;
 const SST_TARGET_BLOCK_BYTES: usize = 32 * 1024;
 const SST_MAX_BLOCK_BYTES: usize = 64 * 1024;
+const SST_ENTRY_HEADER_BYTES: usize = 32;
 const SST_MAX_BLOCKS: u32 = 262_144;
 const SST_TARGET_FILE_BYTES: u64 = 256 * 1024;
 const L0_COMPACTION_TRIGGER: usize = 2;
@@ -1549,7 +1550,8 @@ impl LsmStorage {
         validate_row(&self.shared.borrow().table, values)?;
         transaction.acquire_writer()?;
         let encoded = encode_row(values)?;
-        transaction.ensure_capacity(encoded.len() as u64, 1)?;
+        validate_sstable_row_bytes(encoded.len())?;
+        let pending_bytes = transaction.check_pending_replacement(None, Some(encoded.len()))?;
         let mut shared = self.shared.borrow_mut();
         let key = clustering_key_from_values(&shared, values)?;
         let row_id = LsmRowId(shared.allocate_row_id()?);
@@ -1565,7 +1567,7 @@ impl LsmStorage {
                 revision,
             },
         );
-        transaction.recalculate_pending_bytes()?;
+        transaction.pending_bytes = pending_bytes;
         Ok(LsmRowHandle {
             row_id,
             observed: LsmObservedVersion::Pending(revision),
@@ -1586,7 +1588,11 @@ impl LsmStorage {
         transaction.validate_handle(self, handle)?;
         transaction.ensure_no_prepared_write_conflict(handle.row_id, handle.observed)?;
         let encoded = encode_row(values)?;
-        transaction.ensure_capacity(encoded.len() as u64, 0)?;
+        validate_sstable_row_bytes(encoded.len())?;
+        let pending_bytes = transaction.check_pending_replacement(
+            transaction.pending.get(&handle.row_id),
+            Some(encoded.len()),
+        )?;
         let key = clustering_key_from_values(&self.shared.borrow(), values)?;
         let revision = transaction.next_revision()?;
         if let Some(pending) = transaction.pending.get_mut(&handle.row_id) {
@@ -1615,7 +1621,7 @@ impl LsmStorage {
                 },
             );
         }
-        transaction.recalculate_pending_bytes()?;
+        transaction.pending_bytes = pending_bytes;
         Ok(LsmRowHandle {
             row_id: handle.row_id,
             observed: LsmObservedVersion::Pending(revision),
@@ -1633,6 +1639,13 @@ impl LsmStorage {
         transaction.acquire_writer()?;
         transaction.validate_handle(self, handle)?;
         transaction.ensure_no_prepared_write_conflict(handle.row_id, handle.observed)?;
+        let previous = transaction.pending.get(&handle.row_id);
+        let replacement = if previous.is_some_and(|row| row.original_key.is_none()) {
+            None
+        } else {
+            Some(0)
+        };
+        let pending_bytes = transaction.check_pending_replacement(previous, replacement)?;
         let revision = transaction.next_revision()?;
         if let Some(pending) = transaction.pending.get_mut(&handle.row_id) {
             if pending.original_key.is_none() {
@@ -1663,7 +1676,7 @@ impl LsmStorage {
                 },
             );
         }
-        transaction.recalculate_pending_bytes()?;
+        transaction.pending_bytes = pending_bytes;
         Ok(())
     }
 
@@ -2099,7 +2112,7 @@ impl LsmTransaction {
                 // without a durable batch that a retry could duplicate.
                 let commit_seq = LsmCommitSeq(shared.allocate_commit_seq()?);
                 if shared.change_stream.requires_changes() {
-                    let changes = self.canonical_changes(
+                    let mut changes = self.canonical_changes(
                         shared.manifest.storage_id,
                         &shared.table,
                         commit_seq,
@@ -2185,7 +2198,7 @@ impl LsmTransaction {
                 let batch = self.canonical_batch()?;
                 let mut shared = self.shared.borrow_mut();
                 if shared.change_stream.requires_changes() {
-                    let changes = self.canonical_changes(
+                    let mut changes = self.canonical_changes(
                         shared.manifest.storage_id,
                         &shared.table,
                         LsmCommitSeq(0),
@@ -2277,7 +2290,7 @@ impl LsmTransaction {
                 let batch = self.canonical_batch()?;
                 let mut shared = self.shared.borrow_mut();
                 if shared.change_stream.requires_changes() {
-                    let changes = self.canonical_changes(
+                    let mut changes = self.canonical_changes(
                         shared.manifest.storage_id,
                         &shared.table,
                         LsmCommitSeq(0),
@@ -2992,55 +3005,42 @@ impl LsmTransaction {
         Ok(revision)
     }
 
-    fn ensure_capacity(
+    /// Validate the complete replacement before changing pending state. `None`
+    /// removes an entry; `Some(0)` retains a tombstone. Account for the existing
+    /// 64-byte entry estimate once, and inspect only the row being replaced.
+    /// Recounting the whole map on each write makes an N-row transaction O(N²).
+    fn check_pending_replacement(
         &self,
-        additional_bytes: u64,
-        additional_rows: u64,
-    ) -> Result<(), StorageError> {
-        if self
+        previous: Option<&PendingRow>,
+        replacement_row_bytes: Option<usize>,
+    ) -> Result<u64, StorageError> {
+        let byte_limit = || StorageError::ResourceLimit {
+            resource: "LSM pending transaction bytes",
+            limit: LSM_MAX_PENDING_TRANSACTION_BYTES,
+        };
+        let previous_bytes = previous.map_or(0, |row| {
+            64 + row.row.as_ref().map_or(0, |bytes| bytes.len() as u64)
+        });
+        let replacement_bytes = replacement_row_bytes
+            .map_or(Some(0), |bytes| (bytes as u64).checked_add(64))
+            .ok_or_else(byte_limit)?;
+        let total = self
             .pending_bytes
-            .checked_add(additional_bytes)
-            .is_none_or(|total| total > LSM_MAX_PENDING_TRANSACTION_BYTES)
-        {
-            return Err(StorageError::ResourceLimit {
-                resource: "LSM pending transaction bytes",
-                limit: LSM_MAX_PENDING_TRANSACTION_BYTES,
-            });
+            .checked_sub(previous_bytes)
+            .and_then(|bytes| bytes.checked_add(replacement_bytes))
+            .ok_or_else(byte_limit)?;
+        if total > LSM_MAX_PENDING_TRANSACTION_BYTES {
+            return Err(byte_limit());
         }
-        if u64::try_from(self.pending.len())
-            .unwrap_or(u64::MAX)
-            .checked_add(additional_rows)
-            .is_none_or(|total| total > LSM_MAX_PENDING_MUTATIONS)
-        {
+        let rows = self.pending.len() - usize::from(previous.is_some())
+            + usize::from(replacement_row_bytes.is_some());
+        if rows as u64 > LSM_MAX_PENDING_MUTATIONS {
             return Err(StorageError::ResourceLimit {
                 resource: "LSM pending mutations",
                 limit: LSM_MAX_PENDING_MUTATIONS,
             });
         }
-        Ok(())
-    }
-
-    fn recalculate_pending_bytes(&mut self) -> Result<(), StorageError> {
-        let mut total = 0_u64;
-        for row in self.pending.values() {
-            total = total
-                .checked_add(64)
-                .and_then(|value| {
-                    value.checked_add(row.row.as_ref().map_or(0, |bytes| bytes.len() as u64))
-                })
-                .ok_or(StorageError::ResourceLimit {
-                    resource: "LSM pending transaction bytes",
-                    limit: LSM_MAX_PENDING_TRANSACTION_BYTES,
-                })?;
-        }
-        if total > LSM_MAX_PENDING_TRANSACTION_BYTES {
-            return Err(StorageError::ResourceLimit {
-                resource: "LSM pending transaction bytes",
-                limit: LSM_MAX_PENDING_TRANSACTION_BYTES,
-            });
-        }
-        self.pending_bytes = total;
-        Ok(())
+        Ok(total)
     }
 
     fn validate_handle(
@@ -4865,6 +4865,9 @@ fn decode_wal_record(tag: u8, payload: &[u8]) -> Result<WalRecord, StorageError>
                     LsmError::InvalidWal("invalid transaction ID or mutation count").into(),
                 );
             }
+            if count > (payload.len() - 12) / 28 {
+                return Err(LsmError::InvalidWal("mutation count exceeds remaining bytes").into());
+            }
             let mut offset = 12;
             let mut mutations = Vec::with_capacity(count);
             let mut previous = None;
@@ -6131,8 +6134,21 @@ fn canonicalize_sstables(sstables: &mut [Sstable]) {
     });
 }
 
+// Every committed Put must be representable by the existing SST block format.
+// Reject it while the transaction is still unchanged, not at a later flush that
+// could otherwise prevent all subsequent writer admission.
+fn validate_sstable_row_bytes(row_bytes: usize) -> Result<(), StorageError> {
+    if row_bytes > SST_MAX_BLOCK_BYTES - SST_ENTRY_HEADER_BYTES {
+        return Err(StorageError::ResourceLimit {
+            resource: "LSM SSTable entry bytes",
+            limit: SST_MAX_BLOCK_BYTES as u64,
+        });
+    }
+    Ok(())
+}
+
 fn estimated_entry_bytes(entry: &VersionedEntry) -> u64 {
-    32_u64.saturating_add(value_size(&entry.value))
+    (SST_ENTRY_HEADER_BYTES as u64).saturating_add(value_size(&entry.value))
 }
 
 fn remove_unreferenced_file(path: &Path) -> Result<(), StorageError> {
@@ -7432,6 +7448,215 @@ mod tests {
         PreparedDecision, PreparedTransactionState, PreparedTxnResolution, RecoveryError,
         StorageError, TransactionState,
     };
+
+    #[test]
+    fn resource_pending_byte_rejection_is_atomic_and_replacements_release_budget() {
+        use super::{LSM_MAX_PENDING_TRANSACTION_BYTES, encode_row};
+        let root = root("resource-pending-bytes");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let mut txn = storage.begin_transaction().unwrap();
+        let empty = vec![ScalarValue::Int64(255), ScalarValue::Text(String::new())];
+        let overhead = encode_row(&empty).unwrap().len();
+        // Each legal row consumes exactly 64 KiB of pending budget, including
+        // its 64-byte pending entry. Its SST entry remains within 64 KiB too.
+        let row_text = "x".repeat(65_536 - 64 - overhead);
+        for id in 0..255 {
+            storage
+                .insert_in(
+                    &mut txn,
+                    &[ScalarValue::Int64(id), ScalarValue::Text(row_text.clone())],
+                )
+                .unwrap();
+        }
+        let bytes_before = txn.pending_bytes;
+        let too_much = vec![
+            ScalarValue::Int64(10_000),
+            ScalarValue::Text("x".repeat(65_536 - 32 - overhead)),
+        ];
+        assert!(matches!(
+            storage.insert_in(&mut txn, &too_much),
+            Err(StorageError::ResourceLimit {
+                resource: "LSM pending transaction bytes",
+                ..
+            })
+        ));
+        assert_eq!(txn.pending.len(), 255);
+        assert_eq!(txn.pending_bytes, bytes_before);
+        let exact = vec![ScalarValue::Int64(255), ScalarValue::Text(row_text)];
+        let handle = storage.insert_in(&mut txn, &exact).unwrap();
+        assert_eq!(txn.pending_bytes, LSM_MAX_PENDING_TRANSACTION_BYTES);
+        let handle = storage.update_in(&mut txn, handle, &exact).unwrap();
+        assert_eq!(txn.pending_bytes, LSM_MAX_PENDING_TRANSACTION_BYTES);
+        assert!(storage.insert_in(&mut txn, &empty).is_err());
+        assert_eq!(txn.pending.len(), 256);
+        let handle = storage.update_in(&mut txn, handle, &empty).unwrap();
+        assert_eq!(txn.pending_bytes, bytes_before + (64 + overhead) as u64);
+        storage.delete_in(&mut txn, handle).unwrap();
+        assert_eq!(txn.pending_bytes, bytes_before);
+        storage
+            .insert_in(
+                &mut txn,
+                &[
+                    ScalarValue::Int64(10_001),
+                    ScalarValue::Text("accepted after rejection".into()),
+                ],
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        storage.close().unwrap();
+        let mut reopened = LsmStorage::open(&root, table()).unwrap();
+        let view = reopened.read_view().unwrap();
+        let rows = reopened
+            .scan_columns_with_view(&[ColumnId(1)], &view)
+            .unwrap();
+        assert_eq!(rows.len(), 256);
+        assert!(
+            !rows
+                .iter()
+                .any(|(_, values)| values[0] == ScalarValue::Int64(10_000))
+        );
+        assert!(
+            rows.iter()
+                .any(|(_, values)| values[0] == ScalarValue::Int64(10_001))
+        );
+        drop(view);
+        reopened.close().unwrap();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn resource_sstable_row_limit_is_enforced_before_staging_and_survives_reopen() {
+        use super::{SST_ENTRY_HEADER_BYTES, SST_MAX_BLOCK_BYTES, encode_row};
+        let root = root("resource-sst-row-boundary");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let empty = [ScalarValue::Int64(1), ScalarValue::Text(String::new())];
+        let overhead = encode_row(&empty).unwrap().len();
+        let maximum_text = SST_MAX_BLOCK_BYTES - SST_ENTRY_HEADER_BYTES - overhead;
+        let too_large = [
+            ScalarValue::Int64(1),
+            ScalarValue::Text("x".repeat(maximum_text + 1)),
+        ];
+        let mut txn = storage.begin_transaction().unwrap();
+        assert!(matches!(
+            storage.insert_in(&mut txn, &too_large),
+            Err(StorageError::ResourceLimit {
+                resource: "LSM SSTable entry bytes",
+                ..
+            })
+        ));
+        assert!(txn.pending.is_empty());
+        assert_eq!(txn.pending_bytes, 0);
+        let exact = [
+            ScalarValue::Int64(1),
+            ScalarValue::Text("x".repeat(maximum_text)),
+        ];
+        let handle = storage.insert_in(&mut txn, &exact).unwrap();
+        let bytes = txn.pending_bytes;
+        assert!(matches!(
+            storage.update_in(&mut txn, handle, &too_large),
+            Err(StorageError::ResourceLimit {
+                resource: "LSM SSTable entry bytes",
+                ..
+            })
+        ));
+        assert_eq!(txn.pending_bytes, bytes);
+        // A failed update must not invalidate the previous handle or row.
+        storage.update_in(&mut txn, handle, &exact).unwrap();
+        txn.commit().unwrap();
+        storage.flush().unwrap();
+        storage.close().unwrap();
+        let mut reopened = LsmStorage::open(&root, table()).unwrap();
+        let view = reopened.read_view().unwrap();
+        let rows = reopened
+            .scan_columns_with_view(&[ColumnId(1), ColumnId(2)], &view)
+            .unwrap();
+        assert_eq!(rows[0].1, exact);
+        drop(view);
+        // Writer admission still succeeds after a maximum-size row was flushed.
+        reopened
+            .insert(&[ScalarValue::Int64(2), ScalarValue::Null])
+            .unwrap();
+        reopened.close().unwrap();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn resource_pending_mutation_cap_covers_insert_update_and_delete() {
+        use super::LSM_MAX_PENDING_MUTATIONS;
+        let root = root("resource-pending-count");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let committed = storage
+            .insert(&[ScalarValue::Int64(-1), ScalarValue::Null])
+            .unwrap();
+        let mut txn = storage.begin_transaction().unwrap();
+        let mut last = None;
+        for i in 0..LSM_MAX_PENDING_MUTATIONS {
+            last = Some(
+                storage
+                    .insert_in(&mut txn, &[ScalarValue::Int64(i as i64), ScalarValue::Null])
+                    .unwrap(),
+            );
+        }
+        let bytes = txn.pending_bytes;
+        assert!(matches!(
+            storage.update_in(
+                &mut txn,
+                committed,
+                &[ScalarValue::Int64(-1), ScalarValue::Null]
+            ),
+            Err(StorageError::ResourceLimit {
+                resource: "LSM pending mutations",
+                ..
+            })
+        ));
+        assert!(matches!(
+            storage.delete_in(&mut txn, committed),
+            Err(StorageError::ResourceLimit {
+                resource: "LSM pending mutations",
+                ..
+            })
+        ));
+        assert!(matches!(
+            storage.insert_in(&mut txn, &[ScalarValue::Int64(99), ScalarValue::Null]),
+            Err(StorageError::ResourceLimit {
+                resource: "LSM pending mutations",
+                ..
+            })
+        ));
+        assert_eq!(txn.pending.len() as u64, LSM_MAX_PENDING_MUTATIONS);
+        assert_eq!(txn.pending_bytes, bytes);
+        storage.delete_in(&mut txn, last.unwrap()).unwrap();
+        storage.delete_in(&mut txn, committed).unwrap();
+        assert_eq!(txn.pending.len() as u64, LSM_MAX_PENDING_MUTATIONS);
+        let expected = txn
+            .pending
+            .values()
+            .map(|row| 64 + row.row.as_ref().map_or(0, |v| v.len() as u64))
+            .sum::<u64>();
+        assert_eq!(txn.pending_bytes, expected);
+        txn.rollback().unwrap();
+        assert!(txn.pending.is_empty());
+        assert_eq!(txn.pending_bytes, 0);
+        storage.close().unwrap();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn resource_wal_mutation_count_is_bounded_by_record_bytes() {
+        use super::{LSM_MAX_PENDING_MUTATIONS, LsmError, decode_wal_record};
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_u64.to_le_bytes());
+        payload.extend_from_slice(&(LSM_MAX_PENDING_MUTATIONS as u32).to_le_bytes());
+        assert!(matches!(
+            decode_wal_record(1, &payload),
+            Err(StorageError::Lsm(LsmError::InvalidWal(
+                "mutation count exceeds remaining bytes"
+            )))
+        ));
+    }
 
     #[test]
     fn sstable_entry_count_is_checked_before_reserving_rows() {

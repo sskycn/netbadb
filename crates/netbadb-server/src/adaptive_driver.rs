@@ -310,17 +310,25 @@ impl Error for ServerAdaptiveControlError {
     }
 }
 
+/// Synchronous controls share one outstanding request across all handle clones.
+/// Concurrent callers wait before allocating a reply or copying a proposal;
+/// the permit is released after the reply or a stopped-worker error.
 #[derive(Clone)]
 pub struct ServerAdaptiveControlHandle {
     requests: Sender<ServerAdaptiveControlRequest>,
+    admission: crate::control_admission::ControlAdmission,
 }
 
 impl ServerAdaptiveControlHandle {
-    pub(crate) const fn new(requests: Sender<ServerAdaptiveControlRequest>) -> Self {
-        Self { requests }
+    pub(crate) fn new(requests: Sender<ServerAdaptiveControlRequest>) -> Self {
+        Self {
+            requests,
+            admission: crate::control_admission::ControlAdmission::default(),
+        }
     }
 
     pub fn status(&self) -> Result<ServerAdaptiveStatus, ServerAdaptiveControlError> {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerAdaptiveControlRequest::Status { reply })
@@ -333,6 +341,7 @@ impl ServerAdaptiveControlHandle {
     pub fn rotate_evidence(
         &self,
     ) -> Result<AdaptiveEvidenceRotationReport, ServerAdaptiveControlError> {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerAdaptiveControlRequest::RotateEvidence { reply })
@@ -349,6 +358,7 @@ impl ServerAdaptiveControlHandle {
         &self,
         expected: AdaptiveEvidenceWindowEpoch,
     ) -> Result<AdaptiveEvidenceRotationReport, ServerAdaptiveControlError> {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerAdaptiveControlRequest::RotateEvidenceIfWindow { expected, reply })
@@ -359,6 +369,7 @@ impl ServerAdaptiveControlHandle {
     }
 
     pub fn reset_faulted_scheduler(&self) -> Result<(), ServerAdaptiveControlError> {
+        let _permit = self.admission.enter();
         let (reply, response) = mpsc::sync_channel(1);
         self.requests
             .send(ServerAdaptiveControlRequest::ResetFaultedScheduler { reply })
@@ -766,37 +777,36 @@ pub(crate) fn forward_control_requests<F>(
 ) where
     F: FnMut(ServerAdaptiveWorkerCommand) -> Result<(), ()>,
 {
-    loop {
-        let request = match requests.try_recv() {
-            Ok(request) => request,
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-        };
-        match request {
-            ServerAdaptiveControlRequest::Status { reply } => {
-                let fallback = reply.clone();
-                if submit(ServerAdaptiveWorkerCommand::Inspect { host, reply }).is_err() {
-                    let _ = fallback.send(Err(ServerAdaptiveControlError::ServerStopped));
-                }
+    // Bound listener work even when a caller immediately submits its next control.
+    let request = match requests.try_recv() {
+        Ok(request) => request,
+        Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+    };
+    match request {
+        ServerAdaptiveControlRequest::Status { reply } => {
+            let fallback = reply.clone();
+            if submit(ServerAdaptiveWorkerCommand::Inspect { host, reply }).is_err() {
+                let _ = fallback.send(Err(ServerAdaptiveControlError::ServerStopped));
             }
-            ServerAdaptiveControlRequest::RotateEvidence { reply } => {
-                let fallback = reply.clone();
-                if submit(ServerAdaptiveWorkerCommand::RotateEvidence { reply }).is_err() {
-                    let _ = fallback.send(Err(ServerAdaptiveControlError::ServerStopped));
-                }
+        }
+        ServerAdaptiveControlRequest::RotateEvidence { reply } => {
+            let fallback = reply.clone();
+            if submit(ServerAdaptiveWorkerCommand::RotateEvidence { reply }).is_err() {
+                let _ = fallback.send(Err(ServerAdaptiveControlError::ServerStopped));
             }
-            ServerAdaptiveControlRequest::RotateEvidenceIfWindow { expected, reply } => {
-                let fallback = reply.clone();
-                if submit(ServerAdaptiveWorkerCommand::RotateEvidenceIfWindow { expected, reply })
-                    .is_err()
-                {
-                    let _ = fallback.send(Err(ServerAdaptiveControlError::ServerStopped));
-                }
+        }
+        ServerAdaptiveControlRequest::RotateEvidenceIfWindow { expected, reply } => {
+            let fallback = reply.clone();
+            if submit(ServerAdaptiveWorkerCommand::RotateEvidenceIfWindow { expected, reply })
+                .is_err()
+            {
+                let _ = fallback.send(Err(ServerAdaptiveControlError::ServerStopped));
             }
-            ServerAdaptiveControlRequest::ResetFaultedScheduler { reply } => {
-                let fallback = reply.clone();
-                if submit(ServerAdaptiveWorkerCommand::ResetFaultedScheduler { reply }).is_err() {
-                    let _ = fallback.send(Err(ServerAdaptiveControlError::ServerStopped));
-                }
+        }
+        ServerAdaptiveControlRequest::ResetFaultedScheduler { reply } => {
+            let fallback = reply.clone();
+            if submit(ServerAdaptiveWorkerCommand::ResetFaultedScheduler { reply }).is_err() {
+                let _ = fallback.send(Err(ServerAdaptiveControlError::ServerStopped));
             }
         }
     }
@@ -885,6 +895,29 @@ mod tests {
         )
         .expect("create driver fixture");
         (root, database)
+    }
+
+    #[test]
+    fn resource_control_permit_lasts_until_reply_and_shutdown_releases_it() {
+        let (send, receive) = mpsc::channel();
+        let handle = ServerAdaptiveControlHandle::new(send);
+        let caller = handle.clone();
+        let join = std::thread::spawn(move || caller.status());
+        let request = receive.recv().unwrap();
+        assert!(handle.admission.is_occupied());
+        assert!(matches!(receive.try_recv(), Err(TryRecvError::Empty)));
+        // A lost worker reply must release admission and preserve the typed error.
+        drop(request);
+        assert!(matches!(
+            join.join().unwrap(),
+            Err(ServerAdaptiveControlError::ServerStopped)
+        ));
+        assert!(!handle.admission.is_occupied());
+        drop(receive);
+        assert!(matches!(
+            handle.status(),
+            Err(ServerAdaptiveControlError::ServerStopped)
+        ));
     }
 
     #[test]

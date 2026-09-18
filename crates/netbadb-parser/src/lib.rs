@@ -1969,6 +1969,28 @@ mod tests {
     };
 
     #[test]
+    fn resource_deep_wide_and_huge_limit_inputs_return_errors() {
+        for depth in [100, 1_000, 10_000] {
+            let sql = format!("SELECT {}1{}", "(".repeat(depth), ")".repeat(depth));
+            assert!(parse_statement(&sql).is_err());
+            let sql = format!("SELECT {}true", "NOT ".repeat(depth));
+            assert!(parse_statement(&sql).is_err());
+        }
+        assert!(parse_statement("SELECT 1 LIMIT 18446744073709551615").is_err());
+        assert!(parse_statement("SELECT 1 LIMIT 1 OFFSET 18446744073709551615").is_err());
+        assert!(
+            parse_statement(&format!(
+                "SELECT {}",
+                vec!["1"; super::MAX_SQL_TOKENS].join(",")
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_statement(&format!("SELECT '{}'", "x".repeat(super::MAX_SQL_BYTES))).is_err()
+        );
+    }
+
+    #[test]
     fn parses_the_initial_query_subset() {
         let query = parse("SELECT id, name FROM users WHERE id >= 2 AND name != 'bob' LIMIT 10")
             .expect("query parses");

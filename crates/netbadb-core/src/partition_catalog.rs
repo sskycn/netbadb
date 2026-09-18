@@ -163,7 +163,7 @@ impl PartitionCatalog {
     }
 
     pub(crate) fn open(path: &Path) -> Result<Self, PartitionError> {
-        let mut file = File::open(path).map_err(|source| PartitionError::Io {
+        let file = File::open(path).map_err(|source| PartitionError::Io {
             operation: "open partition catalog",
             path: path.to_owned(),
             source,
@@ -181,7 +181,8 @@ impl PartitionCatalog {
             return Err(PartitionError::CatalogTooLarge);
         }
         let mut bytes = Vec::with_capacity(length);
-        file.read_to_end(&mut bytes)
+        file.take(MAX_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
             .map_err(|source| PartitionError::Io {
                 operation: "read partition catalog",
                 path: path.to_owned(),
@@ -270,7 +271,7 @@ impl PartitionCatalog {
             return Err(PartitionError::CatalogCorrupt("checksum mismatch"));
         }
         let mut decoder = Decoder::new(payload);
-        let table_count = decoder.count("table count", MAX_TABLES)?;
+        let table_count = decoder.count("table count", MAX_TABLES, 49)?;
         let mut tables = Vec::with_capacity(table_count);
         for _ in 0..table_count {
             let table_id = TableId(decoder.u64("table id")?);
@@ -284,7 +285,7 @@ impl PartitionCatalog {
                 1 => {
                     let partition_key = ColumnId(decoder.u32("partition key")?);
                     let key_type = decode_physical_type(decoder.u8("partition key type")?)?;
-                    let partition_count = decoder.count("partition count", MAX_PARTITIONS)?;
+                    let partition_count = decoder.count("partition count", MAX_PARTITIONS, 18)?;
                     let mut partitions = Vec::with_capacity(partition_count);
                     for _ in 0..partition_count {
                         partitions.push(RangePartitionBinding {
@@ -595,11 +596,19 @@ impl<'a> Decoder<'a> {
             .try_into()
             .map_err(|_| PartitionError::TruncatedField(field))
     }
-    fn count(&mut self, field: &'static str, maximum: usize) -> Result<usize, PartitionError> {
+    fn count(
+        &mut self,
+        field: &'static str,
+        maximum: usize,
+        minimum_bytes: usize,
+    ) -> Result<usize, PartitionError> {
         let value =
             usize::try_from(self.u32(field)?).map_err(|_| PartitionError::CountOverflow(field))?;
         if value > maximum {
             return Err(PartitionError::CountTooLarge(field));
+        }
+        if value > (self.bytes.len() - self.offset) / minimum_bytes {
+            return Err(PartitionError::TruncatedField(field));
         }
         Ok(value)
     }
@@ -777,6 +786,27 @@ mod tests {
                     ],
                 },
             }],
+        }
+    }
+
+    #[test]
+    fn resource_catalog_counts_cannot_exceed_encoded_records() {
+        let original = catalog().encode().unwrap();
+        for (offset, count, field) in [
+            (HEADER_LEN, MAX_TABLES as u32, "table count"),
+            (
+                HEADER_LEN + 4 + 8 + 32 + 1 + 4 + 1,
+                MAX_PARTITIONS as u32,
+                "partition count",
+            ),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + 4].copy_from_slice(&count.to_le_bytes());
+            let crc = crc32c::crc32c(&bytes[HEADER_LEN..]);
+            bytes[12..16].copy_from_slice(&crc.to_le_bytes());
+            assert!(
+                matches!(PartitionCatalog::decode(&bytes), Err(PartitionError::TruncatedField(actual)) if actual == field)
+            );
         }
     }
 

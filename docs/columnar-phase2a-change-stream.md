@@ -106,6 +106,16 @@ net transaction effect:
 
 Coalescing never crosses a commit frontier.
 
+The in-memory accumulator indexes each current Insert/Update physical version
+for expected constant-time coalescing. Insert-delete releases its after-image
+immediately. Removed inserts leave payload-free slots, compacted in stable order
+after more than half are removed and before preparing a batch. This bounds total
+compaction work over a deletion sequence by a geometric series, while preserving
+the exact prior mutation order and original Update/Delete version identities.
+The index is allocated lazily for Insert/Update and is dropped on clear. Its
+allocated capacity, like the mutation vector, can follow the peak net-change
+count within the transaction; it is not a transaction-wide memory budget.
+
 ## NBCL v1 durability and recovery
 
 Heap stores `<heap>.change`; LSM stores `<lsm-directory>/change.nbcl`. While a

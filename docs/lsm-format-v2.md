@@ -64,6 +64,13 @@ descriptor. Header CRC32C covers those fields. The Bloom payload immediately
 follows the fixed header and has its own CRC32C. Data blocks retain bounded
 length/count, first/last physical keys, and per-block CRC32C.
 
+The data-block payload is at most 64 KiB. Each entry has a 32-byte envelope, so
+one canonical encoded row must fit in the remaining 65,504 bytes. Insert and
+update admission enforce this existing format bound before staging a mutation;
+accepting a wider WAL row would leave it unflushable. This bound is not a new
+format version or configurable memory budget. Historical WAL decoding is
+unchanged; no oversized historical row is silently discarded or rewritten.
+
 A checksummed `NBLF` footer terminates the file. Its bounded sparse index stores
 every block's exact offset, payload length, entry count, and first/last physical
 key. The fixed trailer records the index byte length and checksum, so open can

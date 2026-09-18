@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -434,13 +434,34 @@ pub(crate) enum AuthoritativeOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct PendingChangeSet {
     mutations: Vec<StorageChange>,
+    // Only live Insert/Update new versions are indexed. Stable vector order
+    // remains the publication order; removed inserts retain payload-free holes
+    // until compaction, avoiding a shift/reindex on every deletion.
+    // Keep optional stream indexing out of every transaction's inline layout,
+    // and do not allocate it for disabled streams or delete-only batches.
+    index: Option<Box<PendingChangeIndex>>,
+    #[cfg(test)]
+    compacted_slots: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingChangeIndex {
+    current_versions: HashMap<StorageVersionKey, usize>,
+    removed: HashSet<usize>,
 }
 
 impl PendingChangeSet {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             mutations: Vec::new(),
+            index: None,
+            #[cfg(test)]
+            compacted_slots: 0,
         }
+    }
+
+    fn index(&mut self) -> &mut PendingChangeIndex {
+        self.index.get_or_insert_with(Box::default)
     }
 
     pub(crate) fn record_insert(
@@ -448,6 +469,8 @@ impl PendingChangeSet {
         new_version: StorageVersionKey,
         after: Vec<ScalarValue>,
     ) {
+        let position = self.mutations.len();
+        self.index().current_versions.insert(new_version, position);
         self.mutations
             .push(StorageChange::Insert { new_version, after });
     }
@@ -458,7 +481,11 @@ impl PendingChangeSet {
         new_version: StorageVersionKey,
         after: Vec<ScalarValue>,
     ) {
-        if let Some(position) = self.current_position(old_version) {
+        if let Some(position) = self
+            .index
+            .as_mut()
+            .and_then(|index| index.current_versions.remove(&old_version))
+        {
             match &mut self.mutations[position] {
                 StorageChange::Insert {
                     new_version: current,
@@ -471,10 +498,13 @@ impl PendingChangeSet {
                 } => {
                     *current = new_version;
                     *row = after;
+                    self.index().current_versions.insert(new_version, position);
                 }
                 StorageChange::Delete { .. } => {}
             }
         } else {
+            let position = self.mutations.len();
+            self.index().current_versions.insert(new_version, position);
             self.mutations.push(StorageChange::Update {
                 old_version,
                 new_version,
@@ -484,13 +514,27 @@ impl PendingChangeSet {
     }
 
     pub(crate) fn record_delete(&mut self, old_version: StorageVersionKey) {
-        if let Some(position) = self.current_position(old_version) {
-            match self.mutations.remove(position) {
-                StorageChange::Insert { .. } => {}
+        if let Some(position) = self
+            .index
+            .as_mut()
+            .and_then(|index| index.current_versions.remove(&old_version))
+        {
+            let previous = std::mem::replace(
+                &mut self.mutations[position],
+                StorageChange::Delete { old_version },
+            );
+            match previous {
+                StorageChange::Insert { .. } => {
+                    self.index().removed.insert(position);
+                    // Each automatic compaction removes over half the slots:
+                    // total copying over a deletion sequence is amortized O(N).
+                    if self.index().removed.len() > self.mutations.len() / 2 {
+                        self.compact();
+                    }
+                }
                 StorageChange::Update { old_version, .. }
                 | StorageChange::Delete { old_version } => {
-                    self.mutations
-                        .insert(position, StorageChange::Delete { old_version });
+                    self.mutations[position] = StorageChange::Delete { old_version };
                 }
             }
         } else {
@@ -498,20 +542,42 @@ impl PendingChangeSet {
         }
     }
 
-    fn current_position(&self, key: StorageVersionKey) -> Option<usize> {
-        self.mutations.iter().position(|mutation| match mutation {
-            StorageChange::Insert { new_version, .. }
-            | StorageChange::Update { new_version, .. } => *new_version == key,
-            StorageChange::Delete { .. } => false,
-        })
+    fn compact(&mut self) {
+        let Some(index) = self.index.as_mut() else {
+            return;
+        };
+        if index.removed.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.compacted_slots += self.mutations.len();
+        }
+        let mut position = 0;
+        self.mutations.retain(|_| {
+            let keep = !index.removed.contains(&position);
+            position += 1;
+            keep
+        });
+        index.removed.clear();
+        index.current_versions.clear();
+        for (position, mutation) in self.mutations.iter().enumerate() {
+            if let StorageChange::Insert { new_version, .. }
+            | StorageChange::Update { new_version, .. } = mutation
+            {
+                index.current_versions.insert(*new_version, position);
+            }
+        }
     }
 
-    pub(crate) fn as_slice(&self) -> &[StorageChange] {
+    pub(crate) fn as_slice(&mut self) -> &[StorageChange] {
+        self.compact();
         &self.mutations
     }
 
     pub(crate) fn clear(&mut self) {
         self.mutations.clear();
+        self.index = None;
     }
 }
 
@@ -2375,7 +2441,17 @@ fn write_guard(path: &Path, header: &Header) -> Result<(), ChangeStreamError> {
 }
 
 fn read_guard(path: &Path) -> Result<Header, ChangeStreamError> {
-    decode_header(&fs::read(path)?)
+    // A guard contains only one versioned header, never change records.
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take((V2_HEADER_SIZE + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > V2_HEADER_SIZE {
+        return Err(ChangeStreamError::InvalidHeader(
+            "guard exceeds header size",
+        ));
+    }
+    decode_header(&bytes)
 }
 
 fn guard_identity_matches(left: &Header, right: &Header) -> bool {
@@ -2836,6 +2912,12 @@ fn decode_record(
     if count == 0 || count > CHANGE_LOG_MAX_MUTATIONS {
         return Err(ChangeStreamError::MutationCountTooLarge(u64::from(count)));
     }
+    // Smallest mutation is a delete: tag (1) plus Heap version key (15).
+    if count as usize > (payload.len() - FIXED) / 16 {
+        return Err(ChangeStreamError::InvalidRecord(
+            "mutation count exceeds remaining bytes",
+        ));
+    }
     let mut offset = FIXED;
     let mut mutations = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -3151,6 +3233,149 @@ mod tests {
                 after: vec![ScalarValue::Int64(42)],
             }],
         }
+    }
+
+    #[test]
+    fn resource_change_coalescing_preserves_order_with_linear_compaction_work() {
+        let key = |id| StorageVersionKey::Heap {
+            storage_id: StorageId(1),
+            row_id: RowId {
+                page: PageId(id),
+                slot: 0,
+                generation: 1,
+            },
+        };
+        for n in [1_u64, 1_000, 10_000, 100_000] {
+            let mut changes = PendingChangeSet::new();
+            for i in 0..n {
+                changes.record_insert(key(i + 1), vec![ScalarValue::UInt64(i)]);
+            }
+            for i in 0..n {
+                changes.record_update(key(i + 1), key(n + i + 1), vec![ScalarValue::UInt64(i + 1)]);
+            }
+            assert_eq!(
+                changes.index.as_ref().unwrap().current_versions.len(),
+                n as usize
+            );
+            for i in (0..n).step_by(2) {
+                changes.record_delete(key(n + i + 1));
+                let live = changes.mutations.len() - changes.index.as_ref().unwrap().removed.len();
+                assert!(changes.mutations.len() <= 2 * live);
+            }
+            let expected = (1..n)
+                .step_by(2)
+                .map(|i| StorageChange::Insert {
+                    new_version: key(n + i + 1),
+                    after: vec![ScalarValue::UInt64(i + 1)],
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(changes.as_slice(), expected);
+            for i in (1..n).step_by(2) {
+                // The index must still point to the same version after compaction.
+                changes.record_update(key(n + i + 1), key(2 * n + i + 1), vec![ScalarValue::Null]);
+                changes.record_delete(key(2 * n + i + 1));
+            }
+            assert!(changes.as_slice().is_empty());
+            assert!(
+                changes
+                    .index
+                    .as_ref()
+                    .is_none_or(|index| index.current_versions.is_empty())
+            );
+            assert!(
+                changes
+                    .index
+                    .as_ref()
+                    .is_none_or(|index| index.removed.is_empty())
+            );
+            assert!(changes.compacted_slots <= 2 * n as usize);
+            eprintln!(
+                "resource change coalescing rows={n} compacted_slots={}",
+                changes.compacted_slots
+            );
+        }
+    }
+
+    #[test]
+    fn resource_change_coalescing_keeps_original_update_delete_identities() {
+        let key = |id| StorageVersionKey::Lsm {
+            storage_id: StorageId(1),
+            row_id: LsmRowId(id),
+            version: LsmCommitSeq(1),
+        };
+        let mut changes = PendingChangeSet::new();
+        assert!(changes.index.is_none());
+        changes.record_delete(key(99));
+        assert_eq!(changes.as_slice().len(), 1);
+        assert!(changes.index.is_none());
+        changes.clear();
+        changes.record_update(key(1), key(11), vec![ScalarValue::Int64(1)]);
+        changes.record_insert(key(2), vec![ScalarValue::Int64(2)]);
+        changes.record_update(key(3), key(13), vec![ScalarValue::Int64(3)]);
+        changes.record_delete(key(4));
+        changes.record_insert(key(5), vec![ScalarValue::Int64(5)]);
+        changes.record_delete(key(2));
+        changes.record_update(key(11), key(21), vec![ScalarValue::Int64(21)]);
+        changes.record_delete(key(13));
+        assert_eq!(
+            changes.as_slice(),
+            [
+                StorageChange::Update {
+                    old_version: key(1),
+                    new_version: key(21),
+                    after: vec![ScalarValue::Int64(21)]
+                },
+                StorageChange::Delete {
+                    old_version: key(3)
+                },
+                StorageChange::Delete {
+                    old_version: key(4)
+                },
+                StorageChange::Insert {
+                    new_version: key(5),
+                    after: vec![ScalarValue::Int64(5)]
+                },
+            ]
+        );
+        changes.clear();
+        assert!(changes.as_slice().is_empty());
+        assert!(changes.index.is_none());
+        changes.record_insert(key(2), vec![ScalarValue::Int64(22)]);
+        assert_eq!(changes.as_slice().len(), 1);
+    }
+
+    #[test]
+    fn resource_guard_reads_only_the_versioned_header_bound() {
+        let path =
+            std::env::temp_dir().join(format!("netbadb-guard-resource-{}", std::process::id()));
+        for bytes in [encode_v1_header(&header()), encode_header(&header())] {
+            fs::write(&path, &bytes).unwrap();
+            assert!(read_guard(&path).is_ok());
+        }
+        let mut bytes = encode_header(&header());
+        bytes.resize(10_000, 0);
+        fs::write(&path, bytes).unwrap();
+        let result = read_guard(&path);
+        fs::remove_file(path).unwrap();
+        assert!(matches!(
+            result,
+            Err(ChangeStreamError::InvalidHeader(
+                "guard exceeds header size"
+            ))
+        ));
+    }
+
+    #[test]
+    fn resource_change_record_count_is_bounded_before_allocation() {
+        let record = encode_record(&batch()).unwrap();
+        let mut payload = record[4..record.len() - 4].to_vec();
+        payload[96..100].copy_from_slice(&CHANGE_LOG_MAX_MUTATIONS.to_le_bytes());
+        assert!(matches!(
+            decode_record(&payload, &header(), &table()),
+            Err(ChangeStreamError::InvalidRecord(
+                "mutation count exceeds remaining bytes"
+            ))
+        ));
     }
 
     #[test]

@@ -554,6 +554,11 @@ impl ProjectionCatalog {
         } else {
             false
         };
+        if count as usize > reader.0.len() / 68 {
+            return Err(ProjectionCatalogError::InvalidFormat(
+                "entry count exceeds remaining bytes",
+            ));
+        }
         let mut entries = Vec::with_capacity(count as usize);
         for _ in 0..count {
             entries.push(ProjectionCatalogEntry {
@@ -581,6 +586,11 @@ impl ProjectionCatalog {
             if column_count > MAX_PENDING_COLUMNS {
                 return Err(ProjectionCatalogError::CapacityExceeded(
                     "pending column count",
+                ));
+            }
+            if column_count as usize > reader.0.len() / 4 {
+                return Err(ProjectionCatalogError::InvalidFormat(
+                    "column count exceeds remaining bytes",
                 ));
             }
             let mut columns = Vec::with_capacity(column_count as usize);
@@ -1041,6 +1051,30 @@ mod tests {
             std::process::id(),
             NEXT_PATH.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn resource_catalog_entry_and_pending_column_counts_precede_allocation() {
+        let catalog = pending_sample();
+        let original = catalog.encode().unwrap();
+        let entry_bytes = 68 + catalog.entries[0].locator.len();
+        for (offset, count, expected) in [
+            (32, MAX_ENTRIES, "entry count exceeds remaining bytes"),
+            (
+                40 + entry_bytes + 68,
+                MAX_PENDING_COLUMNS,
+                "column count exceeds remaining bytes",
+            ),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + 4].copy_from_slice(&count.to_le_bytes());
+            let end = bytes.len() - 4;
+            let crc = crc32c::crc32c(&bytes[..end]);
+            bytes[end..].copy_from_slice(&crc.to_le_bytes());
+            assert!(
+                matches!(ProjectionCatalog::decode_at(&catalog.path, &bytes), Err(ProjectionCatalogError::InvalidFormat(actual)) if actual == expected)
+            );
+        }
     }
 
     #[test]

@@ -47,15 +47,17 @@ fn abandoned_admission_does_not_leave_a_registered_session() {
     let (root, table, policy) = fixture("abandoned-open");
     let database = Database::open(root.join("items"), table).unwrap();
     let (commands, receiver) = mpsc::channel();
-    let (reply, abandoned) = mpsc::sync_channel(1);
-    drop(abandoned);
-    commands
-        .send(PgWorkerCommand::Open {
-            session_id: 1,
-            startup: startup(),
-            reply,
-        })
-        .unwrap();
+    for _ in 0..1_000 {
+        let (reply, abandoned) = mpsc::sync_channel(1);
+        drop(abandoned);
+        commands
+            .send(PgWorkerCommand::Open {
+                session_id: 1,
+                startup: startup(),
+                reply,
+            })
+            .unwrap();
+    }
     let (reply, admitted) = mpsc::sync_channel(1);
     commands
         .send(PgWorkerCommand::Open {
