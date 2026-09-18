@@ -432,6 +432,11 @@ pub enum PostgresTcpServerError {
         startup: Box<PostgresTcpServerError>,
         cleanup: Box<PostgresTcpServerError>,
     },
+    /// Both the listener/connection operation and worker cleanup failed.
+    RuntimeCleanup {
+        primary: Box<PostgresTcpServerError>,
+        cleanup: Box<PostgresTcpServerError>,
+    },
     WorkerStopped,
     WorkerClose(String),
     ThreadPanicked,
@@ -478,6 +483,10 @@ impl fmt::Display for PostgresTcpServerError {
                 formatter,
                 "PostgreSQL server startup failed: {startup}; worker cleanup also failed: {cleanup}"
             ),
+            Self::RuntimeCleanup { primary, cleanup } => write!(
+                formatter,
+                "PostgreSQL server failed: {primary}; cleanup also failed: {cleanup}"
+            ),
             Self::WorkerStopped => {
                 formatter.write_str("PostgreSQL database worker stopped unexpectedly")
             }
@@ -504,7 +513,9 @@ impl Error for PostgresTcpServerError {
             Self::PhysicalDesignMutationReceipts(error) => Some(error),
             Self::Operator(error) => Some(error),
             Self::OperatorAndServerCleanup { server, .. } => Some(server.as_ref()),
-            Self::StartupCleanup { cleanup, .. } => Some(cleanup.as_ref()),
+            Self::StartupCleanup { cleanup, .. } | Self::RuntimeCleanup { cleanup, .. } => {
+                Some(cleanup.as_ref())
+            }
             _ => None,
         }
     }
@@ -541,99 +552,138 @@ fn run_pg_accept_loop(
         .adaptive
         .tick_interval
         .map(ServerAdaptiveHostDriver::new);
-    loop {
-        match shutdown.try_recv() {
-            Ok(()) | Err(TryRecvError::Disconnected) => break,
-            Err(TryRecvError::Empty) => {}
-        }
-        if host_config.adaptive.operator_failures.try_recv().is_ok() {
-            break;
-        }
-        reap_pg_connections(&mut connections);
-        if let Some(host) = adaptive_host.as_mut() {
-            host.poll(|command| {
+    let result = (|| {
+        loop {
+            match shutdown.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
+            if host_config.adaptive.operator_failures.try_recv().is_ok() {
+                break;
+            }
+            if worker.join.is_finished() {
+                return Err(PostgresTcpServerError::WorkerStopped);
+            }
+            reap_pg_connections(&mut connections)?;
+            if let Some(host) = adaptive_host.as_mut() {
+                host.poll(|command| {
+                    worker
+                        .client
+                        .commands
+                        .send(PgWorkerCommand::Adaptive(command))
+                        .map_err(|_| ())
+                });
+            }
+            let host_snapshot = adaptive_host
+                .as_ref()
+                .map(ServerAdaptiveHostDriver::snapshot);
+            forward_control_requests(&host_config.adaptive.controls, host_snapshot, |command| {
                 worker
                     .client
                     .commands
                     .send(PgWorkerCommand::Adaptive(command))
                     .map_err(|_| ())
             });
-        }
-        let host_snapshot = adaptive_host
-            .as_ref()
-            .map(ServerAdaptiveHostDriver::snapshot);
-        forward_control_requests(&host_config.adaptive.controls, host_snapshot, |command| {
-            worker
-                .client
-                .commands
-                .send(PgWorkerCommand::Adaptive(command))
-                .map_err(|_| ())
-        });
-        forward_physical_design_control_requests(
-            &host_config.physical_design_controls,
-            |command| {
-                worker
-                    .client
-                    .commands
-                    .send(PgWorkerCommand::PhysicalDesign(command))
-                    .map_err(|_| ())
-            },
-        );
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if connections.len() >= limits.max_connections() {
-                    let _ = stream.shutdown(Shutdown::Both);
-                    continue;
+            forward_physical_design_control_requests(
+                &host_config.physical_design_controls,
+                |command| {
+                    worker
+                        .client
+                        .commands
+                        .send(PgWorkerCommand::PhysicalDesign(command))
+                        .map_err(|_| ())
+                },
+            );
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if connections.len() >= limits.max_connections() {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                    configure_stream(&stream, limits)
+                        .map_err(PostgresTcpServerError::ListenerConfiguration)?;
+                    let control = stream
+                        .try_clone()
+                        .map_err(PostgresTcpServerError::ListenerConfiguration)?;
+                    let client = worker.client.clone();
+                    let session_id = next_session_id;
+                    next_session_id = next_session_id
+                        .checked_add(1)
+                        .filter(|next| *next != 0)
+                        .ok_or(PostgresTcpServerError::SessionIdExhausted)?;
+                    let join = thread::Builder::new()
+                        .name(format!("netbadb-postgres-connection-{session_id}"))
+                        .spawn(move || {
+                            if let Err(error) = run_pg_connection(stream, session_id, client) {
+                                eprintln!(
+                                    "netbadb PostgreSQL connection {session_id} failed: {error}"
+                                );
+                            }
+                        })
+                        .map_err(PostgresTcpServerError::ThreadSpawn)?;
+                    connections.push(PgConnection {
+                        stream: control,
+                        join,
+                    });
                 }
-                configure_stream(&stream, limits)
-                    .map_err(PostgresTcpServerError::ListenerConfiguration)?;
-                let control = stream
-                    .try_clone()
-                    .map_err(PostgresTcpServerError::ListenerConfiguration)?;
-                let client = worker.client.clone();
-                let session_id = next_session_id;
-                next_session_id = next_session_id
-                    .checked_add(1)
-                    .filter(|next| *next != 0)
-                    .ok_or(PostgresTcpServerError::SessionIdExhausted)?;
-                let join = thread::Builder::new()
-                    .name(format!("netbadb-postgres-connection-{session_id}"))
-                    .spawn(move || {
-                        if let Err(error) = run_pg_connection(stream, session_id, client) {
-                            eprintln!("netbadb PostgreSQL connection {session_id} failed: {error}");
-                        }
-                    })
-                    .map_err(PostgresTcpServerError::ThreadSpawn)?;
-                connections.push(PgConnection {
-                    stream: control,
-                    join,
-                });
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(PostgresTcpServerError::Accept(error)),
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => return Err(PostgresTcpServerError::Accept(error)),
         }
-    }
+        Ok(())
+    })();
+    // Stop accepting before waiting for connection replies or database cleanup.
+    drop(listener);
+    finish_pg_accept_loop(connections, worker, result)
+}
+
+fn finish_pg_accept_loop(
+    connections: Vec<PgConnection>,
+    worker: PgDatabaseWorker,
+    mut result: Result<(), PostgresTcpServerError>,
+) -> Result<(), PostgresTcpServerError> {
     for connection in &connections {
         let _ = connection.stream.shutdown(Shutdown::Both);
     }
     for connection in connections {
-        let _ = connection.join.join();
+        if connection.join.join().is_err() {
+            result = combine_pg_cleanup(result, Err(PostgresTcpServerError::ThreadPanicked));
+        }
     }
-    worker.shutdown()
+    combine_pg_cleanup(result, worker.shutdown())
 }
 
-fn reap_pg_connections(connections: &mut Vec<PgConnection>) {
+fn combine_pg_cleanup(
+    primary: Result<(), PostgresTcpServerError>,
+    cleanup: Result<(), PostgresTcpServerError>,
+) -> Result<(), PostgresTcpServerError> {
+    match (primary, cleanup) {
+        (Ok(()), result) | (result, Ok(())) => result,
+        // This marker is resolved by joining the worker, which owns the cause.
+        (Err(PostgresTcpServerError::WorkerStopped), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(PostgresTcpServerError::RuntimeCleanup {
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        }),
+    }
+}
+
+fn reap_pg_connections(connections: &mut Vec<PgConnection>) -> Result<(), PostgresTcpServerError> {
     let mut index = 0;
     while index < connections.len() {
         if connections[index].join.is_finished() {
             let connection = connections.swap_remove(index);
-            let _ = connection.join.join();
+            connection
+                .join
+                .join()
+                .map_err(|_| PostgresTcpServerError::ThreadPanicked)?;
         } else {
             index += 1;
         }
     }
+    Ok(())
 }
 
 fn configure_stream(stream: &TcpStream, limits: ServerLimits) -> io::Result<()> {
@@ -841,28 +891,29 @@ impl PgDatabaseWorker {
                 )
             })
             .map_err(PostgresTcpServerError::ThreadSpawn)?;
-        match ready_rx
-            .recv()
-            .map_err(|_| PostgresTcpServerError::WorkerStopped)?
-        {
-            Ok(()) => Ok(Self {
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
                 client: PgWorkerClient { commands },
                 join,
             }),
-            Err(PgWorkerStartupError::Database(error)) => {
-                let _ = join.join();
-                Err(PostgresTcpServerError::Database(error))
+            Ok(Err(error)) => {
+                let startup = match error {
+                    PgWorkerStartupError::Database(error) => {
+                        PostgresTcpServerError::Database(error)
+                    }
+                    PgWorkerStartupError::Adaptive(error) => {
+                        PostgresTcpServerError::AdaptiveConfig(error)
+                    }
+                    PgWorkerStartupError::PhysicalDesignMutationReceipts(error) => {
+                        PostgresTcpServerError::PhysicalDesignMutationReceipts(Box::new(error))
+                    }
+                };
+                Err(join_pg_startup_failure(join, startup))
             }
-            Err(PgWorkerStartupError::Adaptive(error)) => {
-                let _ = join.join();
-                Err(PostgresTcpServerError::AdaptiveConfig(error))
-            }
-            Err(PgWorkerStartupError::PhysicalDesignMutationReceipts(error)) => {
-                let _ = join.join();
-                Err(PostgresTcpServerError::PhysicalDesignMutationReceipts(
-                    Box::new(error),
-                ))
-            }
+            Err(_) => match join_pg_worker(join) {
+                Ok(()) => Err(PostgresTcpServerError::WorkerStopped),
+                Err(error) => Err(error),
+            },
         }
     }
 
@@ -876,11 +927,28 @@ impl PgDatabaseWorker {
         {
             let _ = result.recv();
         }
-        match self.join.join() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(message)) => Err(PostgresTcpServerError::WorkerClose(message)),
-            Err(_) => Err(PostgresTcpServerError::ThreadPanicked),
-        }
+        join_pg_worker(self.join)
+    }
+}
+
+fn join_pg_worker(join: JoinHandle<Result<(), String>>) -> Result<(), PostgresTcpServerError> {
+    match join.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err(PostgresTcpServerError::WorkerClose(message)),
+        Err(_) => Err(PostgresTcpServerError::ThreadPanicked),
+    }
+}
+
+fn join_pg_startup_failure(
+    join: JoinHandle<Result<(), String>>,
+    startup: PostgresTcpServerError,
+) -> PostgresTcpServerError {
+    match join_pg_worker(join) {
+        Ok(()) => startup,
+        Err(cleanup) => PostgresTcpServerError::StartupCleanup {
+            startup: Box::new(startup),
+            cleanup: Box::new(cleanup),
+        },
     }
 }
 
@@ -953,7 +1021,9 @@ fn run_pg_worker(
                         }
                     };
                 sessions.insert(session_id, session);
-                let _ = reply.send(Ok(messages));
+                if reply.send(Ok(messages)).is_err() {
+                    close_pg_session(&mut sessions, session_id)?;
+                }
             }
             PgWorkerCommand::Request {
                 session_id,
@@ -972,20 +1042,16 @@ fn run_pg_worker(
                     physical_design.as_mut(),
                     message,
                 );
-                let _ = reply.send(Ok(messages));
+                if reply.send(Ok(messages)).is_err() {
+                    close_pg_session(&mut sessions, session_id)?;
+                }
             }
             PgWorkerCommand::Close { session_id, reply } => {
-                let result = match sessions.get_mut(&session_id) {
-                    Some(session) => session
-                        .execution
-                        .close()
-                        .map_err(|_| PgConnectionError::WorkerStopped),
-                    None => Ok(()),
-                };
-                if result.is_ok() {
-                    sessions.remove(&session_id);
+                if let Err(error) = close_pg_session(&mut sessions, session_id) {
+                    let _ = reply.send(Err(PgConnectionError::WorkerStopped));
+                    return Err(error);
                 }
-                let _ = reply.send(result);
+                let _ = reply.send(Ok(()));
             }
             PgWorkerCommand::Adaptive(command) => match adaptive.as_mut() {
                 Some(adaptive) => adaptive.handle(&mut database, command),
@@ -1014,6 +1080,22 @@ fn run_pg_worker(
             .map_err(|error| error.to_string())?;
     }
     database.close().map_err(|error| error.to_string())
+}
+
+// Keep the handle registered until rollback succeeds. A failure is fatal to the
+// worker: no further command may use storage whose cleanup did not complete.
+fn close_pg_session(
+    sessions: &mut HashMap<u64, PgWorkerSession>,
+    session_id: u64,
+) -> Result<(), String> {
+    if let Some(session) = sessions.get_mut(&session_id) {
+        session
+            .execution
+            .close()
+            .map_err(|error| format!("session {session_id} cleanup failed: {error}"))?;
+        sessions.remove(&session_id);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6693,6 +6775,10 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "postgres_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 #[path = "postgres_adaptive_feedback_tests.rs"]

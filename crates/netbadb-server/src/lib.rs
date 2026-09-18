@@ -20,8 +20,8 @@ use std::fmt;
 
 pub use netbadb_core::AdaptiveEvidenceWindowEpoch;
 use netbadb_core::{
-    Database, DatabaseError, DatabaseTransaction, DdlOutcome, ExecutionResult, ParameterTypeHint,
-    PreparedDdlStatement, PreparedSqlStatement, QueryResult, TransactionState,
+    Database, DatabaseError, DatabaseErrorKind, DatabaseTransaction, DdlOutcome, ExecutionResult,
+    ParameterTypeHint, PreparedDdlStatement, PreparedSqlStatement, QueryResult, TransactionState,
 };
 use netbadb_protocol::{
     ClientMessage, MAX_ERROR_MESSAGE_BYTES, MAX_FRAME_PAYLOAD, PROTOCOL_VERSION, ProtocolError,
@@ -652,6 +652,9 @@ impl SessionState {
     }
 
     fn server_error_batch(&self, request_id: u64, error: ServerError) -> ResponseBatch {
+        if let ServerError::Database(error) = error {
+            return self.database_error_batch(request_id, error);
+        }
         let code = match &error {
             ServerError::ResponseTooLarge | ServerError::ResultRowLimitExceeded { .. } => {
                 ProtocolErrorCode::ResponseTooLarge
@@ -679,7 +682,15 @@ impl SessionState {
 
     fn database_error_batch(&self, request_id: u64, error: DatabaseError) -> ResponseBatch {
         let code = database_error_code(&error);
-        self.error_batch(request_id, code, &error.to_string())
+        // Keep protocol codes and transaction state stable, but never serialize
+        // storage paths, coordinator internals, or nested I/O diagnostics.
+        let message = match error.kind() {
+            DatabaseErrorKind::Operational => "database operation failed".into(),
+            DatabaseErrorKind::Internal => "internal database error".into(),
+            DatabaseErrorKind::TransactionState => "invalid transaction state".into(),
+            _ => error.to_string(),
+        };
+        self.error_batch(request_id, code, &message)
     }
 
     fn error_batch(
@@ -928,6 +939,37 @@ mod tests {
             [ServerMessage::Error { code: actual, transaction_state, .. }]
                 if *actual == code && *transaction_state == state
         ));
+    }
+
+    #[test]
+    fn native_database_errors_do_not_expose_private_paths_or_internal_details() {
+        let session = SessionState::default();
+        for wrapped in [false, true] {
+            let error = DatabaseError::DuplicateStoragePath("/private/database/secret.heap".into());
+            let batch = if wrapped {
+                session.server_error_batch(17, ServerError::Database(error))
+            } else {
+                session.database_error_batch(17, error)
+            };
+            let [
+                ServerMessage::Error {
+                    code,
+                    transaction_state,
+                    message,
+                },
+            ] = batch.messages.as_slice()
+            else {
+                panic!("expected bounded database error");
+            };
+            assert_eq!(batch.request_id, 17);
+            assert_eq!(*code, ProtocolErrorCode::Database);
+            assert_eq!(*transaction_state, WireTransactionState::None);
+            assert_eq!(message, "database operation failed");
+        }
+        let batch = session.database_error_batch(18, DatabaseError::EmptyCatalog);
+        assert!(
+            matches!(&batch.messages[0], ServerMessage::Error { message, .. } if message == "internal database error")
+        );
     }
 
     #[test]

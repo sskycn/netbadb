@@ -3624,3 +3624,26 @@ Fixture construction, index backfill, `ANALYZE`, plan inspection, correctness
 verification, reporting, close, and cleanup remain outside timed query loops.
 The benchmark records current behavior; it does not feed measurements back
 into planning, expose a new planner API, or change any persistent representation.
+
+
+## Error and concurrency audit follow-up
+
+The [2026-09-18 audit](error-concurrency-audit.md) records ownership, waits,
+transaction retries, and regression evidence. PostgreSQL worker cleanup failure
+stops service; worker exit/panic is observed by the listener, and every listener
+exit closes and joins connections before joining the worker. Native and
+PostgreSQL startup preserve both primary and worker-cleanup errors. Native
+operational/internal/transaction-state messages do not expose core diagnostics.
+
+A failed CORD append whose tail rollback also fails invalidates that open log's
+write authority until reopen, preserving both I/O errors. Later appends cannot
+bury an incomplete tail. Even deferred Complete checkpointing propagates this
+loss of authority; ordinary recoverable checkpoint errors retain their existing
+semantics. NBMR checks the active final pathname against the locked inode at
+startup and append boundaries; detected replacement recovery-gates mutations.
+None of these changes adds mutation owners or changes persistent/wire formats.
+
+LSM SSTable entry counts are checked against the block payload's minimum 32-byte
+entry envelope before vector allocation, including valid-checksum malformed
+blocks. This bounds allocation by existing block limits without changing NBL SST
+encoding.

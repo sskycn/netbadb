@@ -101,6 +101,10 @@ pub enum TcpServerError {
         startup: Box<TcpServerError>,
         cleanup: Box<TcpServerError>,
     },
+    RuntimeCleanup {
+        primary: Box<TcpServerError>,
+        cleanup: Box<TcpServerError>,
+    },
     OperatorAndServerCleanup {
         operator: Box<ServerOperatorError>,
         server: Box<TcpServerError>,
@@ -142,6 +146,10 @@ impl fmt::Display for TcpServerError {
                 formatter,
                 "server startup failed: {startup}; database worker cleanup also failed: {cleanup}"
             ),
+            Self::RuntimeCleanup { primary, cleanup } => write!(
+                formatter,
+                "server failed: {primary}; database worker cleanup also failed: {cleanup}"
+            ),
             Self::OperatorAndServerCleanup { operator, server } => write!(
                 formatter,
                 "operator shutdown failed: {operator}; server cleanup also failed: {server}"
@@ -168,7 +176,9 @@ impl Error for TcpServerError {
             | Self::ListenerConfiguration(source)
             | Self::Accept(source)
             | Self::ThreadSpawn(source) => Some(source),
-            Self::StartupCleanup { cleanup, .. } => Some(cleanup.as_ref()),
+            Self::StartupCleanup { cleanup, .. } | Self::RuntimeCleanup { cleanup, .. } => {
+                Some(cleanup.as_ref())
+            }
             Self::OperatorAndServerCleanup { server, .. } => Some(server.as_ref()),
             Self::WorkerFatal(error) => Some(error),
             Self::WorkerStopped
@@ -704,19 +714,15 @@ impl DatabaseWorker {
                 events,
                 join: Some(join),
             }),
-            Ok(Err(WorkerStartupError::Database(error))) => {
-                let _ = join.join();
-                Err(TcpServerError::Database(error))
-            }
-            Ok(Err(WorkerStartupError::Adaptive(error))) => {
-                let _ = join.join();
-                Err(TcpServerError::AdaptiveConfig(error))
-            }
-            Ok(Err(WorkerStartupError::PhysicalDesignMutationReceipts(error))) => {
-                let _ = join.join();
-                Err(TcpServerError::PhysicalDesignMutationReceipts(Box::new(
-                    error,
-                )))
+            Ok(Err(error)) => {
+                let startup = match error {
+                    WorkerStartupError::Database(error) => TcpServerError::Database(error),
+                    WorkerStartupError::Adaptive(error) => TcpServerError::AdaptiveConfig(error),
+                    WorkerStartupError::PhysicalDesignMutationReceipts(error) => {
+                        TcpServerError::PhysicalDesignMutationReceipts(Box::new(error))
+                    }
+                };
+                Err(join_startup_failure(join, startup))
             }
             Err(_) => match join.join() {
                 Ok(Err(error)) => Err(TcpServerError::WorkerFatal(error)),
@@ -780,6 +786,21 @@ impl DatabaseWorker {
             Ok(Err(error)) => Err(TcpServerError::WorkerFatal(expected_error.unwrap_or(error))),
             Err(_) => Err(TcpServerError::WorkerPanicked),
         }
+    }
+}
+
+fn join_startup_failure(
+    join: JoinHandle<Result<(), WorkerFatalError>>,
+    startup: TcpServerError,
+) -> TcpServerError {
+    let cleanup = match join.join() {
+        Ok(Ok(())) => return startup,
+        Ok(Err(error)) => TcpServerError::WorkerFatal(error),
+        Err(_) => TcpServerError::WorkerPanicked,
+    };
+    TcpServerError::StartupCleanup {
+        startup: Box::new(startup),
+        cleanup: Box::new(cleanup),
     }
 }
 
@@ -1346,9 +1367,13 @@ fn finish_accept_loop(
     }
     let client = worker.client();
     join_connections(connections, &client, metrics);
-    match worker.shutdown() {
-        Ok(()) => result,
-        Err(error) => Err(error),
+    match (result, worker.shutdown()) {
+        (Ok(()), result) | (result, Ok(())) => result,
+        (Err(TcpServerError::WorkerStopped), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(TcpServerError::RuntimeCleanup {
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        }),
     }
 }
 
@@ -1572,6 +1597,57 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn startup_failure_retains_worker_cleanup_error_and_panic() {
+        for panic in [false, true] {
+            let join = thread::spawn(move || {
+                assert!(!panic, "injected worker panic");
+                Err(WorkerFatalError::DatabaseCloseFailed {
+                    message: "injected close failure".into(),
+                })
+            });
+            let error = join_startup_failure(join, TcpServerError::SessionIdExhausted);
+            let TcpServerError::StartupCleanup { startup, cleanup } = error else {
+                panic!("startup lost its cleanup failure");
+            };
+            assert!(matches!(*startup, TcpServerError::SessionIdExhausted));
+            if panic {
+                assert!(matches!(*cleanup, TcpServerError::WorkerPanicked));
+            } else {
+                assert!(matches!(*cleanup, TcpServerError::WorkerFatal(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn accept_failure_retains_primary_and_worker_cleanup_failure() {
+        let (commands, receiver) = mpsc::channel();
+        drop(receiver);
+        let (_events, events) = mpsc::channel();
+        let worker = DatabaseWorker {
+            client: WorkerClient { commands },
+            events,
+            join: Some(thread::spawn(|| {
+                Err(WorkerFatalError::DatabaseCloseFailed {
+                    message: "injected close failure".into(),
+                })
+            })),
+        };
+        let result = finish_accept_loop(
+            Vec::new(),
+            worker,
+            &ServerMetricsHandle::new(),
+            Err(TcpServerError::Accept(io::Error::other(
+                "injected accept failure",
+            ))),
+        );
+        let Err(TcpServerError::RuntimeCleanup { primary, cleanup }) = result else {
+            panic!("lost primary or cleanup failure");
+        };
+        assert!(matches!(*primary, TcpServerError::Accept(_)));
+        assert!(matches!(*cleanup, TcpServerError::WorkerFatal(_)));
+    }
 
     #[test]
     fn connection_configuration_applies_read_and_write_timeouts() {

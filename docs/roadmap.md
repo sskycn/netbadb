@@ -3269,3 +3269,12 @@ The planner boundary for unique 4,096-row Heap inner input remains between
 outer 16 and 32. Phase 74 may investigate a richer access/scan layout model
 only if a real workload needs it; it should not add an outer-row threshold or
 continue tuning this benchmark in isolation.
+
+
+### Error handling and concurrency audit (2026-09-18)
+
+Completed the [targeted audit and fixes](error-concurrency-audit.md): coordinator
+append/cleanup failure gating, PostgreSQL worker/session teardown, Native and
+PostgreSQL startup error propagation, Native diagnostic redaction, and active
+NBMR inode checks, and pre-allocation SSTable entry-count validation. Existing synchronous execution and one mutation owner per
+StorageId remain unchanged; general concurrent writers remain future work.

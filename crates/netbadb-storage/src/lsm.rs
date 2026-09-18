@@ -6930,6 +6930,15 @@ fn decode_sstable_entries(
     sstable_id: u64,
     table: &TableDef,
 ) -> Result<Vec<VersionedEntry>, StorageError> {
+    // Every entry requires its 32-byte envelope even for a tombstone. Reject
+    // forged counts before reserving memory from untrusted block metadata.
+    if u64::from(count) > (payload.len() / 32) as u64 {
+        return Err(LsmError::InvalidSstable {
+            sstable_id,
+            reason: "entry count exceeds block payload",
+        }
+        .into());
+    }
     let mut offset = 0_usize;
     let mut entries = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -7318,6 +7327,66 @@ mod tests {
         PreparedDecision, PreparedTransactionState, PreparedTxnResolution, RecoveryError,
         StorageError, TransactionState,
     };
+
+    #[test]
+    fn sstable_entry_count_is_checked_before_reserving_rows() {
+        let table = table();
+        for count in [1, 2, u32::MAX] {
+            let result = super::decode_sstable_entries(&[], count, PhysicalType::Int64, 7, &table);
+            assert!(matches!(
+                result,
+                Err(StorageError::Lsm(super::LsmError::InvalidSstable {
+                    sstable_id: 7,
+                    reason: "entry count exceeds block payload",
+                }))
+            ));
+        }
+        let mut tombstone = [0_u8; 32];
+        tombstone[8..16].copy_from_slice(&1_u64.to_le_bytes());
+        tombstone[16..24].copy_from_slice(&1_u64.to_le_bytes());
+        tombstone[24] = 2;
+        for length in 0..tombstone.len() {
+            assert!(
+                super::decode_sstable_entries(
+                    &tombstone[..length],
+                    1,
+                    PhysicalType::Int64,
+                    7,
+                    &table
+                )
+                .is_err()
+            );
+        }
+        let entries =
+            super::decode_sstable_entries(&tombstone, 1, PhysicalType::Int64, 7, &table).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].value, super::EntryValue::Tombstone));
+
+        let path = root("forged-entry-count");
+        let (mut bytes, _) = super::encode_sstable_block(7, 0, &entries, 0).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let (_, reopened, _) =
+            super::read_sstable_block(&mut file, 7, 0, 0, PhysicalType::Int64, &table).unwrap();
+        assert_eq!(reopened.len(), 1);
+        drop(file);
+        bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let checksum_offset = bytes.len() - 4;
+        let checksum = crc32c::crc32c(&bytes[..checksum_offset]);
+        bytes[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let result = super::read_sstable_block(&mut file, 7, 0, 0, PhysicalType::Int64, &table);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        assert!(matches!(
+            result,
+            Err(StorageError::Lsm(super::LsmError::InvalidSstable {
+                reason: "entry count exceeds block payload",
+                ..
+            }))
+        ));
+    }
 
     fn table() -> TableDef {
         TableDef::new(

@@ -93,7 +93,11 @@ locks the opened v1/v2 source before decoding, locks the new v3 temporary
 before writing or publication, verifies immediately before rename that the
 final path still has the source file's device and inode, and retains the new
 locked handle before releasing the legacy handle. A replaced final path fails
-closed and is not overwritten.
+closed and is not overwritten. Startup also revalidates the locked handle against
+the final component before recovery truncation and readiness. Runtime Begin and
+Outcome appends check that identity before writing and after sync; detected
+replacement fails the append and gates subsequent mutations until reopen.
+These checks do not make pathname replacement atomic with Core mutation.
 
 These are cooperative advisory locks in a trusted Server-owned parent
 namespace. They do not defend against a privileged administrator, a process

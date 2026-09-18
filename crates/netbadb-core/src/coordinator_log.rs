@@ -330,6 +330,7 @@ impl CoordinatorLog {
             .ok_or(CoordinatorLogError::AuthorityUnavailable)
     }
 
+    #[cfg(test)]
     fn file_mut(&mut self) -> Result<&mut File, CoordinatorLogError> {
         self.file
             .as_mut()
@@ -346,7 +347,7 @@ impl CoordinatorLog {
             return Err(CoordinatorLogError::GlobalEnableWithIncompleteDecision);
         }
         let bytes = encode_record(DatabaseTxnId(0), CoordinatorRecord::GlobalEnable)?;
-        append_record(self.file_mut()?, &bytes)?;
+        append_record(&mut self.file, &bytes)?;
         self.file_ref()?.sync_data()?;
         self.global_visibility = true;
         Ok(())
@@ -402,7 +403,7 @@ impl CoordinatorLog {
             self.file_mut()?.write_all(&bytes[..bytes.len() / 2])?;
             crate::coordinator_crash::maybe_crash("during-decision-append");
         }
-        append_record(self.file_mut()?, &bytes)?;
+        append_record(&mut self.file, &bytes)?;
         #[cfg(test)]
         crate::coordinator_crash::maybe_crash("after-decision-append");
         self.decisions.insert(
@@ -526,7 +527,7 @@ impl CoordinatorLog {
             self.file_mut()?.write_all(&bytes[..bytes.len() / 2])?;
             crate::coordinator_crash::maybe_crash("during-group-decision-append");
         }
-        append_record(self.file_mut()?, &bytes)?;
+        append_record(&mut self.file, &bytes)?;
         #[cfg(test)]
         crate::coordinator_crash::maybe_crash("after-group-decision-append");
         for (member, commit_seq) in canonical.into_iter().zip(sequences.iter().copied()) {
@@ -569,6 +570,9 @@ impl CoordinatorLog {
         }
         if let Err(error) = self.append_sequenced_complete(database_txn_id, commit_seq) {
             self.last_checkpoint_error = Some(error.to_string());
+            if self.file.is_none() {
+                return Err(error);
+            }
             return Ok(());
         }
         self.last_checkpoint_error = None;
@@ -853,7 +857,7 @@ impl CoordinatorLog {
             self.file_mut()?.write_all(&bytes[..bytes.len() / 2])?;
             crate::coordinator_crash::maybe_crash("during-complete-append");
         }
-        append_record(self.file_mut()?, &bytes)?;
+        append_record(&mut self.file, &bytes)?;
         #[cfg(test)]
         crate::coordinator_crash::maybe_crash("after-complete-append");
         self.decisions
@@ -982,7 +986,7 @@ impl CoordinatorLog {
             self.file_mut()?.write_all(&bytes[..bytes.len() / 2])?;
             crate::coordinator_crash::maybe_crash("during-decision-append");
         }
-        append_record(self.file_mut()?, &bytes)?;
+        append_record(&mut self.file, &bytes)?;
         #[cfg(test)]
         crate::coordinator_crash::maybe_crash("after-decision-append");
         self.decisions.insert(
@@ -1028,7 +1032,7 @@ impl CoordinatorLog {
             self.file_mut()?.write_all(&bytes[..bytes.len() / 2])?;
             crate::coordinator_crash::maybe_crash("during-complete-append");
         }
-        append_record(self.file_mut()?, &bytes)?;
+        append_record(&mut self.file, &bytes)?;
         #[cfg(test)]
         crate::coordinator_crash::maybe_crash("after-complete-append");
         self.decisions
@@ -1920,13 +1924,47 @@ fn verify_record_checksum(bytes: &[u8], offset: u64) -> Result<(), CoordinatorLo
     Ok(())
 }
 
-fn append_record(file: &mut File, bytes: &[u8]) -> Result<(), CoordinatorLogError> {
+fn append_record(authority: &mut Option<File>, bytes: &[u8]) -> Result<(), CoordinatorLogError> {
+    let file = authority
+        .as_mut()
+        .ok_or(CoordinatorLogError::AuthorityUnavailable)?;
     let offset = file.seek(SeekFrom::End(0))?;
-    if let Err(error) = file.write_all(bytes) {
-        let _ = file.set_len(offset);
-        return Err(error.into());
+    if let Err(append) = write_append_bytes(file, bytes) {
+        if let Err(cleanup) = truncate_failed_append(file, offset) {
+            // A later append could turn a recoverable partial tail into middle
+            // corruption. Only reopen/recovery may reestablish this authority.
+            *authority = None;
+            return Err(CoordinatorLogError::AppendCleanup {
+                offset,
+                append,
+                cleanup,
+            });
+        }
+        return Err(append.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_APPEND_AND_TRUNCATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn write_append_bytes(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_APPEND_AND_TRUNCATE.with(std::cell::Cell::get) {
+        file.write_all(&bytes[..bytes.len() / 2])?;
+        return Err(injected_io_error("append before failed truncate"));
+    }
+    file.write_all(bytes)
+}
+
+fn truncate_failed_append(file: &File, offset: u64) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_APPEND_AND_TRUNCATE.with(|failure| failure.replace(false)) {
+        return Err(injected_io_error("append rollback truncate"));
+    }
+    file.set_len(offset)
 }
 
 #[cfg(test)]
@@ -1977,6 +2015,12 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 #[derive(Debug)]
 pub enum CoordinatorLogError {
     Io(std::io::Error),
+    /// Both append and tail rollback failed; this handle requires reopen.
+    AppendCleanup {
+        offset: u64,
+        append: std::io::Error,
+        cleanup: std::io::Error,
+    },
     InvalidMagic,
     UnsupportedVersion(u16),
     InvalidHeaderSize(u16),
@@ -2106,6 +2150,14 @@ impl fmt::Display for CoordinatorLogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "coordinator log I/O error: {error}"),
+            Self::AppendCleanup {
+                offset,
+                append,
+                cleanup,
+            } => write!(
+                formatter,
+                "coordinator log append at {offset} failed: {append}; tail rollback failed: {cleanup}; reopen required"
+            ),
             Self::InvalidMagic => formatter.write_str("coordinator log magic does not match"),
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported coordinator log version {version}")
@@ -2312,6 +2364,7 @@ impl Error for CoordinatorLogError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::AppendCleanup { cleanup, .. } => Some(cleanup),
             _ => None,
         }
     }
@@ -2801,6 +2854,85 @@ mod tests {
         );
         CoordinatorLog::open(&path).expect("second open is stable");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_append_and_truncate_disable_authority_until_reopen() {
+        let path = path("failed-append-truncate");
+        let mut log = CoordinatorLog::create(&path).unwrap();
+        log.commit_decision(DatabaseTxnId(16), &participants())
+            .unwrap();
+        log.complete(DatabaseTxnId(16)).unwrap();
+        super::FAIL_APPEND_AND_TRUNCATE.with(|failure| failure.set(true));
+        let failure = log
+            .commit_decision(DatabaseTxnId(17), &participants())
+            .unwrap_err();
+        let damaged_tail = std::fs::read(&path).unwrap();
+        let retry = log.commit_decision(DatabaseTxnId(17), &participants());
+        let after_retry = std::fs::read(&path).unwrap();
+        drop(log);
+        let reopened = CoordinatorLog::open(&path);
+        let restored = reopened.map(|mut log| {
+            let prior = log
+                .decisions()
+                .map(|decision| decision.database_txn_id)
+                .collect::<Vec<_>>();
+            log.commit_decision(DatabaseTxnId(17), &participants())
+                .unwrap();
+            log.complete(DatabaseTxnId(17)).unwrap();
+            drop(log);
+            let log = CoordinatorLog::open(&path).unwrap();
+            (
+                prior,
+                log.decisions().filter(|decision| decision.complete).count(),
+            )
+        });
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            matches!(retry, Err(CoordinatorLogError::AuthorityUnavailable)),
+            "retry appended after failed tail cleanup: {retry:?}"
+        );
+        assert_eq!(damaged_tail, after_retry);
+        assert!(
+            failure.to_string().contains("append rollback truncate"),
+            "cleanup error was swallowed: {failure}"
+        );
+        assert_eq!(restored.unwrap(), (vec![DatabaseTxnId(16)], 2));
+    }
+
+    #[test]
+    fn failed_deferred_complete_tail_cleanup_is_not_a_benign_checkpoint_error() {
+        let path = path("failed-deferred-truncate");
+        let mut log = CoordinatorLog::create(&path).unwrap();
+        log.enable_global_visibility().unwrap();
+        let sequence = log
+            .sequenced_commit_decision(DatabaseTxnId(17), &participants(), None)
+            .unwrap();
+        super::FAIL_APPEND_AND_TRUNCATE.with(|failure| failure.set(true));
+        assert!(matches!(
+            log.defer_complete_sequenced(DatabaseTxnId(17), sequence),
+            Err(CoordinatorLogError::AppendCleanup { .. })
+        ));
+        let damaged_tail = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            log.flush_complete_checkpoints(),
+            Err(CoordinatorLogError::AuthorityUnavailable)
+        ));
+        assert!(matches!(
+            log.sequenced_commit_decision(DatabaseTxnId(18), &participants(), None),
+            Err(CoordinatorLogError::AuthorityUnavailable)
+        ));
+        assert_eq!(damaged_tail, std::fs::read(&path).unwrap());
+        drop(log);
+        let mut log = CoordinatorLog::open(&path).unwrap();
+        assert_eq!(log.decisions().count(), 1);
+        assert!(!log.decisions().next().unwrap().complete);
+        log.complete_sequenced(DatabaseTxnId(17), sequence).unwrap();
+        drop(log);
+        let log = CoordinatorLog::open(&path).unwrap();
+        assert!(log.decisions().next().unwrap().complete);
+        drop(log);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

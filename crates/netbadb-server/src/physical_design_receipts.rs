@@ -637,9 +637,9 @@ fn verify_final_path_is_opened_inode(
 
     let opened = source
         .metadata()
-        .map_err(|error| io_error("migration source metadata", final_path, error))?;
+        .map_err(|error| io_error("journal handle metadata", final_path, error))?;
     let current = fs::symlink_metadata(final_path)
-        .map_err(|error| io_error("migration final metadata", final_path, error))?;
+        .map_err(|error| io_error("journal final path metadata", final_path, error))?;
     if !current.file_type().is_file()
         || opened.dev() != current.dev()
         || opened.ino() != current.ino()
@@ -1181,7 +1181,7 @@ impl fmt::Display for ServerPhysicalDesignMutationReceiptJournalError {
                 write!(formatter, "failed to acquire exclusive NBMR journal ownership: {source}")
             }
             Self::FinalPathChanged => formatter.write_str(
-                "NBMR journal final path changed while legacy migration was in progress",
+                "NBMR journal final path no longer identifies the locked journal",
             ),
             Self::FileTooLarge { bytes, maximum } => write!(
                 formatter,
@@ -1317,6 +1317,7 @@ impl ServerPhysicalDesignMutationReceiptJournal {
                 let mut source = secure_open_existing(&config, true)?;
                 verify_opened_regular(&source, &config)?;
                 lock_journal_exclusive(&source)?;
+                verify_final_path_is_opened_inode(&source, config.path())?;
                 let bytes = read_open_file(&mut source, &config)?;
                 let version = journal_version(&bytes)?;
                 match version {
@@ -1337,10 +1338,12 @@ impl ServerPhysicalDesignMutationReceiptJournal {
                 }
             };
 
+            verify_final_path_is_opened_inode(&file, config.path())?;
             let bytes = read_open_file(&mut file, &config)?;
             let journal_incarnation = validate_v3_header(&bytes, *identity.as_bytes())?;
             let decoded = decode_v3_records(&bytes, V3_HEADER_BYTES)?;
             if decoded.valid_bytes < bytes.len() {
+                verify_final_path_is_opened_inode(&file, config.path())?;
                 file.set_len(decoded.valid_bytes as u64)
                     .map_err(|source| io_error("tail truncate", config.path(), source))?;
                 file.sync_all()
@@ -1369,6 +1372,7 @@ impl ServerPhysicalDesignMutationReceiptJournal {
                 test_io_failure: None,
             };
             journal.reconcile(database)?;
+            verify_final_path_is_opened_inode(&journal.file, journal.config.path())?;
             Ok(journal)
         }
     }
@@ -1653,6 +1657,9 @@ impl ServerPhysicalDesignMutationReceiptJournal {
         operation: &'static str,
         record_kind: JournalRecordKind,
     ) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+        // flock owns the open inode, not its directory entry. Detect replacement
+        // at append boundaries so detected stale handles cannot authorize mutation.
+        verify_final_path_is_opened_inode(&self.file, self.config.path())?;
         #[cfg(not(test))]
         let _ = record_kind;
         #[cfg(test)]
@@ -1697,6 +1704,7 @@ impl ServerPhysicalDesignMutationReceiptJournal {
         self.file
             .sync_all()
             .map_err(|source| io_error("record sync", self.config.path(), source))?;
+        verify_final_path_is_opened_inode(&self.file, self.config.path())?;
         self.file_len = self
             .file_len
             .checked_add(bytes.len() as u64)
@@ -2993,6 +3001,63 @@ mod tests {
         drop(reopened);
         reopened_database.close().unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_journal_replacement_blocks_begin_and_outcome() {
+        for after_begin in [false, true] {
+            let root = fixture_root("live-inode-replaced");
+            let database = create_database(&root);
+            let identity = database.physical_design_database_identity().unwrap();
+            let path = root.join("receipts.nbmr");
+            let config = ServerPhysicalDesignMutationReceiptConfig::new(&path, 1_000_000).unwrap();
+            let mut journal =
+                ServerPhysicalDesignMutationReceiptJournal::open(config, identity, &database)
+                    .unwrap();
+            let begin = index_begin(1);
+            if after_begin {
+                journal
+                    .begin(begin.source, begin.evidence_epoch, begin.target.clone())
+                    .unwrap();
+            }
+            let old_path = root.join("old.nbmr");
+            fs::rename(&path, &old_path).unwrap();
+            let old_bytes = fs::read(&old_path).unwrap();
+            let replacement = b"replacement must survive";
+            fs::write(&path, replacement).unwrap();
+            let result = if after_begin {
+                journal.finish(
+                    begin.id,
+                    ServerPhysicalDesignMutationReceiptOutcome::Rejected,
+                )
+            } else {
+                journal
+                    .begin(begin.source, begin.evidence_epoch, begin.target.clone())
+                    .map(|_| ())
+            };
+            let blocked = journal.begin(begin.source, begin.evidence_epoch, begin.target);
+            let current_bytes = fs::read(&path).unwrap();
+            let orphan_bytes = fs::read(&old_path).unwrap();
+            drop(journal);
+            database.close().unwrap();
+            fs::remove_dir_all(root).unwrap();
+            assert!(matches!(
+                result,
+                Err(ServerPhysicalDesignMutationReceiptControlError::Journal(
+                    ServerPhysicalDesignMutationReceiptJournalError::FinalPathChanged
+                ))
+            ));
+            assert!(matches!(
+                blocked,
+                Err(ServerPhysicalDesignMutationReceiptControlError::RecoveryRequired)
+            ));
+            assert_eq!(current_bytes, replacement);
+            assert_eq!(
+                orphan_bytes, old_bytes,
+                "appended to an orphaned journal inode"
+            );
+        }
     }
 
     #[test]
