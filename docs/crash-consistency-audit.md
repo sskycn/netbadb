@@ -242,7 +242,7 @@ include the affected Core/Storage consumers and previous error-audit regressions
 | `cargo fmt --all -- --check` | Passed | Passed |
 | `cargo check --workspace --all-targets` | Passed | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed | Passed |
-| `cargo test --workspace` | Passed | Running |
+| `cargo test --workspace` | Passed | Passed; 0 failures |
 | `cargo test -p netbadb-storage -p netbadb-core crash_audit_ -- --nocapture` | New tests | Passed: 16 test functions |
 | `git diff --check` | Clean | Passed |
 | Added Markdown link/path verification | Not applicable | Passed |
@@ -254,3 +254,12 @@ Counterexample commands additionally included
 The same audit selector was run after temporarily removing only the newly added
 filesystem barriers: two Core and three Storage barrier regressions failed as
 expected; fixed files were restored before the passing final validation.
+
+Final workspace execution completed successfully in 1,314.3 seconds. Selected
+suite totals: Core 662 passed / 3 existing ignored, Executor 97 passed, Server
+261 unit + 11 PostgreSQL integration + 26 TCP integration passed, and Storage
+464 passed. The three existing ignores are the manual ALTER TYPE cost probe
+and two explicit fuzz-corpus generators; no ignore or blanket lint suppression
+was added. All 16 new test functions also passed in the complete workspace run.
+Final source digests were checked unchanged throughout that run, and the final
+code/documentation diff was reviewed before integration.
