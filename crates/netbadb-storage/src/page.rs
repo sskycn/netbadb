@@ -263,6 +263,8 @@ impl Page {
     }
 
     pub fn header(&self) -> Result<PageHeader, StorageError> {
+        #[cfg(test)]
+        tests::record_validation();
         if &self.bytes[0..4] != PAGE_MAGIC {
             return Err(PageError::InvalidMagic.into());
         }
@@ -452,10 +454,12 @@ impl Page {
             }
             .into());
         }
-        let mut records = self.rebuild_slots()?;
-        let reusable = records
-            .iter()
-            .position(|slot| slot.payload.is_none() && slot.generation < u32::MAX);
+        // The complete page was validated above. Decide whether it can fit
+        // before allocating an owned reconstruction of every live payload.
+        let reusable = (0..header.slot_count).find(|&index| {
+            let slot = self.slot_at(SlotId(index));
+            is_deleted_slot(slot) && slot.generation < u32::MAX
+        });
         let required = if reusable.is_some() {
             record.len()
         } else {
@@ -474,15 +478,16 @@ impl Page {
             }
             .into());
         }
+        let mut records = self.rebuild_slots()?;
         let slot_ref = if let Some(index) = reusable {
-            let slot = &mut records[index];
+            let slot = &mut records[usize::from(index)];
             slot.generation = slot.generation.checked_add(1).ok_or(PageError::PageFull {
                 required,
                 available,
             })?;
             slot.payload = Some(record.to_vec());
             SlotRef {
-                slot: SlotId(index as u16),
+                slot: SlotId(index),
                 generation: slot.generation,
             }
         } else {
@@ -640,17 +645,21 @@ impl Page {
     }
 
     fn rebuild_slots(&self) -> Result<Vec<RebuildSlot>, StorageError> {
-        let header = self.header()?;
-        (0..header.slot_count)
+        // The immutable view retains the complete page-wide validation proof
+        // while payloads are copied; no per-record revalidation is necessary.
+        let validated = self.validated()?;
+        (0..validated.header().slot_count)
             .map(|index| {
                 let slot = SlotId(index);
                 let entry = self.slot_at(slot);
                 Ok(RebuildSlot {
                     generation: entry.generation,
-                    payload: if is_deleted_slot(entry) {
-                        None
+                    payload: if let Some((_, payload)) = validated.live_record(slot)? {
+                        #[cfg(test)]
+                        tests::record_rebuild_copy(payload.len());
+                        Some(payload.to_vec())
                     } else {
-                        Some(self.read_record(slot)?.to_vec())
+                        None
                     },
                 })
             })
@@ -1009,12 +1018,188 @@ impl PageManager {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs::File;
     use std::io::Write;
 
     use super::{PAGE_SIZE, Page, PageError, PageManager, PageType, SLOT_SIZE};
     use crate::StorageError;
     use netbadb_types::{Lsn, PageId, SlotId};
+
+    // Attribution is thread-local and test-only: concurrent tests cannot alter
+    // these observations, and production pages carry no counters or trust bits.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct PageWork {
+        validations: usize,
+        copied_records: usize,
+        copied_bytes: usize,
+    }
+
+    thread_local! {
+        static PAGE_WORK: Cell<PageWork> = const { Cell::new(PageWork {
+            validations: 0, copied_records: 0, copied_bytes: 0,
+        }) };
+    }
+
+    pub(super) fn record_validation() {
+        PAGE_WORK.with(|cell| {
+            let mut work = cell.get();
+            work.validations += 1;
+            cell.set(work);
+        });
+    }
+
+    pub(super) fn record_rebuild_copy(bytes: usize) {
+        PAGE_WORK.with(|cell| {
+            let mut work = cell.get();
+            work.copied_records += 1;
+            work.copied_bytes += bytes;
+            cell.set(work);
+        });
+    }
+
+    fn observe_page_work<T>(operation: impl FnOnce() -> T) -> (T, PageWork) {
+        PAGE_WORK.set(PageWork::default());
+        let result = operation();
+        (result, PAGE_WORK.get())
+    }
+
+    #[test]
+    fn rebuild_work_tracks_live_records_and_preserves_tombstones() {
+        for slots in [0_u16, 1, 32, 127] {
+            let mut page = Page::new(PageId(1), PageType::Heap);
+            for index in 0..slots {
+                page.insert_record(&index.to_le_bytes()).expect("insert");
+            }
+            for index in (1..slots).step_by(3) {
+                page.delete_record(SlotId(index)).expect("delete");
+            }
+            let before = *page.bytes();
+            let (records, work) = observe_page_work(|| page.rebuild_slots().expect("rebuild"));
+            let live = (0..slots).filter(|index| index % 3 != 1).count();
+            assert_eq!(work.validations, 1);
+            assert_eq!(work.copied_records, live);
+            assert_eq!(work.copied_bytes, live * 2);
+            assert_eq!(records.len(), usize::from(slots));
+            for (index, record) in records.iter().enumerate() {
+                assert_eq!(record.generation, 1);
+                assert_eq!(
+                    record.payload,
+                    (index % 3 != 1).then(|| (index as u16).to_le_bytes().to_vec())
+                );
+            }
+            assert_eq!(page.bytes(), &before);
+            page.rebuild_records(&records, None).expect("round trip");
+            assert_eq!(page.bytes(), &before);
+        }
+    }
+
+    #[test]
+    fn rebuild_validates_later_corrupt_slots_before_copying_payloads() {
+        let mut valid = Page::new(PageId(1), PageType::Heap);
+        valid.insert_record(b"first").expect("insert first");
+        valid.insert_record(b"last").expect("insert last");
+        let mut checksum = valid.clone();
+        checksum.bytes_mut()[PAGE_SIZE - 1] ^= 1;
+        let mut generation = valid.clone();
+        generation.bytes_mut()
+            [super::PAGE_HEADER_SIZE + SLOT_SIZE + 4..super::PAGE_HEADER_SIZE + SLOT_SIZE + 8]
+            .copy_from_slice(&0_u32.to_le_bytes());
+        generation.refresh_checksum();
+        let mut overlap = valid.clone();
+        let first = overlap.slot_at(SlotId(0));
+        overlap.bytes_mut()
+            [super::PAGE_HEADER_SIZE + SLOT_SIZE..super::PAGE_HEADER_SIZE + SLOT_SIZE + 2]
+            .copy_from_slice(&first.offset.to_le_bytes());
+        overlap.refresh_checksum();
+        for corrupt in [checksum, generation, overlap] {
+            let expected = corrupt.header().expect_err("corruption").to_string();
+            let before = *corrupt.bytes();
+            let (result, work) = observe_page_work(|| corrupt.rebuild_slots());
+            assert_eq!(result.expect_err("rebuild rejects").to_string(), expected);
+            assert_eq!(
+                work,
+                PageWork {
+                    validations: 1,
+                    ..PageWork::default()
+                }
+            );
+            assert_eq!(corrupt.bytes(), &before);
+        }
+    }
+
+    #[test]
+    fn full_page_rejection_tracks_work_without_mutating_bytes() {
+        for slots in [1_usize, 16, 128] {
+            let mut page = Page::new(PageId(1), PageType::Heap);
+            let payload_bytes = PAGE_SIZE - super::PAGE_HEADER_SIZE - slots * SLOT_SIZE;
+            let records = (0..slots)
+                .map(|index| super::RebuildSlot {
+                    generation: 1,
+                    payload: Some(vec![
+                        7;
+                        if index + 1 == slots {
+                            payload_bytes - (slots - 1) * 8
+                        } else {
+                            8
+                        }
+                    ]),
+                })
+                .collect::<Vec<_>>();
+            page.rebuild_records(&records, None).expect("fill page");
+            let before = *page.bytes();
+            let (result, work) = observe_page_work(|| page.insert_record(b"x"));
+            assert!(
+                matches!(result, Err(StorageError::Page(PageError::PageFull {
+                required, available: 0,
+            })) if required == SLOT_SIZE + 1)
+            );
+            assert_eq!(work.validations, 1);
+            assert_eq!(work.copied_records, 0);
+            assert_eq!(work.copied_bytes, 0);
+            assert_eq!(page.bytes(), &before);
+        }
+    }
+
+    #[test]
+    fn insert_preflight_preserves_corruption_and_record_size_error_priority() {
+        let mut full = Page::new(PageId(1), PageType::Heap);
+        full.insert_record(b"first").expect("first");
+        let remaining = full.header().expect("header").free_space() - SLOT_SIZE;
+        full.insert_record(&vec![7; remaining]).expect("fill");
+        let oversized = vec![0; PAGE_SIZE];
+        let before = *full.bytes();
+        let (result, work) = observe_page_work(|| full.insert_record(&oversized));
+        assert!(matches!(
+            result,
+            Err(StorageError::Page(PageError::RecordTooLarge { .. }))
+        ));
+        assert_eq!(work.copied_records, 0);
+        assert_eq!(full.bytes(), &before);
+
+        let mut checksum = full.clone();
+        checksum.bytes_mut()[PAGE_SIZE - 1] ^= 1;
+        let mut generation = full;
+        generation.write_u32(super::PAGE_HEADER_SIZE + SLOT_SIZE + 4, 0);
+        generation.refresh_checksum();
+        for corrupt in [checksum, generation] {
+            let expected = corrupt.header().expect_err("corrupt").to_string();
+            for payload in [b"x".as_slice(), oversized.as_slice()] {
+                let mut page = corrupt.clone();
+                let before = *page.bytes();
+                let (result, work) = observe_page_work(|| page.insert_record(payload));
+                assert_eq!(result.expect_err("reject corruption").to_string(), expected);
+                assert_eq!(
+                    work,
+                    PageWork {
+                        validations: 1,
+                        ..PageWork::default()
+                    }
+                );
+                assert_eq!(page.bytes(), &before);
+            }
+        }
+    }
 
     fn test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("netbadb-{name}-{}", std::process::id()))

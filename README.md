@@ -1319,6 +1319,13 @@ records resource ownership, queue admission, decoder/encoder bounds, LSM pending
 budgets, portal cleanup, and measured 1k/10k/100k-row memory growth. Result-row
 policy remains a post-execution transport check, not an executor memory budget.
 
+The [global performance audit](docs/global-performance-audit.md) adds a measured
+Heap/LSM, executor, transaction, recovery and transport workload matrix. Its
+retained changes reuse complete page validation during reconstruction and reject
+full-page insertions before copying live payloads. Two transport-buffering pilots
+were withdrawn after small-response latency regressions; the report retains
+their negative evidence and the independent control measurements.
+
 ## License
 
 NetbaDB is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE).

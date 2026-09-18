@@ -2355,3 +2355,36 @@ unchanged. Phase 72 adds the explicit physical/inspection operator and advances
 only affected statement Inspection JSON to v5. It retains Protocol v1, SDK
 Schema Spec v1, deployment manifest v4, Heap metadata v4, Page v5, WAL and row
 formats, the storage API, dependencies, and safe Rust boundaries.
+
+## Global performance attribution after the stability audits
+
+See the [global audit report](global-performance-audit.md) for the complete
+workload map, original/retained measurements, control ranges, withdrawn transport
+pilots, ownership accounting and validation. It reuses `phase7_baseline`, global
+commit/group-commit and Columnar targets and adds a real loopback boundary target.
+The original matrix and final matrix use the same explicit coverage boundaries;
+100K Heap setup and 100K wide results are not measured.
+
+From the repository root, on macOS, build preserved optimized executables and
+run three independent serial processes per suite:
+
+```sh
+python3 scripts/run-global-performance.py /private/tmp/netbadb-perf/binaries /private/tmp/netbadb-perf/results --build
+python3 scripts/summarize-global-performance.py /private/tmp/netbadb-perf/results/reads-run1.log /private/tmp/netbadb-perf/results/reads-run2.log /private/tmp/netbadb-perf/results/reads-run3.log
+```
+
+Binary and result directories must be new; keep them outside the repository.
+The runner finishes every build before measuring, uses bench debuginfo for
+separate symbolized profiles, records binary SHA-256 identities, and cleans its
+disposable database fixtures. Its output-parent lock prevents overlapping runners
+sharing that parent. Do not run builds, tests or profilers beside measurements.
+Use `--suites pages,reads,values --rows 1000` for the focused storage matrix, or
+`--suites boundary,boundary_null` for the normal/NULL transport matrix. Omitting
+`--build` reuses preserved binaries without compiling current source.
+
+To reproduce original behavior, put only the benchmark and script changes from
+this report's commit onto baseline `2c1a8bc2e8a2c7a6aa99f6397f6fbd99b75a85de`
+in a separate checkout; keep its production Page/server implementation. This is
+how benchmark coverage was extended before collecting the original-production
+baselines. The report distinguishes within-run means from medians and refuses
+missing cases or changed plans; there is no CI wall-clock pass/fail threshold.

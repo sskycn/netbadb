@@ -3684,3 +3684,23 @@ Change Stream net-change coalescing indexes current physical versions and defers
 stable removal compaction, preserving publication order and original version
 identities while avoiding quadratic lookup/shifting work. Heap transaction state
 and retained after-images still require an explicit future memory-budget design.
+
+## Measured page reconstruction work
+
+The [global performance audit](global-performance-audit.md) reuses the existing
+short-lived immutable `ValidatedPage` inside Heap slot reconstruction. The full
+checksum, slot-directory, generation, bounds and overlap validation precedes all
+payload copies; its proof is reused while the borrow prevents mutation. There
+is no persistent trust flag, cross-operation validation cache or changed Page v5
+layout. Collecting owned slots performs one full validation instead of one plus
+the number of live records; entry checks and rebuilding the final page retain
+their existing validations.
+
+Insertion still validates the complete Heap page and checks RecordTooLarge
+before examining reusable-slot metadata and exact free space. An insufficient
+page returns the same PageFull without building owned payloads. The lowest
+non-exhausted tombstone is reused, generations remain checked, and failure leaves
+the page bytes intact. First-fit traversal, successful reconstruction ownership,
+WAL images, buffer writeback and durability barriers remain existing authority.
+The rejected transport buffering pilots introduced no final transport policy,
+result ownership, worker, queue or resource-limit change.

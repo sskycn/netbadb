@@ -3301,3 +3301,20 @@ Regression coverage includes
 1k/10k/100k logical memory measurements and connection/session lifecycle stress.
 Whole-result budgets/streaming, Sort spill, statement cancellation, aggregate
 temporary-disk quotas and additional execution owners remain future design work.
+
+### Global performance attribution and page reconstruction (2026-09-18)
+
+The [global investigation](global-performance-audit.md) extends existing release
+benchmarks across storage, execution, transactions, recovery and real Native/PG
+boundaries. Retained local changes eliminate repeated full-page validation and
+payload reconstruction before PageFull. Exact malformed-page/error/generation
+and byte-preservation tests protect the existing persistent and ownership
+contracts. First-fit Heap growth still needs a separately justified free-space
+or buffer-policy design; no WAL barrier was weakened.
+
+Unconditional response coalescing and a small-batch exception both improved long
+results but failed scalar/point latency controls, so both pilots were withdrawn.
+Their evidence remains in the report. Public streaming QueryResult and recovery
+history redesign remain separate architecture projects, alongside the existing
+query-memory, cancellation and temporary-disk resource-control work. The closed
+HashJoin/typed-aggregate/IndexJoin calibration decisions are not reopened.

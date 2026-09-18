@@ -19,6 +19,9 @@ use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_storage::HeapStorage;
 use netbadb_types::{ColumnId, PartitionId, PhysicalType, RowId, ScalarValue, TableId};
 
+#[path = "phase7_baseline/global_audit.rs"]
+mod global_audit;
+
 type BenchResult<T> = Result<T, Box<dyn Error>>;
 
 const ITEMS_TABLE_ID: TableId = TableId(1);
@@ -302,6 +305,9 @@ impl Operator {
 }
 
 fn main() -> BenchResult<()> {
+    if global_audit::requested()? {
+        return global_audit::run();
+    }
     let profile = BenchProfile::from_environment()?;
     let settings = profile.settings();
     let mut measurements = Vec::new();

@@ -26,5 +26,9 @@ netbadb-parser = { path = "../netbadb-parser" }
 netbadb-storage = { path = "../netbadb-storage" }
 rcgen = "0.13.2"
 
+[[bench]]
+name = "global_boundary"
+harness = false
+
 [lints]
 workspace = true
