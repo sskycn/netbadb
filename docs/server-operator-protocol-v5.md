@@ -126,9 +126,16 @@ retain exact-approval retry guidance. No receipt lookup heuristic or automatic
 retry is performed.
 
 The same uncertainty code with `receipt: null` covers an accepted worker
-command whose reply was lost: no durable reference was observed and
-`recovery_required` is not asserted by the client. With `receipt` present, the
-Server knows a durable Begin exists and startup reconciliation is required.
+command whose reply was lost, or an ambiguous Core Index/Columnar apply error
+when the optional journal is disabled. Core `Database` and `Advisor(Database)`
+apply errors cannot prove that mutation did not occur, including failures after
+index/projection creation. The programmatic API returns typed unjournaled
+mutation uncertainty and retains the original error as its source. Without a
+receipt, the client reports `recovery_required = false`; the exact same approval
+may be used for idempotent discovery. Definite pre-mutation rejections retain
+their existing typed errors, and no automatic retry or evidence refresh occurs.
+With `receipt` present, the Server knows a durable Begin exists and startup
+reconciliation is required.
 Client classification uses the code and nullable receipt, never message text.
 Connect/configuration and request encoding failures before dispatch remain
 ordinary definite local failures; protocol, request-ID, response-shape, or

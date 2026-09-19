@@ -661,6 +661,8 @@ pub enum ServerPhysicalColumnarDesignControlError {
     ServerStopped,
     MutationOutcomeUncertain,
     PostBeginMutationOutcomeUncertain(Box<ServerPhysicalColumnarDesignControlError>),
+    /// Core apply may have mutated state without a receipt; no journal recovery gate applies.
+    UnjournaledMutationOutcomeUncertain(Box<ServerPhysicalColumnarDesignControlError>),
 }
 
 impl fmt::Display for ServerPhysicalColumnarDesignControlError {
@@ -716,6 +718,9 @@ impl fmt::Display for ServerPhysicalColumnarDesignControlError {
             Self::PostBeginMutationOutcomeUncertain(_) => formatter.write_str(
                 "physical-columnar mutation outcome is uncertain after its durable receipt Begin",
             ),
+            Self::UnjournaledMutationOutcomeUncertain(_) => formatter.write_str(
+                "physical-columnar mutation outcome is uncertain without a durable receipt",
+            ),
         }
     }
 }
@@ -730,7 +735,8 @@ impl Error for ServerPhysicalColumnarDesignControlError {
             Self::Apply(error) => Some(error.as_ref()),
             Self::MutationReceipt(error) => Some(error),
             Self::MutationRecoveryRequired(error) => Some(error),
-            Self::PostBeginMutationOutcomeUncertain(source) => Some(source.as_ref()),
+            Self::PostBeginMutationOutcomeUncertain(source)
+            | Self::UnjournaledMutationOutcomeUncertain(source) => Some(source.as_ref()),
             Self::PhysicalDesignNotEnabled
             | Self::ColumnarApplyNotEnabled
             | Self::ModeNotAllowed(_)
@@ -765,6 +771,8 @@ pub enum ServerPhysicalDesignControlError {
     ServerStopped,
     MutationOutcomeUncertain,
     PostBeginMutationOutcomeUncertain(Box<ServerPhysicalDesignControlError>),
+    /// Core apply may have mutated state without a receipt; no journal recovery gate applies.
+    UnjournaledMutationOutcomeUncertain(Box<ServerPhysicalDesignControlError>),
 }
 
 impl fmt::Display for ServerPhysicalDesignControlError {
@@ -799,6 +807,9 @@ impl fmt::Display for ServerPhysicalDesignControlError {
             Self::PostBeginMutationOutcomeUncertain(_) => formatter.write_str(
                 "physical-index mutation outcome is uncertain after its durable receipt Begin",
             ),
+            Self::UnjournaledMutationOutcomeUncertain(_) => formatter.write_str(
+                "physical-index mutation outcome is uncertain without a durable receipt",
+            ),
         }
     }
 }
@@ -812,7 +823,8 @@ impl Error for ServerPhysicalDesignControlError {
             Self::Apply(error) => Some(error),
             Self::MutationReceipt(error) => Some(error),
             Self::MutationRecoveryRequired(error) => Some(error),
-            Self::PostBeginMutationOutcomeUncertain(source) => Some(source.as_ref()),
+            Self::PostBeginMutationOutcomeUncertain(source)
+            | Self::UnjournaledMutationOutcomeUncertain(source) => Some(source.as_ref()),
             Self::PhysicalDesignNotEnabled
             | Self::EvidenceEpochChanged { .. }
             | Self::ProposalRuntimeChanged
@@ -1290,6 +1302,13 @@ pub(crate) enum ServerPhysicalDesignWorkerCommand {
     },
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestPostApplyFailure {
+    Database,
+    AdvisorDatabase,
+}
+
 /// Independent runtime owned beside, never inside, the adaptive runtime.
 pub(crate) struct ServerPhysicalDesignRuntime {
     identity: Arc<ServerPhysicalDesignRuntimeIdentity>,
@@ -1298,6 +1317,8 @@ pub(crate) struct ServerPhysicalDesignRuntime {
     columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,
     mutation_receipts: Option<ServerPhysicalDesignMutationReceiptJournal>,
     diagnostics: ServerPhysicalDesignDiagnostics,
+    #[cfg(test)]
+    post_apply_failure: Option<TestPostApplyFailure>,
 }
 
 impl ServerPhysicalDesignRuntime {
@@ -1316,6 +1337,8 @@ impl ServerPhysicalDesignRuntime {
             policy: config.advisor_policy(),
             columnar_apply,
             mutation_receipts: None,
+            #[cfg(test)]
+            post_apply_failure: None,
             diagnostics: ServerPhysicalDesignDiagnostics {
                 eligible_query_count: 0,
                 record_success_count: 0,
@@ -1626,21 +1649,45 @@ impl ServerPhysicalDesignRuntime {
         result: Result<T, ServerPhysicalDesignControlError>,
         success_outcome: impl FnOnce(&T) -> ServerPhysicalDesignMutationReceiptOutcome,
     ) -> Result<T, ServerPhysicalDesignControlError> {
-        let Some(receipt_id) = receipt_id else {
-            return result;
-        };
+        // Model a fallible post-mutation Core operation only after a real successful apply.
+        #[cfg(test)]
+        let result = result.and_then(|report| match self.post_apply_failure.take() {
+            None => Ok(report),
+            Some(failure) => Err(ServerPhysicalDesignControlError::Apply(Box::new(
+                match failure {
+                    TestPostApplyFailure::Database => {
+                        PhysicalIndexDesignApplyError::Database(DatabaseError::UndefinedIndex)
+                    }
+                    TestPostApplyFailure::AdvisorDatabase => {
+                        PhysicalIndexDesignApplyError::Advisor(
+                            PhysicalDesignAdvisorError::Database(DatabaseError::UndefinedIndex),
+                        )
+                    }
+                },
+            ))),
+        });
         match result {
             Ok(report) => {
-                let outcome = success_outcome(&report);
-                self.mutation_receipts
-                    .as_mut()
-                    .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
-                    .and_then(|journal| journal.finish(receipt_id, outcome))
-                    .map_err(ServerPhysicalDesignControlError::MutationRecoveryRequired)?;
+                if let Some(receipt_id) = receipt_id {
+                    let outcome = success_outcome(&report);
+                    self.mutation_receipts
+                        .as_mut()
+                        .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+                        .and_then(|journal| journal.finish(receipt_id, outcome))
+                        .map_err(ServerPhysicalDesignControlError::MutationRecoveryRequired)?;
+                }
                 Ok(report)
             }
             Err(error) => {
                 let Some(outcome) = index_error_receipt_outcome(&error) else {
+                    // Execution ambiguity is independent of durable receipt correlation.
+                    if receipt_id.is_none() {
+                        return Err(
+                            ServerPhysicalDesignControlError::UnjournaledMutationOutcomeUncertain(
+                                Box::new(error),
+                            ),
+                        );
+                    }
                     if let Some(journal) = self.mutation_receipts.as_mut() {
                         journal.mark_recovery_required();
                     }
@@ -1650,11 +1697,13 @@ impl ServerPhysicalDesignRuntime {
                         ),
                     );
                 };
-                self.mutation_receipts
-                    .as_mut()
-                    .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
-                    .and_then(|journal| journal.finish(receipt_id, outcome))
-                    .map_err(ServerPhysicalDesignControlError::MutationRecoveryRequired)?;
+                if let Some(receipt_id) = receipt_id {
+                    self.mutation_receipts
+                        .as_mut()
+                        .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+                        .and_then(|journal| journal.finish(receipt_id, outcome))
+                        .map_err(ServerPhysicalDesignControlError::MutationRecoveryRequired)?;
+                }
                 Err(error)
             }
         }
@@ -1696,21 +1745,45 @@ impl ServerPhysicalDesignRuntime {
         result: Result<T, ServerPhysicalColumnarDesignControlError>,
         success_outcome: impl FnOnce(&T) -> ServerPhysicalDesignMutationReceiptOutcome,
     ) -> Result<T, ServerPhysicalColumnarDesignControlError> {
-        let Some(receipt_id) = receipt_id else {
-            return result;
-        };
+        // Model a fallible post-mutation Core operation only after a real successful apply.
+        #[cfg(test)]
+        let result = result.and_then(|report| match self.post_apply_failure.take() {
+            None => Ok(report),
+            Some(failure) => Err(ServerPhysicalColumnarDesignControlError::Apply(Box::new(
+                match failure {
+                    TestPostApplyFailure::Database => {
+                        PhysicalColumnarDesignApplyError::Database(DatabaseError::UndefinedIndex)
+                    }
+                    TestPostApplyFailure::AdvisorDatabase => {
+                        PhysicalColumnarDesignApplyError::Advisor(
+                            PhysicalDesignAdvisorError::Database(DatabaseError::UndefinedIndex),
+                        )
+                    }
+                },
+            ))),
+        });
         match result {
             Ok(report) => {
-                let outcome = success_outcome(&report);
-                self.mutation_receipts
-                    .as_mut()
-                    .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
-                    .and_then(|journal| journal.finish(receipt_id, outcome))
-                    .map_err(ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired)?;
+                if let Some(receipt_id) = receipt_id {
+                    let outcome = success_outcome(&report);
+                    self.mutation_receipts
+                        .as_mut()
+                        .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+                        .and_then(|journal| journal.finish(receipt_id, outcome))
+                        .map_err(
+                            ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired,
+                        )?;
+                }
                 Ok(report)
             }
             Err(error) => {
                 let Some(outcome) = columnar_error_receipt_outcome(&error) else {
+                    // Execution ambiguity is independent of durable receipt correlation.
+                    if receipt_id.is_none() {
+                        return Err(ServerPhysicalColumnarDesignControlError::UnjournaledMutationOutcomeUncertain(
+                            Box::new(error),
+                        ));
+                    }
                     if let Some(journal) = self.mutation_receipts.as_mut() {
                         journal.mark_recovery_required();
                     }
@@ -1720,11 +1793,15 @@ impl ServerPhysicalDesignRuntime {
                         ),
                     );
                 };
-                self.mutation_receipts
-                    .as_mut()
-                    .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
-                    .and_then(|journal| journal.finish(receipt_id, outcome))
-                    .map_err(ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired)?;
+                if let Some(receipt_id) = receipt_id {
+                    self.mutation_receipts
+                        .as_mut()
+                        .ok_or(ServerPhysicalDesignMutationReceiptControlError::NotEnabled)
+                        .and_then(|journal| journal.finish(receipt_id, outcome))
+                        .map_err(
+                            ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired,
+                        )?;
+                }
                 Err(error)
             }
         }
@@ -2157,6 +2234,7 @@ fn index_error_receipt_outcome(
         ServerPhysicalDesignControlError::MutationReceipt(_)
         | ServerPhysicalDesignControlError::MutationRecoveryRequired(_)
         | ServerPhysicalDesignControlError::PostBeginMutationOutcomeUncertain(_)
+        | ServerPhysicalDesignControlError::UnjournaledMutationOutcomeUncertain(_)
         | ServerPhysicalDesignControlError::MutationOutcomeUncertain => None,
         _ => Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected),
     }
@@ -2183,6 +2261,7 @@ fn columnar_error_receipt_outcome(
         ServerPhysicalColumnarDesignControlError::MutationReceipt(_)
         | ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(_)
         | ServerPhysicalColumnarDesignControlError::PostBeginMutationOutcomeUncertain(_)
+        | ServerPhysicalColumnarDesignControlError::UnjournaledMutationOutcomeUncertain(_)
         | ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain => None,
         _ => Some(ServerPhysicalDesignMutationReceiptOutcome::Rejected),
     }
@@ -2476,6 +2555,309 @@ mod tests {
         PhysicalColumnarCandidate {
             table_id: TABLE_ID,
             columns: vec![ColumnId(1)],
+        }
+    }
+
+    // Keep the Database on its execution owner while exercising the public channel API.
+    fn handle_one_apply(
+        fixture: &mut Fixture,
+        runtime: &mut ServerPhysicalDesignRuntime,
+        request: ServerPhysicalDesignControlRequest,
+    ) {
+        let command = match request {
+            ServerPhysicalDesignControlRequest::ApplyIndex {
+                proposal,
+                index_name,
+                reply,
+            } => ServerPhysicalDesignWorkerCommand::ApplyIndex {
+                proposal,
+                index_name,
+                reply,
+            },
+            ServerPhysicalDesignControlRequest::ApplyColumnar { proposal, reply } => {
+                ServerPhysicalDesignWorkerCommand::ApplyColumnar { proposal, reply }
+            }
+            ServerPhysicalDesignControlRequest::ApplyApprovedIndex {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate,
+                index_name,
+                reply,
+            } => ServerPhysicalDesignWorkerCommand::ApplyApprovedIndex {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate,
+                index_name,
+                reply,
+            },
+            ServerPhysicalDesignControlRequest::ApplyApprovedColumnar {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate,
+                mode,
+                placement,
+                reply,
+            } => ServerPhysicalDesignWorkerCommand::ApplyApprovedColumnar {
+                runtime_token_matches,
+                expected_evidence_epoch,
+                candidate,
+                mode,
+                placement,
+                reply,
+            },
+            _ => panic!("expected one mutation request"),
+        };
+        runtime.handle(&mut fixture.database, command);
+    }
+
+    #[test]
+    fn no_journal_index_ambiguous_core_error_is_uncertain() {
+        for failure in [
+            TestPostApplyFailure::Database,
+            TestPostApplyFailure::AdvisorDatabase,
+        ] {
+            let mut fixture = Fixture::create("no-journal-index-ambiguity");
+            let mut runtime = ServerPhysicalDesignRuntime::new(config());
+            record_candidate(&mut fixture.database, &mut runtime);
+            let proposal = propose(&mut fixture.database, &mut runtime).unwrap();
+            runtime.post_apply_failure = Some(failure);
+            let (tx, rx) = mpsc::channel();
+            let caller = std::thread::spawn(move || {
+                ServerPhysicalDesignControlHandle::new(tx)
+                    .apply_index(&proposal, IndexName::new("ambiguous_idx").unwrap())
+            });
+            handle_one_apply(&mut fixture, &mut runtime, rx.recv().unwrap());
+            let error = caller.join().unwrap().unwrap_err();
+            assert!(runtime.mutation_receipts.is_none());
+            assert!(runtime.post_apply_failure.is_none());
+            assert_eq!(fixture.database.indexes(TABLE_ID).unwrap().len(), 1);
+            fixture.close();
+            let ServerPhysicalDesignControlError::UnjournaledMutationOutcomeUncertain(source) =
+                &error
+            else {
+                panic!("expected typed unjournaled uncertainty, got {error:?}");
+            };
+            assert!(error.source().is_some());
+            assert!(
+                matches!(source.as_ref(), ServerPhysicalDesignControlError::Apply(core)
+                if matches!((failure, core.as_ref()),
+                    (TestPostApplyFailure::Database, PhysicalIndexDesignApplyError::Database(_))
+                    | (TestPostApplyFailure::AdvisorDatabase, PhysicalIndexDesignApplyError::Advisor(PhysicalDesignAdvisorError::Database(_)))))
+            );
+        }
+    }
+
+    #[test]
+    fn no_journal_columnar_ambiguous_core_error_is_uncertain() {
+        for failure in [
+            TestPostApplyFailure::Database,
+            TestPostApplyFailure::AdvisorDatabase,
+        ] {
+            let mut fixture = Fixture::create("no-journal-columnar-ambiguity");
+            let placements = fixture.root.join("placements");
+            fs::create_dir(&placements).unwrap();
+            let mut runtime = columnar_runtime(&placements);
+            record_columnar_candidate(&mut fixture.database, &mut runtime);
+            let proposal = propose_columnar(
+                &mut fixture.database,
+                &mut runtime,
+                PhysicalColumnarDesignMode::Snapshot,
+                "ambiguous",
+            )
+            .unwrap();
+            runtime.post_apply_failure = Some(failure);
+            let (tx, rx) = mpsc::channel();
+            let caller = std::thread::spawn(move || {
+                ServerPhysicalDesignControlHandle::new(tx).apply_columnar(&proposal)
+            });
+            handle_one_apply(&mut fixture, &mut runtime, rx.recv().unwrap());
+            let error = caller.join().unwrap().unwrap_err();
+            assert!(runtime.mutation_receipts.is_none());
+            assert!(runtime.post_apply_failure.is_none());
+            assert_eq!(fixture.database.inspect_columnar_projections().len(), 1);
+            fixture.close();
+            let ServerPhysicalColumnarDesignControlError::UnjournaledMutationOutcomeUncertain(
+                source,
+            ) = &error
+            else {
+                panic!("expected typed unjournaled uncertainty, got {error:?}");
+            };
+            assert!(error.source().is_some());
+            assert!(
+                matches!(source.as_ref(), ServerPhysicalColumnarDesignControlError::Apply(core)
+                if matches!((failure, core.as_ref()),
+                    (TestPostApplyFailure::Database, PhysicalColumnarDesignApplyError::Database(_))
+                    | (TestPostApplyFailure::AdvisorDatabase, PhysicalColumnarDesignApplyError::Advisor(PhysicalDesignAdvisorError::Database(_)))))
+            );
+        }
+    }
+
+    #[test]
+    fn no_journal_pre_mutation_rejections_remain_definite() {
+        let mut fixture = Fixture::create("no-journal-rejections");
+        let placements = fixture.root.join("placements");
+        fs::create_dir(&placements).unwrap();
+        let mut runtime = columnar_runtime(&placements);
+        record_candidate(&mut fixture.database, &mut runtime);
+        record_columnar_candidate(&mut fixture.database, &mut runtime);
+        let index = propose(&mut fixture.database, &mut runtime).unwrap();
+        let columnar = propose_columnar(
+            &mut fixture.database,
+            &mut runtime,
+            PhysicalColumnarDesignMode::Snapshot,
+            "occupied",
+        )
+        .unwrap();
+        fs::create_dir(placements.join("occupied")).unwrap();
+        let before = current_commit_seq(&fixture.database);
+        assert!(matches!(
+            apply_columnar(&mut fixture.database, &mut runtime, columnar),
+            Err(ServerPhysicalColumnarDesignControlError::PlacementOccupied { .. })
+        ));
+        runtime.evidence.rotate_window().unwrap();
+        assert!(
+            matches!(apply(&mut fixture.database, &mut runtime, index, "stale_idx"),
+            Err(ServerPhysicalDesignControlError::Apply(error))
+                if matches!(error.as_ref(), PhysicalIndexDesignApplyError::EvidenceEpochChanged { .. }))
+        );
+        assert!(runtime.mutation_receipts.is_none());
+        assert_eq!(current_commit_seq(&fixture.database), before);
+        assert!(fixture.database.indexes(TABLE_ID).unwrap().is_empty());
+        assert!(fixture.database.inspect_columnar_projections().is_empty());
+        fixture.close();
+    }
+
+    #[cfg(unix)]
+    fn assert_nbop_no_journal_ambiguity(columnar: bool, failure: TestPostApplyFailure) {
+        use crate::operator::{
+            OperatorClientError, OperatorErrorCodeV5, OperatorListenerPolicy,
+            OperatorPhysicalColumnarDesignModeV5, OperatorPhysicalDesignRuntimeToken,
+            ServerOperatorClient, ServerOperatorConfig,
+            serve_operator_connection_with_capabilities,
+        };
+        use std::os::unix::net::UnixListener;
+        use std::time::Duration;
+
+        let mut fixture = Fixture::create("nbop-no-journal");
+        let placements = fixture.root.join("placements");
+        fs::create_dir(&placements).unwrap();
+        let mut runtime = columnar_runtime(&placements);
+        if columnar {
+            record_columnar_candidate(&mut fixture.database, &mut runtime);
+        } else {
+            record_candidate(&mut fixture.database, &mut runtime);
+        }
+        let epoch = runtime.evidence.epoch().0;
+        runtime.post_apply_failure = Some(failure);
+        let (tx, rx) = mpsc::channel();
+        let control = ServerPhysicalDesignControlHandle::new(tx);
+        // macOS Unix sockets cannot fit the long per-test system temporary root.
+        let socket = PathBuf::from("/tmp").join(format!(
+            "netbadb-followup-{}-{}.sock",
+            std::process::id(),
+            NEXT_PATH.fetch_add(1, Ordering::Relaxed),
+        ));
+        let socket_cleanup = socket.clone();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let capabilities = runtime.columnar_apply.as_ref().unwrap().capabilities();
+        let server = std::thread::spawn(move || {
+            let (adaptive_tx, _adaptive_rx) = mpsc::channel();
+            let adaptive = crate::ServerAdaptiveControlHandle::new(adaptive_tx);
+            let (mut stream, _) = listener.accept().unwrap();
+            serve_operator_connection_with_capabilities(
+                &mut stream,
+                &adaptive,
+                &control,
+                OperatorListenerPolicy::new(
+                    true,
+                    true,
+                    false,
+                    Some(capabilities),
+                    Some(OperatorPhysicalDesignRuntimeToken::from_bytes([0x11; 16])),
+                ),
+            )
+            .unwrap();
+        });
+        let caller = std::thread::spawn(move || {
+            let config = ServerOperatorConfig::new_with_columnar(
+                socket,
+                Duration::from_secs(30),
+                true,
+                true,
+            )
+            .unwrap();
+            let client = ServerOperatorClient::new(&config);
+            if columnar {
+                client
+                    .apply_physical_columnar(
+                        "11".repeat(16),
+                        epoch,
+                        TABLE_ID.0,
+                        vec![1],
+                        OperatorPhysicalColumnarDesignModeV5::Snapshot,
+                        "ambiguous",
+                    )
+                    .unwrap_err()
+            } else {
+                client
+                    .apply_physical_index("11".repeat(16), epoch, TABLE_ID.0, 2, "ambiguous_idx")
+                    .unwrap_err()
+            }
+        });
+        handle_one_apply(&mut fixture, &mut runtime, rx.recv().unwrap());
+        let error = caller.join().unwrap();
+        server.join().unwrap();
+        fs::remove_file(socket_cleanup).unwrap();
+        assert!(runtime.mutation_receipts.is_none());
+        assert!(runtime.post_apply_failure.is_none());
+        if columnar {
+            assert_eq!(fixture.database.inspect_columnar_projections().len(), 1);
+        } else {
+            assert_eq!(fixture.database.indexes(TABLE_ID).unwrap().len(), 1);
+        }
+        fixture.close();
+        let OperatorClientError::MutationOutcomeUncertain {
+            recovery_required: false,
+            receipt: None,
+            source,
+        } = error
+        else {
+            panic!("expected NBOP uncertainty without receipt or recovery, got {error:?}");
+        };
+        let OperatorClientError::Remote(remote) = *source else {
+            panic!("expected a typed remote response");
+        };
+        assert_eq!(
+            remote.code,
+            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
+        );
+        let wire = serde_json::to_value(&remote).unwrap();
+        assert_eq!(wire["code"], "physical_design_mutation_outcome_uncertain");
+        assert_eq!(wire.get("receipt"), Some(&serde_json::Value::Null));
+        assert!(remote.message.contains("same exact approval"));
+        assert!(!remote.message.contains("without creating"));
+        assert!(!remote.message.contains("restart/reopen"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nbop_no_journal_index_ambiguity_returns_uncertain_without_receipt() {
+        for failure in [
+            TestPostApplyFailure::Database,
+            TestPostApplyFailure::AdvisorDatabase,
+        ] {
+            assert_nbop_no_journal_ambiguity(false, failure);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nbop_no_journal_columnar_ambiguity_returns_uncertain_without_receipt() {
+        for failure in [
+            TestPostApplyFailure::Database,
+            TestPostApplyFailure::AdvisorDatabase,
+        ] {
+            assert_nbop_no_journal_ambiguity(true, failure);
         }
     }
 

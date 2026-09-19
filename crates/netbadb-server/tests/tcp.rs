@@ -981,9 +981,14 @@ fn native_physical_design_control_captures_and_revalidates_current_inventory() {
             2,
             index_name.as_str().to_owned(),
         ),
-        Err(OperatorClientError::Remote(error))
-            if error.code == OperatorErrorCodeV5::PhysicalIndexApplyFailed
-                && error.receipt.is_none()
+        // Core Database apply errors are conservatively uncertain even without NBMR.
+        Err(OperatorClientError::MutationOutcomeUncertain {
+            recovery_required: false,
+            receipt: None,
+            source,
+        }) if matches!(*source, OperatorClientError::Remote(ref error)
+            if error.code == OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
+                && error.receipt.is_none())
     ));
     client.request(7, ClientMessage::Rollback);
 

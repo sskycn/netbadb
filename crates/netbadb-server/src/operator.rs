@@ -2871,6 +2871,7 @@ fn physical_columnar_remote_error_with_receipt(
     if matches!(
         &error,
         ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain
+            | ServerPhysicalColumnarDesignControlError::UnjournaledMutationOutcomeUncertain(_)
     ) {
         return mutation_outcome_uncertain_remote_error(None);
     }
@@ -2911,7 +2912,8 @@ fn physical_columnar_remote_error_with_receipt(
         }
         ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(_)
         | ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain
-        | ServerPhysicalColumnarDesignControlError::PostBeginMutationOutcomeUncertain(_) => {
+        | ServerPhysicalColumnarDesignControlError::PostBeginMutationOutcomeUncertain(_)
+        | ServerPhysicalColumnarDesignControlError::UnjournaledMutationOutcomeUncertain(_) => {
             OperatorErrorCodeV5::PhysicalColumnarApplyFailed
         }
         ServerPhysicalColumnarDesignControlError::MutationReceipt(_) => {
@@ -3090,6 +3092,7 @@ fn physical_design_remote_error_with_receipt(
     if matches!(
         &error,
         ServerPhysicalDesignControlError::MutationOutcomeUncertain
+            | ServerPhysicalDesignControlError::UnjournaledMutationOutcomeUncertain(_)
     ) {
         return mutation_outcome_uncertain_remote_error(None);
     }
@@ -3177,6 +3180,7 @@ fn physical_design_remote_error_with_receipt(
         }
         ServerPhysicalDesignControlError::ServerStopped => OperatorErrorCodeV5::ServerStopped,
         ServerPhysicalDesignControlError::MutationOutcomeUncertain
+        | ServerPhysicalDesignControlError::UnjournaledMutationOutcomeUncertain(_)
         | ServerPhysicalDesignControlError::MutationRecoveryRequired(_)
         | ServerPhysicalDesignControlError::PostBeginMutationOutcomeUncertain(_)
         | ServerPhysicalDesignControlError::MutationReceipt(_) => {
@@ -3257,7 +3261,7 @@ fn mutation_outcome_uncertain_remote_error(
     let message = if receipt.is_some() {
         "physical-design mutation outcome is uncertain; restart/reopen the daemon, allow NBMR startup reconciliation to complete, then inspect the referenced receipt before deciding whether any retry is needed"
     } else {
-        "physical-design mutation result was lost after command dispatch; no receipt reference was observed; the same exact approval may be used for idempotent discovery"
+        "physical-design mutation outcome is uncertain; no receipt reference was observed; the same exact approval may be used for idempotent discovery"
     };
     OperatorRemoteErrorV5 {
         code: OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain,

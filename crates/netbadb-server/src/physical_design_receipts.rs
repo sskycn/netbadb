@@ -481,6 +481,19 @@ impl Drop for OwnedTemp {
     }
 }
 
+#[cfg(unix)]
+fn lock_temporary_journal(
+    file: &File,
+) -> Result<(), ServerPhysicalDesignMutationReceiptJournalError> {
+    #[cfg(test)]
+    if let Some(errno) = TEST_TEMP_LOCK_FAILURE.with(|failure| failure.take()) {
+        return Err(ServerPhysicalDesignMutationReceiptJournalError::Lock(
+            io::Error::from_raw_os_error(errno),
+        ));
+    }
+    lock_journal_exclusive(file)
+}
+
 fn create_owned_temp(
     final_path: &Path,
 ) -> Result<OwnedTemp, ServerPhysicalDesignMutationReceiptJournalError> {
@@ -521,13 +534,19 @@ fn create_owned_temp(
         }
         match options.open(&path) {
             Ok(file) => {
-                #[cfg(unix)]
-                lock_journal_exclusive(&file)?;
-                return Ok(OwnedTemp {
+                // Own cleanup as soon as create_new succeeds, including lock failure.
+                let temp = OwnedTemp {
                     file: Some(file),
                     path,
                     published: false,
-                });
+                };
+                #[cfg(unix)]
+                lock_temporary_journal(
+                    temp.file
+                        .as_ref()
+                        .expect("owned temporary retains its file"),
+                )?;
+                return Ok(temp);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => return Err(io_error("create owned temporary journal", &path, source)),
@@ -704,6 +723,8 @@ struct TestExistingOpenReplacement {
 thread_local! {
     static TEST_JOURNAL_INCARNATIONS: RefCell<VecDeque<[u8; 16]>> = const { RefCell::new(VecDeque::new()) };
     static TEST_MIGRATION_FAILURE: RefCell<Option<TestMigrationFailure>> = const { RefCell::new(None) };
+    #[cfg(unix)]
+    static TEST_TEMP_LOCK_FAILURE: Cell<Option<i32>> = const { Cell::new(None) };
     static TEST_RANDOMNESS_FAILURE: Cell<bool> = const { Cell::new(false) };
     static TEST_PUBLICATION_FAILURE: RefCell<Option<TestPublicationFailure>> = const { RefCell::new(None) };
     static TEST_MIGRATION_FINAL_REPLACEMENT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
@@ -2726,6 +2747,30 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_lock_failure_removes_owned_temporary_and_preserves_error() {
+        let root = fixture_root("temp-lock-failure");
+        let final_path = root.join("receipts.nbmr");
+        TEST_TEMP_LOCK_FAILURE.with(|failure| failure.set(Some(libc::EIO)));
+        let result = create_owned_temp(&final_path);
+        let final_exists = final_path.exists();
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            matches!(result, Err(ServerPhysicalDesignMutationReceiptJournalError::Lock(source))
+            if source.raw_os_error() == Some(libc::EIO))
+        );
+        assert!(!final_exists);
+        assert!(
+            leftovers.is_empty(),
+            "unowned temporary leaked: {leftovers:?}"
+        );
     }
 
     fn create_database(root: &Path) -> Database {
