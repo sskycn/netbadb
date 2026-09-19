@@ -165,6 +165,123 @@ pub struct HeapIdentityInspection {
     pub storage_id: StorageId,
 }
 
+/// Metadata-only conservative write bound for one successful Global Heap
+/// Index build. Counts describe logical BTree/Index Catalog page images and
+/// the owning Heap participant's WAL/status writes. Coordinator, receipt,
+/// filesystem-metadata, device-amplification, and failure-path writes are not
+/// part of this component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapIndexBuildWriteBoundInspection {
+    pub row_upper_bound: u64,
+    pub btree_page_allocation_upper_bound: u64,
+    pub btree_page_image_upper_bound: u64,
+    pub catalog_mutation_call_upper_bound: u64,
+    pub catalog_page_image_upper_bound: u64,
+    pub total_page_image_upper_bound: u64,
+    pub page_generation_reservation_upper_bound: u64,
+    pub heap_page_image_write_bytes_upper_bound: u64,
+    pub heap_wal_write_bytes_upper_bound: u64,
+    pub txn_status_write_bytes_upper_bound: u64,
+    pub total_write_bytes_upper_bound: u64,
+}
+
+impl crate::HeapPhysicalDesignSourceInspection {
+    /// Derives the successful-build participant output bound in O(1) from the
+    /// existing structural row upper bound. It scans no row or key and walks
+    /// neither the BTree nor Index Catalog.
+    pub fn index_build_write_bound(
+        self,
+    ) -> Result<HeapIndexBuildWriteBoundInspection, StorageError> {
+        heap_index_build_write_bound(self.row_upper_bound)
+    }
+}
+
+fn heap_index_build_write_bound(
+    row_upper_bound: u64,
+) -> Result<HeapIndexBuildWriteBoundInspection, StorageError> {
+    const RESOURCE: &str = "Heap Index participant output write";
+
+    fn overflow() -> StorageError {
+        StorageError::ResourceBoundOverflow { resource: RESOURCE }
+    }
+
+    fn add(left: u128, right: u128) -> Result<u128, StorageError> {
+        left.checked_add(right).ok_or_else(overflow)
+    }
+
+    fn multiply(left: u128, right: u128) -> Result<u128, StorageError> {
+        left.checked_mul(right).ok_or_else(overflow)
+    }
+
+    fn as_u64(value: u128) -> Result<u64, StorageError> {
+        u64::try_from(value).map_err(|_| overflow())
+    }
+
+    fn usize_as_u128(value: usize) -> Result<u128, StorageError> {
+        u64::try_from(value).map(u128::from).map_err(|_| overflow())
+    }
+
+    let rows = u128::from(row_upper_bound);
+    let empty_tree_pages = usize_as_u128(crate::btree::EMPTY_TREE_PAGE_COUNT)?;
+    let rows_plus_three = add(rows, 3)?;
+    let backfill_btree_page_images = multiply(rows, rows_plus_three)?;
+    let btree_page_images = add(empty_tree_pages, backfill_btree_page_images)?;
+
+    // Divide an even factor before multiplication. This keeps the exact
+    // R*(R+3)/2 allocation theorem representable without a transient
+    // multiplication overflow.
+    let backfill_allocations = if rows % 2 == 0 {
+        multiply(rows / 2, rows_plus_three)?
+    } else {
+        multiply(rows, rows_plus_three / 2)?
+    };
+    let btree_page_allocations = add(empty_tree_pages, backfill_allocations)?;
+    let catalog_mutation_calls = add(btree_page_allocations, 3)?;
+    let catalog_page_images = multiply(catalog_mutation_calls, 2)?;
+    let total_page_images = add(btree_page_images, catalog_page_images)?;
+
+    let page_size = usize_as_u128(PAGE_SIZE)?;
+    let heap_page_image_write_bytes = multiply(total_page_images, page_size)?;
+    let wal_page_image_bytes = multiply(
+        total_page_images,
+        usize_as_u128(crate::wal::page_image_record_write_bytes())?,
+    )?;
+    let wal_reservation_bytes = multiply(
+        btree_page_allocations,
+        usize_as_u128(crate::wal::page_generation_reservation_record_write_bytes())?,
+    )?;
+    let wal_envelope_bytes = add(
+        add(
+            usize_as_u128(crate::wal::begin_record_write_bytes())?,
+            usize_as_u128(crate::wal::prepare_record_write_bytes())?,
+        )?,
+        usize_as_u128(crate::wal::commit_record_write_bytes())?,
+    )?;
+    let heap_wal_write_bytes = add(
+        add(wal_page_image_bytes, wal_reservation_bytes)?,
+        wal_envelope_bytes,
+    )?;
+    let txn_status_write_bytes = usize_as_u128(crate::txn_status::committed_record_write_bytes())?;
+    let total_write_bytes = add(
+        add(heap_page_image_write_bytes, heap_wal_write_bytes)?,
+        txn_status_write_bytes,
+    )?;
+
+    Ok(HeapIndexBuildWriteBoundInspection {
+        row_upper_bound,
+        btree_page_allocation_upper_bound: as_u64(btree_page_allocations)?,
+        btree_page_image_upper_bound: as_u64(btree_page_images)?,
+        catalog_mutation_call_upper_bound: as_u64(catalog_mutation_calls)?,
+        catalog_page_image_upper_bound: as_u64(catalog_page_images)?,
+        total_page_image_upper_bound: as_u64(total_page_images)?,
+        page_generation_reservation_upper_bound: as_u64(btree_page_allocations)?,
+        heap_page_image_write_bytes_upper_bound: as_u64(heap_page_image_write_bytes)?,
+        heap_wal_write_bytes_upper_bound: as_u64(heap_wal_write_bytes)?,
+        txn_status_write_bytes_upper_bound: as_u64(txn_status_write_bytes)?,
+        total_write_bytes_upper_bound: as_u64(total_write_bytes)?,
+    })
+}
+
 #[derive(Debug)]
 struct ConsumerProjection {
     value_output_slots_by_schema_position: Vec<Vec<usize>>,
@@ -1585,6 +1702,8 @@ impl HeapStorage {
             }
             let mut after = before.clone();
             after.replace_single_payload(PageType::IndexCatalog, &encode_index_catalog(&node)?)?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            let published_page_images = 1 + usize::from(new_after.is_some());
             #[cfg(test)]
             if std::mem::take(&mut self.fail_index_catalog_log) {
                 transaction.inject_partial_append_failure(0);
@@ -1605,7 +1724,12 @@ impl HeapStorage {
                 }
                 *guard.page_mut() = page;
             }
-            self.publish_page_image(page_id, after)
+            self.publish_page_image(page_id, after)?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            crate::index_write_bound_test_activity::record_published_page_images(
+                published_page_images,
+            );
+            Ok(())
         })();
         if result.is_err() {
             transaction.require_rollback();
@@ -3786,7 +3910,8 @@ fn read_array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N],
 mod tests {
     use super::{
         ConsumerProjection, HeapStorage, decode_row, decode_row_columns, decode_row_for_consumer,
-        decode_value, encode_row, resolve_projection, write_heap_metadata,
+        decode_value, encode_row, heap_index_build_write_bound, resolve_projection,
+        write_heap_metadata,
     };
     use crate::crash_test::{self, TestCrashPoint};
     use crate::{
@@ -3806,6 +3931,134 @@ mod tests {
     };
 
     const FIRST_HEAP_PAGE: PageId = PageId(2);
+
+    #[test]
+    fn index_build_write_bound_checked_formulas_cover_boundaries_and_first_overflow() {
+        let empty_tree_pages = u64::try_from(crate::btree::EMPTY_TREE_PAGE_COUNT).unwrap();
+        for rows in [0_u64, 1, 2, 10, 100_000] {
+            let bound = heap_index_build_write_bound(rows).expect("representable bound");
+            let backfill_images = rows.checked_mul(rows + 3).unwrap();
+            let allocations = empty_tree_pages + backfill_images / 2;
+            let btree_images = empty_tree_pages + backfill_images;
+            let catalog_calls = allocations + 3;
+            let catalog_images = catalog_calls * 2;
+            assert_eq!(bound.row_upper_bound, rows);
+            assert_eq!(bound.btree_page_allocation_upper_bound, allocations);
+            assert_eq!(bound.page_generation_reservation_upper_bound, allocations);
+            assert_eq!(bound.btree_page_image_upper_bound, btree_images);
+            assert_eq!(bound.catalog_mutation_call_upper_bound, catalog_calls);
+            assert_eq!(bound.catalog_page_image_upper_bound, catalog_images);
+            assert_eq!(
+                bound.total_page_image_upper_bound,
+                btree_images + catalog_images
+            );
+            assert_eq!(
+                bound.heap_page_image_write_bytes_upper_bound,
+                bound.total_page_image_upper_bound * crate::PAGE_SIZE as u64
+            );
+            assert!(bound.heap_wal_write_bytes_upper_bound > 0);
+            assert_eq!(
+                bound.txn_status_write_bytes_upper_bound,
+                crate::txn_status::committed_record_write_bytes() as u64
+            );
+            assert_eq!(
+                bound.total_write_bytes_upper_bound,
+                bound.heap_page_image_write_bytes_upper_bound
+                    + bound.heap_wal_write_bytes_upper_bound
+                    + bound.txn_status_write_bytes_upper_bound
+            );
+        }
+
+        let mut lower = 0_u64;
+        let mut upper = u64::MAX;
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            if heap_index_build_write_bound(middle).is_ok() {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        let first_overflow = lower;
+        assert!(first_overflow > 0);
+        assert!(heap_index_build_write_bound(first_overflow - 1).is_ok());
+        assert!(matches!(
+            heap_index_build_write_bound(first_overflow),
+            Err(StorageError::ResourceBoundOverflow { .. })
+        ));
+        assert!(matches!(
+            heap_index_build_write_bound(u64::MAX),
+            Err(StorageError::ResourceBoundOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn catalog_node_write_publishes_one_page_or_one_page_plus_one_continuation() {
+        let path = test_path("catalog-write-image-bound");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
+        let root = storage.index_catalog_root;
+        let guard = storage.buffer.read_page(root).unwrap();
+        let before = guard.page().clone();
+        let mut node = decode_index_catalog(
+            before
+                .single_payload(PageType::IndexCatalog)
+                .expect("catalog payload"),
+        )
+        .unwrap();
+        drop(guard);
+        node.next_index_id = Some(IndexId(100));
+        node.pending.push(netbadb_index::RetiredIndexOwnership {
+            index_id: IndexId(90),
+            meta_page: None,
+        });
+        storage.index_catalog_payload_capacity = Some(encode_index_catalog(&node).unwrap().len());
+        node.pending.push(netbadb_index::RetiredIndexOwnership {
+            index_id: IndexId(91),
+            meta_page: None,
+        });
+
+        let mut transaction = storage.begin_transaction().unwrap();
+        crate::index_write_bound_test_activity::take();
+        storage
+            .write_catalog_node_in(&mut transaction, root, before, node)
+            .unwrap();
+        let activity = crate::index_write_bound_test_activity::take();
+        assert_eq!(activity.published_page_images, 2);
+        assert_eq!(activity.wal_page_image_records, 2);
+        assert_eq!(activity.wal_page_update_records, 2);
+        assert_eq!(activity.wal_page_transition_records, 0);
+        transaction.rollback().unwrap();
+        storage.close().unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn empty_index_actual_output_fits_global_envelope_bound_with_small_buffer() {
+        let path = test_path("empty-index-write-bound");
+        cleanup(&path);
+        let mut storage = HeapStorage::create_with_buffer_pool_size(&path, indexed_table(), 1)
+            .expect("create empty heap");
+        let bound = storage
+            .inspect_physical_design_source()
+            .unwrap()
+            .index_build_write_bound()
+            .unwrap();
+        crate::index_write_bound_test_activity::take();
+        storage.create_index(ColumnId(2)).unwrap();
+        let actual = crate::index_write_bound_test_activity::take();
+        assert_eq!(actual.published_page_images, actual.wal_page_image_records);
+        assert!(actual.published_page_images <= bound.total_page_image_upper_bound);
+        assert!(
+            actual.generation_reservation_records <= bound.page_generation_reservation_upper_bound
+        );
+        let actual_output = actual.published_page_images * crate::PAGE_SIZE as u64
+            + actual.wal_appended_bytes
+            + actual.txn_status_appended_bytes;
+        assert!(actual_output <= bound.total_write_bytes_upper_bound);
+        storage.close().unwrap();
+        cleanup(&path);
+    }
 
     fn table() -> TableDef {
         TableDef::new(
@@ -3995,6 +4248,7 @@ mod tests {
             .scan_columns_with_view(&[ColumnId(1)], &view)
             .unwrap();
         assert_eq!(actual.len(), 160);
+        assert!(u64::try_from(actual.len()).unwrap() <= indexed.row_upper_bound);
         let scanned = activity::take();
         assert_eq!(scanned.heap_scan_pages, indexed.managed_page_upper_bound);
         assert_eq!(

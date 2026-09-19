@@ -1355,6 +1355,8 @@ impl<'a> BTree<'a> {
                 crate::crash_test::TestCrashPoint::BTreeAfterInternalSplit,
             );
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::index_write_bound_test_activity::record_published_page_images(changes.len());
         Ok(())
     }
 
@@ -1483,6 +1485,18 @@ mod tests {
         )
     }
 
+    fn text_table() -> TableDef {
+        TableDef::new(
+            TableId(1),
+            "rows",
+            vec![ColumnDef::new(
+                ColumnId(1),
+                "key",
+                TypeSpec::Physical(PhysicalType::Text),
+            )],
+        )
+    }
+
     fn path(case: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("netbadb-btree-{case}-{}", std::process::id()))
     }
@@ -1557,6 +1571,58 @@ mod tests {
         assert_eq!(storage.btree().read_meta(handle).expect("meta").height, 1);
         storage.close().expect("close split baseline");
         (path, handle, trigger)
+    }
+
+    #[test]
+    fn owned_insert_page_images_and_allocations_follow_height_theorems() {
+        let path = path("owned-insert-write-bounds");
+        cleanup(&path);
+        let mut storage =
+            HeapStorage::create_with_buffer_pool_size(&path, text_table(), 1).expect("create heap");
+        let handle = storage
+            .create_index(ColumnId(1))
+            .expect("create owned tree")
+            .handle;
+        let mut saw_no_split = false;
+        let mut saw_leaf_split = false;
+        let mut saw_parent_update = false;
+        let mut saw_internal_split_or_root_growth = false;
+
+        for ordinal in 0..2_000_u64 {
+            let height_before = storage.btree().height(handle).expect("height before");
+            crate::index_write_bound_test_activity::take();
+            storage
+                .btree()
+                .insert(
+                    handle,
+                    ScalarValue::Text(format!("{ordinal:05}-{}", "x".repeat(180))),
+                    row_id(ordinal),
+                )
+                .expect("insert owned entry");
+            let activity = crate::index_write_bound_test_activity::take();
+            let height_after = storage.btree().height(handle).expect("height after");
+            assert_eq!(
+                activity.published_page_images,
+                activity.wal_page_image_records
+            );
+            assert!(activity.published_page_images <= 2 * u64::from(height_before) + 2);
+            assert!(activity.generation_reservation_records <= u64::from(height_before) + 1);
+            saw_no_split |= activity.published_page_images == 1;
+            saw_leaf_split |= activity.generation_reservation_records == 1;
+            saw_parent_update |= height_before >= 2
+                && activity.generation_reservation_records == 1
+                && activity.published_page_images >= 3;
+            saw_internal_split_or_root_growth |=
+                activity.generation_reservation_records >= 2 || height_after > height_before;
+        }
+
+        assert!(saw_no_split);
+        assert!(saw_leaf_split);
+        assert!(saw_parent_update);
+        assert!(saw_internal_split_or_root_growth);
+        assert!(storage.btree().height(handle).unwrap() >= 3);
+        storage.close().expect("close heap");
+        cleanup(&path);
     }
 
     #[test]

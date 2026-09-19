@@ -138,3 +138,7 @@ Still deferred are Index output writes, Columnar peak memory, whole-mutation
 cost, CPU/time, filesystem capacity, cumulative quotas and automatic Physical
 Design. A later phase should begin with a separately justified component proof,
 not a universal format maximum or an inferred total.
+
+Phase 37 later provides that separate Heap Index participant-output proof from
+this phase's metadata-only Heap row upper bound. It leaves the Columnar theorem
+and every format unchanged.

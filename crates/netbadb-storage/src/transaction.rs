@@ -974,6 +974,10 @@ impl Transaction {
     ) -> Result<(), StorageError> {
         if self.prepared_change.is_none() {
             if let Some(stream) = &self.change_stream {
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::index_write_bound_test_activity::record_staged_change_stream_rows(
+                    self.changes.as_slice().len(),
+                );
                 self.prepared_change = stream.borrow_mut().prepare(
                     self.id,
                     database_txn_id,

@@ -479,46 +479,25 @@ mod operator_admission_tests {
                         journal,
                     );
                 }
-                let output = match bounds.output_write_bytes {
-                    Bound::NotProven => {
-                        assert!(matches!(target, Target::Index));
-                        configure(
-                            &mut runtime,
-                            target,
-                            constraint(Dimension::OutputWriteBytes, u64::MAX),
-                        );
-                        rejection(
-                            &mut fixture,
-                            &mut runtime,
-                            target,
-                            Rejection::RequiredBoundNotProven {
-                                dimension: WireDimension::OutputWriteBytes,
-                            },
-                            journal,
-                        );
-                        None
-                    }
-                    Bound::Bounded(n) => {
-                        assert!(!matches!(target, Target::Index));
-                        configure(
-                            &mut runtime,
-                            target,
-                            constraint(Dimension::OutputWriteBytes, n - 1),
-                        );
-                        rejection(
-                            &mut fixture,
-                            &mut runtime,
-                            target,
-                            Rejection::LimitExceeded {
-                                dimension: WireDimension::OutputWriteBytes,
-                                conservative_bound: n,
-                                maximum: n - 1,
-                            },
-                            journal,
-                        );
-                        Some(n)
-                    }
+                let Bound::Bounded(output) = bounds.output_write_bytes else {
+                    panic!("Heap output writes are proven")
                 };
+                configure(
+                    &mut runtime,
+                    target,
+                    constraint(Dimension::OutputWriteBytes, output - 1),
+                );
+                rejection(
+                    &mut fixture,
+                    &mut runtime,
+                    target,
+                    Rejection::LimitExceeded {
+                        dimension: WireDimension::OutputWriteBytes,
+                        conservative_bound: output,
+                        maximum: output - 1,
+                    },
+                    journal,
+                );
                 let Bound::Bounded(work) = bounds.source_work_units else {
                     panic!()
                 };
@@ -527,9 +506,7 @@ mod operator_admission_tests {
                 };
                 let mut limits = constraint(Dimension::SourceWorkUnits, work).limits();
                 limits.source_read_bytes = AtMost(bytes);
-                if let Some(output) = output {
-                    limits.output_write_bytes = AtMost(output);
-                }
+                limits.output_write_bytes = AtMost(output);
                 limits.prerequisite_work_units = AtMost(0);
                 limits.prerequisite_read_bytes = AtMost(0);
                 limits.prerequisite_write_bytes = AtMost(0);

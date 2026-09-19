@@ -97,3 +97,9 @@ repeated application writes actually performed by the writer, including the
 final base-header rewrite. It MUST NOT be represented as device I/O,
 filesystem free space, peak memory, NBPC lifecycle bytes, or whole-mutation
 write cost.
+
+Physical Design Index output bounds MUST model repeated BTree and Index Catalog
+page images plus their Heap participant WAL and transaction-status durability
+writes. Final Heap file growth is not Index output-write accounting. Every bound
+MUST follow the existing production split, reuse, catalog-spill, generation-
+reservation and prepared-commit behavior without scanning rows or keys.

@@ -6,6 +6,7 @@ More-specific `AGENTS.md` files add rules for their directory subtree.
 Scoped rules currently live in:
 
 - `crates/AGENTS.md` for Rust libraries and compiler/execution layers;
+- `crates/netbadb-core/AGENTS.md` for Core Physical Design admission composition;
 - `crates/netbadb-index/AGENTS.md` for typed index ordering and node codecs;
 - `crates/netbadb-storage/AGENTS.md` for persistent formats, pages, heap, and index storage;
 - `crates/netbadb-protocol/AGENTS.md` for the versioned wire contract;

@@ -204,6 +204,10 @@ contract: initial Columnar output writes become proven, and nonempty Snapshot
 LSM source bytes use the existing flush-output theorem to bound the prospective
 post-flush SSTable extent. Index output and LSM source work remain unproven.
 
+Phase 37 later proves the Heap Index participant-output component from the same
+metadata-only row upper bound. This historical Phase 33 result remains the
+source-inspection baseline; the later proof adds no row/key/BTree scan.
+
 ## Validation and audit notes
 
 The final frozen implementation passed all commands below. The full workspace

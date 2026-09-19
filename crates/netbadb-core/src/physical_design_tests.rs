@@ -1729,7 +1729,10 @@ fn mutation_work_all_engine_modes_are_repeatable_pure_and_not_recommendation_gat
                         index.bounds.source_read_bytes,
                         Bound::Bounded(heap.index_backfill_bytes_upper_bound)
                     );
-                    assert_eq!(index.bounds.output_write_bytes, Bound::NotProven);
+                    assert!(matches!(
+                        index.bounds.output_write_bytes,
+                        Bound::Bounded(bytes) if bytes > 0
+                    ));
                     assert_eq!(index.table_fingerprint, first.table_fingerprint);
                 }
                 Source::Lsm(source) => {
@@ -2206,6 +2209,10 @@ mod admission {
         PhysicalIndexDesignAdmissionApplyError as IndexError,
     };
     use netbadb_storage::source_inspection_test_activity as activity;
+    use netbadb_storage::{
+        StoragePhysicalDesignSourceInspection as Source,
+        index_write_bound_test_activity as writer_activity,
+    };
     use netbadb_types::IndexName;
     use std::error::Error;
 
@@ -2370,8 +2377,12 @@ mod admission {
     }
 
     #[test]
-    fn admission_heap_index_bounds_reject_below_accept_equal_and_never_bound_output() {
-        for dimension in [Dimension::SourceWorkUnits, Dimension::SourceReadBytes] {
+    fn admission_heap_index_bounds_reject_below_and_accept_equal() {
+        for dimension in [
+            Dimension::SourceWorkUnits,
+            Dimension::SourceReadBytes,
+            Dimension::OutputWriteBytes,
+        ] {
             let mut fixture = Fixture::create("phase34-index", false);
             let window = evidence_window(&mut fixture);
             let proposal = fixture
@@ -2382,39 +2393,34 @@ mod admission {
                 .database
                 .inspect_physical_index_design_mutation_work(index_candidate())
                 .unwrap();
-            let n = bound(if dimension == Dimension::SourceWorkUnits {
-                inspection.bounds.source_work_units
-            } else {
-                inspection.bounds.source_read_bytes
+            let n = bound(match dimension {
+                Dimension::SourceWorkUnits => inspection.bounds.source_work_units,
+                Dimension::SourceReadBytes => inspection.bounds.source_read_bytes,
+                Dimension::OutputWriteBytes => inspection.bounds.output_write_bytes,
+                _ => unreachable!(),
             });
-            for (d, maximum) in [(dimension, n - 1), (Dimension::OutputWriteBytes, u64::MAX)] {
-                let error = pure_rejection(&mut fixture, &window, |database| {
-                    let error = database
-                        .apply_physical_index_design_with_admission(
-                            &window,
-                            &proposal,
-                            name(),
-                            constraint(d, maximum),
-                        )
-                        .unwrap_err();
-                    assert!(
-                        error
-                            .source()
-                            .unwrap()
-                            .downcast_ref::<AdmissionError>()
-                            .is_some()
-                    );
-                    let IndexError::Admission(error) = error else {
-                        panic!("admission error")
-                    };
-                    *error
-                });
-                if d == dimension {
-                    assert_limit(error, d, n, maximum);
-                } else {
-                    assert_unknown(error, d);
-                }
-            }
+            let error = pure_rejection(&mut fixture, &window, |database| {
+                let error = database
+                    .apply_physical_index_design_with_admission(
+                        &window,
+                        &proposal,
+                        name(),
+                        constraint(dimension, n - 1),
+                    )
+                    .unwrap_err();
+                assert!(
+                    error
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<AdmissionError>()
+                        .is_some()
+                );
+                let IndexError::Admission(error) = error else {
+                    panic!("admission error")
+                };
+                *error
+            });
+            assert_limit(error, dimension, n, n - 1);
             activity::take();
             let report = fixture
                 .database
@@ -2439,6 +2445,66 @@ mod admission {
             assert_eq!(actual.analyze_calls, 0);
             fixture.close();
         }
+    }
+
+    #[test]
+    fn global_index_actual_participant_output_fits_fresh_bound() {
+        let mut fixture = Fixture::create("phase37-global-index-output", false);
+        fixture.database.enable_change_stream(TABLE_ID).unwrap();
+        let window = evidence_window(&mut fixture);
+        let proposal = fixture
+            .database
+            .propose_physical_index_design(&window, policy(1, 1, 0, 8), index_candidate())
+            .unwrap();
+        let inspection = fixture
+            .database
+            .inspect_physical_index_design_mutation_work(index_candidate())
+            .unwrap();
+        let Source::Heap(heap) = inspection.source else {
+            panic!("expected Heap source")
+        };
+        let writer_bound = heap.index_build_write_bound().unwrap();
+        let output = bound(inspection.bounds.output_write_bytes);
+        assert_eq!(output, writer_bound.total_write_bytes_upper_bound);
+
+        writer_activity::take();
+        let report = fixture
+            .database
+            .apply_physical_index_design_with_admission(
+                &window,
+                &proposal,
+                name(),
+                constraint(Dimension::OutputWriteBytes, u64::MAX),
+            )
+            .unwrap();
+        assert!(matches!(
+            report.outcome,
+            PhysicalIndexDesignApplyOutcome::Created { .. }
+        ));
+        let actual = writer_activity::take();
+        assert_eq!(actual.begin_records, 1);
+        assert_eq!(actual.prepare_records, 1);
+        assert_eq!(actual.commit_records, 1);
+        assert_eq!(actual.abort_records, 0);
+        assert_eq!(actual.rollback_complete_records, 0);
+        assert_eq!(actual.staged_change_stream_rows, 0);
+        assert_eq!(actual.published_page_images, actual.wal_page_image_records);
+        assert!(actual.published_page_images <= writer_bound.total_page_image_upper_bound);
+        assert!(
+            actual.generation_reservation_records
+                <= writer_bound.page_generation_reservation_upper_bound
+        );
+        assert!(actual.wal_appended_bytes <= writer_bound.heap_wal_write_bytes_upper_bound);
+        assert_eq!(actual.committed_txn_status_records, 1);
+        assert_eq!(
+            actual.txn_status_appended_bytes,
+            writer_bound.txn_status_write_bytes_upper_bound
+        );
+        let actual_output = actual.published_page_images * netbadb_storage::PAGE_SIZE as u64
+            + actual.wal_appended_bytes
+            + actual.txn_status_appended_bytes;
+        assert!(actual_output <= output);
+        fixture.close();
     }
 
     #[test]

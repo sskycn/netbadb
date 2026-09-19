@@ -1884,6 +1884,10 @@ impl Database {
         let StoragePhysicalDesignSourceInspection::Heap(heap) = source else {
             return Err(PhysicalDesignMutationWorkInspectionError::UnsupportedIndexLayout);
         };
+        let output_write_bytes = heap
+            .index_build_write_bound()
+            .map_err(DatabaseError::from)?
+            .total_write_bytes_upper_bound;
         Ok(PhysicalIndexDesignMutationWorkInspection {
             candidate,
             schema_generation: self.schema_generation(),
@@ -1898,7 +1902,9 @@ impl Database {
                 source_read_bytes: PhysicalDesignMutationConservativeBound::Bounded(
                     heap.index_backfill_bytes_upper_bound,
                 ),
-                output_write_bytes: PhysicalDesignMutationConservativeBound::NotProven,
+                output_write_bytes: PhysicalDesignMutationConservativeBound::Bounded(
+                    output_write_bytes,
+                ),
             },
         })
     }

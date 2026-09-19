@@ -608,7 +608,20 @@ fn retirement_different_owner_drop_pending_cleanup_and_candidate_dedup() {
         81
     );
     // Lowest IDs are the whole-owner meta/root; consume those first.
+    let write_bound = storage
+        .inspect_physical_design_source()
+        .unwrap()
+        .index_build_write_bound()
+        .unwrap();
+    crate::index_write_bound_test_activity::take();
     let other = storage.create_index(ColumnId(3)).unwrap();
+    let actual = crate::index_write_bound_test_activity::take();
+    assert!(actual.wal_page_transition_records >= 2);
+    assert_eq!(actual.published_page_images, actual.wal_page_image_records);
+    let actual_output = actual.published_page_images * crate::PAGE_SIZE as u64
+        + actual.wal_appended_bytes
+        + actual.txn_status_appended_bytes;
+    assert!(actual_output <= write_bound.total_write_bytes_upper_bound);
     storage.compact_index_catalog().unwrap();
     assert!(storage.inspect_index_reclaim().unwrap().pending.is_empty());
     assert_eq!(

@@ -547,6 +547,17 @@ existing Phase 34/35 dimensions; Index output and LSM source work remain
 `NotProven`. Manifest v11, NBOP v6, NBMR v3 and every persistent format remain
 unchanged.
 
+[Adaptive Operations Phase 37](adaptive-operations-phase37.md) adds the
+storage-authored Heap Index participant-output theorem. Starting from the same
+metadata-only Heap row upper bound, it algebraically bounds BTree splits and
+allocations, reusable-page owner detachment, Index Catalog continuation writes,
+full-page WAL, generation reservations, the Global Begin/Prepare/Commit envelope,
+and one committed TxnStatus record. Core maps the storage total to the existing
+`output_write_bytes` dimension. Coordinator, NBMR, failure-path writes and
+whole-mutation resources remain outside the component. Inspection scans no row
+or key and walks no BTree. Manifest v11, NBOP v6, NBMR v3, Native Protocol v2,
+PostgreSQL wire and all persistent formats remain unchanged.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

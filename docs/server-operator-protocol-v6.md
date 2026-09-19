@@ -209,7 +209,10 @@ Constrained NotProven fails closed, equality passes, and unconstrained component
 remain outside the policy. This is partial component admission, not a total cost
 model. Current initial Columnar builds provide a storage-authored
 `output_write_bytes` bound; Snapshot LSM source read is also bounded after its
-prospective flush output is included. Index output remains NotProven. These are
+prospective flush output is included. Heap Index builds likewise provide a
+storage-authored participant-output bound covering logical BTree/Index Catalog
+page images, Heap WAL, and one committed TxnStatus record while excluding the
+Coordinator, NBMR, failure paths and whole-mutation resources. These are
 stronger values for existing v6 dimensions, not new fields or policy widening.
 The CLI renders exact components and structured failures, correlates a
 returned receipt, and never retries, relaxes a limit, switches mode, or queries

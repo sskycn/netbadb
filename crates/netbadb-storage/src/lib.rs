@@ -40,9 +40,10 @@ pub use columnar::{
     columnar_projection_manifest_exists, inspect_columnar_base_artifact_write_bound,
 };
 pub use heap::{
-    HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, HistoricalOrphanAdoptionReport,
-    IndexMaintenanceReport, IndexPageAllocation, IndexReclaimReport, IndexTailReclaimReport,
-    PageReuseClass, PageReuseInspection, PresenceCountSummary, ReusablePageInspection,
+    HeapIdentityInspection, HeapIndexBuildWriteBoundInspection, HeapRecoveryInspection,
+    HeapStorage, HistoricalOrphanAdoptionReport, IndexMaintenanceReport, IndexPageAllocation,
+    IndexReclaimReport, IndexTailReclaimReport, PageReuseClass, PageReuseInspection,
+    PresenceCountSummary, ReusablePageInspection,
 };
 pub(crate) use lsm::LsmRowHandle;
 pub use lsm::{
@@ -114,6 +115,100 @@ pub mod source_inspection_test_activity {
             let mut current = value.get();
             update(&mut current);
             value.set(current);
+        });
+    }
+}
+
+/// Thread-local production-path instrumentation for deterministic Index writer
+/// bound tests. It is absent unless tests or the explicit test-hooks feature
+/// are enabled and never participates in sizing or mutation decisions.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod index_write_bound_test_activity {
+    use std::cell::Cell;
+
+    use crate::{TxnStatus, WalRecordKind};
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Activity {
+        pub published_page_images: u64,
+        pub wal_page_image_records: u64,
+        pub wal_page_update_records: u64,
+        pub wal_page_transition_records: u64,
+        pub generation_reservation_records: u64,
+        pub begin_records: u64,
+        pub prepare_records: u64,
+        pub commit_records: u64,
+        pub abort_records: u64,
+        pub rollback_complete_records: u64,
+        pub wal_appended_bytes: u64,
+        pub committed_txn_status_records: u64,
+        pub txn_status_appended_bytes: u64,
+        pub staged_change_stream_rows: u64,
+    }
+
+    thread_local! { static ACTIVITY: Cell<Activity> = Cell::new(Activity::default()); }
+
+    pub fn take() -> Activity {
+        ACTIVITY.with(|value| value.replace(Activity::default()))
+    }
+
+    fn record(update: impl FnOnce(&mut Activity)) {
+        ACTIVITY.with(|value| {
+            let mut current = value.get();
+            update(&mut current);
+            value.set(current);
+        });
+    }
+
+    pub(crate) fn record_wal_append(kind: &WalRecordKind, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        record(|activity| {
+            activity.wal_appended_bytes = activity.wal_appended_bytes.saturating_add(bytes);
+            match kind {
+                WalRecordKind::Begin => activity.begin_records += 1,
+                WalRecordKind::PageGenerationReservation => {
+                    activity.generation_reservation_records += 1;
+                }
+                WalRecordKind::PageUpdate { .. } => {
+                    activity.wal_page_image_records += 1;
+                    activity.wal_page_update_records += 1;
+                }
+                WalRecordKind::PageAllocationTransition { .. } => {
+                    activity.wal_page_image_records += 1;
+                    activity.wal_page_transition_records += 1;
+                }
+                WalRecordKind::Commit => activity.commit_records += 1,
+                WalRecordKind::Abort => activity.abort_records += 1,
+                WalRecordKind::RollbackComplete => activity.rollback_complete_records += 1,
+                WalRecordKind::Prepare { .. } => activity.prepare_records += 1,
+            }
+        });
+    }
+
+    pub(crate) fn record_txn_status_append(status: TxnStatus, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        record(|activity| {
+            activity.txn_status_appended_bytes =
+                activity.txn_status_appended_bytes.saturating_add(bytes);
+            if matches!(status, TxnStatus::Committed(_)) {
+                activity.committed_txn_status_records += 1;
+            }
+        });
+    }
+
+    pub(crate) fn record_published_page_images(count: usize) {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        record(|activity| {
+            activity.published_page_images = activity.published_page_images.saturating_add(count);
+        });
+    }
+
+    pub(crate) fn record_staged_change_stream_rows(count: usize) {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        record(|activity| {
+            activity.staged_change_stream_rows =
+                activity.staged_change_stream_rows.saturating_add(count);
         });
     }
 }

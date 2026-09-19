@@ -314,6 +314,32 @@ impl WalRecordKind {
     }
 }
 
+const fn encoded_record_len(kind: &WalRecordKind) -> usize {
+    RECORD_HEADER_SIZE + kind.payload_len()
+}
+
+pub(crate) const fn begin_record_write_bytes() -> usize {
+    encoded_record_len(&WalRecordKind::Begin)
+}
+
+pub(crate) const fn page_image_record_write_bytes() -> usize {
+    RECORD_HEADER_SIZE + PAGE_UPDATE_PAYLOAD_SIZE
+}
+
+pub(crate) const fn page_generation_reservation_record_write_bytes() -> usize {
+    encoded_record_len(&WalRecordKind::PageGenerationReservation)
+}
+
+pub(crate) const fn prepare_record_write_bytes() -> usize {
+    encoded_record_len(&WalRecordKind::Prepare {
+        database_txn_id: DatabaseTxnId(1),
+    })
+}
+
+pub(crate) const fn commit_record_write_bytes() -> usize {
+    encoded_record_len(&WalRecordKind::Commit)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecord {
     pub lsn: Lsn,
@@ -632,6 +658,7 @@ impl WalManager {
             kind,
         };
         let bytes = encode_record(&record)?;
+        debug_assert_eq!(bytes.len(), encoded_record_len(&record.kind));
         let next_lsn = Lsn(lsn
             .0
             .checked_add(bytes.len() as u64)
@@ -668,6 +695,8 @@ impl WalManager {
         if let Err(error) = self.file.write_all(&bytes) {
             return Err(self.rollback_failed_append(error));
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::index_write_bound_test_activity::record_wal_append(&record.kind, bytes.len());
         self.next_offset = next_offset;
         self.next_lsn = next_lsn;
         self.written_lsn = Some(lsn);
@@ -1659,9 +1688,9 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
 
-    use netbadb_types::{DatabaseTxnId, PageId, TxnId};
+    use netbadb_types::{DatabaseTxnId, Lsn, PageId, TxnId};
 
-    use super::{WAL_HEADER_SIZE, WalError, WalManager, WalRecordKind};
+    use super::{WAL_HEADER_SIZE, WalError, WalManager, WalRecord, WalRecordKind};
     use crate::{Page, PageType};
 
     fn test_path(name: &str) -> std::path::PathBuf {
@@ -1670,6 +1699,49 @@ mod tests {
 
     fn initial_physical_offset(lsn: netbadb_types::Lsn) -> u64 {
         super::WAL_HEADER_SIZE as u64 + lsn.0 - super::INITIAL_BASE_LSN.0
+    }
+
+    #[test]
+    fn index_write_sizing_helpers_match_the_production_encoder() {
+        let cases = [
+            (WalRecordKind::Begin, super::begin_record_write_bytes()),
+            (
+                WalRecordKind::PageGenerationReservation,
+                super::page_generation_reservation_record_write_bytes(),
+            ),
+            (
+                WalRecordKind::PageUpdate {
+                    page_id: PageId(1),
+                    before: Box::new([0; crate::PAGE_SIZE]),
+                    after: Box::new([0; crate::PAGE_SIZE]),
+                },
+                super::page_image_record_write_bytes(),
+            ),
+            (
+                WalRecordKind::PageAllocationTransition {
+                    page_id: PageId(1),
+                    before: Box::new([0; crate::PAGE_SIZE]),
+                    after: Box::new([0; crate::PAGE_SIZE]),
+                },
+                super::page_image_record_write_bytes(),
+            ),
+            (
+                WalRecordKind::Prepare {
+                    database_txn_id: DatabaseTxnId(1),
+                },
+                super::prepare_record_write_bytes(),
+            ),
+            (WalRecordKind::Commit, super::commit_record_write_bytes()),
+        ];
+        for (kind, expected) in cases {
+            let record = WalRecord {
+                lsn: Lsn(1),
+                txn_id: TxnId(1),
+                prev_lsn: None,
+                kind,
+            };
+            assert_eq!(super::encode_record(&record).unwrap().len(), expected);
+        }
     }
 
     #[test]

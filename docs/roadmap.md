@@ -11,6 +11,27 @@ subprocess recovery-interruption regressions, retaining the prior
 planner or writer-concurrency expansion is included. Real power-loss, hardware
 torn-write and network-filesystem validation remain separate work.
 
+## Heap Index participant output bounds (Adaptive Operations Phase 37 complete)
+
+- derived an O(1), storage-authored successful-build bound from the current
+  Heap structural row upper bound, without scanning rows/keys or walking the
+  BTree/Index Catalog;
+- proved `E + R(R+3)` BTree page images and
+  `E + R(R+3)/2` allocations, including generation reservations, reusable-page
+  transitions and at most one retired-owner detach per allocation;
+- bounded each catalog mutation by one rewritten page plus at most one
+  continuation, charging two floor opportunities and final registration;
+- included logical page-image bytes, exact full-page/reservation WAL records,
+  the Global Begin/Prepare/Commit envelope and one committed TxnStatus record;
+- populated the existing Index `output_write_bytes` dimension and retained
+  equality/one-below, no-op, recovery and coarse-receipt semantics without a
+  Manifest, NBOP, NBMR, wire or persistent-format change.
+
+Still deferred are Index memory, Columnar peak memory, Coordinator-inclusive
+output, whole-mutation cost, CPU/time, filesystem capacity, cumulative quotas
+and automatic Physical Design. See
+[`adaptive-operations-phase37.md`](adaptive-operations-phase37.md).
+
 ## Columnar artifact output bounds (Adaptive Operations Phase 36 complete)
 
 - added storage-authored, metadata-only sizing for one initial NBCS base and
@@ -43,10 +64,11 @@ automatic Physical Design. See
 - retained coarse NBMR v3 Rejected receipts and uncertainty/recovery semantics,
   independent programmatic authority, Native/PG parity and explicit-only apply.
 
-External component admission is complete. Phase 36 now supplies the initial
-Columnar output-write bound without changing the policy schema. Whole-mutation
-work, Index output writes, memory limits, CPU limits, filesystem free-space
-limits, cumulative quotas and automatic design remain deferred. See
+External component admission is complete. Phase 36 supplies the initial
+Columnar output-write bound and Phase 37 supplies Heap Index participant output
+without changing the policy schema. Whole-mutation work, memory limits, CPU
+limits, filesystem free-space limits, cumulative quotas and automatic design
+remain deferred. See
 [`adaptive-operations-phase35.md`](adaptive-operations-phase35.md).
 
 ## Component mutation admission (Adaptive Operations Phase 34 complete)

@@ -16,6 +16,10 @@ const RECORD_SIZE: usize = 32;
 const COMMITTED_TAG: u8 = 1;
 const ABORTED_TAG: u8 = 2;
 
+pub(crate) const fn committed_record_write_bytes() -> usize {
+    RECORD_SIZE
+}
+
 pub(crate) type SharedTxnStatus = Rc<RefCell<TxnStatusStore>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +361,8 @@ impl TxnStatusStore {
         if let TxnStatus::Committed(commit_seq) = status {
             self.maximum_commit_seq = self.maximum_commit_seq.max(commit_seq);
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::index_write_bound_test_activity::record_txn_status_append(status, bytes.len());
         Ok(())
     }
 
@@ -559,6 +565,12 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    #[test]
+    fn committed_record_sizing_helper_matches_the_production_encoder() {
+        let bytes = super::encode_record(TxnId(1), TxnStatus::Committed(CommitSeq(1))).unwrap();
+        assert_eq!(bytes.len(), super::committed_record_write_bytes());
     }
 
     #[test]

@@ -146,6 +146,10 @@ An existing `AtMost` policy may therefore admit a build that this historical
 phase reported as `RequiredBoundNotProven`; configured maxima are not widened.
 Index output remains unproven.
 
+Phase 37 later applies the same conditional-evidence compatibility to Heap
+Index participant output. Unconditional Index disablement uses
+`allow_physical_index_apply: false`, not historical `NotProven` behavior.
+
 ## Implementation audit
 
 The actual starting HEAD and fetched origin/main were both

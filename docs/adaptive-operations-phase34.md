@@ -193,6 +193,10 @@ initial Columnar `OutputWriteBytes` and nonempty Snapshot-LSM
 `SourceReadBytes` become bounded. Comparison order, no-op precedence,
 same-command freshness and independent-component semantics do not change.
 
+Phase 37 later supplies bounded Heap Index participant `OutputWriteBytes`
+through the same dimension and ordering. It does not widen policy into a total
+or Coordinator-inclusive budget.
+
 ## Regression coverage and validation
 
 Policy tests cover constructor boundaries, deterministic first failure, zero

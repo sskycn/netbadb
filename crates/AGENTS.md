@@ -71,10 +71,12 @@ safe or zero. Component bounds MUST NOT be summed into an unproven whole-
 mutation budget.
 
 Physical Design Columnar output admission consumes only the fresh
-storage-authored initial base-artifact write bound. Index output remains
-`NotProven` until a separate BTree/WAL/catalog writer theorem exists. Improving
-a previously unproven component creates neither a new admission dimension nor
-a reusable permit.
+storage-authored initial base-artifact write bound. Index output admission
+consumes only the fresh storage-authored Heap participant writer bound. Neither
+component is a whole-mutation cost: Coordinator, receipts, memory, CPU, device
+amplification, free space, and failed-build rollback remain outside their stated
+accounting. Improving a previously unproven component creates neither a new
+admission dimension nor a reusable permit.
 
 ## Library quality
 
