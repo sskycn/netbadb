@@ -479,20 +479,46 @@ mod operator_admission_tests {
                         journal,
                     );
                 }
-                configure(
-                    &mut runtime,
-                    target,
-                    constraint(Dimension::OutputWriteBytes, u64::MAX),
-                );
-                rejection(
-                    &mut fixture,
-                    &mut runtime,
-                    target,
-                    Rejection::RequiredBoundNotProven {
-                        dimension: WireDimension::OutputWriteBytes,
-                    },
-                    journal,
-                );
+                let output = match bounds.output_write_bytes {
+                    Bound::NotProven => {
+                        assert!(matches!(target, Target::Index));
+                        configure(
+                            &mut runtime,
+                            target,
+                            constraint(Dimension::OutputWriteBytes, u64::MAX),
+                        );
+                        rejection(
+                            &mut fixture,
+                            &mut runtime,
+                            target,
+                            Rejection::RequiredBoundNotProven {
+                                dimension: WireDimension::OutputWriteBytes,
+                            },
+                            journal,
+                        );
+                        None
+                    }
+                    Bound::Bounded(n) => {
+                        assert!(!matches!(target, Target::Index));
+                        configure(
+                            &mut runtime,
+                            target,
+                            constraint(Dimension::OutputWriteBytes, n - 1),
+                        );
+                        rejection(
+                            &mut fixture,
+                            &mut runtime,
+                            target,
+                            Rejection::LimitExceeded {
+                                dimension: WireDimension::OutputWriteBytes,
+                                conservative_bound: n,
+                                maximum: n - 1,
+                            },
+                            journal,
+                        );
+                        Some(n)
+                    }
+                };
                 let Bound::Bounded(work) = bounds.source_work_units else {
                     panic!()
                 };
@@ -501,6 +527,9 @@ mod operator_admission_tests {
                 };
                 let mut limits = constraint(Dimension::SourceWorkUnits, work).limits();
                 limits.source_read_bytes = AtMost(bytes);
+                if let Some(output) = output {
+                    limits.output_write_bytes = AtMost(output);
+                }
                 limits.prerequisite_work_units = AtMost(0);
                 limits.prerequisite_read_bytes = AtMost(0);
                 limits.prerequisite_write_bytes = AtMost(0);
@@ -712,21 +741,48 @@ mod operator_admission_tests {
                     .database
                     .inspect_physical_columnar_design_mutation_work(&candidate(), mode)
                     .unwrap();
-                let policy = if mode == PhysicalColumnarDesignMode::Snapshot && !empty {
-                    configure(
-                        &mut runtime,
-                        target,
-                        constraint(Dimension::SourceReadBytes, u64::MAX),
-                    );
-                    rejection(
-                        &mut fixture,
-                        &mut runtime,
-                        target,
-                        Rejection::RequiredBoundNotProven {
-                            dimension: WireDimension::SourceReadBytes,
-                        },
-                        true,
-                    );
+                let Bound::Bounded(source_read) = inspection.bounds.source_read_bytes else {
+                    panic!("SSTable bytes")
+                };
+                assert!(source_read > 0);
+                configure(
+                    &mut runtime,
+                    target,
+                    constraint(Dimension::SourceReadBytes, source_read - 1),
+                );
+                rejection(
+                    &mut fixture,
+                    &mut runtime,
+                    target,
+                    Rejection::LimitExceeded {
+                        dimension: WireDimension::SourceReadBytes,
+                        conservative_bound: source_read,
+                        maximum: source_read - 1,
+                    },
+                    true,
+                );
+                let Bound::Bounded(output) = inspection.bounds.output_write_bytes else {
+                    panic!("Columnar output bytes")
+                };
+                configure(
+                    &mut runtime,
+                    target,
+                    constraint(Dimension::OutputWriteBytes, output - 1),
+                );
+                rejection(
+                    &mut fixture,
+                    &mut runtime,
+                    target,
+                    Rejection::LimitExceeded {
+                        dimension: WireDimension::OutputWriteBytes,
+                        conservative_bound: output,
+                        maximum: output - 1,
+                    },
+                    true,
+                );
+                let mut limits = constraint(Dimension::OutputWriteBytes, output).limits();
+                limits.source_read_bytes = AtMost(source_read);
+                if mode == PhysicalColumnarDesignMode::Snapshot && !empty {
                     let Prerequisite::LsmFlush {
                         conservative_bound: bound,
                         ..
@@ -766,35 +822,15 @@ mod operator_admission_tests {
                             );
                         }
                     }
-                    // Only prerequisite writes are constrained: partial component admission.
-                    constraint(Dimension::PrerequisiteWriteBytes, bound.write_bytes)
+                    // The other components remain independent; this policy
+                    // constrains only source read, output, and flush writes.
+                    limits.prerequisite_write_bytes = AtMost(bound.write_bytes);
                 } else {
-                    let Bound::Bounded(n) = inspection.bounds.source_read_bytes else {
-                        panic!("SSTable bytes")
-                    };
-                    assert!(n > 0);
-                    configure(
-                        &mut runtime,
-                        target,
-                        constraint(Dimension::SourceReadBytes, n - 1),
-                    );
-                    rejection(
-                        &mut fixture,
-                        &mut runtime,
-                        target,
-                        Rejection::LimitExceeded {
-                            dimension: WireDimension::SourceReadBytes,
-                            conservative_bound: n,
-                            maximum: n - 1,
-                        },
-                        true,
-                    );
-                    let mut limits = constraint(Dimension::SourceReadBytes, n).limits();
                     limits.prerequisite_work_units = AtMost(0);
                     limits.prerequisite_read_bytes = AtMost(0);
                     limits.prerequisite_write_bytes = AtMost(0);
-                    PhysicalDesignMutationAdmissionPolicy::new(limits).unwrap()
-                };
+                }
+                let policy = PhysicalDesignMutationAdmissionPolicy::new(limits).unwrap();
                 assert_eq!(
                     fixture
                         .database

@@ -7888,6 +7888,19 @@ mod tests {
                 .map(|sstable| std::fs::metadata(&sstable.path).unwrap().len())
                 .sum()
         );
+        assert_eq!(
+            inspected.row_upper_bound().unwrap(),
+            inspected.sstable_entry_count + inspected.memtable_entry_count
+        );
+        assert_eq!(
+            inspected
+                .prospective_snapshot_sstable_bytes_upper_bound()
+                .unwrap(),
+            inspected.total_sstable_bytes
+                + inspected
+                    .flush_conservative_bound
+                    .map_or(0, |bound| bound.write_bytes)
+        );
         // Open validated contiguous, nonoverlapping blocks inside each exact file
         // extent. The production full cursor advances next_block monotonically.
         for sstable in &shared.sstables {
@@ -7921,6 +7934,10 @@ mod tests {
         assert_eq!(memtable.memtable_entry_count, 1);
         assert_eq!(memtable.total_sstable_bytes, 0);
         let bound = memtable.flush_conservative_bound.unwrap();
+        let prospective = memtable
+            .prospective_snapshot_sstable_bytes_upper_bound()
+            .unwrap();
+        let sstables_before = memtable.sstable_count;
         let writes = storage.inspection().write_amplification;
         storage.flush().unwrap();
         let flushed = assert_physical_design_source(&mut storage);
@@ -7930,6 +7947,8 @@ mod tests {
         assert!(after.flush_input_bytes - writes.flush_input_bytes <= bound.read_bytes);
         assert!(after.flush_output_bytes - writes.flush_output_bytes <= bound.write_bytes);
         assert!(flushed.sstable_entry_count <= bound.work_units);
+        assert!(flushed.total_sstable_bytes <= prospective);
+        assert!(flushed.sstable_count <= sstables_before + 1);
         storage.analyze().unwrap();
         let analyzed = storage.table_statistics();
         let first = storage

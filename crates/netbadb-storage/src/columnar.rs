@@ -25,7 +25,10 @@ use netbadb_types::{
     StorageDataVersion, StorageId, TableId,
 };
 
-use crate::{ChangeBatch, ChangeStreamCursor, StorageChange, StorageVersionKey};
+use crate::{
+    ChangeBatch, ChangeStreamCursor, StorageChange, StorageError,
+    StoragePhysicalDesignSourceInspection, StorageVersionKey,
+};
 
 const MANIFEST_MAGIC: &[u8; 4] = b"NBCM";
 const SEGMENT_MAGIC: &[u8; 4] = b"NBCS";
@@ -48,6 +51,28 @@ const MAX_TEXT_BYTES: u64 = 1 << 32;
 const MAX_LAZY_BLOCK_BYTES: u64 = 1 << 26;
 const MAX_INDEX_BYTES: u64 = 1 << 28;
 const DEFAULT_ROW_GROUP_ROWS: usize = 256;
+const VERSION_KEY_BYTES: u64 = 24;
+const BLOCK_REF_BYTES: u64 = 24;
+const COLUMN_CHUNK_FIXED_BYTES: u64 = 28;
+const GROUP_DIRECTORY_FIXED_BYTES: u64 = 12;
+const COLUMN_DIRECTORY_FIXED_BYTES: u64 = 48;
+const SEGMENT_FOOTER_FIXED_BYTES: u64 = 52;
+const MANIFEST_PREFIX_FIXED_BYTES: u64 = 132;
+const MANIFEST_COLUMN_BYTES: u64 = 8;
+const MANIFEST_SEGMENT_FIXED_BYTES: u64 = 24;
+const MANIFEST_INCREMENTAL_FIXED_BYTES: u64 = 60;
+const CHECKSUM_BYTES: u64 = 4;
+const MAX_U64_DECIMAL_BYTES: u64 = 20;
+const BASE_SEGMENT_FILENAME_LITERAL_BYTES: u64 = "projection--g.nbcs".len() as u64;
+const MAX_BASE_SEGMENT_FILENAME_BYTES: u64 =
+    BASE_SEGMENT_FILENAME_LITERAL_BYTES + 2 * MAX_U64_DECIMAL_BYTES;
+
+fn base_segment_file_name(
+    projection_id: ColumnarProjectionId,
+    generation: ColumnarGeneration,
+) -> String {
+    format!("projection-{}-g{}.nbcs", projection_id.0, generation.0)
+}
 
 /// Reports whether the one final manifest that authorizes an NBC artifact is
 /// present at this exact projection root.
@@ -79,7 +104,7 @@ pub fn cleanup_unpublished_projection_build(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(ColumnarError::Io(error)),
     };
-    let final_segment = format!("projection-{}-g{}.nbcs", projection_id.0, generation.0);
+    let final_segment = base_segment_file_name(projection_id, generation);
     let temporary_segment_prefix = format!(".{final_segment}.tmp.");
     let temporary_manifest_prefix = format!(".{MANIFEST_FILE}.tmp.");
     let identity_suffix = format!(".{}.{}", projection_id.0, generation.0);
@@ -111,6 +136,288 @@ pub fn cleanup_unpublished_projection_build(
 enum SnapshotKind {
     Heap,
     Lsm,
+}
+
+/// Existing initial immutable-base writer mode. This is storage-owned so
+/// callers do not need to know NBCS/NBCM layout details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnarBaseArtifactMode {
+    Snapshot,
+    Incremental,
+}
+
+/// Metadata-only conservative sizing for the two files written by one initial
+/// Columnar build. Write bytes include the final NBCS header rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnarBaseArtifactWriteBoundInspection {
+    pub row_upper_bound: u64,
+    pub row_group_upper_bound: u64,
+    pub source_scalar_payload_bytes_upper_bound: u64,
+    pub segment_file_bytes_upper_bound: u64,
+    pub segment_write_bytes_upper_bound: u64,
+    pub manifest_write_bytes_upper_bound: u64,
+    pub total_write_bytes_upper_bound: u64,
+}
+
+fn bound_overflow(resource: &'static str) -> StorageError {
+    StorageError::ResourceBoundOverflow { resource }
+}
+
+fn checked_bound_add(left: u64, right: u64, resource: &'static str) -> Result<u64, StorageError> {
+    left.checked_add(right)
+        .ok_or_else(|| bound_overflow(resource))
+}
+
+fn checked_bound_mul(left: u64, right: u64, resource: &'static str) -> Result<u64, StorageError> {
+    left.checked_mul(right)
+        .ok_or_else(|| bound_overflow(resource))
+}
+
+fn checked_div_ceil(value: u64, divisor: u64, resource: &'static str) -> Result<u64, StorageError> {
+    let quotient = value / divisor;
+    checked_bound_add(quotient, u64::from(value % divisor != 0), resource)
+}
+
+fn encoded_fixed_scalar_bytes(physical: PhysicalType) -> Option<u64> {
+    match physical {
+        PhysicalType::Bool | PhysicalType::Int8 | PhysicalType::UInt8 => Some(1),
+        PhysicalType::Int16 | PhysicalType::UInt16 => Some(2),
+        PhysicalType::Int32 | PhysicalType::UInt32 | PhysicalType::Float32 => Some(4),
+        PhysicalType::Int64 | PhysicalType::UInt64 | PhysicalType::Float64 => Some(8),
+        PhysicalType::Int128 | PhysicalType::UInt128 => Some(16),
+        PhysicalType::Text | PhysicalType::Bytes => None,
+    }
+}
+
+fn manifest_encoded_bytes(
+    column_count: u64,
+    mode: ColumnarBaseArtifactMode,
+    segment_filename_bytes: u64,
+) -> Result<u64, StorageError> {
+    let columns = checked_bound_mul(
+        column_count,
+        MANIFEST_COLUMN_BYTES,
+        "Columnar manifest column bytes",
+    )?;
+    let mut bytes = checked_bound_add(
+        MANIFEST_PREFIX_FIXED_BYTES,
+        columns,
+        "Columnar manifest bytes",
+    )?;
+    bytes = checked_bound_add(
+        bytes,
+        MANIFEST_SEGMENT_FIXED_BYTES,
+        "Columnar manifest bytes",
+    )?;
+    bytes = checked_bound_add(
+        bytes,
+        segment_filename_bytes,
+        "Columnar manifest filename bytes",
+    )?;
+    if mode == ColumnarBaseArtifactMode::Incremental {
+        bytes = checked_bound_add(
+            bytes,
+            MANIFEST_INCREMENTAL_FIXED_BYTES,
+            "Columnar manifest incremental bytes",
+        )?;
+    }
+    checked_bound_add(bytes, CHECKSUM_BYTES, "Columnar manifest checksum bytes")
+}
+
+fn initial_manifest_write_bound(
+    column_count: u64,
+    mode: ColumnarBaseArtifactMode,
+) -> Result<u64, StorageError> {
+    manifest_encoded_bytes(column_count, mode, MAX_BASE_SEGMENT_FILENAME_BYTES)
+}
+
+/// Derives the initial NBCS+NBCM application-write bound from the current
+/// source structure and the production format. It scans no values, performs no
+/// flush, and reserves no projection identity.
+pub fn inspect_columnar_base_artifact_write_bound(
+    table: &TableDef,
+    source: StoragePhysicalDesignSourceInspection,
+    columns: &[ColumnId],
+    mode: ColumnarBaseArtifactMode,
+) -> Result<ColumnarBaseArtifactWriteBoundInspection, StorageError> {
+    let specs = resolve_columns(table, columns).map_err(StorageError::Columnar)?;
+    let (row_upper_bound, source_scalar_payload_bytes_upper_bound) = match source {
+        StoragePhysicalDesignSourceInspection::Heap(heap) => {
+            (heap.row_upper_bound, heap.main_file_bytes_upper_bound)
+        }
+        StoragePhysicalDesignSourceInspection::Lsm(lsm) => {
+            let payload = match mode {
+                ColumnarBaseArtifactMode::Snapshot => {
+                    lsm.prospective_snapshot_sstable_bytes_upper_bound()?
+                }
+                ColumnarBaseArtifactMode::Incremental => checked_bound_add(
+                    lsm.total_sstable_bytes,
+                    lsm.memtable_bytes,
+                    "Incremental LSM scalar payload bytes",
+                )?,
+            };
+            (lsm.row_upper_bound()?, payload)
+        }
+    };
+    let row_group_rows = u64::try_from(DEFAULT_ROW_GROUP_ROWS)
+        .map_err(|_| bound_overflow("Columnar default row-group rows"))?;
+    let row_group_upper_bound =
+        checked_div_ceil(row_upper_bound, row_group_rows, "Columnar row-group count")?;
+    let column_count = u64::try_from(specs.len())
+        .map_err(|_| bound_overflow("Columnar projected column count"))?;
+
+    let mut payload_fixed_per_group = 0_u64;
+    let mut directory_fixed_per_group = if mode == ColumnarBaseArtifactMode::Incremental {
+        checked_bound_add(
+            GROUP_DIRECTORY_FIXED_BYTES,
+            BLOCK_REF_BYTES,
+            "Columnar group directory bytes",
+        )?
+    } else {
+        GROUP_DIRECTORY_FIXED_BYTES
+    };
+    let mut fixed_value_width_sum = 0_u64;
+    let mut variable_column_count = 0_u64;
+    for spec in &specs {
+        match encoded_fixed_scalar_bytes(spec.physical_type) {
+            Some(width) => {
+                fixed_value_width_sum =
+                    checked_bound_add(fixed_value_width_sum, width, "Columnar fixed value width")?;
+                let statistic_bytes = checked_bound_add(
+                    2,
+                    checked_bound_mul(2, width, "Columnar fixed statistic bytes")?,
+                    "Columnar fixed statistic bytes",
+                )?;
+                payload_fixed_per_group = checked_bound_add(
+                    payload_fixed_per_group,
+                    checked_bound_add(
+                        COLUMN_CHUNK_FIXED_BYTES,
+                        statistic_bytes,
+                        "Columnar fixed payload structure bytes",
+                    )?,
+                    "Columnar payload structure bytes",
+                )?;
+                directory_fixed_per_group = checked_bound_add(
+                    directory_fixed_per_group,
+                    checked_bound_add(
+                        COLUMN_DIRECTORY_FIXED_BYTES,
+                        statistic_bytes,
+                        "Columnar fixed directory structure bytes",
+                    )?,
+                    "Columnar directory structure bytes",
+                )?;
+            }
+            None => {
+                variable_column_count =
+                    checked_bound_add(variable_column_count, 1, "Columnar variable column count")?;
+                // Two present optional values: one-byte tag plus u32 length.
+                let variable_statistic_fixed_bytes = 10;
+                payload_fixed_per_group = checked_bound_add(
+                    payload_fixed_per_group,
+                    COLUMN_CHUNK_FIXED_BYTES + variable_statistic_fixed_bytes,
+                    "Columnar variable payload structure bytes",
+                )?;
+                directory_fixed_per_group = checked_bound_add(
+                    directory_fixed_per_group,
+                    COLUMN_DIRECTORY_FIXED_BYTES + variable_statistic_fixed_bytes,
+                    "Columnar variable directory structure bytes",
+                )?;
+            }
+        }
+    }
+
+    let payload_structure_bytes = checked_bound_mul(
+        row_group_upper_bound,
+        payload_fixed_per_group,
+        "Columnar payload structure bytes",
+    )?;
+    let validity_per_column =
+        checked_div_ceil(row_upper_bound, 8, "Columnar validity bitmap bytes")?;
+    let validity_bytes = checked_bound_mul(
+        validity_per_column,
+        column_count,
+        "Columnar validity bitmap bytes",
+    )?;
+    let fixed_value_bytes = checked_bound_mul(
+        row_upper_bound,
+        fixed_value_width_sum,
+        "Columnar fixed value bytes",
+    )?;
+    let variable_offset_count = checked_bound_add(
+        row_upper_bound,
+        row_group_upper_bound,
+        "Columnar variable offset count",
+    )?;
+    let variable_offset_bytes = checked_bound_mul(
+        checked_bound_mul(variable_offset_count, 4, "Columnar variable offset bytes")?,
+        variable_column_count,
+        "Columnar variable offset bytes",
+    )?;
+    // Raw Text/Bytes data is a subset of the source scalar payload. Each
+    // group's selected min and max are disjoint-group source values; the same
+    // pair occurs once in its payload block and once in the footer. Thus one
+    // shared source payload budget covers data plus four statistic copies.
+    let variable_payload_and_statistics = if variable_column_count == 0 {
+        0
+    } else {
+        checked_bound_mul(
+            source_scalar_payload_bytes_upper_bound,
+            5,
+            "Columnar variable payload and statistic bytes",
+        )?
+    };
+    let version_bytes = if mode == ColumnarBaseArtifactMode::Incremental {
+        checked_bound_mul(
+            row_upper_bound,
+            VERSION_KEY_BYTES,
+            "Columnar source-version bytes",
+        )?
+    } else {
+        0
+    };
+    let directory_bytes = checked_bound_mul(
+        row_group_upper_bound,
+        directory_fixed_per_group,
+        "Columnar footer directory bytes",
+    )?;
+
+    let mut segment_file_bytes_upper_bound = LAZY_SEGMENT_HEADER_BYTES;
+    for component in [
+        payload_structure_bytes,
+        validity_bytes,
+        fixed_value_bytes,
+        variable_offset_bytes,
+        variable_payload_and_statistics,
+        version_bytes,
+        SEGMENT_FOOTER_FIXED_BYTES,
+        directory_bytes,
+    ] {
+        segment_file_bytes_upper_bound = checked_bound_add(
+            segment_file_bytes_upper_bound,
+            component,
+            "Columnar base segment file bytes",
+        )?;
+    }
+    let segment_write_bytes_upper_bound = checked_bound_add(
+        segment_file_bytes_upper_bound,
+        LAZY_SEGMENT_HEADER_BYTES,
+        "Columnar base segment application-write bytes",
+    )?;
+    let manifest_write_bytes_upper_bound = initial_manifest_write_bound(column_count, mode)?;
+    let total_write_bytes_upper_bound = checked_bound_add(
+        segment_write_bytes_upper_bound,
+        manifest_write_bytes_upper_bound,
+        "Columnar base artifact application-write bytes",
+    )?;
+    Ok(ColumnarBaseArtifactWriteBoundInspection {
+        row_upper_bound,
+        row_group_upper_bound,
+        source_scalar_payload_bytes_upper_bound,
+        segment_file_bytes_upper_bound,
+        segment_write_bytes_upper_bound,
+        manifest_write_bytes_upper_bound,
+        total_write_bytes_upper_bound,
+    })
 }
 
 /// Equality-only identity of one committed read horizon in one physical storage.
@@ -697,7 +1004,7 @@ impl ColumnarProjection {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root).map_err(ColumnarError::Io)?;
         let segment_id = ColumnarSegmentId(generation.0);
-        let segment_file = format!("projection-{}-g{}.nbcs", id.0, generation.0);
+        let segment_file = base_segment_file_name(id, generation);
         let row_groups = rows
             .chunks(group_rows)
             .map(|chunk| encode_row_group(&column_specs, chunk))
@@ -797,7 +1104,7 @@ impl ColumnarProjection {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root).map_err(ColumnarError::Io)?;
         let segment_id = ColumnarSegmentId(generation.0);
-        let segment_file = format!("projection-{}-g{}.nbcs", id.0, generation.0);
+        let segment_file = base_segment_file_name(id, generation);
         let fingerprint = table.fingerprint().map_err(ColumnarError::Schema)?;
         let identity = SegmentIdentity {
             projection_id: id,
@@ -978,7 +1285,7 @@ impl ColumnarProjection {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root).map_err(ColumnarError::Io)?;
         let segment_id = ColumnarSegmentId(generation.0);
-        let segment_file = format!("projection-{}-g{}.nbcs", id.0, generation.0);
+        let segment_file = base_segment_file_name(id, generation);
         let fingerprint = table.fingerprint().map_err(ColumnarError::Schema)?;
         let identity = SegmentIdentity {
             projection_id: id,
@@ -1170,7 +1477,7 @@ impl ColumnarProjection {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(&root).map_err(ColumnarError::Io)?;
         let segment_id = ColumnarSegmentId(generation.0);
-        let segment_file = format!("projection-{}-g{}.nbcs", id.0, generation.0);
+        let segment_file = base_segment_file_name(id, generation);
         let row_groups = rows
             .chunks(group_rows)
             .map(|chunk| encode_versioned_row_group(&column_specs, chunk))
@@ -1831,7 +2138,7 @@ impl ColumnarProjection {
                 .ok_or(ColumnarError::InvalidInput("compacted row count overflow"))
         })?;
         let segment_id = ColumnarSegmentId(generation.0);
-        let segment_file = format!("projection-{}-g{}.nbcs", self.metadata.id.0, generation.0);
+        let segment_file = base_segment_file_name(self.metadata.id, generation);
         let mut metadata = self.metadata.clone();
         metadata.generation = generation;
         metadata.row_count = row_count;
@@ -1931,7 +2238,7 @@ impl ColumnarProjection {
             .first()
             .map_or(DEFAULT_ROW_GROUP_ROWS, |group| group.rows as usize);
         let segment_id = ColumnarSegmentId(generation.0);
-        let segment_file = format!("projection-{}-g{}.nbcs", self.metadata.id.0, generation.0);
+        let segment_file = base_segment_file_name(self.metadata.id, generation);
         let suffix = format!(
             "compact.{}.{}.{}",
             std::process::id(),
@@ -6026,6 +6333,495 @@ mod tests {
             )
             .and_then(|prepared| prepared.publish())
         };
+    }
+
+    fn artifact_bound_source(
+        rows: u64,
+        scalar_payload_bytes: u64,
+    ) -> crate::StoragePhysicalDesignSourceInspection {
+        crate::StoragePhysicalDesignSourceInspection::Heap(
+            crate::HeapPhysicalDesignSourceInspection {
+                storage_id: StorageId(7),
+                visibility_boundary: crate::StorageVisibilityBoundary::new(
+                    StorageId(7),
+                    crate::StorageKind::Heap,
+                    1,
+                )
+                .expect("visibility boundary"),
+                managed_page_upper_bound: 1,
+                row_upper_bound: rows,
+                main_file_bytes_upper_bound: scalar_payload_bytes,
+                index_backfill_page_upper_bound: 1,
+                index_backfill_bytes_upper_bound: scalar_payload_bytes,
+            },
+        )
+    }
+
+    fn actual_initial_artifact_write_bytes(root: &std::path::Path, id: u64) -> u64 {
+        let segment = fs::metadata(root.join(format!("projection-{id}-g1.nbcs")))
+            .expect("segment metadata")
+            .len();
+        let manifest = fs::metadata(root.join(super::MANIFEST_FILE))
+            .expect("manifest metadata")
+            .len();
+        segment + super::LAZY_SEGMENT_HEADER_BYTES + manifest
+    }
+
+    #[test]
+    fn base_artifact_format_sizing_stays_tied_to_production_encoders() {
+        use super::*;
+        assert_eq!(
+            base_segment_file_name(ColumnarProjectionId(u64::MAX), ColumnarGeneration(u64::MAX),)
+                .len() as u64,
+            MAX_BASE_SEGMENT_FILENAME_BYTES
+        );
+        let block = BlockRef {
+            offset: 1,
+            length: 2,
+            checksum: 3,
+        };
+        let mut encoded = Vec::new();
+        encode_block_ref(&mut encoded, block);
+        assert_eq!(encoded.len() as u64, BLOCK_REF_BYTES);
+        for key in [
+            StorageVersionKey::Heap {
+                storage_id: StorageId(7),
+                row_id: RowId {
+                    page: PageId(1),
+                    slot: 2,
+                    generation: 3,
+                },
+            },
+            StorageVersionKey::Lsm {
+                storage_id: StorageId(7),
+                row_id: LsmRowId(1),
+                version: LsmCommitSeq(2),
+            },
+        ] {
+            let mut encoded = Vec::new();
+            encode_version_key(&mut encoded, key, StorageId(7)).expect("version key");
+            assert_eq!(encoded.len() as u64, VERSION_KEY_BYTES);
+        }
+        let header = encode_lazy_segment_header(
+            SegmentIdentity {
+                projection_id: ColumnarProjectionId(1),
+                generation: ColumnarGeneration(1),
+                segment_id: ColumnarSegmentId(1),
+                table_id: TableId(7),
+                storage_id: StorageId(7),
+                fingerprint: SchemaFingerprint::from_bytes([0; 32]),
+            },
+            SnapshotKind::Heap,
+            false,
+            1,
+            0,
+            0,
+            block,
+        )
+        .expect("header");
+        assert_eq!(header.len() as u64, LAZY_SEGMENT_HEADER_BYTES);
+
+        let table = table();
+        let columns = resolve_columns(&table, &[ColumnId(1), ColumnId(4)]).expect("columns");
+        for mode in [
+            ColumnarBaseArtifactMode::Snapshot,
+            ColumnarBaseArtifactMode::Incremental,
+        ] {
+            let incremental = (mode == ColumnarBaseArtifactMode::Incremental).then_some(
+                ColumnarIncrementalMetadata {
+                    stream_generation: ChangeStreamGeneration(1),
+                    base_frontier: StorageDataVersion(0),
+                    applied_frontier: StorageDataVersion(0),
+                    delta_segments: Vec::new(),
+                    delta_mutation_count: 0,
+                    delta_live_row_count: 0,
+                    suppressed_version_count: 0,
+                    delta_bytes: 0,
+                },
+            );
+            let metadata = ColumnarProjectionMetadata {
+                id: ColumnarProjectionId(u64::MAX),
+                generation: ColumnarGeneration(u64::MAX),
+                table_id: table.id,
+                source_storage_id: StorageId(7),
+                source_token: StorageSnapshotToken::heap(StorageId(7), 0),
+                schema_fingerprint: table.fingerprint().expect("fingerprint"),
+                columns: columns.clone(),
+                row_count: 0,
+                row_group_count: 0,
+                segment_count: 1,
+                segment_bytes: LAZY_SEGMENT_HEADER_BYTES + SEGMENT_FOOTER_FIXED_BYTES,
+                incremental,
+            };
+            let filename = base_segment_file_name(
+                ColumnarProjectionId(u64::MAX),
+                ColumnarGeneration(u64::MAX),
+            );
+            let manifest =
+                encode_manifest(&metadata, ColumnarSegmentId(1), &filename, 0).expect("manifest");
+            assert_eq!(
+                manifest.len() as u64,
+                manifest_encoded_bytes(columns.len() as u64, mode, filename.len() as u64)
+                    .expect("manifest size")
+            );
+        }
+    }
+
+    #[test]
+    fn base_artifact_bound_covers_default_group_boundaries_and_actual_header_rewrite() {
+        use super::*;
+        let table = table();
+        let columns = [ColumnId(1), ColumnId(3), ColumnId(4)];
+        for row_count in [0_usize, 1, 255, 256, 257, 512, 513] {
+            let directory = test_directory(&format!("phase36-bound-{row_count}"));
+            let rows = (0..row_count)
+                .map(|row| {
+                    vec![
+                        ScalarValue::Int64(row as i64),
+                        if row % 3 == 0 {
+                            ScalarValue::Null
+                        } else {
+                            ScalarValue::Bool(row % 2 == 0)
+                        },
+                        if row % 5 == 0 {
+                            ScalarValue::Null
+                        } else {
+                            ScalarValue::Text(format!("row-{row}-{}", "x".repeat(row % 37)))
+                        },
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let bound = inspect_columnar_base_artifact_write_bound(
+                &table,
+                artifact_bound_source(row_count as u64, 1 << 20),
+                &columns,
+                ColumnarBaseArtifactMode::Snapshot,
+            )
+            .expect("artifact bound");
+            assert_eq!(
+                bound.row_group_upper_bound,
+                (row_count as u64).div_ceil(256)
+            );
+            assert!(bound.total_write_bytes_upper_bound > 0);
+            build_projection!(
+                &directory,
+                ColumnarProjectionId(36),
+                ColumnarGeneration(1),
+                &table,
+                StorageId(7),
+                StorageSnapshotToken::heap(StorageId(7), 1),
+                &columns,
+                &rows,
+                None,
+            )
+            .expect("publish projection");
+            assert!(
+                actual_initial_artifact_write_bytes(&directory, 36)
+                    <= bound.total_write_bytes_upper_bound
+            );
+            fs::remove_dir_all(directory).expect("remove projection");
+        }
+    }
+
+    #[test]
+    fn base_artifact_incremental_bound_covers_version_blocks_and_overflow_is_typed() {
+        use super::*;
+        let table = table();
+        let columns = [ColumnId(2), ColumnId(4)];
+        let row_count = 257_u64;
+        let snapshot = inspect_columnar_base_artifact_write_bound(
+            &table,
+            artifact_bound_source(row_count, 1 << 20),
+            &columns,
+            ColumnarBaseArtifactMode::Snapshot,
+        )
+        .expect("snapshot bound");
+        let incremental = inspect_columnar_base_artifact_write_bound(
+            &table,
+            artifact_bound_source(row_count, 1 << 20),
+            &columns,
+            ColumnarBaseArtifactMode::Incremental,
+        )
+        .expect("incremental bound");
+        assert!(
+            incremental.segment_file_bytes_upper_bound
+                >= snapshot.segment_file_bytes_upper_bound + row_count * VERSION_KEY_BYTES
+        );
+
+        let directory = test_directory("phase36-incremental-bound");
+        let rows = (0..row_count)
+            .map(|row| {
+                (
+                    StorageVersionKey::Heap {
+                        storage_id: StorageId(7),
+                        row_id: RowId {
+                            page: PageId(row + 1),
+                            slot: 0,
+                            generation: 1,
+                        },
+                    },
+                    vec![
+                        ScalarValue::UInt64(row),
+                        if row % 7 == 0 {
+                            ScalarValue::Null
+                        } else {
+                            ScalarValue::Text(format!("incremental-{row}"))
+                        },
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        ColumnarProjection::prepare_incremental_streaming(
+            &directory,
+            ColumnarProjectionId(37),
+            ColumnarGeneration(1),
+            &table,
+            StorageId(7),
+            StorageSnapshotToken::heap(StorageId(7), 1),
+            ChangeStreamCursor {
+                storage_id: StorageId(7),
+                generation: ChangeStreamGeneration(1),
+                frontier: StorageDataVersion(0),
+            },
+            &columns,
+            rows,
+            None,
+        )
+        .expect("prepare incremental projection")
+        .publish()
+        .expect("publish incremental projection");
+        assert!(
+            actual_initial_artifact_write_bytes(&directory, 37)
+                <= incremental.total_write_bytes_upper_bound
+        );
+        fs::remove_dir_all(directory).expect("remove incremental projection");
+
+        let directory = test_directory("phase36-incremental-lsm-bound");
+        let rows = (0..row_count)
+            .map(|row| {
+                (
+                    StorageVersionKey::Lsm {
+                        storage_id: StorageId(7),
+                        row_id: LsmRowId(row + 1),
+                        version: LsmCommitSeq(row + 1),
+                    },
+                    vec![
+                        ScalarValue::UInt64(row),
+                        if row % 7 == 0 {
+                            ScalarValue::Null
+                        } else {
+                            ScalarValue::Text(format!("lsm-incremental-{row}"))
+                        },
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        ColumnarProjection::prepare_incremental_streaming(
+            &directory,
+            ColumnarProjectionId(37),
+            ColumnarGeneration(1),
+            &table,
+            StorageId(7),
+            StorageSnapshotToken::lsm(StorageId(7), 1, 1),
+            ChangeStreamCursor {
+                storage_id: StorageId(7),
+                generation: ChangeStreamGeneration(1),
+                frontier: StorageDataVersion(0),
+            },
+            &columns,
+            rows,
+            None,
+        )
+        .expect("prepare incremental LSM projection")
+        .publish()
+        .expect("publish incremental LSM projection");
+        assert!(
+            actual_initial_artifact_write_bytes(&directory, 37)
+                <= incremental.total_write_bytes_upper_bound
+        );
+        fs::remove_dir_all(directory).expect("remove incremental LSM projection");
+
+        let error = inspect_columnar_base_artifact_write_bound(
+            &table,
+            artifact_bound_source(u64::MAX, u64::MAX),
+            &[ColumnId(1)],
+            ColumnarBaseArtifactMode::Incremental,
+        )
+        .unwrap_err();
+        assert!(matches!(error, StorageError::ResourceBoundOverflow { .. }));
+    }
+
+    #[test]
+    fn base_artifact_sizing_crosses_block_and_footer_caps_without_allocating_prospective_data() {
+        use super::*;
+        let table = table();
+        let below = inspect_columnar_base_artifact_write_bound(
+            &table,
+            artifact_bound_source(256, MAX_LAZY_BLOCK_BYTES - 1),
+            &[ColumnId(4)],
+            ColumnarBaseArtifactMode::Snapshot,
+        )
+        .expect("below-block-cap bound");
+        let at_cap = inspect_columnar_base_artifact_write_bound(
+            &table,
+            artifact_bound_source(256, MAX_LAZY_BLOCK_BYTES),
+            &[ColumnId(4)],
+            ColumnarBaseArtifactMode::Snapshot,
+        )
+        .expect("at-block-cap bound");
+        assert_eq!(
+            at_cap.total_write_bytes_upper_bound - below.total_write_bytes_upper_bound,
+            5,
+            "one raw variable byte is charged once as data and four times as duplicated min/max"
+        );
+
+        let prospective_groups = MAX_INDEX_BYTES / 64 + 1;
+        let large = inspect_columnar_base_artifact_write_bound(
+            &table,
+            artifact_bound_source(prospective_groups * DEFAULT_ROW_GROUP_ROWS as u64, 0),
+            &[ColumnId(1)],
+            ColumnarBaseArtifactMode::Snapshot,
+        )
+        .expect("large algebraic bound");
+        assert_eq!(large.row_group_upper_bound, prospective_groups);
+        assert!(large.segment_file_bytes_upper_bound > MAX_INDEX_BYTES);
+    }
+
+    #[test]
+    fn fixed_scalar_widths_cover_every_frozen_physical_type() {
+        use super::*;
+        for (physical, width) in [
+            (PhysicalType::Bool, Some(1)),
+            (PhysicalType::Int8, Some(1)),
+            (PhysicalType::Int16, Some(2)),
+            (PhysicalType::Int32, Some(4)),
+            (PhysicalType::Int64, Some(8)),
+            (PhysicalType::Int128, Some(16)),
+            (PhysicalType::UInt8, Some(1)),
+            (PhysicalType::UInt16, Some(2)),
+            (PhysicalType::UInt32, Some(4)),
+            (PhysicalType::UInt64, Some(8)),
+            (PhysicalType::UInt128, Some(16)),
+            (PhysicalType::Float32, Some(4)),
+            (PhysicalType::Float64, Some(8)),
+            (PhysicalType::Text, None),
+            (PhysicalType::Bytes, None),
+        ] {
+            assert_eq!(encoded_fixed_scalar_bytes(physical), width);
+        }
+    }
+
+    #[test]
+    fn base_artifact_bound_covers_all_physical_types_nullability_text_and_bytes() {
+        use super::*;
+        let physical_types = [
+            PhysicalType::Bool,
+            PhysicalType::Int8,
+            PhysicalType::Int16,
+            PhysicalType::Int32,
+            PhysicalType::Int64,
+            PhysicalType::Int128,
+            PhysicalType::UInt8,
+            PhysicalType::UInt16,
+            PhysicalType::UInt32,
+            PhysicalType::UInt64,
+            PhysicalType::UInt128,
+            PhysicalType::Float32,
+            PhysicalType::Float64,
+            PhysicalType::Text,
+            PhysicalType::Bytes,
+        ];
+        let table = TableDef::new(
+            TableId(7),
+            "all_values",
+            physical_types
+                .iter()
+                .enumerate()
+                .map(|(index, physical)| {
+                    ColumnDef::new(
+                        ColumnId(index as u32 + 1),
+                        format!("c{}", index + 1),
+                        TypeSpec::Physical(*physical),
+                    )
+                    .nullable(true)
+                })
+                .collect(),
+        );
+        let non_null = vec![
+            ScalarValue::Bool(true),
+            ScalarValue::Int8(-1),
+            ScalarValue::Int16(-2),
+            ScalarValue::Int32(-3),
+            ScalarValue::Int64(-4),
+            ScalarValue::Int128(-5),
+            ScalarValue::UInt8(1),
+            ScalarValue::UInt16(2),
+            ScalarValue::UInt32(3),
+            ScalarValue::UInt64(4),
+            ScalarValue::UInt128(5),
+            ScalarValue::Float32(Float32Value::from_bits(1.5_f32.to_bits())),
+            ScalarValue::Float64(Float64Value::from_bits(2.5_f64.to_bits())),
+            ScalarValue::Text(format!("long-{}", "x".repeat(16_384))),
+            ScalarValue::Bytes(vec![0, 255, 128, 1, 2, 3]),
+        ];
+        let mut mixed = non_null.clone();
+        for index in (0..mixed.len()).step_by(2) {
+            mixed[index] = ScalarValue::Null;
+        }
+        let mut rows = vec![
+            non_null.clone(),
+            vec![ScalarValue::Null; physical_types.len()],
+            mixed,
+        ];
+        for row in 3..257 {
+            let mut values = non_null.clone();
+            values[13] = ScalarValue::Text(match row {
+                3 => String::new(),
+                4 => "short".to_owned(),
+                _ => format!("text-{row}"),
+            });
+            values[14] = ScalarValue::Bytes(match row {
+                3 => Vec::new(),
+                4 => b"short".to_vec(),
+                5 => vec![0x80; 16_384],
+                _ => vec![0, 0xff, 0x80, row as u8],
+            });
+            if row % 11 == 0 {
+                values[13] = ScalarValue::Null;
+            }
+            if row % 13 == 0 {
+                values[14] = ScalarValue::Null;
+            }
+            rows.push(values);
+        }
+        let columns = (1..=physical_types.len() as u32)
+            .map(ColumnId)
+            .collect::<Vec<_>>();
+        let bound = inspect_columnar_base_artifact_write_bound(
+            &table,
+            artifact_bound_source(rows.len() as u64, 1 << 20),
+            &columns,
+            ColumnarBaseArtifactMode::Snapshot,
+        )
+        .expect("all-type artifact bound");
+        let directory = test_directory("phase36-all-types");
+        build_projection!(
+            &directory,
+            ColumnarProjectionId(38),
+            ColumnarGeneration(1),
+            &table,
+            StorageId(7),
+            StorageSnapshotToken::heap(StorageId(7), 1),
+            &columns,
+            &rows,
+            None,
+        )
+        .expect("all-type projection");
+        assert!(
+            actual_initial_artifact_write_bytes(&directory, 38)
+                <= bound.total_write_bytes_upper_bound
+        );
+        fs::remove_dir_all(directory).expect("remove all-type projection");
     }
 
     #[test]

@@ -90,3 +90,10 @@ MUST be tied to the stated production component; account for work prerequisites
 such as Index empty-tree allocation before backfill. Unknown dimensions MUST
 remain explicit, and arithmetic overflow MUST return a typed error rather than
 saturate or masquerade as an unproven bound.
+
+A Columnar artifact output bound MUST be derived from the production NBC
+encoder/writer and current storage-authored source structure. It MUST include
+repeated application writes actually performed by the writer, including the
+final base-header rewrite. It MUST NOT be represented as device I/O,
+filesystem free space, peak memory, NBPC lifecycle bytes, or whole-mutation
+write cost.

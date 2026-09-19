@@ -141,8 +141,20 @@ A constrained NotProven bound rejects, even at u64::MAX. Equality passes.
 Unconstrained components are outside the policy, never proven safe or zero.
 A policy constraining only Snapshot LSM prerequisite writes is **partial
 component admission**: it says nothing about source traversal or total mutation
-cost. Components are never summed. Output writes, whole-mutation work, CPU,
-memory, filesystem free space, and cumulative quotas are not proven limits.
+cost. Components are never summed. Current initial Snapshot and Incremental
+Columnar builds prove `output_write_bytes` for their one NBCS base plus NBCM,
+including the second NBCS header write. Snapshot LSM also proves
+`source_read_bytes` from the prospective post-flush SSTable extent. Index output
+writes, whole-mutation work, CPU, memory, filesystem free space, and cumulative
+quotas remain unproven.
+
+`AtMost(M)` is conditional on current engine evidence. It is not a permanent
+disable switch: a later engine may prove a component and admit it when the bound
+fits the unchanged maximum. To disable a domain unconditionally, set
+`allow_physical_columnar_apply` false or set the applicable
+`columnar_apply.allow_snapshot` / `allow_incremental` permission false and use
+the required `unadmitted` mode. A policy constraining only Columnar output is
+still partial admission; it does not constrain source, prerequisites or memory.
 
 Manifest parsing and `netbadb inspect` validate configuration, not whether current
 data fits. They perform no mutation-work inspection or source scan and do not

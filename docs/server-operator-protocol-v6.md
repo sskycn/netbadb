@@ -207,7 +207,11 @@ Core recomputes current work immediately before a still-needed mutation.
 
 Constrained NotProven fails closed, equality passes, and unconstrained components
 remain outside the policy. This is partial component admission, not a total cost
-model. The CLI renders exact components and structured failures, correlates a
+model. Current initial Columnar builds provide a storage-authored
+`output_write_bytes` bound; Snapshot LSM source read is also bounded after its
+prospective flush output is included. Index output remains NotProven. These are
+stronger values for existing v6 dimensions, not new fields or policy widening.
+The CLI renders exact components and structured failures, correlates a
 returned receipt, and never retries, relaxes a limit, switches mode, or queries
 receipts automatically. No automatic design, evidence rotation, stream enablement,
 scheduler action, or client transaction-state change is introduced.

@@ -1698,7 +1698,10 @@ fn mutation_work_all_engine_modes_are_repeatable_pure_and_not_recommendation_gat
                 Some(first.table_schema_version),
                 fixture.database.table_schema_version(TABLE_ID)
             );
-            assert_eq!(first.bounds.output_write_bytes, Bound::NotProven);
+            assert!(matches!(
+                first.bounds.output_write_bytes,
+                Bound::Bounded(bytes) if bytes > 0
+            ));
             match first.source {
                 Source::Heap(heap) => {
                     assert!(!lsm);
@@ -1743,7 +1746,13 @@ fn mutation_work_all_engine_modes_are_repeatable_pure_and_not_recommendation_gat
                                 conservative_bound: source.flush_conservative_bound.unwrap()
                             }
                         );
-                        assert_eq!(first.bounds.source_read_bytes, Bound::NotProven);
+                        assert_eq!(
+                            first.bounds.source_read_bytes,
+                            Bound::Bounded(
+                                source.total_sstable_bytes
+                                    + source.flush_conservative_bound.unwrap().write_bytes
+                            )
+                        );
                     } else {
                         assert_eq!(first.prerequisite, Prerequisite::None);
                         assert_eq!(first.bounds.source_read_bytes, Bound::Bounded(0));
@@ -2438,7 +2447,11 @@ mod admission {
             PhysicalColumnarDesignMode::Snapshot,
             PhysicalColumnarDesignMode::Incremental,
         ] {
-            for dimension in [Dimension::SourceWorkUnits, Dimension::SourceReadBytes] {
+            for dimension in [
+                Dimension::SourceWorkUnits,
+                Dimension::SourceReadBytes,
+                Dimension::OutputWriteBytes,
+            ] {
                 let mut fixture = Fixture::create("phase34-heap-columnar", false);
                 fixture.database.enable_change_stream(TABLE_ID).unwrap();
                 let window = evidence_window(&mut fixture);
@@ -2447,10 +2460,11 @@ mod admission {
                     .database
                     .inspect_physical_columnar_design_mutation_work(&candidate(), mode)
                     .unwrap();
-                let n = bound(if dimension == Dimension::SourceWorkUnits {
-                    inspection.bounds.source_work_units
-                } else {
-                    inspection.bounds.source_read_bytes
+                let n = bound(match dimension {
+                    Dimension::SourceWorkUnits => inspection.bounds.source_work_units,
+                    Dimension::SourceReadBytes => inspection.bounds.source_read_bytes,
+                    Dimension::OutputWriteBytes => inspection.bounds.output_write_bytes,
+                    _ => unreachable!(),
                 });
                 let error = columnar_rejection(
                     &mut fixture,
@@ -2459,17 +2473,12 @@ mod admission {
                     constraint(dimension, n - 1),
                 );
                 assert_limit(error, dimension, n, n - 1);
-                let error = columnar_rejection(
-                    &mut fixture,
-                    &window,
-                    &proposal,
-                    constraint(Dimension::OutputWriteBytes, u64::MAX),
-                );
-                assert_unknown(error, Dimension::OutputWriteBytes);
                 let mut limits = constraint(dimension, n).limits();
-                limits.prerequisite_work_units = AtMost(0);
-                limits.prerequisite_read_bytes = AtMost(0);
-                limits.prerequisite_write_bytes = AtMost(0);
+                if dimension != Dimension::OutputWriteBytes {
+                    limits.prerequisite_work_units = AtMost(0);
+                    limits.prerequisite_read_bytes = AtMost(0);
+                    limits.prerequisite_write_bytes = AtMost(0);
+                }
                 activity::take();
                 let report = fixture
                     .database
@@ -2529,11 +2538,13 @@ mod admission {
                 .unwrap();
             let n = bound(inspection.bounds.source_read_bytes);
             assert!(n > 0);
-            for d in [Dimension::SourceWorkUnits, Dimension::OutputWriteBytes] {
-                let error =
-                    columnar_rejection(&mut fixture, &window, &proposal, constraint(d, u64::MAX));
-                assert_unknown(error, d);
-            }
+            let error = columnar_rejection(
+                &mut fixture,
+                &window,
+                &proposal,
+                constraint(Dimension::SourceWorkUnits, u64::MAX),
+            );
+            assert_unknown(error, Dimension::SourceWorkUnits);
             let error = columnar_rejection(
                 &mut fixture,
                 &window,
@@ -2541,7 +2552,16 @@ mod admission {
                 constraint(Dimension::SourceReadBytes, n - 1),
             );
             assert_limit(error, Dimension::SourceReadBytes, n, n - 1);
+            let output = bound(inspection.bounds.output_write_bytes);
+            let error = columnar_rejection(
+                &mut fixture,
+                &window,
+                &proposal,
+                constraint(Dimension::OutputWriteBytes, output - 1),
+            );
+            assert_limit(error, Dimension::OutputWriteBytes, output, output - 1);
             let mut limits = constraint(Dimension::SourceReadBytes, n).limits();
+            limits.output_write_bytes = AtMost(output);
             limits.prerequisite_work_units = AtMost(0);
             limits.prerequisite_read_bytes = AtMost(0);
             limits.prerequisite_write_bytes = AtMost(0);
@@ -2600,14 +2620,30 @@ mod admission {
             else {
                 panic!("flush prerequisite")
             };
-            for d in [
-                Dimension::SourceWorkUnits,
-                Dimension::SourceReadBytes,
-                Dimension::OutputWriteBytes,
+            let error = columnar_rejection(
+                &mut fixture,
+                &window,
+                &proposal,
+                constraint(Dimension::SourceWorkUnits, u64::MAX),
+            );
+            assert_unknown(error, Dimension::SourceWorkUnits);
+            for (d, component) in [
+                (
+                    Dimension::SourceReadBytes,
+                    bound(inspection.bounds.source_read_bytes),
+                ),
+                (
+                    Dimension::OutputWriteBytes,
+                    bound(inspection.bounds.output_write_bytes),
+                ),
             ] {
-                let error =
-                    columnar_rejection(&mut fixture, &window, &proposal, constraint(d, u64::MAX));
-                assert_unknown(error, d);
+                let error = columnar_rejection(
+                    &mut fixture,
+                    &window,
+                    &proposal,
+                    constraint(d, component - 1),
+                );
+                assert_limit(error, d, component, component - 1);
             }
             let n = match dimension {
                 Dimension::PrerequisiteWorkUnits => flush.work_units,
@@ -2629,12 +2665,15 @@ mod admission {
                 assert_eq!(dimension, Dimension::PrerequisiteReadBytes);
             }
             activity::take();
+            let mut limits = constraint(dimension, n).limits();
+            limits.source_read_bytes = AtMost(bound(inspection.bounds.source_read_bytes));
+            limits.output_write_bytes = AtMost(bound(inspection.bounds.output_write_bytes));
             fixture
                 .database
                 .apply_physical_columnar_design_with_admission(
                     &window,
                     &proposal,
-                    constraint(dimension, n),
+                    Admission::new(limits).unwrap(),
                 )
                 .unwrap();
             let actual = activity::take();

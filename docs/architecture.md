@@ -533,6 +533,20 @@ latter is a typed `recovery_required` admission rejection. Both durably reject
 an existing Begin without recovery-gating NBMR. NBMR v3, Native v2, PG wire,
 Inspection JSON v7 and all persistent formats remain unchanged.
 
+[Adaptive Operations Phase 36](adaptive-operations-phase36.md) adds a
+storage-authored upper bound for the initial immutable Columnar base artifact.
+The proof sizes the existing NBCS payload blocks, validity and offsets,
+duplicated zone maps, incremental source-version blocks, footer/block
+references, fixed header and NBCM manifest from current source structure. It
+also charges the production writer's final NBCS header rewrite. Heap derives a
+row upper bound from current page geometry; LSM counts current physical entries
+and reuses the existing flush-output theorem to bound Snapshot's prospective
+post-flush SSTable extent. Inspection remains metadata-only and O(columns) or
+O(SSTables + columns). Columnar output and Snapshot-LSM source read populate the
+existing Phase 34/35 dimensions; Index output and LSM source work remain
+`NotProven`. Manifest v11, NBOP v6, NBMR v3 and every persistent format remain
+unchanged.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

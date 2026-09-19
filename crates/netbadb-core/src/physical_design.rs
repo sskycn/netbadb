@@ -7,11 +7,11 @@ use netbadb_planner::PlanVariant;
 use netbadb_rel::{
     BinaryOp, LogicalQueryShape, QueryColumnShape, QueryExpressionShape, QueryExpressionShapeKind,
 };
-use netbadb_schema::SchemaFingerprint;
+use netbadb_schema::{SchemaFingerprint, TableDef};
 use netbadb_storage::{
-    CheckpointError, LsmMaintenanceAnchor, LsmMaintenanceBoundInspection, StorageError,
-    StorageKind, StoragePhysicalDesignSourceInspection, TableStorage, TransactionError,
-    TxnStatusError,
+    CheckpointError, ColumnarBaseArtifactMode, LsmMaintenanceAnchor, LsmMaintenanceBoundInspection,
+    StorageError, StorageKind, StoragePhysicalDesignSourceInspection, TableStorage,
+    TransactionError, TxnStatusError, inspect_columnar_base_artifact_write_bound,
 };
 use netbadb_types::{
     ChangeStreamGeneration, ColumnId, ColumnarProjectionId, DatabaseCommitSeq, IndexId, IndexName,
@@ -633,8 +633,9 @@ fn incremental_design_source_generation(
 
 fn mutation_source_bounds(
     source: StoragePhysicalDesignSourceInspection,
-    prerequisite: PhysicalColumnarMutationPrerequisiteInspection,
-) -> PhysicalDesignMutationResourceBounds {
+    mode: PhysicalColumnarDesignMode,
+    output_write_bytes: u64,
+) -> Result<PhysicalDesignMutationResourceBounds, StorageError> {
     use PhysicalDesignMutationConservativeBound::{Bounded, NotProven};
     let (source_work_units, source_read_bytes) = match source {
         StoragePhysicalDesignSourceInspection::Heap(heap) => (
@@ -643,21 +644,19 @@ fn mutation_source_bounds(
         ),
         StoragePhysicalDesignSourceInspection::Lsm(lsm) => (
             NotProven,
-            if matches!(
-                prerequisite,
-                PhysicalColumnarMutationPrerequisiteInspection::None
-            ) {
-                Bounded(lsm.total_sstable_bytes)
-            } else {
-                NotProven
-            },
+            Bounded(match mode {
+                PhysicalColumnarDesignMode::Snapshot => {
+                    lsm.prospective_snapshot_sstable_bytes_upper_bound()?
+                }
+                PhysicalColumnarDesignMode::Incremental => lsm.total_sstable_bytes,
+            }),
         ),
     };
-    PhysicalDesignMutationResourceBounds {
+    Ok(PhysicalDesignMutationResourceBounds {
         source_work_units,
         source_read_bytes,
-        output_write_bytes: NotProven,
-    }
+        output_write_bytes: Bounded(output_write_bytes),
+    })
 }
 
 /// Work paid by executions structurally relevant to a candidate. Work can
@@ -1843,7 +1842,7 @@ impl Database {
         &self,
         table_id: TableId,
     ) -> Result<(), PhysicalDesignMutationWorkInspectionError> {
-        let (_, _, storage) = self.mutation_work_source(table_id, &[])?;
+        let (_, _, _, storage) = self.mutation_work_source(table_id, &[])?;
         storage.inject_recovery_required();
         Ok(())
     }
@@ -1874,7 +1873,7 @@ impl Database {
         candidate: PhysicalIndexCandidate,
     ) -> Result<PhysicalIndexDesignMutationWorkInspection, PhysicalDesignMutationWorkInspectionError>
     {
-        let (table_schema_version, table_fingerprint, storage) =
+        let (table_schema_version, table_fingerprint, _, storage) =
             self.mutation_work_source(candidate.table_id, &[candidate.column_id])?;
         if storage.kind() != StorageKind::Heap {
             return Err(PhysicalDesignMutationWorkInspectionError::UnsupportedIndexLayout);
@@ -1916,7 +1915,7 @@ impl Database {
         PhysicalColumnarDesignMutationWorkInspection,
         PhysicalDesignMutationWorkInspectionError,
     > {
-        let (table_schema_version, table_fingerprint, storage) =
+        let (table_schema_version, table_fingerprint, table, storage) =
             self.mutation_work_source(candidate.table_id, &candidate.columns)?;
         if !self.projections.is_managed() {
             return Err(PhysicalDesignMutationWorkInspectionError::DurableCatalogRequired);
@@ -1973,6 +1972,16 @@ impl Database {
             },
             _ => PhysicalColumnarMutationPrerequisiteInspection::None,
         };
+        let artifact = inspect_columnar_base_artifact_write_bound(
+            table,
+            source,
+            &candidate.columns,
+            match mode {
+                PhysicalColumnarDesignMode::Snapshot => ColumnarBaseArtifactMode::Snapshot,
+                PhysicalColumnarDesignMode::Incremental => ColumnarBaseArtifactMode::Incremental,
+            },
+        )
+        .map_err(DatabaseError::from)?;
         Ok(PhysicalColumnarDesignMutationWorkInspection {
             candidate: candidate.clone(),
             mode,
@@ -1982,7 +1991,8 @@ impl Database {
             storage_id: storage.storage_id(),
             source,
             prerequisite,
-            bounds: mutation_source_bounds(source, prerequisite),
+            bounds: mutation_source_bounds(source, mode, artifact.total_write_bytes_upper_bound)
+                .map_err(DatabaseError::from)?,
         })
     }
 
@@ -1991,7 +2001,12 @@ impl Database {
         table_id: TableId,
         columns: &[ColumnId],
     ) -> Result<
-        (TableSchemaVersion, SchemaFingerprint, &TableStorage),
+        (
+            TableSchemaVersion,
+            SchemaFingerprint,
+            &TableDef,
+            &TableStorage,
+        ),
         PhysicalDesignMutationWorkInspectionError,
     > {
         use PhysicalDesignMutationWorkInspectionError as WorkError;
@@ -2038,6 +2053,7 @@ impl Database {
         Ok((
             version,
             table.fingerprint().map_err(DatabaseError::from)?,
+            table,
             storage,
         ))
     }

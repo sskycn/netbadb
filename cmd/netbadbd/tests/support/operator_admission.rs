@@ -4,7 +4,9 @@ mod phase35 {
     use netbadb_core::{DatabaseCoordinatorConfig, TableStorageCreateSpec};
     use netbadb_server::{
         OperatorClientError, OperatorErrorCodeV6, OperatorPhysicalColumnarDesignModeV6 as Mode,
+        OperatorPhysicalDesignMutationAdmissionDimensionV6 as AdmissionDimension,
         OperatorPhysicalDesignMutationAdmissionModeV6 as Admission,
+        OperatorPhysicalDesignMutationAdmissionRejectionV6 as AdmissionRejection,
         OperatorPhysicalDesignMutationReceiptOutcomeV6 as ReceiptOutcome,
     };
     use serde_json::json;
@@ -91,7 +93,7 @@ mod phase35 {
         source["operator"]["allow_physical_design_receipt_read"] = json!(true);
         source["operator"]["physical_index_admission"] = policy("source_read_bytes", 0);
         source["operator"]["physical_columnar_snapshot_admission"] =
-            policy("output_write_bytes", u64::MAX);
+            policy("output_write_bytes", 0);
         source["operator"]["physical_columnar_incremental_admission"] =
             policy("source_read_bytes", u64::MAX);
         let manifest = directory.join("server.json");
@@ -186,7 +188,10 @@ mod phase35 {
             }
         }
     }
-    fn rejected(error: OperatorClientError, operator: &ServerOperatorClient<'_>) {
+    fn rejected(
+        error: OperatorClientError,
+        operator: &ServerOperatorClient<'_>,
+    ) -> AdmissionRejection {
         let OperatorClientError::Remote(remote) = error else {
             panic!("definite rejection")
         };
@@ -194,7 +199,7 @@ mod phase35 {
             remote.code,
             OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected
         );
-        assert!(remote.admission.is_some());
+        let admission = remote.admission.unwrap();
         let reference = remote.receipt.unwrap();
         let page = operator
             .physical_design_mutation_receipts(None, 128)
@@ -206,6 +211,7 @@ mod phase35 {
             .find(|r| r.receipt.receipt_id == reference.receipt_id)
             .unwrap();
         assert_eq!(receipt.outcome, ReceiptOutcome::Rejected);
+        admission
     }
 
     fn run(postgres: bool) {
@@ -242,13 +248,13 @@ mod phase35 {
         );
         let old_token = design.physical_index_apply.runtime_token.unwrap();
         let epoch = design.evidence.epoch;
-        rejected(
+        let _ = rejected(
             operator
                 .apply_physical_index(old_token.clone(), epoch, 1, 2, "by_category")
                 .unwrap_err(),
             &operator,
         );
-        rejected(
+        let columnar_rejection = rejected(
             operator
                 .apply_physical_columnar(
                     old_token.clone(),
@@ -261,6 +267,14 @@ mod phase35 {
                 .unwrap_err(),
             &operator,
         );
+        assert!(matches!(
+            columnar_rejection,
+            AdmissionRejection::LimitExceeded {
+                dimension: AdmissionDimension::OutputWriteBytes,
+                conservative_bound,
+                maximum: 0,
+            } if conservative_bound > 0
+        ));
         assert_eq!(
             operator.status().unwrap().physical_design.unwrap().evidence,
             design.evidence

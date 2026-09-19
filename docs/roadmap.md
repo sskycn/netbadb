@@ -11,6 +11,26 @@ subprocess recovery-interruption regressions, retaining the prior
 planner or writer-concurrency expansion is included. Real power-loss, hardware
 torn-write and network-filesystem validation remain separate work.
 
+## Columnar artifact output bounds (Adaptive Operations Phase 36 complete)
+
+- added storage-authored, metadata-only sizing for one initial NBCS base and
+  NBCM manifest, including payloads, validity, offsets, duplicate zone maps,
+  source-version keys, footer/header/checksums and the final header rewrite;
+- derived Heap row/payload bounds from current validated file geometry and LSM
+  row/payload bounds from current physical entries and resident/persistent bytes;
+- reused the existing LSM flush-output theorem to bound the prospective
+  post-flush SSTable extent, making nonempty Snapshot source reads proven while
+  keeping its prerequisite components separate;
+- populated the existing Columnar output admission dimension for Heap/LSM
+  Snapshot and Incremental builds, with equality/one-below Core and NBOP
+  regressions; Index output and LSM source work remain unproven;
+- retained Manifest v11, NBOP v6, NBMR v3 and every database persistent format.
+
+Still deferred are Index output-write bounds, Columnar peak-memory bounds,
+whole-mutation cost, CPU/time, filesystem capacity, cumulative quotas and
+automatic Physical Design. See
+[`adaptive-operations-phase36.md`](adaptive-operations-phase36.md).
+
 ## Operator component admission (Adaptive Operations Phase 35 complete)
 
 - Manifest v11 requires three independent explicit operator admission modes and
@@ -23,10 +43,10 @@ torn-write and network-filesystem validation remain separate work.
 - retained coarse NBMR v3 Rejected receipts and uncertainty/recovery semantics,
   independent programmatic authority, Native/PG parity and explicit-only apply.
 
-External component admission is complete. Whole-mutation work bounds,
-output-write bounds, memory limits, CPU limits, filesystem free-space limits,
-cumulative quotas and automatic design remain deferred. Phase36 should first
-justify a new storage-authored bound before extending policy. See
+External component admission is complete. Phase 36 now supplies the initial
+Columnar output-write bound without changing the policy schema. Whole-mutation
+work, Index output writes, memory limits, CPU limits, filesystem free-space
+limits, cumulative quotas and automatic design remain deferred. See
 [`adaptive-operations-phase35.md`](adaptive-operations-phase35.md).
 
 ## Component mutation admission (Adaptive Operations Phase 34 complete)

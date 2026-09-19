@@ -148,6 +148,9 @@ pub struct HeapPhysicalDesignSourceInspection {
     /// All managed pages, including access-method/catalog/free pages that the
     /// production sequential scan validates and skips. No row-count claim.
     pub managed_page_upper_bound: u64,
+    /// Maximum rows a valid production scan could emit from the current page
+    /// geometry. This is deliberately not a current live-row count.
+    pub row_upper_bound: u64,
     /// Full aligned main-file extent, including its header. A format-level
     /// source footprint, not device I/O, cache misses, or elapsed time.
     pub main_file_bytes_upper_bound: u64,
@@ -178,6 +181,33 @@ pub struct LsmPhysicalDesignSourceInspection {
     /// Existing production flush theorem. None means precisely an empty
     /// MemTable (no flush output), not an unknown or zero resource bound.
     pub flush_conservative_bound: Option<crate::LsmMaintenanceBoundInspection>,
+}
+
+impl LsmPhysicalDesignSourceInspection {
+    /// Physical versions and tombstones are included, so visible rows can only
+    /// be fewer than this current structural bound.
+    pub fn row_upper_bound(self) -> Result<u64, StorageError> {
+        self.sstable_entry_count
+            .checked_add(self.memtable_entry_count)
+            .ok_or(StorageError::ResourceBoundOverflow {
+                resource: "LSM source row",
+            })
+    }
+
+    /// Bounds the persistent SSTable extent that Snapshot capture can scan
+    /// after its ordinary pre-scan flush. The existing flush theorem describes
+    /// the one newly added SSTable; that flush performs no compaction.
+    pub fn prospective_snapshot_sstable_bytes_upper_bound(self) -> Result<u64, StorageError> {
+        match self.flush_conservative_bound {
+            None => Ok(self.total_sstable_bytes),
+            Some(flush) => self
+                .total_sstable_bytes
+                .checked_add(flush.write_bytes)
+                .ok_or(StorageError::ResourceBoundOverflow {
+                    resource: "prospective Snapshot LSM SSTable bytes",
+                }),
+        }
+    }
 }
 
 /// Runtime observation of the current source; not durable mutation permission.

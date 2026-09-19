@@ -188,6 +188,11 @@ approval and typed diagnostics. It should preserve same-command freshness,
 no-op precedence and Begin ordering, and must not reinterpret the currently
 unproven source/output dimensions as whole-mutation bounds.
 
+Phase 36 later supplies stronger evidence to these unchanged six dimensions:
+initial Columnar `OutputWriteBytes` and nonempty Snapshot-LSM
+`SourceReadBytes` become bounded. Comparison order, no-op precedence,
+same-command freshness and independent-component semantics do not change.
+
 ## Regression coverage and validation
 
 Policy tests cover constructor boundaries, deterministic first failure, zero

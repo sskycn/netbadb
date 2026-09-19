@@ -2729,6 +2729,20 @@ impl HeapStorage {
         let index_pages = pages
             .checked_add(pre_scan_growth)
             .ok_or(StorageError::CountOverflow)?;
+        let managed_page_upper_bound = pages
+            .checked_sub(FIRST_MANAGED_PAGE.0)
+            .ok_or(StorageError::CountOverflow)?;
+        // A valid page cannot represent more slots than fit in its slot
+        // directory. Counting every representable slot as live is deliberately
+        // looser than decoding current pages and remains valid for every page
+        // kind the sequential scan may encounter.
+        let maximum_slots_per_page = u64::try_from((PAGE_SIZE - PAGE_HEADER_SIZE) / SLOT_SIZE)
+            .map_err(|_| StorageError::CountOverflow)?;
+        let row_upper_bound = managed_page_upper_bound
+            .checked_mul(maximum_slots_per_page)
+            .ok_or(StorageError::ResourceBoundOverflow {
+                resource: "Heap source row",
+            })?;
         // scan_columns_with_view visits exactly FIRST_MANAGED_PAGE..page_count.
         // Allocation extends the file before publishing page_count; tail reclaim
         // updates both. validated_page_count rejects misalignment and disagreement.
@@ -2739,9 +2753,8 @@ impl HeapStorage {
                 crate::StorageKind::Heap,
                 self.current_commit_seq().0,
             )?,
-            managed_page_upper_bound: pages
-                .checked_sub(FIRST_MANAGED_PAGE.0)
-                .ok_or(StorageError::CountOverflow)?,
+            managed_page_upper_bound,
+            row_upper_bound,
             main_file_bytes_upper_bound: pages
                 .checked_mul(PAGE_SIZE as u64)
                 .ok_or(StorageError::CountOverflow)?,
@@ -3922,6 +3935,12 @@ mod tests {
             3 * crate::PAGE_SIZE as u64
         );
         assert_eq!(empty.managed_page_upper_bound, 2);
+        let maximum_slots_per_page =
+            ((crate::PAGE_SIZE - crate::PAGE_HEADER_SIZE) / crate::SLOT_SIZE) as u64;
+        assert_eq!(
+            empty.row_upper_bound,
+            empty.managed_page_upper_bound * maximum_slots_per_page
+        );
         storage.analyze().unwrap();
         let stale_statistics = storage.table_statistics;
         let mut transaction = storage.begin_transaction().unwrap();
@@ -3943,6 +3962,10 @@ mod tests {
         drop(transaction);
         let grown = storage.inspect_physical_design_source().unwrap();
         assert!(grown.managed_page_upper_bound > empty.managed_page_upper_bound);
+        assert_eq!(
+            grown.row_upper_bound,
+            grown.managed_page_upper_bound * maximum_slots_per_page
+        );
         assert_eq!(storage.table_statistics, stale_statistics);
         activity::take();
         let index = storage.create_index(ColumnId(2)).unwrap();

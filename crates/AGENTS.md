@@ -70,6 +70,12 @@ dimension is explicitly outside the policy and MUST NOT be described as proven
 safe or zero. Component bounds MUST NOT be summed into an unproven whole-
 mutation budget.
 
+Physical Design Columnar output admission consumes only the fresh
+storage-authored initial base-artifact write bound. Index output remains
+`NotProven` until a separate BTree/WAL/catalog writer theorem exists. Improving
+a previously unproven component creates neither a new admission dimension nor
+a reusable permit.
+
 ## Library quality
 
 - Public types MUST have stable, documented invariants and domain-specific

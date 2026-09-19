@@ -140,6 +140,12 @@ NotProven component (especially output writes or whole-mutation work), before
 extending policy. Memory/CPU/free-space limits, cumulative quotas and automatic
 design remain deferred. No blanket safety claim follows from partial admission.
 
+Phase 36 later proves initial Columnar `output_write_bytes` and prospective
+Snapshot-LSM `source_read_bytes` under the same Manifest v11/NBOP v6 contract.
+An existing `AtMost` policy may therefore admit a build that this historical
+phase reported as `RequiredBoundNotProven`; configured maxima are not widened.
+Index output remains unproven.
+
 ## Implementation audit
 
 The actual starting HEAD and fetched origin/main were both

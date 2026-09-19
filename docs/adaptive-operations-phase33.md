@@ -199,6 +199,11 @@ upper bound. It must not approve a mutation based on an unproven required
 dimension, or mistake a per-component source bound for a whole-mutation bound.
 Phase 33 introduces no mutation admission policy.
 
+Phase 36 later strengthens this current evidence without rewriting the Phase 33
+contract: initial Columnar output writes become proven, and nonempty Snapshot
+LSM source bytes use the existing flush-output theorem to bound the prospective
+post-flush SSTable extent. Index output and LSM source work remain unproven.
+
 ## Validation and audit notes
 
 The final frozen implementation passed all commands below. The full workspace

@@ -31,12 +31,13 @@ pub use change_stream::{
     lsm_change_log_path, validate_change_log_file,
 };
 pub use columnar::{
-    ColumnarBatch, ColumnarBatchColumn, ColumnarColumnSpec, ColumnarColumnStatistics,
-    ColumnarConstraint, ColumnarDeltaSegmentMetadata, ColumnarError, ColumnarIncrementalMetadata,
-    ColumnarProjection, ColumnarProjectionMetadata, ColumnarRepresentationStatistics,
-    ColumnarRowGroupStatistics, ColumnarScanStatistics, ColumnarVector, PreparedColumnarAdvance,
-    PreparedColumnarProjection, StorageSnapshotToken, cleanup_unpublished_projection_build,
-    columnar_projection_manifest_exists,
+    ColumnarBaseArtifactMode, ColumnarBaseArtifactWriteBoundInspection, ColumnarBatch,
+    ColumnarBatchColumn, ColumnarColumnSpec, ColumnarColumnStatistics, ColumnarConstraint,
+    ColumnarDeltaSegmentMetadata, ColumnarError, ColumnarIncrementalMetadata, ColumnarProjection,
+    ColumnarProjectionMetadata, ColumnarRepresentationStatistics, ColumnarRowGroupStatistics,
+    ColumnarScanStatistics, ColumnarVector, PreparedColumnarAdvance, PreparedColumnarProjection,
+    StorageSnapshotToken, cleanup_unpublished_projection_build,
+    columnar_projection_manifest_exists, inspect_columnar_base_artifact_write_bound,
 };
 pub use heap::{
     HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, HistoricalOrphanAdoptionReport,
@@ -676,6 +677,9 @@ pub enum StorageError {
         column_id: netbadb_types::ColumnId,
     },
     CountOverflow,
+    ResourceBoundOverflow {
+        resource: &'static str,
+    },
     RowNotFound {
         row_id: netbadb_types::RowId,
     },
@@ -777,6 +781,9 @@ impl fmt::Display for StorageError {
                 write!(formatter, "table has no column with ID {}", column_id.0)
             }
             Self::CountOverflow => formatter.write_str("exact presence count overflowed u128"),
+            Self::ResourceBoundOverflow { resource } => {
+                write!(formatter, "{resource} conservative bound overflowed u64")
+            }
             Self::RowNotFound { row_id } => write!(
                 formatter,
                 "row at page {}, slot {}, generation {} does not exist",
