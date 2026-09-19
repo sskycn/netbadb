@@ -516,8 +516,18 @@ No-op results bypass admission. The immutable policy travels in one worker
 command; NBMR Begin remains first and admission/inspection rejection writes
 terminal `Rejected`. Existing mutation uncertainty and Columnar recovery priority
 remain unchanged. Manifest v10, NBOP v5, NBMR v3, CLI/daemon, database wire and
-persistent formats gain no admission surface. Deployment/operator externalization
-is reserved for a separately versioned Phase 35 contract.
+persistent formats gained no admission surface in Phase 34.
+
+[Adaptive Operations Phase 35](adaptive-operations-phase35.md) adds operator
+component mutation admission through Manifest v11 and NBOP v6. Three required,
+independent Index/Snapshot/Incremental modes select explicit unadmitted behavior
+or a Core-validated six-component policy. The sole worker owns the immutable
+deployment modes; approved requests carry no budget or inspection and remain
+one command. Core recomputes current bounds only after no-op/stale/advisor
+checks. Status presents exact configured constraints; typed rejection diagnostics
+expose no private inspection errors. NBMR Begin/Rejected/uncertainty semantics
+and programmatic per-call authority remain intact. NBMR v3, Native v2, PG wire,
+Inspection JSON v7 and all persistent formats remain unchanged.
 
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta

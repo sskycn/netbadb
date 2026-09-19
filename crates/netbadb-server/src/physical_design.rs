@@ -1,3 +1,6 @@
+use crate::operator::{
+    ServerOperatorMutationAdmissions, ServerOperatorPhysicalDesignMutationAdmission,
+};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -1402,8 +1405,17 @@ impl TestPostApplyFailure {
     }
 }
 
+/// Final immutable startup settings shared by the Native and PostgreSQL workers.
+pub(crate) struct ServerPhysicalDesignStartupConfig {
+    pub(crate) advisor: ServerPhysicalDesignAdvisorConfig,
+    pub(crate) columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,
+    pub(crate) mutation_receipts: Option<ServerPhysicalDesignMutationReceiptConfig>,
+    pub(crate) operator_admissions: ServerOperatorMutationAdmissions,
+}
+
 /// Independent runtime owned beside, never inside, the adaptive runtime.
 pub(crate) struct ServerPhysicalDesignRuntime {
+    operator_admissions: ServerOperatorMutationAdmissions,
     identity: Arc<ServerPhysicalDesignRuntimeIdentity>,
     evidence: PhysicalDesignEvidenceWindow,
     policy: PhysicalDesignAdvisorPolicy,
@@ -1415,6 +1427,20 @@ pub(crate) struct ServerPhysicalDesignRuntime {
 }
 
 impl ServerPhysicalDesignRuntime {
+    pub(crate) fn from_startup(
+        config: ServerPhysicalDesignStartupConfig,
+        database: &Database,
+    ) -> Result<Self, ServerPhysicalDesignMutationReceiptStartupError> {
+        let mut runtime = Self::new_with_mutation_receipts(
+            config.advisor,
+            config.columnar_apply,
+            config.mutation_receipts,
+            database,
+        )?;
+        runtime.operator_admissions = config.operator_admissions;
+        Ok(runtime)
+    }
+
     #[cfg(test)]
     pub(crate) fn new(config: ServerPhysicalDesignAdvisorConfig) -> Self {
         Self::new_with_columnar(config, None)
@@ -1425,6 +1451,7 @@ impl ServerPhysicalDesignRuntime {
         columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,
     ) -> Self {
         Self {
+            operator_admissions: ServerOperatorMutationAdmissions::UNADMITTED,
             identity: Arc::new(ServerPhysicalDesignRuntimeIdentity),
             evidence: PhysicalDesignEvidenceWindow::new(config.evidence_limits()),
             policy: config.advisor_policy(),
@@ -2163,9 +2190,19 @@ impl ServerPhysicalDesignRuntime {
                     return Err(ServerPhysicalDesignControlError::Proposal(Box::new(error)));
                 }
             };
-        let report = database
-            .apply_physical_index_design(&self.evidence, &proposal, index_name.clone())
-            .map_err(|error| ServerPhysicalDesignControlError::Apply(Box::new(error)))?;
+        let report = match self.operator_admissions.index {
+            ServerOperatorPhysicalDesignMutationAdmission::Unadmitted => database
+                .apply_physical_index_design(&self.evidence, &proposal, index_name.clone())
+                .map_err(|error| ServerPhysicalDesignControlError::Apply(Box::new(error))),
+            ServerOperatorPhysicalDesignMutationAdmission::ComponentLimits(policy) => database
+                .apply_physical_index_design_with_admission(
+                    &self.evidence,
+                    &proposal,
+                    index_name.clone(),
+                    policy,
+                )
+                .map_err(ServerPhysicalDesignControlError::from),
+        }?;
         let outcome = match report.outcome {
             PhysicalIndexDesignApplyOutcome::Created { index_id } => {
                 ServerApprovedPhysicalIndexApplyOutcome::Created { index_id }
@@ -2326,9 +2363,18 @@ impl ServerPhysicalDesignRuntime {
                 ));
             }
         };
-        let report = database
-            .apply_physical_columnar_design(&self.evidence, &proposal)
-            .map_err(|error| ServerPhysicalColumnarDesignControlError::Apply(Box::new(error)))?;
+        let admission = match mode {
+            PhysicalColumnarDesignMode::Snapshot => self.operator_admissions.snapshot,
+            PhysicalColumnarDesignMode::Incremental => self.operator_admissions.incremental,
+        };
+        let report = match admission {
+            ServerOperatorPhysicalDesignMutationAdmission::Unadmitted => database
+                .apply_physical_columnar_design(&self.evidence, &proposal)
+                .map_err(|error| ServerPhysicalColumnarDesignControlError::Apply(Box::new(error))),
+            ServerOperatorPhysicalDesignMutationAdmission::ComponentLimits(policy) => database
+                .apply_physical_columnar_design_with_admission(&self.evidence, &proposal, policy)
+                .map_err(ServerPhysicalColumnarDesignControlError::from),
+        }?;
         let outcome = match report.outcome {
             PhysicalColumnarDesignApplyOutcome::Created { projection_id } => {
                 ServerApprovedPhysicalColumnarApplyOutcome::Created { projection_id }
@@ -2888,7 +2934,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nbop_no_journal_columnar_projection_catalog_recovery_preserves_restart_guidance() {
-        use crate::operator::{OperatorClientError, OperatorErrorCodeV5};
+        use crate::operator::{OperatorClientError, OperatorErrorCodeV6};
 
         let error = nbop_no_journal_post_apply_error(
             true,
@@ -2899,7 +2945,7 @@ mod tests {
         };
         assert_eq!(
             remote.code,
-            OperatorErrorCodeV5::PhysicalColumnarRecoveryRequired
+            OperatorErrorCodeV6::PhysicalColumnarRecoveryRequired
         );
         let wire = serde_json::to_value(&remote).unwrap();
         assert_eq!(wire["code"], "physical_columnar_recovery_required");
@@ -3021,7 +3067,7 @@ mod tests {
         failure: TestPostApplyFailure,
     ) -> crate::operator::OperatorClientError {
         use crate::operator::{
-            OperatorListenerPolicy, OperatorPhysicalColumnarDesignModeV5,
+            OperatorListenerPolicy, OperatorPhysicalColumnarDesignModeV6,
             OperatorPhysicalDesignRuntimeToken, ServerOperatorClient, ServerOperatorConfig,
             serve_operator_connection_with_capabilities,
         };
@@ -3084,7 +3130,7 @@ mod tests {
                         epoch,
                         TABLE_ID.0,
                         vec![1],
-                        OperatorPhysicalColumnarDesignModeV5::Snapshot,
+                        OperatorPhysicalColumnarDesignModeV6::Snapshot,
                         "ambiguous",
                     )
                     .unwrap_err()
@@ -3111,7 +3157,7 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_nbop_no_journal_ambiguity(columnar: bool, failure: TestPostApplyFailure) {
-        use crate::operator::{OperatorClientError, OperatorErrorCodeV5};
+        use crate::operator::{OperatorClientError, OperatorErrorCodeV6};
 
         let error = nbop_no_journal_post_apply_error(columnar, failure);
         let OperatorClientError::MutationOutcomeUncertain {
@@ -3127,7 +3173,7 @@ mod tests {
         };
         assert_eq!(
             remote.code,
-            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
+            OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain
         );
         let wire = serde_json::to_value(&remote).unwrap();
         assert_eq!(wire["code"], "physical_design_mutation_outcome_uncertain");
@@ -5094,13 +5140,13 @@ mod tests {
             evidence_epoch,
             TABLE_ID.0
         );
-        let mut frame = b"NBOP\0\x05\0\0".to_vec();
+        let mut frame = b"NBOP\0\x06\0\0".to_vec();
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload.as_bytes());
         client.write_all(&frame).unwrap();
         let mut header = [0_u8; 12];
         client.read_exact(&mut header).unwrap();
-        assert_eq!(&header[..8], b"NBOP\0\x05\0\0");
+        assert_eq!(&header[..8], b"NBOP\0\x06\0\0");
         let length = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
         let mut response = vec![0_u8; length];
         client.read_exact(&mut response).unwrap();
@@ -5687,4 +5733,5 @@ mod tests {
             }
         }
     }
+    include!("physical_design_operator_admission_tests.rs");
 }

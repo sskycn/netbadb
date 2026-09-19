@@ -15,7 +15,9 @@ use netbadb_core::{
     PhysicalColumnarRecommendationInspection, PhysicalDesignAdvisorError,
     PhysicalDesignAdvisorReport, PhysicalDesignCandidateDecision,
     PhysicalDesignEvidenceRecordError, PhysicalDesignEvidenceRecordOutcome,
-    PhysicalDesignEvidenceSummary, PhysicalDesignNoActionReason, PhysicalIndexCandidate,
+    PhysicalDesignEvidenceSummary, PhysicalDesignMutationAdmissionConstraint,
+    PhysicalDesignMutationAdmissionDimension, PhysicalDesignMutationAdmissionError,
+    PhysicalDesignMutationAdmissionPolicy, PhysicalDesignNoActionReason, PhysicalIndexCandidate,
     PhysicalIndexDesignApplyError, PhysicalIndexDesignProposalError,
     PhysicalIndexRecommendationInspection, ProjectionCatalogError,
 };
@@ -42,7 +44,7 @@ use crate::{
     ServerPhysicalDesignMutationSource, ServerPhysicalDesignMutationTarget,
 };
 
-pub const OPERATOR_PROTOCOL_VERSION: u16 = 5;
+pub const OPERATOR_PROTOCOL_VERSION: u16 = 6;
 pub const MAX_OPERATOR_PAYLOAD_BYTES: u32 = 64 * 1024;
 
 const OPERATOR_MAGIC: [u8; 4] = *b"NBOP";
@@ -105,6 +107,32 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+/// Immutable deployment authority for one local operator mutation domain.
+/// `Unadmitted` selects the existing apply API; it is not an unconstrained policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerOperatorPhysicalDesignMutationAdmission {
+    Unadmitted,
+    ComponentLimits(PhysicalDesignMutationAdmissionPolicy),
+}
+
+/// Resolved once from the manifest and copied unchanged to the worker and status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServerOperatorMutationAdmissions {
+    pub(crate) index: ServerOperatorPhysicalDesignMutationAdmission,
+    pub(crate) snapshot: ServerOperatorPhysicalDesignMutationAdmission,
+    pub(crate) incremental: ServerOperatorPhysicalDesignMutationAdmission,
+}
+
+impl ServerOperatorMutationAdmissions {
+    // Used for runtimes without an operator and explicitly unadmitted test fixtures.
+    // A present manifest operator must supply every mode; it never uses this fallback.
+    pub(crate) const UNADMITTED: Self = Self {
+        index: ServerOperatorPhysicalDesignMutationAdmission::Unadmitted,
+        snapshot: ServerOperatorPhysicalDesignMutationAdmission::Unadmitted,
+        incremental: ServerOperatorPhysicalDesignMutationAdmission::Unadmitted,
+    };
+}
+
 /// Runtime-ready local operator configuration resolved from the deployment
 /// manifest. The socket path is absolute and its parent already exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +142,7 @@ pub struct ServerOperatorConfig {
     allow_physical_index_apply: bool,
     allow_physical_columnar_apply: bool,
     allow_physical_design_receipt_read: bool,
+    pub(crate) admissions: ServerOperatorMutationAdmissions,
 }
 
 impl ServerOperatorConfig {
@@ -142,12 +171,31 @@ impl ServerOperatorConfig {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_receipt_read(
         unix_socket: PathBuf,
         io_timeout: Duration,
         allow_physical_index_apply: bool,
         allow_physical_columnar_apply: bool,
         allow_physical_design_receipt_read: bool,
+    ) -> Result<Self, ServerOperatorConfigError> {
+        Self::new_with_admission(
+            unix_socket,
+            io_timeout,
+            allow_physical_index_apply,
+            allow_physical_columnar_apply,
+            allow_physical_design_receipt_read,
+            ServerOperatorMutationAdmissions::UNADMITTED,
+        )
+    }
+
+    pub(crate) fn new_with_admission(
+        unix_socket: PathBuf,
+        io_timeout: Duration,
+        allow_physical_index_apply: bool,
+        allow_physical_columnar_apply: bool,
+        allow_physical_design_receipt_read: bool,
+        admissions: ServerOperatorMutationAdmissions,
     ) -> Result<Self, ServerOperatorConfigError> {
         if io_timeout.is_zero() {
             return Err(ServerOperatorConfigError::ZeroIoTimeout);
@@ -158,6 +206,7 @@ impl ServerOperatorConfig {
             allow_physical_index_apply,
             allow_physical_columnar_apply,
             allow_physical_design_receipt_read,
+            admissions,
         })
     }
 
@@ -185,6 +234,24 @@ impl ServerOperatorConfig {
     pub const fn allow_physical_design_receipt_read(&self) -> bool {
         self.allow_physical_design_receipt_read
     }
+    #[must_use]
+    pub const fn physical_index_admission(&self) -> ServerOperatorPhysicalDesignMutationAdmission {
+        self.admissions.index
+    }
+
+    #[must_use]
+    pub const fn physical_columnar_snapshot_admission(
+        &self,
+    ) -> ServerOperatorPhysicalDesignMutationAdmission {
+        self.admissions.snapshot
+    }
+
+    #[must_use]
+    pub const fn physical_columnar_incremental_admission(
+        &self,
+    ) -> ServerOperatorPhysicalDesignMutationAdmission {
+        self.admissions.incremental
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,21 +271,21 @@ impl Error for ServerOperatorConfigError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorAdaptiveModeV5 {
+pub enum OperatorAdaptiveModeV6 {
     FeedbackOnly,
     Driven,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorEvidencePoolHealthV5 {
+pub enum OperatorEvidencePoolHealthV6 {
     Healthy,
     RotationRecommended,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorEvidenceRecordOutcomeV5 {
+pub enum OperatorEvidenceRecordOutcomeV6 {
     Recorded,
     SchemaRotated,
     RecordedWithCapacityRejection,
@@ -227,7 +294,7 @@ pub enum OperatorEvidenceRecordOutcomeV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorEvidenceRecordErrorV5 {
+pub enum OperatorEvidenceRecordErrorV6 {
     GlobalVisibilityRequired,
     StaleSchemaEvidence,
     OutOfOrderVisibility,
@@ -240,7 +307,7 @@ pub enum OperatorEvidenceRecordErrorV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorSchedulerDelayClassV5 {
+pub enum OperatorSchedulerDelayClassV6 {
     Normal,
     Idle,
     NoProgress,
@@ -248,7 +315,7 @@ pub enum OperatorSchedulerDelayClassV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorEvidenceRenewalReasonV5 {
+pub enum OperatorEvidenceRenewalReasonV6 {
     ColumnarPhysicalStateChanged,
     ColumnarEligibilityChanged,
     AuthoritativeLsmLayoutChanged,
@@ -256,7 +323,7 @@ pub enum OperatorEvidenceRenewalReasonV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorSchedulerFaultV5 {
+pub enum OperatorSchedulerFaultV6 {
     MaintenanceEnvelopeExceeded,
     StepFailed,
     ConsumptionOverflow,
@@ -264,9 +331,9 @@ pub enum OperatorSchedulerFaultV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OperatorSchedulerGateV5 {
+pub enum OperatorSchedulerGateV6 {
     Open {
-        delay_class: OperatorSchedulerDelayClassV5,
+        delay_class: OperatorSchedulerDelayClassV6,
     },
     AwaitingTrialProgress {
         window_epoch: u64,
@@ -275,16 +342,16 @@ pub enum OperatorSchedulerGateV5 {
     },
     AwaitingEvidenceRenewal {
         blocked_window_epoch: u64,
-        renewal_reason: OperatorEvidenceRenewalReasonV5,
+        renewal_reason: OperatorEvidenceRenewalReasonV6,
     },
     Faulted {
-        fault: OperatorSchedulerFaultV5,
+        fault: OperatorSchedulerFaultV6,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorOrchestrationStopReasonV5 {
+pub enum OperatorOrchestrationStopReasonV6 {
     NoReadyWork,
     StepLimitReached,
     ActiveTrial,
@@ -296,7 +363,7 @@ pub enum OperatorOrchestrationStopReasonV5 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorFeedbackStatusV5 {
+pub struct OperatorFeedbackStatusV6 {
     pub eligible_query_count: u64,
     pub record_success_count: u64,
     pub record_error_count: u64,
@@ -304,20 +371,20 @@ pub struct OperatorFeedbackStatusV5 {
     pub schema_rotation_count: u64,
     pub incomplete_report_count: u64,
     pub counter_overflowed: bool,
-    pub last_record_outcome: Option<OperatorEvidenceRecordOutcomeV5>,
-    pub last_record_error: Option<OperatorEvidenceRecordErrorV5>,
+    pub last_record_outcome: Option<OperatorEvidenceRecordOutcomeV6>,
+    pub last_record_error: Option<OperatorEvidenceRecordErrorV6>,
     pub window_epoch: u64,
     pub schema_generation: Option<u64>,
     pub recorded_reports: u64,
-    pub pool_health: OperatorEvidencePoolHealthV5,
+    pub pool_health: OperatorEvidencePoolHealthV6,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorDriverStatusV5 {
+pub struct OperatorDriverStatusV6 {
     pub scheduler_last_observed_tick: Option<u64>,
     pub scheduler_last_run_tick: Option<u64>,
-    pub scheduler_gate: OperatorSchedulerGateV5,
+    pub scheduler_gate: OperatorSchedulerGateV6,
     pub last_submitted_logical_tick: Option<u64>,
     pub tick_pending: bool,
     pub driver_tick_count: u64,
@@ -325,36 +392,39 @@ pub struct OperatorDriverStatusV5 {
     pub scheduler_ran_count: u64,
     pub scheduler_held_count: u64,
     pub scheduler_error_count: u64,
-    pub last_orchestration_stop_reason: Option<OperatorOrchestrationStopReasonV5>,
+    pub last_orchestration_stop_reason: Option<OperatorOrchestrationStopReasonV6>,
     pub host_clock_exhausted: bool,
     pub counter_overflowed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorAdaptiveStatusV5 {
-    pub mode: OperatorAdaptiveModeV5,
-    pub feedback: OperatorFeedbackStatusV5,
-    pub driver: Option<OperatorDriverStatusV5>,
+pub struct OperatorAdaptiveStatusV6 {
+    pub mode: OperatorAdaptiveModeV6,
+    pub feedback: OperatorFeedbackStatusV6,
+    pub driver: Option<OperatorDriverStatusV6>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorStatusV5 {
-    pub adaptive: Option<OperatorAdaptiveStatusV5>,
-    pub physical_design: Option<OperatorPhysicalDesignStatusV5>,
+pub struct OperatorStatusV6 {
+    pub adaptive: Option<OperatorAdaptiveStatusV6>,
+    pub physical_design: Option<OperatorPhysicalDesignStatusV6>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalIndexApplyStatusV5 {
+pub struct OperatorPhysicalIndexApplyStatusV6 {
+    pub admission: OperatorPhysicalDesignMutationAdmissionModeV6,
     pub enabled: bool,
     pub runtime_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalColumnarApplyStatusV5 {
+pub struct OperatorPhysicalColumnarApplyStatusV6 {
+    pub snapshot_admission: OperatorPhysicalDesignMutationAdmissionModeV6,
+    pub incremental_admission: OperatorPhysicalDesignMutationAdmissionModeV6,
     pub enabled: bool,
     pub allow_snapshot: bool,
     pub allow_incremental: bool,
@@ -363,13 +433,13 @@ pub struct OperatorPhysicalColumnarApplyStatusV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalIndexApplyCapabilityV5 {
+pub struct OperatorPhysicalIndexApplyCapabilityV6 {
     pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalColumnarApplyCapabilityV5 {
+pub struct OperatorPhysicalColumnarApplyCapabilityV6 {
     pub enabled: bool,
     pub allow_snapshot: bool,
     pub allow_incremental: bool,
@@ -377,7 +447,7 @@ pub struct OperatorPhysicalColumnarApplyCapabilityV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorPhysicalDesignRecordOutcomeV5 {
+pub enum OperatorPhysicalDesignRecordOutcomeV6 {
     Recorded,
     SchemaRotated,
     RecordedWithCapacityRejection,
@@ -386,7 +456,7 @@ pub enum OperatorPhysicalDesignRecordOutcomeV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorPhysicalDesignRecordErrorV5 {
+pub enum OperatorPhysicalDesignRecordErrorV6 {
     GlobalVisibilityRequired,
     StaleSchemaEvidence,
     OutOfOrderVisibility,
@@ -395,7 +465,7 @@ pub enum OperatorPhysicalDesignRecordErrorV5 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignDiagnosticsV5 {
+pub struct OperatorPhysicalDesignDiagnosticsV6 {
     pub eligible_query_count: u64,
     pub record_success_count: u64,
     pub record_error_count: u64,
@@ -403,13 +473,13 @@ pub struct OperatorPhysicalDesignDiagnosticsV5 {
     pub capacity_rejection_count: u64,
     pub incomplete_report_count: u64,
     pub counter_overflowed: bool,
-    pub last_record_outcome: Option<OperatorPhysicalDesignRecordOutcomeV5>,
-    pub last_record_error: Option<OperatorPhysicalDesignRecordErrorV5>,
+    pub last_record_outcome: Option<OperatorPhysicalDesignRecordOutcomeV6>,
+    pub last_record_error: Option<OperatorPhysicalDesignRecordErrorV6>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignEvidenceLimitsV5 {
+pub struct OperatorPhysicalDesignEvidenceLimitsV6 {
     pub max_index_candidates: u64,
     pub max_columnar_candidates: u64,
     pub max_query_shapes_per_candidate: u64,
@@ -418,8 +488,8 @@ pub struct OperatorPhysicalDesignEvidenceLimitsV5 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignEvidenceStatusV5 {
-    pub limits: OperatorPhysicalDesignEvidenceLimitsV5,
+pub struct OperatorPhysicalDesignEvidenceStatusV6 {
+    pub limits: OperatorPhysicalDesignEvidenceLimitsV6,
     pub epoch: u64,
     pub schema_generation: Option<u64>,
     pub first_global_commit_seq: Option<u64>,
@@ -437,17 +507,17 @@ pub struct OperatorPhysicalDesignEvidenceStatusV5 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignStatusV5 {
-    pub diagnostics: OperatorPhysicalDesignDiagnosticsV5,
-    pub evidence: OperatorPhysicalDesignEvidenceStatusV5,
-    pub physical_index_apply: OperatorPhysicalIndexApplyStatusV5,
-    pub physical_columnar_apply: OperatorPhysicalColumnarApplyStatusV5,
-    pub physical_design_mutation_receipts: OperatorPhysicalDesignMutationReceiptCapabilityV5,
+pub struct OperatorPhysicalDesignStatusV6 {
+    pub diagnostics: OperatorPhysicalDesignDiagnosticsV6,
+    pub evidence: OperatorPhysicalDesignEvidenceStatusV6,
+    pub physical_index_apply: OperatorPhysicalIndexApplyStatusV6,
+    pub physical_columnar_apply: OperatorPhysicalColumnarApplyStatusV6,
+    pub physical_design_mutation_receipts: OperatorPhysicalDesignMutationReceiptCapabilityV6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignEvidenceSummaryV5 {
+pub struct OperatorPhysicalDesignEvidenceSummaryV6 {
     pub report_count: u64,
     pub distinct_query_shapes: u64,
     pub total_actual_scan_work_units: u64,
@@ -459,7 +529,7 @@ pub struct OperatorPhysicalDesignEvidenceSummaryV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorPhysicalDesignNoActionReasonV5 {
+pub enum OperatorPhysicalDesignNoActionReasonV6 {
     BelowMinimumReports,
     BelowMinimumShapeDiversity,
     BelowMinimumActualWork,
@@ -472,36 +542,36 @@ pub enum OperatorPhysicalDesignNoActionReasonV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OperatorPhysicalDesignDecisionV5 {
+pub enum OperatorPhysicalDesignDecisionV6 {
     Recommend {},
     NoAction {
-        reason: OperatorPhysicalDesignNoActionReasonV5,
+        reason: OperatorPhysicalDesignNoActionReasonV6,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalIndexCandidateV5 {
+pub struct OperatorPhysicalIndexCandidateV6 {
     pub table_id: u64,
     pub column_id: u32,
     pub point_report_count: u64,
     pub range_report_count: u64,
-    pub evidence: OperatorPhysicalDesignEvidenceSummaryV5,
-    pub decision: OperatorPhysicalDesignDecisionV5,
+    pub evidence: OperatorPhysicalDesignEvidenceSummaryV6,
+    pub decision: OperatorPhysicalDesignDecisionV6,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalColumnarCandidateV5 {
+pub struct OperatorPhysicalColumnarCandidateV6 {
     pub table_id: u64,
     pub columns: Vec<u32>,
-    pub evidence: OperatorPhysicalDesignEvidenceSummaryV5,
-    pub decision: OperatorPhysicalDesignDecisionV5,
+    pub evidence: OperatorPhysicalDesignEvidenceSummaryV6,
+    pub decision: OperatorPhysicalDesignDecisionV6,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignAdvisorReportV5 {
+pub struct OperatorPhysicalDesignAdvisorReportV6 {
     pub evidence_epoch: u64,
     pub schema_generation: u64,
     pub first_global_commit_seq: u64,
@@ -510,19 +580,19 @@ pub struct OperatorPhysicalDesignAdvisorReportV5 {
     pub discarded_incomplete_reports: u64,
     pub overflowed: bool,
     pub incomplete: bool,
-    pub index_candidates: Vec<OperatorPhysicalIndexCandidateV5>,
-    pub columnar_candidates: Vec<OperatorPhysicalColumnarCandidateV5>,
+    pub index_candidates: Vec<OperatorPhysicalIndexCandidateV6>,
+    pub columnar_candidates: Vec<OperatorPhysicalColumnarCandidateV6>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignRecommendationsV5 {
+pub struct OperatorPhysicalDesignRecommendationsV6 {
     pub runtime_token: Option<String>,
-    pub report: OperatorPhysicalDesignAdvisorReportV5,
+    pub report: OperatorPhysicalDesignAdvisorReportV6,
 }
 
-impl std::ops::Deref for OperatorPhysicalDesignRecommendationsV5 {
-    type Target = OperatorPhysicalDesignAdvisorReportV5;
+impl std::ops::Deref for OperatorPhysicalDesignRecommendationsV6 {
+    type Target = OperatorPhysicalDesignAdvisorReportV6;
 
     fn deref(&self) -> &Self::Target {
         &self.report
@@ -531,7 +601,7 @@ impl std::ops::Deref for OperatorPhysicalDesignRecommendationsV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OperatorPhysicalIndexApplyOutcomeV5 {
+pub enum OperatorPhysicalIndexApplyOutcomeV6 {
     Created { index_id: u64 },
     AlreadyApplied { index_id: u64 },
     AlreadyCovered,
@@ -539,14 +609,14 @@ pub enum OperatorPhysicalIndexApplyOutcomeV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorPhysicalColumnarDesignModeV5 {
+pub enum OperatorPhysicalColumnarDesignModeV6 {
     Snapshot,
     Incremental,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OperatorPhysicalColumnarApplyOutcomeV5 {
+pub enum OperatorPhysicalColumnarApplyOutcomeV6 {
     Created { projection_id: u64 },
     AlreadyApplied { projection_id: u64 },
     AlreadyCovered,
@@ -554,48 +624,48 @@ pub enum OperatorPhysicalColumnarApplyOutcomeV5 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalColumnarApplyResultV5 {
+pub struct OperatorPhysicalColumnarApplyResultV6 {
     pub table_id: u64,
     pub columns: Vec<u32>,
-    pub mode: OperatorPhysicalColumnarDesignModeV5,
+    pub mode: OperatorPhysicalColumnarDesignModeV6,
     pub placement_key: String,
-    pub outcome: OperatorPhysicalColumnarApplyOutcomeV5,
-    pub receipt: Option<OperatorPhysicalDesignMutationReceiptRefV5>,
+    pub outcome: OperatorPhysicalColumnarApplyOutcomeV6,
+    pub receipt: Option<OperatorPhysicalDesignMutationReceiptRefV6>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalIndexApplyResultV5 {
+pub struct OperatorPhysicalIndexApplyResultV6 {
     pub table_id: u64,
     pub column_id: u32,
     pub index_name: String,
-    pub outcome: OperatorPhysicalIndexApplyOutcomeV5,
-    pub receipt: Option<OperatorPhysicalDesignMutationReceiptRefV5>,
+    pub outcome: OperatorPhysicalIndexApplyOutcomeV6,
+    pub receipt: Option<OperatorPhysicalDesignMutationReceiptRefV6>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignMutationReceiptRefV5 {
+pub struct OperatorPhysicalDesignMutationReceiptRefV6 {
     pub journal_incarnation: String,
     pub receipt_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignMutationReceiptCursorV5 {
+pub struct OperatorPhysicalDesignMutationReceiptCursorV6 {
     pub journal_incarnation: String,
     pub receipt_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignMutationReceiptCapabilityV5 {
+pub struct OperatorPhysicalDesignMutationReceiptCapabilityV6 {
     pub read_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignMutationReceiptStatusV5 {
+pub struct OperatorPhysicalDesignMutationReceiptStatusV6 {
     pub journal_incarnation: String,
     pub recovery_required: bool,
     pub latest_receipt_id: Option<u64>,
@@ -604,14 +674,14 @@ pub struct OperatorPhysicalDesignMutationReceiptStatusV5 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorPhysicalDesignMutationReceiptSourceV5 {
+pub enum OperatorPhysicalDesignMutationReceiptSourceV6 {
     Programmatic,
     LocalOperator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OperatorPhysicalDesignMutationReceiptTargetV5 {
+pub enum OperatorPhysicalDesignMutationReceiptTargetV6 {
     Index {
         table_id: u64,
         column_id: u32,
@@ -620,14 +690,14 @@ pub enum OperatorPhysicalDesignMutationReceiptTargetV5 {
     Columnar {
         table_id: u64,
         columns: Vec<u32>,
-        mode: OperatorPhysicalColumnarDesignModeV5,
+        mode: OperatorPhysicalColumnarDesignModeV6,
         placement_key: String,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OperatorPhysicalDesignMutationReceiptOutcomeV5 {
+pub enum OperatorPhysicalDesignMutationReceiptOutcomeV6 {
     Pending,
     CreatedIndex { index_id: u64 },
     CreatedColumnar { projection_id: u64 },
@@ -644,32 +714,32 @@ pub enum OperatorPhysicalDesignMutationReceiptOutcomeV5 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignMutationReceiptV5 {
-    pub receipt: OperatorPhysicalDesignMutationReceiptRefV5,
-    pub source: OperatorPhysicalDesignMutationReceiptSourceV5,
+pub struct OperatorPhysicalDesignMutationReceiptV6 {
+    pub receipt: OperatorPhysicalDesignMutationReceiptRefV6,
+    pub source: OperatorPhysicalDesignMutationReceiptSourceV6,
     pub evidence_epoch: u64,
-    pub target: OperatorPhysicalDesignMutationReceiptTargetV5,
-    pub outcome: OperatorPhysicalDesignMutationReceiptOutcomeV5,
+    pub target: OperatorPhysicalDesignMutationReceiptTargetV6,
+    pub outcome: OperatorPhysicalDesignMutationReceiptOutcomeV6,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignMutationReceiptPageV5 {
+pub struct OperatorPhysicalDesignMutationReceiptPageV6 {
     pub journal_incarnation: String,
-    pub receipts: Vec<OperatorPhysicalDesignMutationReceiptV5>,
-    pub next_after: Option<OperatorPhysicalDesignMutationReceiptCursorV5>,
+    pub receipts: Vec<OperatorPhysicalDesignMutationReceiptV6>,
+    pub next_after: Option<OperatorPhysicalDesignMutationReceiptCursorV6>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorPhysicalDesignRotationV5 {
+pub struct OperatorPhysicalDesignRotationV6 {
     pub previous_epoch: u64,
     pub new_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorEvidenceRotationV5 {
+pub struct OperatorEvidenceRotationV6 {
     pub previous_window_epoch: u64,
     pub new_window_epoch: u64,
     pub schema_generation: Option<u64>,
@@ -681,9 +751,117 @@ pub struct OperatorEvidenceRotationV5 {
     pub was_truncated: bool,
 }
 
+/// Status presentation only. Apply requests never accept component limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorPhysicalDesignMutationAdmissionConstraintV6 {
+    Unconstrained {},
+    AtMost { maximum: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPhysicalDesignMutationAdmissionPolicyV6 {
+    pub source_work_units: OperatorPhysicalDesignMutationAdmissionConstraintV6,
+    pub source_read_bytes: OperatorPhysicalDesignMutationAdmissionConstraintV6,
+    pub prerequisite_work_units: OperatorPhysicalDesignMutationAdmissionConstraintV6,
+    pub prerequisite_read_bytes: OperatorPhysicalDesignMutationAdmissionConstraintV6,
+    pub prerequisite_write_bytes: OperatorPhysicalDesignMutationAdmissionConstraintV6,
+    pub output_write_bytes: OperatorPhysicalDesignMutationAdmissionConstraintV6,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorPhysicalDesignMutationAdmissionModeV6 {
+    Unadmitted {},
+    ComponentLimits {
+        policy: OperatorPhysicalDesignMutationAdmissionPolicyV6,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OperatorErrorCodeV5 {
+pub enum OperatorPhysicalDesignMutationAdmissionDimensionV6 {
+    SourceWorkUnits,
+    SourceReadBytes,
+    PrerequisiteWorkUnits,
+    PrerequisiteReadBytes,
+    PrerequisiteWriteBytes,
+    OutputWriteBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorPhysicalDesignMutationAdmissionRejectionV6 {
+    RequiredBoundNotProven {
+        dimension: OperatorPhysicalDesignMutationAdmissionDimensionV6,
+    },
+    LimitExceeded {
+        dimension: OperatorPhysicalDesignMutationAdmissionDimensionV6,
+        conservative_bound: u64,
+        maximum: u64,
+    },
+    InspectionFailed {},
+}
+
+impl From<PhysicalDesignMutationAdmissionConstraint>
+    for OperatorPhysicalDesignMutationAdmissionConstraintV6
+{
+    fn from(value: PhysicalDesignMutationAdmissionConstraint) -> Self {
+        match value {
+            PhysicalDesignMutationAdmissionConstraint::Unconstrained => Self::Unconstrained {},
+            PhysicalDesignMutationAdmissionConstraint::AtMost(maximum) => Self::AtMost { maximum },
+        }
+    }
+}
+
+impl From<ServerOperatorPhysicalDesignMutationAdmission>
+    for OperatorPhysicalDesignMutationAdmissionModeV6
+{
+    fn from(value: ServerOperatorPhysicalDesignMutationAdmission) -> Self {
+        match value {
+            ServerOperatorPhysicalDesignMutationAdmission::Unadmitted => Self::Unadmitted {},
+            ServerOperatorPhysicalDesignMutationAdmission::ComponentLimits(policy) => {
+                let limits = policy.limits();
+                Self::ComponentLimits {
+                    policy: OperatorPhysicalDesignMutationAdmissionPolicyV6 {
+                        source_work_units: limits.source_work_units.into(),
+                        source_read_bytes: limits.source_read_bytes.into(),
+                        prerequisite_work_units: limits.prerequisite_work_units.into(),
+                        prerequisite_read_bytes: limits.prerequisite_read_bytes.into(),
+                        prerequisite_write_bytes: limits.prerequisite_write_bytes.into(),
+                        output_write_bytes: limits.output_write_bytes.into(),
+                    },
+                }
+            }
+        }
+    }
+}
+
+impl From<PhysicalDesignMutationAdmissionDimension>
+    for OperatorPhysicalDesignMutationAdmissionDimensionV6
+{
+    fn from(value: PhysicalDesignMutationAdmissionDimension) -> Self {
+        match value {
+            PhysicalDesignMutationAdmissionDimension::SourceWorkUnits => Self::SourceWorkUnits,
+            PhysicalDesignMutationAdmissionDimension::SourceReadBytes => Self::SourceReadBytes,
+            PhysicalDesignMutationAdmissionDimension::PrerequisiteWorkUnits => {
+                Self::PrerequisiteWorkUnits
+            }
+            PhysicalDesignMutationAdmissionDimension::PrerequisiteReadBytes => {
+                Self::PrerequisiteReadBytes
+            }
+            PhysicalDesignMutationAdmissionDimension::PrerequisiteWriteBytes => {
+                Self::PrerequisiteWriteBytes
+            }
+            PhysicalDesignMutationAdmissionDimension::OutputWriteBytes => Self::OutputWriteBytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorErrorCodeV6 {
     AdaptiveNotEnabled,
     DriverNotEnabled,
     SchedulerNotFaulted,
@@ -715,6 +893,7 @@ pub enum OperatorErrorCodeV5 {
     PhysicalColumnarChangeStreamChanged,
     PhysicalColumnarRecoveryRequired,
     PhysicalColumnarApplyFailed,
+    PhysicalDesignMutationAdmissionRejected,
     PhysicalDesignMutationOutcomeUncertain,
     PhysicalDesignMutationReceiptCapacityExceeded,
     PhysicalDesignMutationReceiptUnavailable,
@@ -734,26 +913,27 @@ pub enum OperatorErrorCodeV5 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OperatorRemoteErrorV5 {
-    pub code: OperatorErrorCodeV5,
+pub struct OperatorRemoteErrorV6 {
+    pub admission: Option<OperatorPhysicalDesignMutationAdmissionRejectionV6>,
+    pub code: OperatorErrorCodeV6,
     pub message: String,
-    pub receipt: Option<OperatorPhysicalDesignMutationReceiptRefV5>,
+    pub receipt: Option<OperatorPhysicalDesignMutationReceiptRefV6>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OperatorRequestV5 {
+struct OperatorRequestV6 {
     request_id: u64,
-    operation: OperatorOperationV5,
+    operation: OperatorOperationV6,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum OperatorOperationV5 {
+enum OperatorOperationV6 {
     Status {},
     PhysicalDesignMutationReceiptStatus {},
     PhysicalDesignMutationReceipts {
-        after: Option<OperatorPhysicalDesignMutationReceiptCursorV5>,
+        after: Option<OperatorPhysicalDesignMutationReceiptCursorV6>,
         limit: u32,
     },
     RotateEvidence {
@@ -776,7 +956,7 @@ enum OperatorOperationV5 {
         expected_evidence_epoch: u64,
         table_id: u64,
         columns: Vec<u32>,
-        mode: OperatorPhysicalColumnarDesignModeV5,
+        mode: OperatorPhysicalColumnarDesignModeV6,
         placement_key: String,
     },
 }
@@ -794,24 +974,24 @@ struct OperatorPhysicalColumnarApplyInput {
     expected_evidence_epoch: u64,
     table_id: u64,
     columns: Vec<u32>,
-    mode: OperatorPhysicalColumnarDesignModeV5,
+    mode: OperatorPhysicalColumnarDesignModeV6,
     placement_key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
-enum OperatorResponseV5 {
+enum OperatorResponseV6 {
     Ok {
         request_id: u64,
-        result: OperatorResultV5,
+        result: OperatorResultV6,
     },
     Error {
         request_id: u64,
-        error: OperatorRemoteErrorV5,
+        error: OperatorRemoteErrorV6,
     },
 }
 
-impl OperatorResponseV5 {
+impl OperatorResponseV6 {
     const fn request_id(&self) -> u64 {
         match self {
             Self::Ok { request_id, .. } | Self::Error { request_id, .. } => *request_id,
@@ -821,32 +1001,32 @@ impl OperatorResponseV5 {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum OperatorResultV5 {
+enum OperatorResultV6 {
     Status {
-        status: Box<OperatorStatusV5>,
+        status: Box<OperatorStatusV6>,
     },
     EvidenceRotated {
-        rotation: OperatorEvidenceRotationV5,
+        rotation: OperatorEvidenceRotationV6,
     },
     SchedulerReset {},
     PhysicalDesignRecommendations {
         runtime_token: Option<String>,
-        report: OperatorPhysicalDesignAdvisorReportV5,
+        report: OperatorPhysicalDesignAdvisorReportV6,
     },
     PhysicalDesignEvidenceRotated {
-        rotation: OperatorPhysicalDesignRotationV5,
+        rotation: OperatorPhysicalDesignRotationV6,
     },
     PhysicalIndexApplied {
-        apply: OperatorPhysicalIndexApplyResultV5,
+        apply: OperatorPhysicalIndexApplyResultV6,
     },
     PhysicalColumnarApplied {
-        apply: OperatorPhysicalColumnarApplyResultV5,
+        apply: OperatorPhysicalColumnarApplyResultV6,
     },
     PhysicalDesignMutationReceiptStatus {
-        status: OperatorPhysicalDesignMutationReceiptStatusV5,
+        status: OperatorPhysicalDesignMutationReceiptStatusV6,
     },
     PhysicalDesignMutationReceipts {
-        page: OperatorPhysicalDesignMutationReceiptPageV5,
+        page: OperatorPhysicalDesignMutationReceiptPageV6,
     },
 }
 
@@ -987,10 +1167,10 @@ pub enum OperatorClientError {
         received: u64,
     },
     UnexpectedResult,
-    Remote(OperatorRemoteErrorV5),
+    Remote(OperatorRemoteErrorV6),
     MutationOutcomeUncertain {
         recovery_required: bool,
-        receipt: Option<OperatorPhysicalDesignMutationReceiptRefV5>,
+        receipt: Option<OperatorPhysicalDesignMutationReceiptRefV6>,
         source: Box<OperatorClientError>,
     },
 }
@@ -1053,9 +1233,9 @@ impl<'a> ServerOperatorClient<'a> {
         Self { config }
     }
 
-    pub fn status(&self) -> Result<OperatorStatusV5, OperatorClientError> {
-        match self.exchange(OperatorOperationV5::Status {})? {
-            OperatorResultV5::Status { status } => Ok(*status),
+    pub fn status(&self) -> Result<OperatorStatusV6, OperatorClientError> {
+        match self.exchange(OperatorOperationV6::Status {})? {
+            OperatorResultV6::Status { status } => Ok(*status),
             _ => Err(OperatorClientError::UnexpectedResult),
         }
     }
@@ -1063,30 +1243,30 @@ impl<'a> ServerOperatorClient<'a> {
     pub fn rotate_evidence(
         &self,
         expected_window_epoch: u64,
-    ) -> Result<OperatorEvidenceRotationV5, OperatorClientError> {
-        match self.exchange(OperatorOperationV5::RotateEvidence {
+    ) -> Result<OperatorEvidenceRotationV6, OperatorClientError> {
+        match self.exchange(OperatorOperationV6::RotateEvidence {
             expected_window_epoch,
         })? {
-            OperatorResultV5::EvidenceRotated { rotation } => Ok(rotation),
+            OperatorResultV6::EvidenceRotated { rotation } => Ok(rotation),
             _ => Err(OperatorClientError::UnexpectedResult),
         }
     }
 
     pub fn reset_faulted_scheduler(&self) -> Result<(), OperatorClientError> {
-        match self.exchange(OperatorOperationV5::ResetFaultedScheduler {})? {
-            OperatorResultV5::SchedulerReset {} => Ok(()),
+        match self.exchange(OperatorOperationV6::ResetFaultedScheduler {})? {
+            OperatorResultV6::SchedulerReset {} => Ok(()),
             _ => Err(OperatorClientError::UnexpectedResult),
         }
     }
 
     pub fn physical_design_recommendations(
         &self,
-    ) -> Result<OperatorPhysicalDesignRecommendationsV5, OperatorClientError> {
-        match self.exchange(OperatorOperationV5::PhysicalDesignRecommendations {})? {
-            OperatorResultV5::PhysicalDesignRecommendations {
+    ) -> Result<OperatorPhysicalDesignRecommendationsV6, OperatorClientError> {
+        match self.exchange(OperatorOperationV6::PhysicalDesignRecommendations {})? {
+            OperatorResultV6::PhysicalDesignRecommendations {
                 runtime_token,
                 report,
-            } => Ok(OperatorPhysicalDesignRecommendationsV5 {
+            } => Ok(OperatorPhysicalDesignRecommendationsV6 {
                 runtime_token,
                 report,
             }),
@@ -1096,20 +1276,20 @@ impl<'a> ServerOperatorClient<'a> {
 
     pub fn physical_design_mutation_receipt_status(
         &self,
-    ) -> Result<OperatorPhysicalDesignMutationReceiptStatusV5, OperatorClientError> {
-        match self.exchange(OperatorOperationV5::PhysicalDesignMutationReceiptStatus {})? {
-            OperatorResultV5::PhysicalDesignMutationReceiptStatus { status } => Ok(status),
+    ) -> Result<OperatorPhysicalDesignMutationReceiptStatusV6, OperatorClientError> {
+        match self.exchange(OperatorOperationV6::PhysicalDesignMutationReceiptStatus {})? {
+            OperatorResultV6::PhysicalDesignMutationReceiptStatus { status } => Ok(status),
             _ => Err(OperatorClientError::UnexpectedResult),
         }
     }
 
     pub fn physical_design_mutation_receipts(
         &self,
-        after: Option<OperatorPhysicalDesignMutationReceiptCursorV5>,
+        after: Option<OperatorPhysicalDesignMutationReceiptCursorV6>,
         limit: u32,
-    ) -> Result<OperatorPhysicalDesignMutationReceiptPageV5, OperatorClientError> {
-        match self.exchange(OperatorOperationV5::PhysicalDesignMutationReceipts { after, limit })? {
-            OperatorResultV5::PhysicalDesignMutationReceipts { page } => Ok(page),
+    ) -> Result<OperatorPhysicalDesignMutationReceiptPageV6, OperatorClientError> {
+        match self.exchange(OperatorOperationV6::PhysicalDesignMutationReceipts { after, limit })? {
+            OperatorResultV6::PhysicalDesignMutationReceipts { page } => Ok(page),
             _ => Err(OperatorClientError::UnexpectedResult),
         }
     }
@@ -1117,11 +1297,11 @@ impl<'a> ServerOperatorClient<'a> {
     pub fn rotate_physical_design_evidence(
         &self,
         expected_evidence_epoch: u64,
-    ) -> Result<OperatorPhysicalDesignRotationV5, OperatorClientError> {
-        match self.exchange(OperatorOperationV5::RotatePhysicalDesignEvidence {
+    ) -> Result<OperatorPhysicalDesignRotationV6, OperatorClientError> {
+        match self.exchange(OperatorOperationV6::RotatePhysicalDesignEvidence {
             expected_evidence_epoch,
         })? {
-            OperatorResultV5::PhysicalDesignEvidenceRotated { rotation } => Ok(rotation),
+            OperatorResultV6::PhysicalDesignEvidenceRotated { rotation } => Ok(rotation),
             _ => Err(OperatorClientError::UnexpectedResult),
         }
     }
@@ -1133,8 +1313,8 @@ impl<'a> ServerOperatorClient<'a> {
         table_id: u64,
         column_id: u32,
         index_name: impl Into<String>,
-    ) -> Result<OperatorPhysicalIndexApplyResultV5, OperatorClientError> {
-        let result = self.exchange_mutating(OperatorOperationV5::ApplyPhysicalIndex {
+    ) -> Result<OperatorPhysicalIndexApplyResultV6, OperatorClientError> {
+        let result = self.exchange_mutating(OperatorOperationV6::ApplyPhysicalIndex {
             expected_runtime_token: expected_runtime_token.into(),
             expected_evidence_epoch,
             table_id,
@@ -1142,7 +1322,7 @@ impl<'a> ServerOperatorClient<'a> {
             index_name: index_name.into(),
         })?;
         match result {
-            OperatorResultV5::PhysicalIndexApplied { apply } => Ok(apply),
+            OperatorResultV6::PhysicalIndexApplied { apply } => Ok(apply),
             _ => Err(classify_mutating_client_error(
                 OperatorClientError::UnexpectedResult,
             )),
@@ -1155,10 +1335,10 @@ impl<'a> ServerOperatorClient<'a> {
         expected_evidence_epoch: u64,
         table_id: u64,
         columns: Vec<u32>,
-        mode: OperatorPhysicalColumnarDesignModeV5,
+        mode: OperatorPhysicalColumnarDesignModeV6,
         placement_key: impl Into<String>,
-    ) -> Result<OperatorPhysicalColumnarApplyResultV5, OperatorClientError> {
-        let result = self.exchange_mutating(OperatorOperationV5::ApplyPhysicalColumnar {
+    ) -> Result<OperatorPhysicalColumnarApplyResultV6, OperatorClientError> {
+        let result = self.exchange_mutating(OperatorOperationV6::ApplyPhysicalColumnar {
             expected_runtime_token: expected_runtime_token.into(),
             expected_evidence_epoch,
             table_id,
@@ -1167,7 +1347,7 @@ impl<'a> ServerOperatorClient<'a> {
             placement_key: placement_key.into(),
         })?;
         match result {
-            OperatorResultV5::PhysicalColumnarApplied { apply } => Ok(apply),
+            OperatorResultV6::PhysicalColumnarApplied { apply } => Ok(apply),
             _ => Err(classify_mutating_client_error(
                 OperatorClientError::UnexpectedResult,
             )),
@@ -1177,12 +1357,12 @@ impl<'a> ServerOperatorClient<'a> {
     #[cfg(unix)]
     fn exchange_mutating(
         &self,
-        operation: OperatorOperationV5,
-    ) -> Result<OperatorResultV5, OperatorClientError> {
+        operation: OperatorOperationV6,
+    ) -> Result<OperatorResultV6, OperatorClientError> {
         use std::os::unix::net::UnixStream;
 
         let request_id = 1;
-        let frame = encode_frame(&OperatorRequestV5 {
+        let frame = encode_frame(&OperatorRequestV6 {
             request_id,
             operation,
         })
@@ -1205,18 +1385,18 @@ impl<'a> ServerOperatorClient<'a> {
                     OperatorProtocolError::Io(error),
                 ))
             })?;
-        let response: OperatorResponseV5 = read_frame(&mut stream)
+        let response: OperatorResponseV6 = read_frame(&mut stream)
             .map_err(OperatorClientError::Protocol)
             .map_err(classify_mutating_client_error)?;
         let result = match response {
-            OperatorResponseV5::Ok {
+            OperatorResponseV6::Ok {
                 request_id: received,
                 result,
             } => {
                 verify_request_id(request_id, received).map_err(classify_mutating_client_error)?;
                 Ok(result)
             }
-            OperatorResponseV5::Error {
+            OperatorResponseV6::Error {
                 request_id: received,
                 error,
             } => {
@@ -1233,16 +1413,16 @@ impl<'a> ServerOperatorClient<'a> {
     #[cfg(not(unix))]
     fn exchange_mutating(
         &self,
-        _operation: OperatorOperationV5,
-    ) -> Result<OperatorResultV5, OperatorClientError> {
+        _operation: OperatorOperationV6,
+    ) -> Result<OperatorResultV6, OperatorClientError> {
         Err(OperatorClientError::UnsupportedPlatform)
     }
 
     #[cfg(unix)]
     fn exchange(
         &self,
-        operation: OperatorOperationV5,
-    ) -> Result<OperatorResultV5, OperatorClientError> {
+        operation: OperatorOperationV6,
+    ) -> Result<OperatorResultV6, OperatorClientError> {
         use std::os::unix::net::UnixStream;
 
         let mut stream = UnixStream::connect(self.config.unix_socket()).map_err(|source| {
@@ -1258,23 +1438,23 @@ impl<'a> ServerOperatorClient<'a> {
         let request_id = 1;
         write_frame(
             &mut stream,
-            &OperatorRequestV5 {
+            &OperatorRequestV6 {
                 request_id,
                 operation,
             },
         )
         .map_err(OperatorClientError::Protocol)?;
-        let response: OperatorResponseV5 =
+        let response: OperatorResponseV6 =
             read_frame(&mut stream).map_err(OperatorClientError::Protocol)?;
         match response {
-            OperatorResponseV5::Ok {
+            OperatorResponseV6::Ok {
                 request_id: received,
                 result,
             } => {
                 verify_request_id(request_id, received)?;
                 Ok(result)
             }
-            OperatorResponseV5::Error {
+            OperatorResponseV6::Error {
                 request_id: received,
                 error,
             } => {
@@ -1289,8 +1469,8 @@ impl<'a> ServerOperatorClient<'a> {
     #[cfg(not(unix))]
     fn exchange(
         &self,
-        _operation: OperatorOperationV5,
-    ) -> Result<OperatorResultV5, OperatorClientError> {
+        _operation: OperatorOperationV6,
+    ) -> Result<OperatorResultV6, OperatorClientError> {
         Err(OperatorClientError::UnsupportedPlatform)
     }
 }
@@ -1298,7 +1478,7 @@ impl<'a> ServerOperatorClient<'a> {
 fn classify_mutating_client_error(error: OperatorClientError) -> OperatorClientError {
     let (recovery_required, receipt) = match &error {
         OperatorClientError::Remote(remote)
-            if remote.code == OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain =>
+            if remote.code == OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain =>
         {
             (remote.receipt.is_some(), remote.receipt.clone())
         }
@@ -1474,13 +1654,14 @@ impl ServerOperatorPlane {
             return Err(ServerOperatorError::Configure { path, source });
         }
         let (shutdown, shutdown_rx) = mpsc::channel();
-        let listener_policy = OperatorListenerPolicy::new(
+        let mut listener_policy = OperatorListenerPolicy::new(
             config.allow_physical_index_apply(),
             config.allow_physical_columnar_apply(),
             config.allow_physical_design_receipt_read(),
             columnar_capabilities,
             runtime_token,
         );
+        listener_policy.admissions = config.admissions;
         let join = std::thread::Builder::new()
             .name("netbadb-operator-listener".into())
             .spawn(move || {
@@ -1651,6 +1832,7 @@ pub(crate) struct OperatorListenerPolicy {
     allow_physical_design_receipt_read: bool,
     columnar_capabilities: Option<ServerPhysicalColumnarApplyCapabilities>,
     runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
+    admissions: ServerOperatorMutationAdmissions,
 }
 
 impl OperatorListenerPolicy {
@@ -1667,6 +1849,7 @@ impl OperatorListenerPolicy {
             allow_physical_design_receipt_read,
             columnar_capabilities,
             runtime_token,
+            admissions: ServerOperatorMutationAdmissions::UNADMITTED,
         }
     }
 }
@@ -1741,10 +1924,10 @@ pub(crate) fn serve_operator_connection_with_capabilities(
     physical_design_control: &ServerPhysicalDesignControlHandle,
     policy: OperatorListenerPolicy,
 ) -> Result<(), OperatorProtocolError> {
-    let request = match read_frame::<OperatorRequestV5>(stream) {
+    let request = match read_frame::<OperatorRequestV6>(stream) {
         Ok(request) => request,
         Err(error) => {
-            let response = OperatorResponseV5::Error {
+            let response = OperatorResponseV6::Error {
                 request_id: 0,
                 error: protocol_remote_error(&error),
             };
@@ -1763,13 +1946,13 @@ pub(crate) fn serve_operator_connection_with_capabilities(
 
 fn write_operator_response(
     writer: &mut impl Write,
-    response: &OperatorResponseV5,
+    response: &OperatorResponseV6,
 ) -> Result<(), OperatorProtocolError> {
     let request_id = response.request_id();
     match write_frame(writer, response) {
         Err(OperatorProtocolError::PayloadTooLarge(_)) => write_frame(
             writer,
-            &OperatorResponseV5::Error {
+            &OperatorResponseV6::Error {
                 request_id,
                 error: response_too_large_error(),
             },
@@ -1780,12 +1963,12 @@ fn write_operator_response(
 
 #[cfg(test)]
 fn execute_operator_request(
-    request: OperatorRequestV5,
+    request: OperatorRequestV6,
     adaptive_control: &ServerAdaptiveControlHandle,
     physical_design_control: &ServerPhysicalDesignControlHandle,
     allow_physical_index_apply: bool,
     runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
-) -> OperatorResponseV5 {
+) -> OperatorResponseV6 {
     execute_operator_request_with_capabilities(
         request,
         adaptive_control,
@@ -1801,31 +1984,25 @@ fn execute_operator_request(
 }
 
 fn execute_operator_request_with_capabilities(
-    request: OperatorRequestV5,
+    request: OperatorRequestV6,
     adaptive_control: &ServerAdaptiveControlHandle,
     physical_design_control: &ServerPhysicalDesignControlHandle,
     policy: OperatorListenerPolicy,
-) -> OperatorResponseV5 {
+) -> OperatorResponseV6 {
     let result = match request.operation {
-        OperatorOperationV5::Status {} => operator_status_with_capabilities(
-            adaptive_control,
-            physical_design_control,
-            policy.allow_physical_index_apply,
-            policy.allow_physical_columnar_apply,
-            policy.allow_physical_design_receipt_read,
-            policy.columnar_capabilities,
-            policy.runtime_token,
-        )
-        .map(|status| OperatorResultV5::Status {
-            status: Box::new(status),
-        }),
-        OperatorOperationV5::PhysicalDesignMutationReceiptStatus {} => {
+        OperatorOperationV6::Status {} => {
+            operator_status_with_capabilities(adaptive_control, physical_design_control, policy)
+                .map(|status| OperatorResultV6::Status {
+                    status: Box::new(status),
+                })
+        }
+        OperatorOperationV6::PhysicalDesignMutationReceiptStatus {} => {
             execute_physical_design_mutation_receipt_status(
                 physical_design_control,
                 policy.allow_physical_design_receipt_read,
             )
         }
-        OperatorOperationV5::PhysicalDesignMutationReceipts { after, limit } => {
+        OperatorOperationV6::PhysicalDesignMutationReceipts { after, limit } => {
             execute_physical_design_mutation_receipts(
                 physical_design_control,
                 policy.allow_physical_design_receipt_read,
@@ -1833,37 +2010,37 @@ fn execute_operator_request_with_capabilities(
                 limit,
             )
         }
-        OperatorOperationV5::RotateEvidence {
+        OperatorOperationV6::RotateEvidence {
             expected_window_epoch,
         } => adaptive_control
             .rotate_evidence_if_window(AdaptiveEvidenceWindowEpoch(expected_window_epoch))
             .map(operator_rotation)
-            .map(|rotation| OperatorResultV5::EvidenceRotated { rotation })
+            .map(|rotation| OperatorResultV6::EvidenceRotated { rotation })
             .map_err(control_remote_error),
-        OperatorOperationV5::ResetFaultedScheduler {} => adaptive_control
+        OperatorOperationV6::ResetFaultedScheduler {} => adaptive_control
             .reset_faulted_scheduler()
-            .map(|()| OperatorResultV5::SchedulerReset {})
+            .map(|()| OperatorResultV6::SchedulerReset {})
             .map_err(control_remote_error),
-        OperatorOperationV5::PhysicalDesignRecommendations {} => physical_design_control
+        OperatorOperationV6::PhysicalDesignRecommendations {} => physical_design_control
             .recommendations()
             .map(operator_physical_design_report)
-            .map(|report| OperatorResultV5::PhysicalDesignRecommendations {
+            .map(|report| OperatorResultV6::PhysicalDesignRecommendations {
                 runtime_token: policy
                     .runtime_token
                     .map(OperatorPhysicalDesignRuntimeToken::encode),
                 report,
             })
             .map_err(physical_design_remote_error),
-        OperatorOperationV5::RotatePhysicalDesignEvidence {
+        OperatorOperationV6::RotatePhysicalDesignEvidence {
             expected_evidence_epoch,
         } => physical_design_control
             .rotate_evidence_if_epoch(netbadb_core::PhysicalDesignEvidenceEpoch(
                 expected_evidence_epoch,
             ))
             .map(operator_physical_design_rotation)
-            .map(|rotation| OperatorResultV5::PhysicalDesignEvidenceRotated { rotation })
+            .map(|rotation| OperatorResultV6::PhysicalDesignEvidenceRotated { rotation })
             .map_err(physical_design_remote_error),
-        OperatorOperationV5::ApplyPhysicalIndex {
+        OperatorOperationV6::ApplyPhysicalIndex {
             expected_runtime_token,
             expected_evidence_epoch,
             table_id,
@@ -1881,7 +2058,7 @@ fn execute_operator_request_with_capabilities(
                 index_name,
             },
         ),
-        OperatorOperationV5::ApplyPhysicalColumnar {
+        OperatorOperationV6::ApplyPhysicalColumnar {
             expected_runtime_token,
             expected_evidence_epoch,
             table_id,
@@ -1903,20 +2080,21 @@ fn execute_operator_request_with_capabilities(
         ),
     };
     match result {
-        Ok(result) => OperatorResponseV5::Ok {
+        Ok(result) => OperatorResponseV6::Ok {
             request_id: request.request_id,
             result,
         },
-        Err(error) => OperatorResponseV5::Error {
+        Err(error) => OperatorResponseV6::Error {
             request_id: request.request_id,
             error,
         },
     }
 }
 
-fn receipt_read_not_allowed_error() -> OperatorRemoteErrorV5 {
-    OperatorRemoteErrorV5 {
-        code: OperatorErrorCodeV5::PhysicalDesignMutationReceiptReadNotAllowed,
+fn receipt_read_not_allowed_error() -> OperatorRemoteErrorV6 {
+    OperatorRemoteErrorV6 {
+        admission: None,
+        code: OperatorErrorCodeV6::PhysicalDesignMutationReceiptReadNotAllowed,
         message: "operator physical-design receipt read is not allowed by the manifest".into(),
         receipt: None,
     }
@@ -1925,43 +2103,44 @@ fn receipt_read_not_allowed_error() -> OperatorRemoteErrorV5 {
 fn execute_physical_design_mutation_receipt_status(
     physical_design_control: &ServerPhysicalDesignControlHandle,
     allowed: bool,
-) -> Result<OperatorResultV5, OperatorRemoteErrorV5> {
+) -> Result<OperatorResultV6, OperatorRemoteErrorV6> {
     if !allowed {
         return Err(receipt_read_not_allowed_error());
     }
     physical_design_control
         .mutation_receipt_status()
         .map(operator_mutation_receipt_status)
-        .map(|status| OperatorResultV5::PhysicalDesignMutationReceiptStatus { status })
+        .map(|status| OperatorResultV6::PhysicalDesignMutationReceiptStatus { status })
         .map_err(receipt_read_remote_error)
 }
 
 fn execute_physical_design_mutation_receipts(
     physical_design_control: &ServerPhysicalDesignControlHandle,
     allowed: bool,
-    after: Option<OperatorPhysicalDesignMutationReceiptCursorV5>,
+    after: Option<OperatorPhysicalDesignMutationReceiptCursorV6>,
     limit: u32,
-) -> Result<OperatorResultV5, OperatorRemoteErrorV5> {
+) -> Result<OperatorResultV6, OperatorRemoteErrorV6> {
     if !allowed {
         return Err(receipt_read_not_allowed_error());
     }
     let after = after
         .map(operator_receipt_cursor)
         .transpose()
-        .map_err(|()| OperatorRemoteErrorV5 {
-            code: OperatorErrorCodeV5::InvalidPhysicalDesignMutationReceiptCursor,
+        .map_err(|()| OperatorRemoteErrorV6 {
+            admission: None,
+            code: OperatorErrorCodeV6::InvalidPhysicalDesignMutationReceiptCursor,
             message: "receipt cursor requires exactly 32 lowercase hexadecimal incarnation characters and a nonzero receipt ID".into(),
             receipt: None,
         })?;
     physical_design_control
         .mutation_receipts_scoped(after, limit)
         .map(operator_mutation_receipt_page)
-        .map(|page| OperatorResultV5::PhysicalDesignMutationReceipts { page })
+        .map(|page| OperatorResultV6::PhysicalDesignMutationReceipts { page })
         .map_err(receipt_read_remote_error)
 }
 
 fn operator_receipt_cursor(
-    cursor: OperatorPhysicalDesignMutationReceiptCursorV5,
+    cursor: OperatorPhysicalDesignMutationReceiptCursorV6,
 ) -> Result<ServerPhysicalDesignMutationReceiptCursor, ()> {
     let incarnation = decode_lower_hex_16(&cursor.journal_incarnation)
         .and_then(|bytes| ServerPhysicalDesignMutationReceiptJournalIncarnation::new(bytes).ok())
@@ -1975,8 +2154,8 @@ fn operator_receipt_cursor(
 
 fn operator_receipt_reference(
     reference: ServerPhysicalDesignMutationReceiptReference,
-) -> OperatorPhysicalDesignMutationReceiptRefV5 {
-    OperatorPhysicalDesignMutationReceiptRefV5 {
+) -> OperatorPhysicalDesignMutationReceiptRefV6 {
+    OperatorPhysicalDesignMutationReceiptRefV6 {
         journal_incarnation: encode_lower_hex_16(*reference.journal_incarnation().as_bytes()),
         receipt_id: reference.receipt_id().0,
     }
@@ -1984,8 +2163,8 @@ fn operator_receipt_reference(
 
 fn operator_mutation_receipt_status(
     status: ServerPhysicalDesignMutationReceiptStatus,
-) -> OperatorPhysicalDesignMutationReceiptStatusV5 {
-    OperatorPhysicalDesignMutationReceiptStatusV5 {
+) -> OperatorPhysicalDesignMutationReceiptStatusV6 {
+    OperatorPhysicalDesignMutationReceiptStatusV6 {
         journal_incarnation: encode_lower_hex_16(*status.journal_incarnation.as_bytes()),
         recovery_required: status.recovery_required,
         latest_receipt_id: status.latest_receipt_id.map(|id| id.0),
@@ -1995,9 +2174,9 @@ fn operator_mutation_receipt_status(
 
 fn operator_mutation_receipt_page(
     page: ServerPhysicalDesignMutationReceiptScopedPage,
-) -> OperatorPhysicalDesignMutationReceiptPageV5 {
+) -> OperatorPhysicalDesignMutationReceiptPageV6 {
     let incarnation = page.journal_incarnation;
-    OperatorPhysicalDesignMutationReceiptPageV5 {
+    OperatorPhysicalDesignMutationReceiptPageV6 {
         journal_incarnation: encode_lower_hex_16(*incarnation.as_bytes()),
         receipts: page
             .receipts
@@ -2006,7 +2185,7 @@ fn operator_mutation_receipt_page(
             .collect(),
         next_after: page
             .next_after
-            .map(|cursor| OperatorPhysicalDesignMutationReceiptCursorV5 {
+            .map(|cursor| OperatorPhysicalDesignMutationReceiptCursorV6 {
                 journal_incarnation: encode_lower_hex_16(*cursor.journal_incarnation().as_bytes()),
                 receipt_id: cursor.receipt_id().0,
             }),
@@ -2016,18 +2195,18 @@ fn operator_mutation_receipt_page(
 fn operator_mutation_receipt(
     incarnation: ServerPhysicalDesignMutationReceiptJournalIncarnation,
     receipt: ServerPhysicalDesignMutationReceipt,
-) -> OperatorPhysicalDesignMutationReceiptV5 {
-    OperatorPhysicalDesignMutationReceiptV5 {
-        receipt: OperatorPhysicalDesignMutationReceiptRefV5 {
+) -> OperatorPhysicalDesignMutationReceiptV6 {
+    OperatorPhysicalDesignMutationReceiptV6 {
+        receipt: OperatorPhysicalDesignMutationReceiptRefV6 {
             journal_incarnation: encode_lower_hex_16(*incarnation.as_bytes()),
             receipt_id: receipt.id.0,
         },
         source: match receipt.source {
             ServerPhysicalDesignMutationSource::Programmatic => {
-                OperatorPhysicalDesignMutationReceiptSourceV5::Programmatic
+                OperatorPhysicalDesignMutationReceiptSourceV6::Programmatic
             }
             ServerPhysicalDesignMutationSource::LocalOperator => {
-                OperatorPhysicalDesignMutationReceiptSourceV5::LocalOperator
+                OperatorPhysicalDesignMutationReceiptSourceV6::LocalOperator
             }
         },
         evidence_epoch: receipt.evidence_epoch.0,
@@ -2036,7 +2215,7 @@ fn operator_mutation_receipt(
                 table_id,
                 column_id,
                 index_name,
-            } => OperatorPhysicalDesignMutationReceiptTargetV5::Index {
+            } => OperatorPhysicalDesignMutationReceiptTargetV6::Index {
                 table_id: table_id.0,
                 column_id: column_id.0,
                 index_name: index_name.as_str().to_owned(),
@@ -2046,15 +2225,15 @@ fn operator_mutation_receipt(
                 columns,
                 mode,
                 placement,
-            } => OperatorPhysicalDesignMutationReceiptTargetV5::Columnar {
+            } => OperatorPhysicalDesignMutationReceiptTargetV6::Columnar {
                 table_id: table_id.0,
                 columns: columns.into_iter().map(|column| column.0).collect(),
                 mode: match mode {
                     PhysicalColumnarDesignMode::Snapshot => {
-                        OperatorPhysicalColumnarDesignModeV5::Snapshot
+                        OperatorPhysicalColumnarDesignModeV6::Snapshot
                     }
                     PhysicalColumnarDesignMode::Incremental => {
-                        OperatorPhysicalColumnarDesignModeV5::Incremental
+                        OperatorPhysicalColumnarDesignModeV6::Incremental
                     }
                 },
                 placement_key: placement.as_str().to_owned(),
@@ -2062,52 +2241,52 @@ fn operator_mutation_receipt(
         },
         outcome: match receipt.outcome {
             ServerPhysicalDesignMutationReceiptOutcome::Pending => {
-                OperatorPhysicalDesignMutationReceiptOutcomeV5::Pending
+                OperatorPhysicalDesignMutationReceiptOutcomeV6::Pending
             }
             ServerPhysicalDesignMutationReceiptOutcome::CreatedIndex { index_id } => {
-                OperatorPhysicalDesignMutationReceiptOutcomeV5::CreatedIndex {
+                OperatorPhysicalDesignMutationReceiptOutcomeV6::CreatedIndex {
                     index_id: index_id.0,
                 }
             }
             ServerPhysicalDesignMutationReceiptOutcome::CreatedColumnar { projection_id } => {
-                OperatorPhysicalDesignMutationReceiptOutcomeV5::CreatedColumnar {
+                OperatorPhysicalDesignMutationReceiptOutcomeV6::CreatedColumnar {
                     projection_id: projection_id.0,
                 }
             }
             ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedIndex { index_id } => {
-                OperatorPhysicalDesignMutationReceiptOutcomeV5::AlreadyAppliedIndex {
+                OperatorPhysicalDesignMutationReceiptOutcomeV6::AlreadyAppliedIndex {
                     index_id: index_id.0,
                 }
             }
             ServerPhysicalDesignMutationReceiptOutcome::AlreadyAppliedColumnar {
                 projection_id,
-            } => OperatorPhysicalDesignMutationReceiptOutcomeV5::AlreadyAppliedColumnar {
+            } => OperatorPhysicalDesignMutationReceiptOutcomeV6::AlreadyAppliedColumnar {
                 projection_id: projection_id.0,
             },
             ServerPhysicalDesignMutationReceiptOutcome::AlreadyCovered => {
-                OperatorPhysicalDesignMutationReceiptOutcomeV5::AlreadyCovered
+                OperatorPhysicalDesignMutationReceiptOutcomeV6::AlreadyCovered
             }
             ServerPhysicalDesignMutationReceiptOutcome::Rejected => {
-                OperatorPhysicalDesignMutationReceiptOutcomeV5::Rejected
+                OperatorPhysicalDesignMutationReceiptOutcomeV6::Rejected
             }
             ServerPhysicalDesignMutationReceiptOutcome::Failed => {
-                OperatorPhysicalDesignMutationReceiptOutcomeV5::Failed
+                OperatorPhysicalDesignMutationReceiptOutcomeV6::Failed
             }
             ServerPhysicalDesignMutationReceiptOutcome::RecoveredAppliedIndex { index_id } => {
-                OperatorPhysicalDesignMutationReceiptOutcomeV5::RecoveredAppliedIndex {
+                OperatorPhysicalDesignMutationReceiptOutcomeV6::RecoveredAppliedIndex {
                     index_id: index_id.0,
                 }
             }
             ServerPhysicalDesignMutationReceiptOutcome::RecoveredAppliedColumnar {
                 projection_id,
-            } => OperatorPhysicalDesignMutationReceiptOutcomeV5::RecoveredAppliedColumnar {
+            } => OperatorPhysicalDesignMutationReceiptOutcomeV6::RecoveredAppliedColumnar {
                 projection_id: projection_id.0,
             },
             ServerPhysicalDesignMutationReceiptOutcome::RecoveredNotApplied => {
-                OperatorPhysicalDesignMutationReceiptOutcomeV5::RecoveredNotApplied
+                OperatorPhysicalDesignMutationReceiptOutcomeV6::RecoveredNotApplied
             }
             ServerPhysicalDesignMutationReceiptOutcome::RecoveredConflict => {
-                OperatorPhysicalDesignMutationReceiptOutcomeV5::RecoveredConflict
+                OperatorPhysicalDesignMutationReceiptOutcomeV6::RecoveredConflict
             }
         },
     }
@@ -2115,31 +2294,32 @@ fn operator_mutation_receipt(
 
 fn receipt_read_remote_error(
     error: ServerPhysicalDesignMutationReceiptControlError,
-) -> OperatorRemoteErrorV5 {
+) -> OperatorRemoteErrorV6 {
     let (code, message) = match error {
         ServerPhysicalDesignMutationReceiptControlError::NotEnabled => (
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptsNotEnabled,
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptsNotEnabled,
             "physical-design mutation receipts are not enabled",
         ),
         ServerPhysicalDesignMutationReceiptControlError::InvalidLimit { .. } => (
-            OperatorErrorCodeV5::InvalidPhysicalDesignMutationReceiptLimit,
+            OperatorErrorCodeV6::InvalidPhysicalDesignMutationReceiptLimit,
             "receipt read limit must be between 1 and 128",
         ),
         ServerPhysicalDesignMutationReceiptControlError::JournalChanged { .. } => (
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptJournalChanged,
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptJournalChanged,
             "receipt cursor belongs to a different journal incarnation",
         ),
         ServerPhysicalDesignMutationReceiptControlError::ServerStopped => (
-            OperatorErrorCodeV5::ServerStopped,
+            OperatorErrorCodeV6::ServerStopped,
             "server physical-design control is stopped",
         ),
         ServerPhysicalDesignMutationReceiptControlError::RecoveryRequired
         | ServerPhysicalDesignMutationReceiptControlError::Journal(_) => (
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptReadFailed,
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptReadFailed,
             "physical-design mutation receipt read failed",
         ),
     };
-    OperatorRemoteErrorV5 {
+    OperatorRemoteErrorV6 {
+        admission: None,
         code,
         message: message.into(),
         receipt: None,
@@ -2151,24 +2331,27 @@ fn execute_physical_index_apply(
     allow_physical_index_apply: bool,
     runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
     input: OperatorPhysicalIndexApplyInput,
-) -> Result<OperatorResultV5, OperatorRemoteErrorV5> {
+) -> Result<OperatorResultV6, OperatorRemoteErrorV6> {
     if !allow_physical_index_apply {
-        return Err(OperatorRemoteErrorV5 {
-            code: OperatorErrorCodeV5::PhysicalIndexApplyNotEnabled,
+        return Err(OperatorRemoteErrorV6 {
+            admission: None,
+            code: OperatorErrorCodeV6::PhysicalIndexApplyNotEnabled,
             message: "operator physical-index apply is not enabled by the manifest".into(),
             receipt: None,
         });
     }
     let expected = OperatorPhysicalDesignRuntimeToken::parse(&input.expected_runtime_token)
-        .ok_or_else(|| OperatorRemoteErrorV5 {
-            code: OperatorErrorCodeV5::MalformedRequest,
+        .ok_or_else(|| OperatorRemoteErrorV6 {
+            admission: None,
+            code: OperatorErrorCodeV6::MalformedRequest,
             message: "expected_runtime_token must be exactly 32 lowercase hexadecimal characters"
                 .into(),
             receipt: None,
         })?;
     let runtime_token_matches = runtime_token == Some(expected);
-    let index_name = IndexName::new(input.index_name).map_err(|_| OperatorRemoteErrorV5 {
-        code: OperatorErrorCodeV5::InvalidIndexName,
+    let index_name = IndexName::new(input.index_name).map_err(|_| OperatorRemoteErrorV6 {
+        admission: None,
+        code: OperatorErrorCodeV6::InvalidIndexName,
         message: "index_name must be nonempty and at most 255 bytes".into(),
         receipt: None,
     })?;
@@ -2183,7 +2366,7 @@ fn execute_physical_index_apply(
     );
     let receipt = reply.receipt.map(operator_receipt_reference);
     match reply.result {
-        Ok(report) => Ok(OperatorResultV5::PhysicalIndexApplied {
+        Ok(report) => Ok(OperatorResultV6::PhysicalIndexApplied {
             apply: operator_physical_index_apply_result(report, receipt),
         }),
         Err(error) => Err(physical_design_remote_error_with_receipt(error, receipt)),
@@ -2192,24 +2375,24 @@ fn execute_physical_index_apply(
 
 fn operator_physical_index_apply_result(
     report: ServerApprovedPhysicalIndexApplyReport,
-    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV5>,
-) -> OperatorPhysicalIndexApplyResultV5 {
+    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV6>,
+) -> OperatorPhysicalIndexApplyResultV6 {
     let outcome = match report.outcome {
         ServerApprovedPhysicalIndexApplyOutcome::Created { index_id } => {
-            OperatorPhysicalIndexApplyOutcomeV5::Created {
+            OperatorPhysicalIndexApplyOutcomeV6::Created {
                 index_id: index_id.0,
             }
         }
         ServerApprovedPhysicalIndexApplyOutcome::AlreadyApplied { index_id } => {
-            OperatorPhysicalIndexApplyOutcomeV5::AlreadyApplied {
+            OperatorPhysicalIndexApplyOutcomeV6::AlreadyApplied {
                 index_id: index_id.0,
             }
         }
         ServerApprovedPhysicalIndexApplyOutcome::AlreadyCovered => {
-            OperatorPhysicalIndexApplyOutcomeV5::AlreadyCovered
+            OperatorPhysicalIndexApplyOutcomeV6::AlreadyCovered
         }
     };
-    OperatorPhysicalIndexApplyResultV5 {
+    OperatorPhysicalIndexApplyResultV6 {
         table_id: report.candidate.table_id.0,
         column_id: report.candidate.column_id.0,
         index_name: report.index_name.as_str().to_owned(),
@@ -2223,24 +2406,27 @@ fn execute_physical_columnar_apply(
     allow_physical_columnar_apply: bool,
     runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
     input: OperatorPhysicalColumnarApplyInput,
-) -> Result<OperatorResultV5, OperatorRemoteErrorV5> {
+) -> Result<OperatorResultV6, OperatorRemoteErrorV6> {
     if !allow_physical_columnar_apply {
-        return Err(OperatorRemoteErrorV5 {
-            code: OperatorErrorCodeV5::PhysicalColumnarApplyNotEnabled,
+        return Err(OperatorRemoteErrorV6 {
+            admission: None,
+            code: OperatorErrorCodeV6::PhysicalColumnarApplyNotEnabled,
             message: "operator physical-columnar apply is not enabled by the manifest".into(),
             receipt: None,
         });
     }
     if input.columns.is_empty() {
-        return Err(OperatorRemoteErrorV5 {
-            code: OperatorErrorCodeV5::MalformedRequest,
+        return Err(OperatorRemoteErrorV6 {
+            admission: None,
+            code: OperatorErrorCodeV6::MalformedRequest,
             message: "columns must contain at least one column".into(),
             receipt: None,
         });
     }
     let expected = OperatorPhysicalDesignRuntimeToken::parse(&input.expected_runtime_token)
-        .ok_or_else(|| OperatorRemoteErrorV5 {
-            code: OperatorErrorCodeV5::MalformedRequest,
+        .ok_or_else(|| OperatorRemoteErrorV6 {
+            admission: None,
+            code: OperatorErrorCodeV6::MalformedRequest,
             message: "expected_runtime_token must be exactly 32 lowercase hexadecimal characters"
                 .into(),
             receipt: None,
@@ -2248,8 +2434,9 @@ fn execute_physical_columnar_apply(
     let runtime_token_matches = runtime_token == Some(expected);
     let placement =
         crate::ServerPhysicalColumnarPlacementKey::new(input.placement_key).map_err(|_| {
-            OperatorRemoteErrorV5 {
-                code: OperatorErrorCodeV5::InvalidPhysicalColumnarPlacementKey,
+            OperatorRemoteErrorV6 {
+                admission: None,
+                code: OperatorErrorCodeV6::InvalidPhysicalColumnarPlacementKey,
                 message: "placement_key must be one direct-child ASCII namespace key".into(),
                 receipt: None,
             }
@@ -2262,8 +2449,8 @@ fn execute_physical_columnar_apply(
             columns: input.columns.into_iter().map(ColumnId).collect(),
         },
         match input.mode {
-            OperatorPhysicalColumnarDesignModeV5::Snapshot => PhysicalColumnarDesignMode::Snapshot,
-            OperatorPhysicalColumnarDesignModeV5::Incremental => {
+            OperatorPhysicalColumnarDesignModeV6::Snapshot => PhysicalColumnarDesignMode::Snapshot,
+            OperatorPhysicalColumnarDesignModeV6::Incremental => {
                 PhysicalColumnarDesignMode::Incremental
             }
         },
@@ -2271,7 +2458,7 @@ fn execute_physical_columnar_apply(
     );
     let receipt = reply.receipt.map(operator_receipt_reference);
     match reply.result {
-        Ok(report) => Ok(OperatorResultV5::PhysicalColumnarApplied {
+        Ok(report) => Ok(OperatorResultV6::PhysicalColumnarApplied {
             apply: operator_physical_columnar_apply_result(report, receipt),
         }),
         Err(error) => Err(physical_columnar_remote_error_with_receipt(error, receipt)),
@@ -2280,24 +2467,24 @@ fn execute_physical_columnar_apply(
 
 fn operator_physical_columnar_apply_result(
     report: ServerApprovedPhysicalColumnarApplyReport,
-    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV5>,
-) -> OperatorPhysicalColumnarApplyResultV5 {
+    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV6>,
+) -> OperatorPhysicalColumnarApplyResultV6 {
     let outcome = match report.outcome {
         ServerApprovedPhysicalColumnarApplyOutcome::Created { projection_id } => {
-            OperatorPhysicalColumnarApplyOutcomeV5::Created {
+            OperatorPhysicalColumnarApplyOutcomeV6::Created {
                 projection_id: projection_id.0,
             }
         }
         ServerApprovedPhysicalColumnarApplyOutcome::AlreadyApplied { projection_id } => {
-            OperatorPhysicalColumnarApplyOutcomeV5::AlreadyApplied {
+            OperatorPhysicalColumnarApplyOutcomeV6::AlreadyApplied {
                 projection_id: projection_id.0,
             }
         }
         ServerApprovedPhysicalColumnarApplyOutcome::AlreadyCovered => {
-            OperatorPhysicalColumnarApplyOutcomeV5::AlreadyCovered
+            OperatorPhysicalColumnarApplyOutcomeV6::AlreadyCovered
         }
     };
-    OperatorPhysicalColumnarApplyResultV5 {
+    OperatorPhysicalColumnarApplyResultV6 {
         table_id: report.candidate.table_id.0,
         columns: report
             .candidate
@@ -2306,9 +2493,9 @@ fn operator_physical_columnar_apply_result(
             .map(|column| column.0)
             .collect(),
         mode: match report.mode {
-            PhysicalColumnarDesignMode::Snapshot => OperatorPhysicalColumnarDesignModeV5::Snapshot,
+            PhysicalColumnarDesignMode::Snapshot => OperatorPhysicalColumnarDesignModeV6::Snapshot,
             PhysicalColumnarDesignMode::Incremental => {
-                OperatorPhysicalColumnarDesignModeV5::Incremental
+                OperatorPhysicalColumnarDesignModeV6::Incremental
             }
         },
         placement_key: report.placement.as_str().to_owned(),
@@ -2320,12 +2507,8 @@ fn operator_physical_columnar_apply_result(
 fn operator_status_with_capabilities(
     adaptive_control: &ServerAdaptiveControlHandle,
     physical_design_control: &ServerPhysicalDesignControlHandle,
-    allow_physical_index_apply: bool,
-    allow_physical_columnar_apply: bool,
-    allow_physical_design_receipt_read: bool,
-    columnar_capabilities: Option<ServerPhysicalColumnarApplyCapabilities>,
-    runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
-) -> Result<OperatorStatusV5, OperatorRemoteErrorV5> {
+    policy: OperatorListenerPolicy,
+) -> Result<OperatorStatusV6, OperatorRemoteErrorV6> {
     let adaptive = match adaptive_control.status() {
         Ok(status) if status.mode == ServerAdaptiveMode::Disabled => None,
         Ok(status) => Some(operator_adaptive_status(status).map_err(control_remote_error)?),
@@ -2334,24 +2517,20 @@ fn operator_status_with_capabilities(
     };
     let physical_design = match physical_design_control.status() {
         Ok(status) => Some(operator_physical_design_status_with_capabilities(
-            status,
-            allow_physical_index_apply,
-            allow_physical_columnar_apply,
-            allow_physical_design_receipt_read,
-            columnar_capabilities,
-            runtime_token,
+            status, policy,
         )),
         Err(ServerPhysicalDesignControlError::PhysicalDesignNotEnabled) => None,
         Err(error) => return Err(physical_design_remote_error(error)),
     };
     if adaptive.is_none() && physical_design.is_none() {
-        return Err(OperatorRemoteErrorV5 {
-            code: OperatorErrorCodeV5::Internal,
+        return Err(OperatorRemoteErrorV6 {
+            admission: None,
+            code: OperatorErrorCodeV6::Internal,
             message: "operator plane has no managed runtime".into(),
             receipt: None,
         });
     }
-    Ok(OperatorStatusV5 {
+    Ok(OperatorStatusV6 {
         adaptive,
         physical_design,
     })
@@ -2359,17 +2538,17 @@ fn operator_status_with_capabilities(
 
 fn operator_adaptive_status(
     status: ServerAdaptiveStatus,
-) -> Result<OperatorAdaptiveStatusV5, ServerAdaptiveControlError> {
+) -> Result<OperatorAdaptiveStatusV6, ServerAdaptiveControlError> {
     let mode = match status.mode {
-        ServerAdaptiveMode::FeedbackOnly => OperatorAdaptiveModeV5::FeedbackOnly,
-        ServerAdaptiveMode::Driven => OperatorAdaptiveModeV5::Driven,
+        ServerAdaptiveMode::FeedbackOnly => OperatorAdaptiveModeV6::FeedbackOnly,
+        ServerAdaptiveMode::Driven => OperatorAdaptiveModeV6::Driven,
         ServerAdaptiveMode::Disabled => return Err(ServerAdaptiveControlError::AdaptiveNotEnabled),
     };
     let feedback = status
         .feedback
         .ok_or(ServerAdaptiveControlError::AdaptiveNotEnabled)?;
     let progress = feedback.evidence_progress;
-    let feedback = OperatorFeedbackStatusV5 {
+    let feedback = OperatorFeedbackStatusV6 {
         eligible_query_count: feedback.eligible_query_count,
         record_success_count: feedback.record_success_count,
         record_error_count: feedback.record_error_count,
@@ -2383,13 +2562,13 @@ fn operator_adaptive_status(
         schema_generation: progress.schema_generation.map(|generation| generation.0),
         recorded_reports: progress.recorded_reports,
         pool_health: match feedback.pool_health {
-            AdaptiveEvidencePoolHealth::Healthy => OperatorEvidencePoolHealthV5::Healthy,
+            AdaptiveEvidencePoolHealth::Healthy => OperatorEvidencePoolHealthV6::Healthy,
             AdaptiveEvidencePoolHealth::RotationRecommended => {
-                OperatorEvidencePoolHealthV5::RotationRecommended
+                OperatorEvidencePoolHealthV6::RotationRecommended
             }
         },
     };
-    let driver = status.driver.map(|driver| OperatorDriverStatusV5 {
+    let driver = status.driver.map(|driver| OperatorDriverStatusV6 {
         scheduler_last_observed_tick: driver.scheduler_state.last_observed_tick.map(|tick| tick.0),
         scheduler_last_run_tick: driver.scheduler_state.last_run_tick.map(|tick| tick.0),
         scheduler_gate: scheduler_gate(driver.scheduler_state.gate),
@@ -2406,70 +2585,70 @@ fn operator_adaptive_status(
         host_clock_exhausted: driver.host_clock_exhausted,
         counter_overflowed: driver.counter_overflowed,
     });
-    Ok(OperatorAdaptiveStatusV5 {
+    Ok(OperatorAdaptiveStatusV6 {
         mode,
         feedback,
         driver,
     })
 }
 
-fn record_outcome(outcome: AdaptiveEvidenceRecordOutcome) -> OperatorEvidenceRecordOutcomeV5 {
+fn record_outcome(outcome: AdaptiveEvidenceRecordOutcome) -> OperatorEvidenceRecordOutcomeV6 {
     match outcome {
-        AdaptiveEvidenceRecordOutcome::Recorded => OperatorEvidenceRecordOutcomeV5::Recorded,
+        AdaptiveEvidenceRecordOutcome::Recorded => OperatorEvidenceRecordOutcomeV6::Recorded,
         AdaptiveEvidenceRecordOutcome::SchemaRotated => {
-            OperatorEvidenceRecordOutcomeV5::SchemaRotated
+            OperatorEvidenceRecordOutcomeV6::SchemaRotated
         }
         AdaptiveEvidenceRecordOutcome::RecordedWithCapacityRejection => {
-            OperatorEvidenceRecordOutcomeV5::RecordedWithCapacityRejection
+            OperatorEvidenceRecordOutcomeV6::RecordedWithCapacityRejection
         }
         AdaptiveEvidenceRecordOutcome::SchemaRotatedWithCapacityRejection => {
-            OperatorEvidenceRecordOutcomeV5::SchemaRotatedWithCapacityRejection
+            OperatorEvidenceRecordOutcomeV6::SchemaRotatedWithCapacityRejection
         }
     }
 }
 
-fn record_error(error: AdaptiveEvidenceRecordError) -> OperatorEvidenceRecordErrorV5 {
+fn record_error(error: AdaptiveEvidenceRecordError) -> OperatorEvidenceRecordErrorV6 {
     match error {
         AdaptiveEvidenceRecordError::GlobalVisibilityRequired => {
-            OperatorEvidenceRecordErrorV5::GlobalVisibilityRequired
+            OperatorEvidenceRecordErrorV6::GlobalVisibilityRequired
         }
         AdaptiveEvidenceRecordError::StaleSchemaEvidence { .. } => {
-            OperatorEvidenceRecordErrorV5::StaleSchemaEvidence
+            OperatorEvidenceRecordErrorV6::StaleSchemaEvidence
         }
         AdaptiveEvidenceRecordError::OutOfOrderVisibility { .. } => {
-            OperatorEvidenceRecordErrorV5::OutOfOrderVisibility
+            OperatorEvidenceRecordErrorV6::OutOfOrderVisibility
         }
         AdaptiveEvidenceRecordError::StaleTargetGenerationEvidence { .. } => {
-            OperatorEvidenceRecordErrorV5::StaleTargetGenerationEvidence
+            OperatorEvidenceRecordErrorV6::StaleTargetGenerationEvidence
         }
         AdaptiveEvidenceRecordError::StaleTargetIdentityEvidence { .. } => {
-            OperatorEvidenceRecordErrorV5::StaleTargetIdentityEvidence
+            OperatorEvidenceRecordErrorV6::StaleTargetIdentityEvidence
         }
         AdaptiveEvidenceRecordError::RetiredTargetEvidence { .. } => {
-            OperatorEvidenceRecordErrorV5::RetiredTargetEvidence
+            OperatorEvidenceRecordErrorV6::RetiredTargetEvidence
         }
         AdaptiveEvidenceRecordError::StaleCalibrationEpochEvidence { .. } => {
-            OperatorEvidenceRecordErrorV5::StaleCalibrationEpochEvidence
+            OperatorEvidenceRecordErrorV6::StaleCalibrationEpochEvidence
         }
         AdaptiveEvidenceRecordError::EvidenceWindowEpochExhausted => {
-            OperatorEvidenceRecordErrorV5::EvidenceWindowEpochExhausted
+            OperatorEvidenceRecordErrorV6::EvidenceWindowEpochExhausted
         }
     }
 }
 
-fn scheduler_gate(gate: AutomaticSchedulerGate) -> OperatorSchedulerGateV5 {
+fn scheduler_gate(gate: AutomaticSchedulerGate) -> OperatorSchedulerGateV6 {
     match gate {
-        AutomaticSchedulerGate::Open { delay } => OperatorSchedulerGateV5::Open {
+        AutomaticSchedulerGate::Open { delay } => OperatorSchedulerGateV6::Open {
             delay_class: match delay {
-                AutomaticSchedulerDelayClass::Normal => OperatorSchedulerDelayClassV5::Normal,
-                AutomaticSchedulerDelayClass::Idle => OperatorSchedulerDelayClassV5::Idle,
+                AutomaticSchedulerDelayClass::Normal => OperatorSchedulerDelayClassV6::Normal,
+                AutomaticSchedulerDelayClass::Idle => OperatorSchedulerDelayClassV6::Idle,
                 AutomaticSchedulerDelayClass::NoProgress => {
-                    OperatorSchedulerDelayClassV5::NoProgress
+                    OperatorSchedulerDelayClassV6::NoProgress
                 }
             },
         },
         AutomaticSchedulerGate::AwaitingTrialProgress { evidence } => {
-            OperatorSchedulerGateV5::AwaitingTrialProgress {
+            OperatorSchedulerGateV6::AwaitingTrialProgress {
                 window_epoch: evidence.window_epoch.0,
                 schema_generation: evidence.schema_generation.map(|generation| generation.0),
                 recorded_reports: evidence.recorded_reports,
@@ -2478,28 +2657,28 @@ fn scheduler_gate(gate: AutomaticSchedulerGate) -> OperatorSchedulerGateV5 {
         AutomaticSchedulerGate::AwaitingEvidenceRenewal {
             blocked_window_epoch,
             recommendation,
-        } => OperatorSchedulerGateV5::AwaitingEvidenceRenewal {
+        } => OperatorSchedulerGateV6::AwaitingEvidenceRenewal {
             blocked_window_epoch: blocked_window_epoch.0,
             renewal_reason: match recommendation.reason {
                 AutomaticEvidenceRenewalReason::ColumnarPhysicalStateChanged => {
-                    OperatorEvidenceRenewalReasonV5::ColumnarPhysicalStateChanged
+                    OperatorEvidenceRenewalReasonV6::ColumnarPhysicalStateChanged
                 }
                 AutomaticEvidenceRenewalReason::ColumnarEligibilityChanged => {
-                    OperatorEvidenceRenewalReasonV5::ColumnarEligibilityChanged
+                    OperatorEvidenceRenewalReasonV6::ColumnarEligibilityChanged
                 }
                 AutomaticEvidenceRenewalReason::AuthoritativeLsmLayoutChanged => {
-                    OperatorEvidenceRenewalReasonV5::AuthoritativeLsmLayoutChanged
+                    OperatorEvidenceRenewalReasonV6::AuthoritativeLsmLayoutChanged
                 }
             },
         },
-        AutomaticSchedulerGate::Faulted(fault) => OperatorSchedulerGateV5::Faulted {
+        AutomaticSchedulerGate::Faulted(fault) => OperatorSchedulerGateV6::Faulted {
             fault: match fault {
                 AutomaticSchedulerFault::MaintenanceEnvelopeExceeded => {
-                    OperatorSchedulerFaultV5::MaintenanceEnvelopeExceeded
+                    OperatorSchedulerFaultV6::MaintenanceEnvelopeExceeded
                 }
-                AutomaticSchedulerFault::StepFailed => OperatorSchedulerFaultV5::StepFailed,
+                AutomaticSchedulerFault::StepFailed => OperatorSchedulerFaultV6::StepFailed,
                 AutomaticSchedulerFault::ConsumptionOverflow => {
-                    OperatorSchedulerFaultV5::ConsumptionOverflow
+                    OperatorSchedulerFaultV6::ConsumptionOverflow
                 }
             },
         },
@@ -2508,34 +2687,34 @@ fn scheduler_gate(gate: AutomaticSchedulerGate) -> OperatorSchedulerGateV5 {
 
 fn orchestration_stop_reason(
     reason: AutomaticOrchestrationStopReason,
-) -> OperatorOrchestrationStopReasonV5 {
+) -> OperatorOrchestrationStopReasonV6 {
     match reason {
         AutomaticOrchestrationStopReason::NoReadyWork => {
-            OperatorOrchestrationStopReasonV5::NoReadyWork
+            OperatorOrchestrationStopReasonV6::NoReadyWork
         }
         AutomaticOrchestrationStopReason::StepLimitReached => {
-            OperatorOrchestrationStopReasonV5::StepLimitReached
+            OperatorOrchestrationStopReasonV6::StepLimitReached
         }
         AutomaticOrchestrationStopReason::ActiveTrial(_) => {
-            OperatorOrchestrationStopReasonV5::ActiveTrial
+            OperatorOrchestrationStopReasonV6::ActiveTrial
         }
         AutomaticOrchestrationStopReason::TrialBoundaryResolved => {
-            OperatorOrchestrationStopReasonV5::TrialBoundaryResolved
+            OperatorOrchestrationStopReasonV6::TrialBoundaryResolved
         }
         AutomaticOrchestrationStopReason::EvidenceRenewalRecommended(_) => {
-            OperatorOrchestrationStopReasonV5::EvidenceRenewalRecommended
+            OperatorOrchestrationStopReasonV6::EvidenceRenewalRecommended
         }
         AutomaticOrchestrationStopReason::SelectedCandidateDidNotProgress => {
-            OperatorOrchestrationStopReasonV5::SelectedCandidateDidNotProgress
+            OperatorOrchestrationStopReasonV6::SelectedCandidateDidNotProgress
         }
         AutomaticOrchestrationStopReason::MaintenanceEnvelopeExceeded { .. } => {
-            OperatorOrchestrationStopReasonV5::MaintenanceEnvelopeExceeded
+            OperatorOrchestrationStopReasonV6::MaintenanceEnvelopeExceeded
         }
     }
 }
 
-fn operator_rotation(report: AdaptiveEvidenceRotationReport) -> OperatorEvidenceRotationV5 {
-    OperatorEvidenceRotationV5 {
+fn operator_rotation(report: AdaptiveEvidenceRotationReport) -> OperatorEvidenceRotationV6 {
+    OperatorEvidenceRotationV6 {
         previous_window_epoch: report.previous_window_epoch.0,
         new_window_epoch: report.new_window_epoch.0,
         schema_generation: report.schema_generation.map(|generation| generation.0),
@@ -2553,33 +2732,39 @@ fn operator_physical_design_status(
     status: ServerPhysicalDesignStatus,
     allow_physical_index_apply: bool,
     runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
-) -> OperatorPhysicalDesignStatusV5 {
+) -> OperatorPhysicalDesignStatusV6 {
     operator_physical_design_status_with_capabilities(
         status,
-        allow_physical_index_apply,
-        false,
-        false,
-        None,
-        runtime_token,
+        OperatorListenerPolicy::new(
+            allow_physical_index_apply,
+            false,
+            false,
+            None,
+            runtime_token,
+        ),
     )
 }
 
 fn operator_physical_design_status_with_capabilities(
     status: ServerPhysicalDesignStatus,
-    allow_physical_index_apply: bool,
-    allow_physical_columnar_apply: bool,
-    allow_physical_design_receipt_read: bool,
-    columnar_capabilities: Option<ServerPhysicalColumnarApplyCapabilities>,
-    runtime_token: Option<OperatorPhysicalDesignRuntimeToken>,
-) -> OperatorPhysicalDesignStatusV5 {
+    policy: OperatorListenerPolicy,
+) -> OperatorPhysicalDesignStatusV6 {
+    let OperatorListenerPolicy {
+        allow_physical_index_apply,
+        allow_physical_columnar_apply,
+        allow_physical_design_receipt_read,
+        columnar_capabilities,
+        runtime_token,
+        admissions,
+    } = policy;
     let diagnostics = status.diagnostics;
     let evidence = status.evidence;
     let columnar_apply = operator_physical_columnar_apply_capability(
         allow_physical_columnar_apply,
         columnar_capabilities,
     );
-    OperatorPhysicalDesignStatusV5 {
-        diagnostics: OperatorPhysicalDesignDiagnosticsV5 {
+    OperatorPhysicalDesignStatusV6 {
+        diagnostics: OperatorPhysicalDesignDiagnosticsV6 {
             eligible_query_count: diagnostics.eligible_query_count,
             record_success_count: diagnostics.record_success_count,
             record_error_count: diagnostics.record_error_count,
@@ -2594,8 +2779,8 @@ fn operator_physical_design_status_with_capabilities(
                 .last_record_error
                 .map(physical_design_record_error),
         },
-        evidence: OperatorPhysicalDesignEvidenceStatusV5 {
-            limits: OperatorPhysicalDesignEvidenceLimitsV5 {
+        evidence: OperatorPhysicalDesignEvidenceStatusV6 {
+            limits: OperatorPhysicalDesignEvidenceLimitsV6 {
                 max_index_candidates: evidence.limits.max_index_candidates,
                 max_columnar_candidates: evidence.limits.max_columnar_candidates,
                 max_query_shapes_per_candidate: evidence.limits.max_query_shapes_per_candidate,
@@ -2617,13 +2802,16 @@ fn operator_physical_design_status_with_capabilities(
             incomplete: evidence.incomplete,
             truncated: evidence.truncated,
         },
-        physical_index_apply: OperatorPhysicalIndexApplyStatusV5 {
+        physical_index_apply: OperatorPhysicalIndexApplyStatusV6 {
+            admission: admissions.index.into(),
             enabled: allow_physical_index_apply,
             runtime_token: allow_physical_index_apply
                 .then(|| runtime_token.map(OperatorPhysicalDesignRuntimeToken::encode))
                 .flatten(),
         },
-        physical_columnar_apply: OperatorPhysicalColumnarApplyStatusV5 {
+        physical_columnar_apply: OperatorPhysicalColumnarApplyStatusV6 {
+            snapshot_admission: admissions.snapshot.into(),
+            incremental_admission: admissions.incremental.into(),
             enabled: columnar_apply.enabled,
             allow_snapshot: columnar_apply.allow_snapshot,
             allow_incremental: columnar_apply.allow_incremental,
@@ -2631,7 +2819,7 @@ fn operator_physical_design_status_with_capabilities(
                 .then(|| runtime_token.map(OperatorPhysicalDesignRuntimeToken::encode))
                 .flatten(),
         },
-        physical_design_mutation_receipts: OperatorPhysicalDesignMutationReceiptCapabilityV5 {
+        physical_design_mutation_receipts: OperatorPhysicalDesignMutationReceiptCapabilityV6 {
             read_enabled: allow_physical_design_receipt_read,
         },
     }
@@ -2640,8 +2828,8 @@ fn operator_physical_design_status_with_capabilities(
 fn operator_physical_columnar_apply_capability(
     enabled: bool,
     capabilities: Option<ServerPhysicalColumnarApplyCapabilities>,
-) -> OperatorPhysicalColumnarApplyCapabilityV5 {
-    OperatorPhysicalColumnarApplyCapabilityV5 {
+) -> OperatorPhysicalColumnarApplyCapabilityV6 {
+    OperatorPhysicalColumnarApplyCapabilityV6 {
         enabled,
         allow_snapshot: enabled
             && capabilities.is_some_and(|capabilities| capabilities.allow_snapshot),
@@ -2652,46 +2840,46 @@ fn operator_physical_columnar_apply_capability(
 
 const fn physical_design_record_outcome(
     outcome: PhysicalDesignEvidenceRecordOutcome,
-) -> OperatorPhysicalDesignRecordOutcomeV5 {
+) -> OperatorPhysicalDesignRecordOutcomeV6 {
     match outcome {
         PhysicalDesignEvidenceRecordOutcome::Recorded => {
-            OperatorPhysicalDesignRecordOutcomeV5::Recorded
+            OperatorPhysicalDesignRecordOutcomeV6::Recorded
         }
         PhysicalDesignEvidenceRecordOutcome::SchemaRotated => {
-            OperatorPhysicalDesignRecordOutcomeV5::SchemaRotated
+            OperatorPhysicalDesignRecordOutcomeV6::SchemaRotated
         }
         PhysicalDesignEvidenceRecordOutcome::RecordedWithCapacityRejection => {
-            OperatorPhysicalDesignRecordOutcomeV5::RecordedWithCapacityRejection
+            OperatorPhysicalDesignRecordOutcomeV6::RecordedWithCapacityRejection
         }
         PhysicalDesignEvidenceRecordOutcome::SchemaRotatedWithCapacityRejection => {
-            OperatorPhysicalDesignRecordOutcomeV5::SchemaRotatedWithCapacityRejection
+            OperatorPhysicalDesignRecordOutcomeV6::SchemaRotatedWithCapacityRejection
         }
     }
 }
 
 const fn physical_design_record_error(
     error: PhysicalDesignEvidenceRecordError,
-) -> OperatorPhysicalDesignRecordErrorV5 {
+) -> OperatorPhysicalDesignRecordErrorV6 {
     match error {
         PhysicalDesignEvidenceRecordError::GlobalVisibilityRequired => {
-            OperatorPhysicalDesignRecordErrorV5::GlobalVisibilityRequired
+            OperatorPhysicalDesignRecordErrorV6::GlobalVisibilityRequired
         }
         PhysicalDesignEvidenceRecordError::StaleSchemaEvidence { .. } => {
-            OperatorPhysicalDesignRecordErrorV5::StaleSchemaEvidence
+            OperatorPhysicalDesignRecordErrorV6::StaleSchemaEvidence
         }
         PhysicalDesignEvidenceRecordError::OutOfOrderVisibility { .. } => {
-            OperatorPhysicalDesignRecordErrorV5::OutOfOrderVisibility
+            OperatorPhysicalDesignRecordErrorV6::OutOfOrderVisibility
         }
         PhysicalDesignEvidenceRecordError::EvidenceWindowEpochExhausted => {
-            OperatorPhysicalDesignRecordErrorV5::EvidenceWindowEpochExhausted
+            OperatorPhysicalDesignRecordErrorV6::EvidenceWindowEpochExhausted
         }
     }
 }
 
 fn operator_physical_design_report(
     report: PhysicalDesignAdvisorReport,
-) -> OperatorPhysicalDesignAdvisorReportV5 {
-    OperatorPhysicalDesignAdvisorReportV5 {
+) -> OperatorPhysicalDesignAdvisorReportV6 {
+    OperatorPhysicalDesignAdvisorReportV6 {
         evidence_epoch: report.evidence_epoch.0,
         schema_generation: report.schema_generation.0,
         first_global_commit_seq: report.first_global_commit_seq.0,
@@ -2715,8 +2903,8 @@ fn operator_physical_design_report(
 
 fn operator_index_candidate(
     inspection: PhysicalIndexRecommendationInspection,
-) -> OperatorPhysicalIndexCandidateV5 {
-    OperatorPhysicalIndexCandidateV5 {
+) -> OperatorPhysicalIndexCandidateV6 {
+    OperatorPhysicalIndexCandidateV6 {
         table_id: inspection.candidate.table_id.0,
         column_id: inspection.candidate.column_id.0,
         point_report_count: inspection.point_report_count,
@@ -2728,8 +2916,8 @@ fn operator_index_candidate(
 
 fn operator_columnar_candidate(
     inspection: PhysicalColumnarRecommendationInspection,
-) -> OperatorPhysicalColumnarCandidateV5 {
-    OperatorPhysicalColumnarCandidateV5 {
+) -> OperatorPhysicalColumnarCandidateV6 {
+    OperatorPhysicalColumnarCandidateV6 {
         table_id: inspection.candidate.table_id.0,
         columns: inspection
             .candidate
@@ -2744,8 +2932,8 @@ fn operator_columnar_candidate(
 
 const fn operator_evidence_summary(
     evidence: PhysicalDesignEvidenceSummary,
-) -> OperatorPhysicalDesignEvidenceSummaryV5 {
-    OperatorPhysicalDesignEvidenceSummaryV5 {
+) -> OperatorPhysicalDesignEvidenceSummaryV6 {
+    OperatorPhysicalDesignEvidenceSummaryV6 {
         report_count: evidence.report_count,
         distinct_query_shapes: evidence.distinct_query_shapes,
         total_actual_scan_work_units: evidence.total_actual_scan_work_units,
@@ -2758,13 +2946,13 @@ const fn operator_evidence_summary(
 
 const fn operator_design_decision(
     decision: PhysicalDesignCandidateDecision,
-) -> OperatorPhysicalDesignDecisionV5 {
+) -> OperatorPhysicalDesignDecisionV6 {
     match decision {
         PhysicalDesignCandidateDecision::Recommend => {
-            OperatorPhysicalDesignDecisionV5::Recommend {}
+            OperatorPhysicalDesignDecisionV6::Recommend {}
         }
         PhysicalDesignCandidateDecision::NoAction(reason) => {
-            OperatorPhysicalDesignDecisionV5::NoAction {
+            OperatorPhysicalDesignDecisionV6::NoAction {
                 reason: operator_no_action_reason(reason),
             }
         }
@@ -2773,69 +2961,70 @@ const fn operator_design_decision(
 
 const fn operator_no_action_reason(
     reason: PhysicalDesignNoActionReason,
-) -> OperatorPhysicalDesignNoActionReasonV5 {
+) -> OperatorPhysicalDesignNoActionReasonV6 {
     match reason {
         PhysicalDesignNoActionReason::BelowMinimumReports => {
-            OperatorPhysicalDesignNoActionReasonV5::BelowMinimumReports
+            OperatorPhysicalDesignNoActionReasonV6::BelowMinimumReports
         }
         PhysicalDesignNoActionReason::BelowMinimumShapeDiversity => {
-            OperatorPhysicalDesignNoActionReasonV5::BelowMinimumShapeDiversity
+            OperatorPhysicalDesignNoActionReasonV6::BelowMinimumShapeDiversity
         }
         PhysicalDesignNoActionReason::BelowMinimumActualWork => {
-            OperatorPhysicalDesignNoActionReasonV5::BelowMinimumActualWork
+            OperatorPhysicalDesignNoActionReasonV6::BelowMinimumActualWork
         }
         PhysicalDesignNoActionReason::ExistingDesignCovers => {
-            OperatorPhysicalDesignNoActionReasonV5::ExistingDesignCovers
+            OperatorPhysicalDesignNoActionReasonV6::ExistingDesignCovers
         }
         PhysicalDesignNoActionReason::UnsupportedCurrentLayout => {
-            OperatorPhysicalDesignNoActionReasonV5::UnsupportedCurrentLayout
+            OperatorPhysicalDesignNoActionReasonV6::UnsupportedCurrentLayout
         }
         PhysicalDesignNoActionReason::IncompleteEvidence => {
-            OperatorPhysicalDesignNoActionReasonV5::IncompleteEvidence
+            OperatorPhysicalDesignNoActionReasonV6::IncompleteEvidence
         }
         PhysicalDesignNoActionReason::CurrentProjectionUnavailable => {
-            OperatorPhysicalDesignNoActionReasonV5::CurrentProjectionUnavailable
+            OperatorPhysicalDesignNoActionReasonV6::CurrentProjectionUnavailable
         }
         PhysicalDesignNoActionReason::RecommendationLimitReached => {
-            OperatorPhysicalDesignNoActionReasonV5::RecommendationLimitReached
+            OperatorPhysicalDesignNoActionReasonV6::RecommendationLimitReached
         }
     }
 }
 
 const fn operator_physical_design_rotation(
     report: ServerPhysicalDesignRotationReport,
-) -> OperatorPhysicalDesignRotationV5 {
-    OperatorPhysicalDesignRotationV5 {
+) -> OperatorPhysicalDesignRotationV6 {
+    OperatorPhysicalDesignRotationV6 {
         previous_epoch: report.previous_epoch.0,
         new_epoch: report.new_epoch.0,
     }
 }
 
-fn control_remote_error(error: ServerAdaptiveControlError) -> OperatorRemoteErrorV5 {
+fn control_remote_error(error: ServerAdaptiveControlError) -> OperatorRemoteErrorV6 {
     let code = match error {
-        ServerAdaptiveControlError::AdaptiveNotEnabled => OperatorErrorCodeV5::AdaptiveNotEnabled,
-        ServerAdaptiveControlError::DriverNotEnabled => OperatorErrorCodeV5::DriverNotEnabled,
-        ServerAdaptiveControlError::SchedulerNotFaulted => OperatorErrorCodeV5::SchedulerNotFaulted,
+        ServerAdaptiveControlError::AdaptiveNotEnabled => OperatorErrorCodeV6::AdaptiveNotEnabled,
+        ServerAdaptiveControlError::DriverNotEnabled => OperatorErrorCodeV6::DriverNotEnabled,
+        ServerAdaptiveControlError::SchedulerNotFaulted => OperatorErrorCodeV6::SchedulerNotFaulted,
         ServerAdaptiveControlError::EvidenceWindowChanged { .. } => {
-            OperatorErrorCodeV5::EvidenceWindowChanged
+            OperatorErrorCodeV6::EvidenceWindowChanged
         }
         ServerAdaptiveControlError::EvidenceRotation(
             AdaptiveEvidenceRotationError::EvidenceWindowEpochExhausted,
-        ) => OperatorErrorCodeV5::EvidenceWindowEpochExhausted,
-        ServerAdaptiveControlError::ServerStopped => OperatorErrorCodeV5::ServerStopped,
+        ) => OperatorErrorCodeV6::EvidenceWindowEpochExhausted,
+        ServerAdaptiveControlError::ServerStopped => OperatorErrorCodeV6::ServerStopped,
     };
     let message = match code {
-        OperatorErrorCodeV5::AdaptiveNotEnabled => "adaptive runtime is not enabled",
-        OperatorErrorCodeV5::DriverNotEnabled => "adaptive driver is not enabled",
-        OperatorErrorCodeV5::SchedulerNotFaulted => "adaptive scheduler is not faulted",
-        OperatorErrorCodeV5::EvidenceWindowChanged => "adaptive evidence window changed",
-        OperatorErrorCodeV5::EvidenceWindowEpochExhausted => {
+        OperatorErrorCodeV6::AdaptiveNotEnabled => "adaptive runtime is not enabled",
+        OperatorErrorCodeV6::DriverNotEnabled => "adaptive driver is not enabled",
+        OperatorErrorCodeV6::SchedulerNotFaulted => "adaptive scheduler is not faulted",
+        OperatorErrorCodeV6::EvidenceWindowChanged => "adaptive evidence window changed",
+        OperatorErrorCodeV6::EvidenceWindowEpochExhausted => {
             "adaptive evidence window epoch is exhausted"
         }
-        OperatorErrorCodeV5::ServerStopped => "server adaptive control is stopped",
+        OperatorErrorCodeV6::ServerStopped => "server adaptive control is stopped",
         _ => "operator request failed",
     };
-    OperatorRemoteErrorV5 {
+    OperatorRemoteErrorV6 {
+        admission: None,
         code,
         message: message.into(),
         receipt: None,
@@ -2845,14 +3034,14 @@ fn control_remote_error(error: ServerAdaptiveControlError) -> OperatorRemoteErro
 #[cfg(test)]
 fn physical_columnar_remote_error(
     error: ServerPhysicalColumnarDesignControlError,
-) -> OperatorRemoteErrorV5 {
+) -> OperatorRemoteErrorV6 {
     physical_columnar_remote_error_with_receipt(error, None)
 }
 
 fn physical_columnar_remote_error_with_receipt(
     error: ServerPhysicalColumnarDesignControlError,
-    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV5>,
-) -> OperatorRemoteErrorV5 {
+    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV6>,
+) -> OperatorRemoteErrorV6 {
     if matches!(
         &error,
         ServerPhysicalColumnarDesignControlError::MutationRecoveryRequired(_)
@@ -2862,7 +3051,8 @@ fn physical_columnar_remote_error_with_receipt(
     }
     if let ServerPhysicalColumnarDesignControlError::MutationReceipt(ref error) = error {
         let code = mutation_receipt_begin_error_code(error);
-        return OperatorRemoteErrorV5 {
+        return OperatorRemoteErrorV6 {
+            admission: None,
             code,
             message: mutation_receipt_begin_error_message(error).into(),
             receipt: None,
@@ -2877,32 +3067,32 @@ fn physical_columnar_remote_error_with_receipt(
     }
     let code = match error {
         ServerPhysicalColumnarDesignControlError::PhysicalDesignNotEnabled => {
-            OperatorErrorCodeV5::PhysicalDesignNotEnabled
+            OperatorErrorCodeV6::PhysicalDesignNotEnabled
         }
         ServerPhysicalColumnarDesignControlError::ColumnarApplyNotEnabled => {
-            OperatorErrorCodeV5::PhysicalColumnarApplyNotEnabled
+            OperatorErrorCodeV6::PhysicalColumnarApplyNotEnabled
         }
         ServerPhysicalColumnarDesignControlError::ModeNotAllowed(_) => {
-            OperatorErrorCodeV5::PhysicalColumnarModeNotAllowed
+            OperatorErrorCodeV6::PhysicalColumnarModeNotAllowed
         }
         ServerPhysicalColumnarDesignControlError::PlacementRootUnavailable(_) => {
-            OperatorErrorCodeV5::PhysicalColumnarPlacementUnavailable
+            OperatorErrorCodeV6::PhysicalColumnarPlacementUnavailable
         }
         ServerPhysicalColumnarDesignControlError::PlacementOccupied { .. } => {
-            OperatorErrorCodeV5::PhysicalColumnarPlacementOccupied
+            OperatorErrorCodeV6::PhysicalColumnarPlacementOccupied
         }
         ServerPhysicalColumnarDesignControlError::LocationConflict { .. } => {
-            OperatorErrorCodeV5::PhysicalColumnarLocationConflict
+            OperatorErrorCodeV6::PhysicalColumnarLocationConflict
         }
         ServerPhysicalColumnarDesignControlError::PlacementInspection { .. }
         | ServerPhysicalColumnarDesignControlError::LocationInspection(_) => {
-            OperatorErrorCodeV5::PhysicalColumnarPlacementUnavailable
+            OperatorErrorCodeV6::PhysicalColumnarPlacementUnavailable
         }
         ServerPhysicalColumnarDesignControlError::EvidenceEpochChanged { .. } => {
-            OperatorErrorCodeV5::PhysicalDesignEvidenceEpochChanged
+            OperatorErrorCodeV6::PhysicalDesignEvidenceEpochChanged
         }
         ServerPhysicalColumnarDesignControlError::PhysicalDesignRuntimeChanged => {
-            OperatorErrorCodeV5::PhysicalDesignRuntimeChanged
+            OperatorErrorCodeV6::PhysicalDesignRuntimeChanged
         }
         ServerPhysicalColumnarDesignControlError::Proposal(error) => {
             physical_columnar_proposal_code(*error)
@@ -2914,71 +3104,73 @@ fn physical_columnar_remote_error_with_receipt(
         | ServerPhysicalColumnarDesignControlError::MutationOutcomeUncertain
         | ServerPhysicalColumnarDesignControlError::PostBeginMutationOutcomeUncertain(_)
         | ServerPhysicalColumnarDesignControlError::UnjournaledMutationOutcomeUncertain(_) => {
-            OperatorErrorCodeV5::PhysicalColumnarApplyFailed
+            OperatorErrorCodeV6::PhysicalColumnarApplyFailed
         }
         ServerPhysicalColumnarDesignControlError::MutationReceipt(_) => {
-            OperatorErrorCodeV5::PhysicalColumnarApplyFailed
+            OperatorErrorCodeV6::PhysicalColumnarApplyFailed
         }
         ServerPhysicalColumnarDesignControlError::ProposalRuntimeChanged => {
-            OperatorErrorCodeV5::PhysicalDesignRuntimeChanged
+            OperatorErrorCodeV6::PhysicalDesignRuntimeChanged
         }
         ServerPhysicalColumnarDesignControlError::PlacementInvariantViolated => {
-            OperatorErrorCodeV5::PhysicalColumnarApplyFailed
+            OperatorErrorCodeV6::PhysicalColumnarApplyFailed
         }
-        // Programmatic-only; NBOP never carries a component admission policy.
-        ServerPhysicalColumnarDesignControlError::Admission(_) => OperatorErrorCodeV5::Internal,
+        ServerPhysicalColumnarDesignControlError::Admission(error) => {
+            return admission_remote_error(*error, receipt);
+        }
         ServerPhysicalColumnarDesignControlError::ServerStopped => {
-            OperatorErrorCodeV5::ServerStopped
+            OperatorErrorCodeV6::ServerStopped
         }
     };
     let message = match code {
-        OperatorErrorCodeV5::PhysicalDesignNotEnabled => "physical-design advisor is not enabled",
-        OperatorErrorCodeV5::PhysicalColumnarApplyNotEnabled => {
+        OperatorErrorCodeV6::PhysicalDesignNotEnabled => "physical-design advisor is not enabled",
+        OperatorErrorCodeV6::PhysicalColumnarApplyNotEnabled => {
             "physical-columnar apply is not enabled"
         }
-        OperatorErrorCodeV5::PhysicalColumnarModeNotAllowed => {
+        OperatorErrorCodeV6::PhysicalColumnarModeNotAllowed => {
             "physical-columnar mode is not allowed"
         }
-        OperatorErrorCodeV5::PhysicalColumnarPlacementUnavailable => {
+        OperatorErrorCodeV6::PhysicalColumnarPlacementUnavailable => {
             "physical-columnar placement is unavailable"
         }
-        OperatorErrorCodeV5::PhysicalColumnarPlacementOccupied => {
+        OperatorErrorCodeV6::PhysicalColumnarPlacementOccupied => {
             "physical-columnar placement is occupied"
         }
-        OperatorErrorCodeV5::PhysicalColumnarLocationConflict => {
+        OperatorErrorCodeV6::PhysicalColumnarLocationConflict => {
             "physical-columnar placement conflicts with a registered projection"
         }
-        OperatorErrorCodeV5::PhysicalColumnarCandidateNotObserved => {
+        OperatorErrorCodeV6::PhysicalColumnarCandidateNotObserved => {
             "physical-columnar candidate was not observed in current evidence"
         }
-        OperatorErrorCodeV5::PhysicalColumnarNotRecommended => {
+        OperatorErrorCodeV6::PhysicalColumnarNotRecommended => {
             "physical-columnar candidate is not currently recommended"
         }
-        OperatorErrorCodeV5::PhysicalColumnarChangeStreamNotEnabled => {
+        OperatorErrorCodeV6::PhysicalColumnarChangeStreamNotEnabled => {
             "incremental physical-columnar apply requires an enabled change stream"
         }
-        OperatorErrorCodeV5::PhysicalColumnarChangeStreamUnavailable => {
+        OperatorErrorCodeV6::PhysicalColumnarChangeStreamUnavailable => {
             "incremental physical-columnar change stream is unavailable"
         }
-        OperatorErrorCodeV5::PhysicalColumnarChangeStreamChanged => {
+        OperatorErrorCodeV6::PhysicalColumnarChangeStreamChanged => {
             "incremental physical-columnar change stream changed"
         }
-        OperatorErrorCodeV5::PhysicalColumnarRecoveryRequired => {
+        OperatorErrorCodeV6::PhysicalColumnarRecoveryRequired => {
             "physical-columnar publication is ambiguous; restart/reopen the daemon before retrying the exact approval"
         }
-        OperatorErrorCodeV5::PhysicalColumnarApplyFailed => {
+        OperatorErrorCodeV6::PhysicalColumnarApplyFailed => {
             "physical-columnar apply failed without creating a new projection"
         }
-        OperatorErrorCodeV5::PhysicalDesignEvidenceEpochChanged => {
+        OperatorErrorCodeV6::PhysicalDesignEvidenceEpochChanged => {
             "physical-design evidence epoch changed"
         }
-        OperatorErrorCodeV5::PhysicalDesignRuntimeChanged => {
+        OperatorErrorCodeV6::PhysicalDesignRuntimeChanged => {
             "physical-design approval belongs to a previous daemon/operator runtime"
         }
-        OperatorErrorCodeV5::ServerStopped => "server physical-design control is stopped",
+        OperatorErrorCodeV6::ServerStopped => "server physical-design control is stopped",
         _ => "operator request failed",
     };
-    OperatorRemoteErrorV5 {
+    OperatorRemoteErrorV6 {
+        admission: None,
         code,
         message: message.into(),
         receipt,
@@ -2987,95 +3179,95 @@ fn physical_columnar_remote_error_with_receipt(
 
 fn physical_columnar_proposal_code(
     error: PhysicalColumnarDesignProposalError,
-) -> OperatorErrorCodeV5 {
+) -> OperatorErrorCodeV6 {
     match error {
         PhysicalColumnarDesignProposalError::Advisor(PhysicalDesignAdvisorError::NoEvidence) => {
-            OperatorErrorCodeV5::PhysicalDesignNoEvidence
+            OperatorErrorCodeV6::PhysicalDesignNoEvidence
         }
         PhysicalColumnarDesignProposalError::Advisor(PhysicalDesignAdvisorError::StaleSchema {
             ..
-        }) => OperatorErrorCodeV5::PhysicalDesignStaleSchema,
+        }) => OperatorErrorCodeV6::PhysicalDesignStaleSchema,
         PhysicalColumnarDesignProposalError::Advisor(
             PhysicalDesignAdvisorError::InconclusiveCapacity { .. },
-        ) => OperatorErrorCodeV5::PhysicalDesignInconclusiveCapacity,
+        ) => OperatorErrorCodeV6::PhysicalDesignInconclusiveCapacity,
         PhysicalColumnarDesignProposalError::CandidateNotObserved(_) => {
-            OperatorErrorCodeV5::PhysicalColumnarCandidateNotObserved
+            OperatorErrorCodeV6::PhysicalColumnarCandidateNotObserved
         }
         PhysicalColumnarDesignProposalError::CandidateNotRecommended { .. } => {
-            OperatorErrorCodeV5::PhysicalColumnarNotRecommended
+            OperatorErrorCodeV6::PhysicalColumnarNotRecommended
         }
         PhysicalColumnarDesignProposalError::IncrementalChangeStreamNotEnabled { .. } => {
-            OperatorErrorCodeV5::PhysicalColumnarChangeStreamNotEnabled
+            OperatorErrorCodeV6::PhysicalColumnarChangeStreamNotEnabled
         }
         PhysicalColumnarDesignProposalError::IncrementalChangeStreamUnavailable { .. } => {
-            OperatorErrorCodeV5::PhysicalColumnarChangeStreamUnavailable
+            OperatorErrorCodeV6::PhysicalColumnarChangeStreamUnavailable
         }
         PhysicalColumnarDesignProposalError::ProjectionLocationConflict { .. } => {
-            OperatorErrorCodeV5::PhysicalColumnarLocationConflict
+            OperatorErrorCodeV6::PhysicalColumnarLocationConflict
         }
         PhysicalColumnarDesignProposalError::GlobalVisibilityRequired
         | PhysicalColumnarDesignProposalError::DurableCatalogRequired
         | PhysicalColumnarDesignProposalError::Advisor(PhysicalDesignAdvisorError::Database(_))
         | PhysicalColumnarDesignProposalError::Database(_) => {
-            OperatorErrorCodeV5::PhysicalColumnarApplyFailed
+            OperatorErrorCodeV6::PhysicalColumnarApplyFailed
         }
     }
 }
 
-fn physical_columnar_apply_code(error: PhysicalColumnarDesignApplyError) -> OperatorErrorCodeV5 {
+fn physical_columnar_apply_code(error: PhysicalColumnarDesignApplyError) -> OperatorErrorCodeV6 {
     match error {
         PhysicalColumnarDesignApplyError::EvidenceEpochChanged { .. } => {
-            OperatorErrorCodeV5::PhysicalDesignEvidenceEpochChanged
+            OperatorErrorCodeV6::PhysicalDesignEvidenceEpochChanged
         }
         PhysicalColumnarDesignApplyError::CandidateNotObserved(_) => {
-            OperatorErrorCodeV5::PhysicalColumnarCandidateNotObserved
+            OperatorErrorCodeV6::PhysicalColumnarCandidateNotObserved
         }
         PhysicalColumnarDesignApplyError::RecommendationNoLongerValid(_) => {
-            OperatorErrorCodeV5::PhysicalColumnarNotRecommended
+            OperatorErrorCodeV6::PhysicalColumnarNotRecommended
         }
         PhysicalColumnarDesignApplyError::StaleProposal(reason) => match reason {
             PhysicalColumnarDesignProposalStaleReason::ChangeStreamDisabled => {
-                OperatorErrorCodeV5::PhysicalColumnarChangeStreamNotEnabled
+                OperatorErrorCodeV6::PhysicalColumnarChangeStreamNotEnabled
             }
             PhysicalColumnarDesignProposalStaleReason::ChangeStreamUnavailable => {
-                OperatorErrorCodeV5::PhysicalColumnarChangeStreamUnavailable
+                OperatorErrorCodeV6::PhysicalColumnarChangeStreamUnavailable
             }
             PhysicalColumnarDesignProposalStaleReason::ChangeStreamGenerationChanged { .. } => {
-                OperatorErrorCodeV5::PhysicalColumnarChangeStreamChanged
+                OperatorErrorCodeV6::PhysicalColumnarChangeStreamChanged
             }
-            _ => OperatorErrorCodeV5::PhysicalColumnarApplyFailed,
+            _ => OperatorErrorCodeV6::PhysicalColumnarApplyFailed,
         },
         PhysicalColumnarDesignApplyError::ProjectionLocationConflict { .. } => {
-            OperatorErrorCodeV5::PhysicalColumnarLocationConflict
+            OperatorErrorCodeV6::PhysicalColumnarLocationConflict
         }
         PhysicalColumnarDesignApplyError::Advisor(PhysicalDesignAdvisorError::NoEvidence) => {
-            OperatorErrorCodeV5::PhysicalDesignNoEvidence
+            OperatorErrorCodeV6::PhysicalDesignNoEvidence
         }
         PhysicalColumnarDesignApplyError::Advisor(PhysicalDesignAdvisorError::StaleSchema {
             ..
-        }) => OperatorErrorCodeV5::PhysicalDesignStaleSchema,
+        }) => OperatorErrorCodeV6::PhysicalDesignStaleSchema,
         PhysicalColumnarDesignApplyError::Advisor(
             PhysicalDesignAdvisorError::InconclusiveCapacity { .. },
-        ) => OperatorErrorCodeV5::PhysicalDesignInconclusiveCapacity,
+        ) => OperatorErrorCodeV6::PhysicalDesignInconclusiveCapacity,
         PhysicalColumnarDesignApplyError::Database(DatabaseError::ProjectionCatalog(
             ProjectionCatalogError::RecoveryRequired { .. },
-        )) => OperatorErrorCodeV5::PhysicalColumnarRecoveryRequired,
+        )) => OperatorErrorCodeV6::PhysicalColumnarRecoveryRequired,
         PhysicalColumnarDesignApplyError::DatabaseIdentityChanged
         | PhysicalColumnarDesignApplyError::Advisor(PhysicalDesignAdvisorError::Database(_))
         | PhysicalColumnarDesignApplyError::Database(_) => {
-            OperatorErrorCodeV5::PhysicalColumnarApplyFailed
+            OperatorErrorCodeV6::PhysicalColumnarApplyFailed
         }
     }
 }
 
-fn physical_design_remote_error(error: ServerPhysicalDesignControlError) -> OperatorRemoteErrorV5 {
+fn physical_design_remote_error(error: ServerPhysicalDesignControlError) -> OperatorRemoteErrorV6 {
     physical_design_remote_error_with_receipt(error, None)
 }
 
 fn physical_design_remote_error_with_receipt(
     error: ServerPhysicalDesignControlError,
-    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV5>,
-) -> OperatorRemoteErrorV5 {
+    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV6>,
+) -> OperatorRemoteErrorV6 {
     if matches!(
         &error,
         ServerPhysicalDesignControlError::MutationRecoveryRequired(_)
@@ -3085,7 +3277,8 @@ fn physical_design_remote_error_with_receipt(
     }
     if let ServerPhysicalDesignControlError::MutationReceipt(ref error) = error {
         let code = mutation_receipt_begin_error_code(error);
-        return OperatorRemoteErrorV5 {
+        return OperatorRemoteErrorV6 {
+            admission: None,
             code,
             message: mutation_receipt_begin_error_message(error).into(),
             receipt: None,
@@ -3100,145 +3293,183 @@ fn physical_design_remote_error_with_receipt(
     }
     let code = match error {
         ServerPhysicalDesignControlError::PhysicalDesignNotEnabled => {
-            OperatorErrorCodeV5::PhysicalDesignNotEnabled
+            OperatorErrorCodeV6::PhysicalDesignNotEnabled
         }
         ServerPhysicalDesignControlError::EvidenceEpochChanged { .. } => {
-            OperatorErrorCodeV5::PhysicalDesignEvidenceEpochChanged
+            OperatorErrorCodeV6::PhysicalDesignEvidenceEpochChanged
         }
         ServerPhysicalDesignControlError::EvidenceRotation(
             PhysicalDesignEvidenceRecordError::EvidenceWindowEpochExhausted,
-        ) => OperatorErrorCodeV5::PhysicalDesignEvidenceEpochExhausted,
-        ServerPhysicalDesignControlError::EvidenceRotation(_) => OperatorErrorCodeV5::Internal,
+        ) => OperatorErrorCodeV6::PhysicalDesignEvidenceEpochExhausted,
+        ServerPhysicalDesignControlError::EvidenceRotation(_) => OperatorErrorCodeV6::Internal,
         ServerPhysicalDesignControlError::Advisor(PhysicalDesignAdvisorError::NoEvidence) => {
-            OperatorErrorCodeV5::PhysicalDesignNoEvidence
+            OperatorErrorCodeV6::PhysicalDesignNoEvidence
         }
         ServerPhysicalDesignControlError::Advisor(PhysicalDesignAdvisorError::StaleSchema {
             ..
-        }) => OperatorErrorCodeV5::PhysicalDesignStaleSchema,
+        }) => OperatorErrorCodeV6::PhysicalDesignStaleSchema,
         ServerPhysicalDesignControlError::Advisor(
             PhysicalDesignAdvisorError::InconclusiveCapacity { .. },
-        ) => OperatorErrorCodeV5::PhysicalDesignInconclusiveCapacity,
+        ) => OperatorErrorCodeV6::PhysicalDesignInconclusiveCapacity,
         ServerPhysicalDesignControlError::Advisor(PhysicalDesignAdvisorError::Database(_)) => {
-            OperatorErrorCodeV5::Internal
+            OperatorErrorCodeV6::Internal
         }
         ServerPhysicalDesignControlError::Proposal(error) => match *error {
             PhysicalIndexDesignProposalError::Advisor(PhysicalDesignAdvisorError::NoEvidence) => {
-                OperatorErrorCodeV5::PhysicalDesignNoEvidence
+                OperatorErrorCodeV6::PhysicalDesignNoEvidence
             }
             PhysicalIndexDesignProposalError::Advisor(
                 PhysicalDesignAdvisorError::StaleSchema { .. },
-            ) => OperatorErrorCodeV5::PhysicalDesignStaleSchema,
+            ) => OperatorErrorCodeV6::PhysicalDesignStaleSchema,
             PhysicalIndexDesignProposalError::Advisor(
                 PhysicalDesignAdvisorError::InconclusiveCapacity { .. },
-            ) => OperatorErrorCodeV5::PhysicalDesignInconclusiveCapacity,
+            ) => OperatorErrorCodeV6::PhysicalDesignInconclusiveCapacity,
             PhysicalIndexDesignProposalError::CandidateNotObserved(_) => {
-                OperatorErrorCodeV5::PhysicalIndexCandidateNotObserved
+                OperatorErrorCodeV6::PhysicalIndexCandidateNotObserved
             }
             PhysicalIndexDesignProposalError::CandidateNotRecommended { .. } => {
-                OperatorErrorCodeV5::PhysicalIndexNotRecommended
+                OperatorErrorCodeV6::PhysicalIndexNotRecommended
             }
             PhysicalIndexDesignProposalError::GlobalVisibilityRequired
             | PhysicalIndexDesignProposalError::DurableCatalogRequired
             | PhysicalIndexDesignProposalError::Advisor(PhysicalDesignAdvisorError::Database(_))
             | PhysicalIndexDesignProposalError::Database(_) => {
-                OperatorErrorCodeV5::PhysicalIndexApplyFailed
+                OperatorErrorCodeV6::PhysicalIndexApplyFailed
             }
         },
         ServerPhysicalDesignControlError::Apply(error) => match *error {
             PhysicalIndexDesignApplyError::EvidenceEpochChanged { .. } => {
-                OperatorErrorCodeV5::PhysicalDesignEvidenceEpochChanged
+                OperatorErrorCodeV6::PhysicalDesignEvidenceEpochChanged
             }
             PhysicalIndexDesignApplyError::CandidateNotObserved(_) => {
-                OperatorErrorCodeV5::PhysicalIndexCandidateNotObserved
+                OperatorErrorCodeV6::PhysicalIndexCandidateNotObserved
             }
             PhysicalIndexDesignApplyError::RecommendationNoLongerValid(_) => {
-                OperatorErrorCodeV5::PhysicalIndexNotRecommended
+                OperatorErrorCodeV6::PhysicalIndexNotRecommended
             }
             PhysicalIndexDesignApplyError::Advisor(PhysicalDesignAdvisorError::NoEvidence) => {
-                OperatorErrorCodeV5::PhysicalDesignNoEvidence
+                OperatorErrorCodeV6::PhysicalDesignNoEvidence
             }
             PhysicalIndexDesignApplyError::Advisor(PhysicalDesignAdvisorError::StaleSchema {
                 ..
-            }) => OperatorErrorCodeV5::PhysicalDesignStaleSchema,
+            }) => OperatorErrorCodeV6::PhysicalDesignStaleSchema,
             PhysicalIndexDesignApplyError::Advisor(
                 PhysicalDesignAdvisorError::InconclusiveCapacity { .. },
-            ) => OperatorErrorCodeV5::PhysicalDesignInconclusiveCapacity,
+            ) => OperatorErrorCodeV6::PhysicalDesignInconclusiveCapacity,
             PhysicalIndexDesignApplyError::IndexNameConflict(_) => {
-                OperatorErrorCodeV5::PhysicalIndexNameConflict
+                OperatorErrorCodeV6::PhysicalIndexNameConflict
             }
             PhysicalIndexDesignApplyError::DatabaseIdentityChanged
             | PhysicalIndexDesignApplyError::StaleProposal(_)
             | PhysicalIndexDesignApplyError::Advisor(PhysicalDesignAdvisorError::Database(_))
             | PhysicalIndexDesignApplyError::Database(_) => {
-                OperatorErrorCodeV5::PhysicalIndexApplyFailed
+                OperatorErrorCodeV6::PhysicalIndexApplyFailed
             }
         },
         ServerPhysicalDesignControlError::PhysicalDesignRuntimeChanged
         | ServerPhysicalDesignControlError::ProposalRuntimeChanged => {
-            OperatorErrorCodeV5::PhysicalDesignRuntimeChanged
+            OperatorErrorCodeV6::PhysicalDesignRuntimeChanged
         }
         ServerPhysicalDesignControlError::PhysicalIndexNameConflict(_) => {
-            OperatorErrorCodeV5::PhysicalIndexNameConflict
+            OperatorErrorCodeV6::PhysicalIndexNameConflict
         }
-        // Programmatic-only; NBOP never carries a component admission policy.
-        ServerPhysicalDesignControlError::Admission(_) => OperatorErrorCodeV5::Internal,
-        ServerPhysicalDesignControlError::ServerStopped => OperatorErrorCodeV5::ServerStopped,
+        ServerPhysicalDesignControlError::Admission(error) => {
+            return admission_remote_error(*error, receipt);
+        }
+        ServerPhysicalDesignControlError::ServerStopped => OperatorErrorCodeV6::ServerStopped,
         ServerPhysicalDesignControlError::MutationOutcomeUncertain
         | ServerPhysicalDesignControlError::UnjournaledMutationOutcomeUncertain(_)
         | ServerPhysicalDesignControlError::MutationRecoveryRequired(_)
         | ServerPhysicalDesignControlError::PostBeginMutationOutcomeUncertain(_)
         | ServerPhysicalDesignControlError::MutationReceipt(_) => {
-            OperatorErrorCodeV5::PhysicalIndexApplyFailed
+            OperatorErrorCodeV6::PhysicalIndexApplyFailed
         }
     };
     let message = match code {
-        OperatorErrorCodeV5::PhysicalDesignNotEnabled => "physical-design advisor is not enabled",
-        OperatorErrorCodeV5::PhysicalDesignEvidenceEpochChanged => {
+        OperatorErrorCodeV6::PhysicalDesignNotEnabled => "physical-design advisor is not enabled",
+        OperatorErrorCodeV6::PhysicalDesignEvidenceEpochChanged => {
             "physical-design evidence epoch changed"
         }
-        OperatorErrorCodeV5::PhysicalDesignEvidenceEpochExhausted => {
+        OperatorErrorCodeV6::PhysicalDesignEvidenceEpochExhausted => {
             "physical-design evidence epoch is exhausted"
         }
-        OperatorErrorCodeV5::PhysicalDesignNoEvidence => "physical-design evidence window is empty",
-        OperatorErrorCodeV5::PhysicalDesignStaleSchema => {
+        OperatorErrorCodeV6::PhysicalDesignNoEvidence => "physical-design evidence window is empty",
+        OperatorErrorCodeV6::PhysicalDesignStaleSchema => {
             "physical-design evidence schema is stale"
         }
-        OperatorErrorCodeV5::PhysicalDesignInconclusiveCapacity => {
+        OperatorErrorCodeV6::PhysicalDesignInconclusiveCapacity => {
             "physical-design evidence is capacity-truncated"
         }
-        OperatorErrorCodeV5::PhysicalDesignRuntimeChanged => {
+        OperatorErrorCodeV6::PhysicalDesignRuntimeChanged => {
             "physical-design approval belongs to a previous daemon/operator runtime"
         }
-        OperatorErrorCodeV5::PhysicalIndexCandidateNotObserved => {
+        OperatorErrorCodeV6::PhysicalIndexCandidateNotObserved => {
             "physical-index candidate was not observed in current evidence"
         }
-        OperatorErrorCodeV5::PhysicalIndexNotRecommended => {
+        OperatorErrorCodeV6::PhysicalIndexNotRecommended => {
             "physical-index candidate is not currently recommended"
         }
-        OperatorErrorCodeV5::PhysicalIndexNameConflict => {
+        OperatorErrorCodeV6::PhysicalIndexNameConflict => {
             "physical-index name is already bound to another target"
         }
-        OperatorErrorCodeV5::PhysicalIndexApplyFailed => {
+        OperatorErrorCodeV6::PhysicalIndexApplyFailed => {
             "physical-index apply failed without creating a new index"
         }
-        OperatorErrorCodeV5::ServerStopped => "server physical-design control is stopped",
+        OperatorErrorCodeV6::ServerStopped => "server physical-design control is stopped",
         _ => "operator request failed",
     };
-    OperatorRemoteErrorV5 {
+    OperatorRemoteErrorV6 {
+        admission: None,
         code,
         message: message.into(),
         receipt,
     }
 }
 
+fn admission_remote_error(
+    error: PhysicalDesignMutationAdmissionError,
+    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV6>,
+) -> OperatorRemoteErrorV6 {
+    let (admission, message) = match error {
+        PhysicalDesignMutationAdmissionError::RequiredBoundNotProven { dimension } => (
+            OperatorPhysicalDesignMutationAdmissionRejectionV6::RequiredBoundNotProven {
+                dimension: dimension.into(),
+            },
+            "physical-design mutation admission requires a proven current component bound",
+        ),
+        PhysicalDesignMutationAdmissionError::LimitExceeded {
+            dimension,
+            conservative_bound,
+            maximum,
+        } => (
+            OperatorPhysicalDesignMutationAdmissionRejectionV6::LimitExceeded {
+                dimension: dimension.into(),
+                conservative_bound,
+                maximum,
+            },
+            "physical-design mutation component bound exceeds its configured maximum",
+        ),
+        PhysicalDesignMutationAdmissionError::Inspection(_) => (
+            OperatorPhysicalDesignMutationAdmissionRejectionV6::InspectionFailed {},
+            "current mutation-work inspection failed before mutation",
+        ),
+    };
+    OperatorRemoteErrorV6 {
+        code: OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected,
+        message: message.into(),
+        receipt,
+        admission: Some(admission),
+    }
+}
+
 fn mutation_receipt_begin_error_code(
     error: &ServerPhysicalDesignMutationReceiptControlError,
-) -> OperatorErrorCodeV5 {
+) -> OperatorErrorCodeV6 {
     match error {
         ServerPhysicalDesignMutationReceiptControlError::Journal(
             ServerPhysicalDesignMutationReceiptJournalError::CapacityExceeded,
-        ) => OperatorErrorCodeV5::PhysicalDesignMutationReceiptCapacityExceeded,
-        _ => OperatorErrorCodeV5::PhysicalDesignMutationReceiptUnavailable,
+        ) => OperatorErrorCodeV6::PhysicalDesignMutationReceiptCapacityExceeded,
+        _ => OperatorErrorCodeV6::PhysicalDesignMutationReceiptUnavailable,
     }
 }
 
@@ -3260,60 +3491,63 @@ const fn mutation_receipt_begin_error_message(
 }
 
 fn mutation_outcome_uncertain_remote_error(
-    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV5>,
-) -> OperatorRemoteErrorV5 {
+    receipt: Option<OperatorPhysicalDesignMutationReceiptRefV6>,
+) -> OperatorRemoteErrorV6 {
     let message = if receipt.is_some() {
         "physical-design mutation outcome is uncertain; restart/reopen the daemon, allow NBMR startup reconciliation to complete, then inspect the referenced receipt before deciding whether any retry is needed"
     } else {
         "physical-design mutation outcome is uncertain; no receipt reference was observed; the same exact approval may be used for idempotent discovery"
     };
-    OperatorRemoteErrorV5 {
-        code: OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain,
+    OperatorRemoteErrorV6 {
+        admission: None,
+        code: OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain,
         message: message.into(),
         receipt,
     }
 }
 
-fn response_too_large_error() -> OperatorRemoteErrorV5 {
-    OperatorRemoteErrorV5 {
-        code: OperatorErrorCodeV5::ResponseTooLarge,
+fn response_too_large_error() -> OperatorRemoteErrorV6 {
+    OperatorRemoteErrorV6 {
+        admission: None,
+        code: OperatorErrorCodeV6::ResponseTooLarge,
         message: "operator response exceeds the NBOP payload limit".into(),
         receipt: None,
     }
 }
 
-fn protocol_remote_error(error: &OperatorProtocolError) -> OperatorRemoteErrorV5 {
+fn protocol_remote_error(error: &OperatorProtocolError) -> OperatorRemoteErrorV6 {
     let (code, message) = match error {
         OperatorProtocolError::UnsupportedVersion(_) => (
-            OperatorErrorCodeV5::UnsupportedProtocolVersion,
+            OperatorErrorCodeV6::UnsupportedProtocolVersion,
             "unsupported operator protocol version",
         ),
         OperatorProtocolError::RequestTooLarge(_) | OperatorProtocolError::PayloadTooLarge(_) => (
-            OperatorErrorCodeV5::RequestTooLarge,
+            OperatorErrorCodeV6::RequestTooLarge,
             "operator request is too large",
         ),
         OperatorProtocolError::TruncatedHeader | OperatorProtocolError::TruncatedPayload => (
-            OperatorErrorCodeV5::MalformedRequest,
+            OperatorErrorCodeV6::MalformedRequest,
             "truncated operator request",
         ),
         OperatorProtocolError::WrongMagic => (
-            OperatorErrorCodeV5::MalformedRequest,
+            OperatorErrorCodeV6::MalformedRequest,
             "invalid operator request magic",
         ),
         OperatorProtocolError::NonzeroReserved(_) => (
-            OperatorErrorCodeV5::MalformedRequest,
+            OperatorErrorCodeV6::MalformedRequest,
             "operator reserved field is nonzero",
         ),
         OperatorProtocolError::InvalidJson(_) => (
-            OperatorErrorCodeV5::MalformedRequest,
+            OperatorErrorCodeV6::MalformedRequest,
             "invalid operator request JSON",
         ),
         OperatorProtocolError::Io(_) => (
-            OperatorErrorCodeV5::MalformedRequest,
+            OperatorErrorCodeV6::MalformedRequest,
             "operator request I/O failed",
         ),
     };
-    OperatorRemoteErrorV5 {
+    OperatorRemoteErrorV6 {
+        admission: None,
         code,
         message: message.into(),
         receipt: None,
@@ -3352,12 +3586,12 @@ mod tests {
         let listener = UnixListener::bind(path).unwrap();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let request: OperatorRequestV5 = read_frame(&mut stream).unwrap();
+            let request: OperatorRequestV6 = read_frame(&mut stream).unwrap();
             write_frame(
                 &mut stream,
-                &OperatorResponseV5::Ok {
+                &OperatorResponseV6::Ok {
                     request_id: request.request_id,
-                    result: OperatorResultV5::SchedulerReset {},
+                    result: OperatorResultV6::SchedulerReset {},
                 },
             )
             .unwrap();
@@ -3371,7 +3605,7 @@ mod tests {
         let listener = UnixListener::bind(path).unwrap();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let _: OperatorRequestV5 = read_frame(&mut stream).unwrap();
+            let _: OperatorRequestV6 = read_frame(&mut stream).unwrap();
         })
     }
 
@@ -3406,7 +3640,7 @@ mod tests {
                 1,
                 2,
                 vec![3],
-                OperatorPhysicalColumnarDesignModeV5::Snapshot,
+                OperatorPhysicalColumnarDesignModeV6::Snapshot,
                 "events",
             )
             .unwrap_err();
@@ -3475,42 +3709,42 @@ mod tests {
     }
 
     #[test]
-    fn frame_header_is_exact_big_endian_nbop_v5() {
-        let request = OperatorRequestV5 {
+    fn frame_header_is_exact_big_endian_nbop_v6() {
+        let request = OperatorRequestV6 {
             request_id: 42,
-            operation: OperatorOperationV5::Status {},
+            operation: OperatorOperationV6::Status {},
         };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &request).unwrap();
         assert_eq!(&bytes[..4], b"NBOP");
-        assert_eq!(&bytes[4..6], &[0, 5]);
+        assert_eq!(&bytes[4..6], &[0, 6]);
         assert_eq!(&bytes[6..8], &[0, 0]);
         assert_eq!(
             u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize,
             bytes.len() - OPERATOR_HEADER_BYTES
         );
-        let decoded: OperatorRequestV5 = read_frame(&mut bytes.as_slice()).unwrap();
+        let decoded: OperatorRequestV6 = read_frame(&mut bytes.as_slice()).unwrap();
         assert_eq!(decoded.request_id, 42);
-        assert!(matches!(decoded.operation, OperatorOperationV5::Status {}));
+        assert!(matches!(decoded.operation, OperatorOperationV6::Status {}));
     }
 
     #[test]
     fn response_frame_and_request_id_echo_are_stable() {
-        let response = OperatorResponseV5::Ok {
+        let response = OperatorResponseV6::Ok {
             request_id: 42,
-            result: OperatorResultV5::SchedulerReset {},
+            result: OperatorResultV6::SchedulerReset {},
         };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &response).unwrap();
         let payload = br#"{"outcome":"ok","request_id":42,"result":{"type":"scheduler_reset"}}"#;
         assert_eq!(&bytes[..4], b"NBOP");
-        assert_eq!(&bytes[4..8], &[0, 5, 0, 0]);
+        assert_eq!(&bytes[4..8], &[0, 6, 0, 0]);
         assert_eq!(&bytes[8..12], &(payload.len() as u32).to_be_bytes());
         assert_eq!(&bytes[12..], payload);
     }
 
     #[test]
-    fn phase30_recommendation_payload_remains_shape_compatible_inside_v5() {
+    fn phase30_recommendation_payload_remains_shape_compatible_inside_v6() {
         #[derive(Debug, Deserialize)]
         #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
         enum FrozenResponse {
@@ -3520,7 +3754,7 @@ mod tests {
             },
             Error {
                 request_id: u64,
-                error: OperatorRemoteErrorV5,
+                error: OperatorRemoteErrorV6,
             },
         }
 
@@ -3529,7 +3763,7 @@ mod tests {
         enum FrozenResult {
             PhysicalDesignRecommendations {
                 runtime_token: Option<String>,
-                report: OperatorPhysicalDesignAdvisorReportV5,
+                report: OperatorPhysicalDesignAdvisorReportV6,
             },
         }
 
@@ -3541,21 +3775,21 @@ mod tests {
         frozen_frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frozen_frame.extend_from_slice(payload);
         assert!(matches!(
-            read_frame::<OperatorResponseV5>(&mut frozen_frame.as_slice()).unwrap(),
-            OperatorResponseV5::Ok {
+            read_frame::<OperatorResponseV6>(&mut frozen_frame.as_slice()).unwrap(),
+            OperatorResponseV6::Ok {
                 request_id: 30,
-                result: OperatorResultV5::PhysicalDesignRecommendations {
+                result: OperatorResultV6::PhysicalDesignRecommendations {
                     runtime_token: Some(_),
                     ..
                 }
             }
         ));
 
-        let response = OperatorResponseV5::Ok {
+        let response = OperatorResponseV6::Ok {
             request_id: 31,
-            result: OperatorResultV5::PhysicalDesignRecommendations {
+            result: OperatorResultV6::PhysicalDesignRecommendations {
                 runtime_token: None,
-                report: OperatorPhysicalDesignAdvisorReportV5 {
+                report: OperatorPhysicalDesignAdvisorReportV6 {
                     evidence_epoch: 1,
                     schema_generation: 2,
                     first_global_commit_seq: 3,
@@ -3590,180 +3824,184 @@ mod tests {
             }
         }
         assert_eq!(
-            serde_json::from_str::<OperatorErrorCodeV5>(
+            serde_json::from_str::<OperatorErrorCodeV6>(
                 "\"physical_design_mutation_outcome_uncertain\""
             )
             .unwrap(),
-            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
+            OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain
         );
         assert_eq!(
-            serde_json::from_str::<OperatorErrorCodeV5>("\"internal\"").unwrap(),
-            OperatorErrorCodeV5::Internal
+            serde_json::from_str::<OperatorErrorCodeV6>("\"internal\"").unwrap(),
+            OperatorErrorCodeV6::Internal
         );
     }
 
     #[test]
-    fn nbop_v5_error_set_is_exact() {
-        fn frozen_wire_name(code: OperatorErrorCodeV5) -> &'static str {
+    fn nbop_v6_error_set_is_exact() {
+        fn frozen_wire_name(code: OperatorErrorCodeV6) -> &'static str {
             match code {
-                OperatorErrorCodeV5::AdaptiveNotEnabled => "adaptive_not_enabled",
-                OperatorErrorCodeV5::DriverNotEnabled => "driver_not_enabled",
-                OperatorErrorCodeV5::SchedulerNotFaulted => "scheduler_not_faulted",
-                OperatorErrorCodeV5::EvidenceWindowChanged => "evidence_window_changed",
-                OperatorErrorCodeV5::EvidenceWindowEpochExhausted => {
+                OperatorErrorCodeV6::AdaptiveNotEnabled => "adaptive_not_enabled",
+                OperatorErrorCodeV6::DriverNotEnabled => "driver_not_enabled",
+                OperatorErrorCodeV6::SchedulerNotFaulted => "scheduler_not_faulted",
+                OperatorErrorCodeV6::EvidenceWindowChanged => "evidence_window_changed",
+                OperatorErrorCodeV6::EvidenceWindowEpochExhausted => {
                     "evidence_window_epoch_exhausted"
                 }
-                OperatorErrorCodeV5::PhysicalDesignNotEnabled => "physical_design_not_enabled",
-                OperatorErrorCodeV5::PhysicalDesignEvidenceEpochChanged => {
+                OperatorErrorCodeV6::PhysicalDesignNotEnabled => "physical_design_not_enabled",
+                OperatorErrorCodeV6::PhysicalDesignEvidenceEpochChanged => {
                     "physical_design_evidence_epoch_changed"
                 }
-                OperatorErrorCodeV5::PhysicalDesignEvidenceEpochExhausted => {
+                OperatorErrorCodeV6::PhysicalDesignEvidenceEpochExhausted => {
                     "physical_design_evidence_epoch_exhausted"
                 }
-                OperatorErrorCodeV5::PhysicalDesignNoEvidence => "physical_design_no_evidence",
-                OperatorErrorCodeV5::PhysicalDesignStaleSchema => "physical_design_stale_schema",
-                OperatorErrorCodeV5::PhysicalDesignInconclusiveCapacity => {
+                OperatorErrorCodeV6::PhysicalDesignNoEvidence => "physical_design_no_evidence",
+                OperatorErrorCodeV6::PhysicalDesignStaleSchema => "physical_design_stale_schema",
+                OperatorErrorCodeV6::PhysicalDesignInconclusiveCapacity => {
                     "physical_design_inconclusive_capacity"
                 }
-                OperatorErrorCodeV5::PhysicalIndexApplyNotEnabled => {
+                OperatorErrorCodeV6::PhysicalIndexApplyNotEnabled => {
                     "physical_index_apply_not_enabled"
                 }
-                OperatorErrorCodeV5::PhysicalDesignRuntimeChanged => {
+                OperatorErrorCodeV6::PhysicalDesignRuntimeChanged => {
                     "physical_design_runtime_changed"
                 }
-                OperatorErrorCodeV5::InvalidIndexName => "invalid_index_name",
-                OperatorErrorCodeV5::PhysicalIndexCandidateNotObserved => {
+                OperatorErrorCodeV6::InvalidIndexName => "invalid_index_name",
+                OperatorErrorCodeV6::PhysicalIndexCandidateNotObserved => {
                     "physical_index_candidate_not_observed"
                 }
-                OperatorErrorCodeV5::PhysicalIndexNotRecommended => {
+                OperatorErrorCodeV6::PhysicalIndexNotRecommended => {
                     "physical_index_not_recommended"
                 }
-                OperatorErrorCodeV5::PhysicalIndexNameConflict => "physical_index_name_conflict",
-                OperatorErrorCodeV5::PhysicalIndexApplyFailed => "physical_index_apply_failed",
-                OperatorErrorCodeV5::PhysicalColumnarApplyNotEnabled => {
+                OperatorErrorCodeV6::PhysicalIndexNameConflict => "physical_index_name_conflict",
+                OperatorErrorCodeV6::PhysicalIndexApplyFailed => "physical_index_apply_failed",
+                OperatorErrorCodeV6::PhysicalColumnarApplyNotEnabled => {
                     "physical_columnar_apply_not_enabled"
                 }
-                OperatorErrorCodeV5::InvalidPhysicalColumnarPlacementKey => {
+                OperatorErrorCodeV6::InvalidPhysicalColumnarPlacementKey => {
                     "invalid_physical_columnar_placement_key"
                 }
-                OperatorErrorCodeV5::PhysicalColumnarModeNotAllowed => {
+                OperatorErrorCodeV6::PhysicalColumnarModeNotAllowed => {
                     "physical_columnar_mode_not_allowed"
                 }
-                OperatorErrorCodeV5::PhysicalColumnarPlacementUnavailable => {
+                OperatorErrorCodeV6::PhysicalColumnarPlacementUnavailable => {
                     "physical_columnar_placement_unavailable"
                 }
-                OperatorErrorCodeV5::PhysicalColumnarPlacementOccupied => {
+                OperatorErrorCodeV6::PhysicalColumnarPlacementOccupied => {
                     "physical_columnar_placement_occupied"
                 }
-                OperatorErrorCodeV5::PhysicalColumnarLocationConflict => {
+                OperatorErrorCodeV6::PhysicalColumnarLocationConflict => {
                     "physical_columnar_location_conflict"
                 }
-                OperatorErrorCodeV5::PhysicalColumnarCandidateNotObserved => {
+                OperatorErrorCodeV6::PhysicalColumnarCandidateNotObserved => {
                     "physical_columnar_candidate_not_observed"
                 }
-                OperatorErrorCodeV5::PhysicalColumnarNotRecommended => {
+                OperatorErrorCodeV6::PhysicalColumnarNotRecommended => {
                     "physical_columnar_not_recommended"
                 }
-                OperatorErrorCodeV5::PhysicalColumnarChangeStreamNotEnabled => {
+                OperatorErrorCodeV6::PhysicalColumnarChangeStreamNotEnabled => {
                     "physical_columnar_change_stream_not_enabled"
                 }
-                OperatorErrorCodeV5::PhysicalColumnarChangeStreamUnavailable => {
+                OperatorErrorCodeV6::PhysicalColumnarChangeStreamUnavailable => {
                     "physical_columnar_change_stream_unavailable"
                 }
-                OperatorErrorCodeV5::PhysicalColumnarChangeStreamChanged => {
+                OperatorErrorCodeV6::PhysicalColumnarChangeStreamChanged => {
                     "physical_columnar_change_stream_changed"
                 }
-                OperatorErrorCodeV5::PhysicalColumnarRecoveryRequired => {
+                OperatorErrorCodeV6::PhysicalColumnarRecoveryRequired => {
                     "physical_columnar_recovery_required"
                 }
-                OperatorErrorCodeV5::PhysicalColumnarApplyFailed => {
+                OperatorErrorCodeV6::PhysicalColumnarApplyFailed => {
                     "physical_columnar_apply_failed"
                 }
-                OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain => {
+                OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain => {
                     "physical_design_mutation_outcome_uncertain"
                 }
-                OperatorErrorCodeV5::PhysicalDesignMutationReceiptCapacityExceeded => {
+                OperatorErrorCodeV6::PhysicalDesignMutationReceiptCapacityExceeded => {
                     "physical_design_mutation_receipt_capacity_exceeded"
                 }
-                OperatorErrorCodeV5::PhysicalDesignMutationReceiptUnavailable => {
+                OperatorErrorCodeV6::PhysicalDesignMutationReceiptUnavailable => {
                     "physical_design_mutation_receipt_unavailable"
                 }
-                OperatorErrorCodeV5::PhysicalDesignMutationReceiptReadNotAllowed => {
+                OperatorErrorCodeV6::PhysicalDesignMutationReceiptReadNotAllowed => {
                     "physical_design_mutation_receipt_read_not_allowed"
                 }
-                OperatorErrorCodeV5::PhysicalDesignMutationReceiptsNotEnabled => {
+                OperatorErrorCodeV6::PhysicalDesignMutationReceiptsNotEnabled => {
                     "physical_design_mutation_receipts_not_enabled"
                 }
-                OperatorErrorCodeV5::InvalidPhysicalDesignMutationReceiptCursor => {
+                OperatorErrorCodeV6::InvalidPhysicalDesignMutationReceiptCursor => {
                     "invalid_physical_design_mutation_receipt_cursor"
                 }
-                OperatorErrorCodeV5::PhysicalDesignMutationReceiptJournalChanged => {
+                OperatorErrorCodeV6::PhysicalDesignMutationReceiptJournalChanged => {
                     "physical_design_mutation_receipt_journal_changed"
                 }
-                OperatorErrorCodeV5::InvalidPhysicalDesignMutationReceiptLimit => {
+                OperatorErrorCodeV6::InvalidPhysicalDesignMutationReceiptLimit => {
                     "invalid_physical_design_mutation_receipt_limit"
                 }
-                OperatorErrorCodeV5::PhysicalDesignMutationReceiptReadFailed => {
+                OperatorErrorCodeV6::PhysicalDesignMutationReceiptReadFailed => {
                     "physical_design_mutation_receipt_read_failed"
                 }
-                OperatorErrorCodeV5::ResponseTooLarge => "response_too_large",
-                OperatorErrorCodeV5::ServerStopped => "server_stopped",
-                OperatorErrorCodeV5::MalformedRequest => "malformed_request",
-                OperatorErrorCodeV5::UnsupportedProtocolVersion => "unsupported_protocol_version",
-                OperatorErrorCodeV5::RequestTooLarge => "request_too_large",
-                OperatorErrorCodeV5::Internal => "internal",
+                OperatorErrorCodeV6::ResponseTooLarge => "response_too_large",
+                OperatorErrorCodeV6::ServerStopped => "server_stopped",
+                OperatorErrorCodeV6::MalformedRequest => "malformed_request",
+                OperatorErrorCodeV6::UnsupportedProtocolVersion => "unsupported_protocol_version",
+                OperatorErrorCodeV6::RequestTooLarge => "request_too_large",
+                OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected => {
+                    "physical_design_mutation_admission_rejected"
+                }
+                OperatorErrorCodeV6::Internal => "internal",
             }
         }
 
         let frozen_codes = [
-            OperatorErrorCodeV5::AdaptiveNotEnabled,
-            OperatorErrorCodeV5::DriverNotEnabled,
-            OperatorErrorCodeV5::SchedulerNotFaulted,
-            OperatorErrorCodeV5::EvidenceWindowChanged,
-            OperatorErrorCodeV5::EvidenceWindowEpochExhausted,
-            OperatorErrorCodeV5::PhysicalDesignNotEnabled,
-            OperatorErrorCodeV5::PhysicalDesignEvidenceEpochChanged,
-            OperatorErrorCodeV5::PhysicalDesignEvidenceEpochExhausted,
-            OperatorErrorCodeV5::PhysicalDesignNoEvidence,
-            OperatorErrorCodeV5::PhysicalDesignStaleSchema,
-            OperatorErrorCodeV5::PhysicalDesignInconclusiveCapacity,
-            OperatorErrorCodeV5::PhysicalIndexApplyNotEnabled,
-            OperatorErrorCodeV5::PhysicalDesignRuntimeChanged,
-            OperatorErrorCodeV5::InvalidIndexName,
-            OperatorErrorCodeV5::PhysicalIndexCandidateNotObserved,
-            OperatorErrorCodeV5::PhysicalIndexNotRecommended,
-            OperatorErrorCodeV5::PhysicalIndexNameConflict,
-            OperatorErrorCodeV5::PhysicalIndexApplyFailed,
-            OperatorErrorCodeV5::PhysicalColumnarApplyNotEnabled,
-            OperatorErrorCodeV5::InvalidPhysicalColumnarPlacementKey,
-            OperatorErrorCodeV5::PhysicalColumnarModeNotAllowed,
-            OperatorErrorCodeV5::PhysicalColumnarPlacementUnavailable,
-            OperatorErrorCodeV5::PhysicalColumnarPlacementOccupied,
-            OperatorErrorCodeV5::PhysicalColumnarLocationConflict,
-            OperatorErrorCodeV5::PhysicalColumnarCandidateNotObserved,
-            OperatorErrorCodeV5::PhysicalColumnarNotRecommended,
-            OperatorErrorCodeV5::PhysicalColumnarChangeStreamNotEnabled,
-            OperatorErrorCodeV5::PhysicalColumnarChangeStreamUnavailable,
-            OperatorErrorCodeV5::PhysicalColumnarChangeStreamChanged,
-            OperatorErrorCodeV5::PhysicalColumnarRecoveryRequired,
-            OperatorErrorCodeV5::PhysicalColumnarApplyFailed,
-            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain,
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptCapacityExceeded,
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptUnavailable,
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptReadNotAllowed,
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptsNotEnabled,
-            OperatorErrorCodeV5::InvalidPhysicalDesignMutationReceiptCursor,
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptJournalChanged,
-            OperatorErrorCodeV5::InvalidPhysicalDesignMutationReceiptLimit,
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptReadFailed,
-            OperatorErrorCodeV5::ResponseTooLarge,
-            OperatorErrorCodeV5::ServerStopped,
-            OperatorErrorCodeV5::MalformedRequest,
-            OperatorErrorCodeV5::UnsupportedProtocolVersion,
-            OperatorErrorCodeV5::RequestTooLarge,
-            OperatorErrorCodeV5::Internal,
+            OperatorErrorCodeV6::AdaptiveNotEnabled,
+            OperatorErrorCodeV6::DriverNotEnabled,
+            OperatorErrorCodeV6::SchedulerNotFaulted,
+            OperatorErrorCodeV6::EvidenceWindowChanged,
+            OperatorErrorCodeV6::EvidenceWindowEpochExhausted,
+            OperatorErrorCodeV6::PhysicalDesignNotEnabled,
+            OperatorErrorCodeV6::PhysicalDesignEvidenceEpochChanged,
+            OperatorErrorCodeV6::PhysicalDesignEvidenceEpochExhausted,
+            OperatorErrorCodeV6::PhysicalDesignNoEvidence,
+            OperatorErrorCodeV6::PhysicalDesignStaleSchema,
+            OperatorErrorCodeV6::PhysicalDesignInconclusiveCapacity,
+            OperatorErrorCodeV6::PhysicalIndexApplyNotEnabled,
+            OperatorErrorCodeV6::PhysicalDesignRuntimeChanged,
+            OperatorErrorCodeV6::InvalidIndexName,
+            OperatorErrorCodeV6::PhysicalIndexCandidateNotObserved,
+            OperatorErrorCodeV6::PhysicalIndexNotRecommended,
+            OperatorErrorCodeV6::PhysicalIndexNameConflict,
+            OperatorErrorCodeV6::PhysicalIndexApplyFailed,
+            OperatorErrorCodeV6::PhysicalColumnarApplyNotEnabled,
+            OperatorErrorCodeV6::InvalidPhysicalColumnarPlacementKey,
+            OperatorErrorCodeV6::PhysicalColumnarModeNotAllowed,
+            OperatorErrorCodeV6::PhysicalColumnarPlacementUnavailable,
+            OperatorErrorCodeV6::PhysicalColumnarPlacementOccupied,
+            OperatorErrorCodeV6::PhysicalColumnarLocationConflict,
+            OperatorErrorCodeV6::PhysicalColumnarCandidateNotObserved,
+            OperatorErrorCodeV6::PhysicalColumnarNotRecommended,
+            OperatorErrorCodeV6::PhysicalColumnarChangeStreamNotEnabled,
+            OperatorErrorCodeV6::PhysicalColumnarChangeStreamUnavailable,
+            OperatorErrorCodeV6::PhysicalColumnarChangeStreamChanged,
+            OperatorErrorCodeV6::PhysicalColumnarRecoveryRequired,
+            OperatorErrorCodeV6::PhysicalColumnarApplyFailed,
+            OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected,
+            OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain,
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptCapacityExceeded,
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptUnavailable,
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptReadNotAllowed,
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptsNotEnabled,
+            OperatorErrorCodeV6::InvalidPhysicalDesignMutationReceiptCursor,
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptJournalChanged,
+            OperatorErrorCodeV6::InvalidPhysicalDesignMutationReceiptLimit,
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptReadFailed,
+            OperatorErrorCodeV6::ResponseTooLarge,
+            OperatorErrorCodeV6::ServerStopped,
+            OperatorErrorCodeV6::MalformedRequest,
+            OperatorErrorCodeV6::UnsupportedProtocolVersion,
+            OperatorErrorCodeV6::RequestTooLarge,
+            OperatorErrorCodeV6::Internal,
         ];
-        assert_eq!(frozen_codes.len(), 46);
+        assert_eq!(frozen_codes.len(), 47);
         for code in frozen_codes {
             assert_eq!(
                 serde_json::to_string(&code).unwrap(),
@@ -3773,15 +4011,15 @@ mod tests {
     }
 
     #[test]
-    fn v5_columnar_request_and_response_json_contract_is_stable() {
-        let request = OperatorRequestV5 {
+    fn v6_columnar_request_and_response_json_contract_is_stable() {
+        let request = OperatorRequestV6 {
             request_id: 7,
-            operation: OperatorOperationV5::ApplyPhysicalColumnar {
+            operation: OperatorOperationV6::ApplyPhysicalColumnar {
                 expected_runtime_token: "00112233445566778899aabbccddeeff".into(),
                 expected_evidence_epoch: 3,
                 table_id: 5,
                 columns: vec![2, 4],
-                mode: OperatorPhysicalColumnarDesignModeV5::Snapshot,
+                mode: OperatorPhysicalColumnarDesignModeV6::Snapshot,
                 placement_key: "users-v1".into(),
             },
         };
@@ -3801,15 +4039,15 @@ mod tests {
             })
         );
 
-        let response = OperatorResponseV5::Ok {
+        let response = OperatorResponseV6::Ok {
             request_id: 7,
-            result: OperatorResultV5::PhysicalColumnarApplied {
-                apply: OperatorPhysicalColumnarApplyResultV5 {
+            result: OperatorResultV6::PhysicalColumnarApplied {
+                apply: OperatorPhysicalColumnarApplyResultV6 {
                     table_id: 5,
                     columns: vec![2, 4],
-                    mode: OperatorPhysicalColumnarDesignModeV5::Snapshot,
+                    mode: OperatorPhysicalColumnarDesignModeV6::Snapshot,
                     placement_key: "users-v1".into(),
-                    outcome: OperatorPhysicalColumnarApplyOutcomeV5::Created { projection_id: 9 },
+                    outcome: OperatorPhysicalColumnarApplyOutcomeV6::Created { projection_id: 9 },
                     receipt: None,
                 },
             },
@@ -3833,16 +4071,16 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_string(&OperatorErrorCodeV5::PhysicalColumnarApplyNotEnabled).unwrap(),
+            serde_json::to_string(&OperatorErrorCodeV6::PhysicalColumnarApplyNotEnabled).unwrap(),
             "\"physical_columnar_apply_not_enabled\""
         );
     }
 
     #[test]
     fn receipt_request_json_is_scoped_strict_and_has_no_bare_cursor() {
-        let status = OperatorRequestV5 {
+        let status = OperatorRequestV6 {
             request_id: 32,
-            operation: OperatorOperationV5::PhysicalDesignMutationReceiptStatus {},
+            operation: OperatorOperationV6::PhysicalDesignMutationReceiptStatus {},
         };
         assert_eq!(
             serde_json::to_value(status).unwrap(),
@@ -3852,9 +4090,9 @@ mod tests {
             })
         );
 
-        let initial = OperatorRequestV5 {
+        let initial = OperatorRequestV6 {
             request_id: 33,
-            operation: OperatorOperationV5::PhysicalDesignMutationReceipts {
+            operation: OperatorOperationV6::PhysicalDesignMutationReceipts {
                 after: None,
                 limit: 32,
             },
@@ -3871,10 +4109,10 @@ mod tests {
             })
         );
 
-        let continuation = OperatorRequestV5 {
+        let continuation = OperatorRequestV6 {
             request_id: 34,
-            operation: OperatorOperationV5::PhysicalDesignMutationReceipts {
-                after: Some(OperatorPhysicalDesignMutationReceiptCursorV5 {
+            operation: OperatorOperationV6::PhysicalDesignMutationReceipts {
+                after: Some(OperatorPhysicalDesignMutationReceiptCursorV6 {
                     journal_incarnation: "00112233445566778899aabbccddeeff".into(),
                     receipt_id: 41,
                 }),
@@ -3903,7 +4141,7 @@ mod tests {
             }),
         ] {
             assert!(
-                serde_json::from_value::<OperatorRequestV5>(serde_json::json!({
+                serde_json::from_value::<OperatorRequestV6>(serde_json::json!({
                     "request_id": 1,
                     "operation": operation
                 }))
@@ -3925,10 +4163,10 @@ mod tests {
         ] {
             let (design_tx, design_rx) = std::sync::mpsc::channel();
             let response = execute_operator_request_with_capabilities(
-                OperatorRequestV5 {
+                OperatorRequestV6 {
                     request_id: 1,
-                    operation: OperatorOperationV5::PhysicalDesignMutationReceipts {
-                        after: Some(OperatorPhysicalDesignMutationReceiptCursorV5 {
+                    operation: OperatorOperationV6::PhysicalDesignMutationReceipts {
+                        after: Some(OperatorPhysicalDesignMutationReceiptCursorV6 {
                             journal_incarnation: incarnation.into(),
                             receipt_id: 1,
                         }),
@@ -3941,9 +4179,10 @@ mod tests {
             );
             assert!(matches!(
                 response,
-                OperatorResponseV5::Error {
-                    error: OperatorRemoteErrorV5 {
-                        code: OperatorErrorCodeV5::InvalidPhysicalDesignMutationReceiptCursor,
+                OperatorResponseV6::Error {
+                    error: OperatorRemoteErrorV6 {
+                        admission: None,
+                        code: OperatorErrorCodeV6::InvalidPhysicalDesignMutationReceiptCursor,
                         receipt: None,
                         ..
                     },
@@ -3955,10 +4194,10 @@ mod tests {
 
         let (design_tx, design_rx) = std::sync::mpsc::channel();
         let response = execute_operator_request_with_capabilities(
-            OperatorRequestV5 {
+            OperatorRequestV6 {
                 request_id: 2,
-                operation: OperatorOperationV5::PhysicalDesignMutationReceipts {
-                    after: Some(OperatorPhysicalDesignMutationReceiptCursorV5 {
+                operation: OperatorOperationV6::PhysicalDesignMutationReceipts {
+                    after: Some(OperatorPhysicalDesignMutationReceiptCursorV6 {
                         journal_incarnation: "00112233445566778899aabbccddeeff".into(),
                         receipt_id: 0,
                     }),
@@ -3971,9 +4210,10 @@ mod tests {
         );
         assert!(matches!(
             response,
-            OperatorResponseV5::Error {
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::InvalidPhysicalDesignMutationReceiptCursor,
+            OperatorResponseV6::Error {
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::InvalidPhysicalDesignMutationReceiptCursor,
                     ..
                 },
                 ..
@@ -3987,9 +4227,9 @@ mod tests {
         let (adaptive_tx, _adaptive_rx) = std::sync::mpsc::channel();
         let (design_tx, design_rx) = std::sync::mpsc::channel();
         let response = execute_operator_request_with_capabilities(
-            OperatorRequestV5 {
+            OperatorRequestV6 {
                 request_id: 1,
-                operation: OperatorOperationV5::PhysicalDesignMutationReceiptStatus {},
+                operation: OperatorOperationV6::PhysicalDesignMutationReceiptStatus {},
             },
             &ServerAdaptiveControlHandle::new(adaptive_tx),
             &ServerPhysicalDesignControlHandle::new(design_tx),
@@ -3997,9 +4237,10 @@ mod tests {
         );
         assert!(matches!(
             response,
-            OperatorResponseV5::Error {
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::PhysicalDesignMutationReceiptReadNotAllowed,
+            OperatorResponseV6::Error {
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::PhysicalDesignMutationReceiptReadNotAllowed,
                     receipt: None,
                     ..
                 },
@@ -4072,9 +4313,9 @@ mod tests {
         let design = ServerPhysicalDesignControlHandle::new(design_tx);
 
         let status = execute_operator_request_with_capabilities(
-            OperatorRequestV5 {
+            OperatorRequestV6 {
                 request_id: 1,
-                operation: OperatorOperationV5::PhysicalDesignMutationReceiptStatus {},
+                operation: OperatorOperationV6::PhysicalDesignMutationReceiptStatus {},
             },
             &adaptive,
             &design,
@@ -4082,9 +4323,9 @@ mod tests {
         );
         assert!(matches!(
             status,
-            OperatorResponseV5::Ok {
-                result: OperatorResultV5::PhysicalDesignMutationReceiptStatus {
-                    status: OperatorPhysicalDesignMutationReceiptStatusV5 {
+            OperatorResponseV6::Ok {
+                result: OperatorResultV6::PhysicalDesignMutationReceiptStatus {
+                    status: OperatorPhysicalDesignMutationReceiptStatusV6 {
                         recovery_required: true,
                         latest_receipt_id: Some(1),
                         max_receipts_per_read: 128,
@@ -4096,10 +4337,10 @@ mod tests {
         ));
 
         let page = execute_operator_request_with_capabilities(
-            OperatorRequestV5 {
+            OperatorRequestV6 {
                 request_id: 2,
-                operation: OperatorOperationV5::PhysicalDesignMutationReceipts {
-                    after: Some(OperatorPhysicalDesignMutationReceiptCursorV5 {
+                operation: OperatorOperationV6::PhysicalDesignMutationReceipts {
+                    after: Some(OperatorPhysicalDesignMutationReceiptCursorV6 {
                         journal_incarnation: "11111111111111111111111111111111".into(),
                         receipt_id: 1,
                     }),
@@ -4110,8 +4351,8 @@ mod tests {
             &design,
             OperatorListenerPolicy::new(false, false, true, None, None),
         );
-        let OperatorResponseV5::Ok {
-            result: OperatorResultV5::PhysicalDesignMutationReceipts { page },
+        let OperatorResponseV6::Ok {
+            result: OperatorResultV6::PhysicalDesignMutationReceipts { page },
             ..
         } = page
         else {
@@ -4123,7 +4364,7 @@ mod tests {
         assert_eq!(page.next_after.unwrap().receipt_id, 2);
         assert_eq!(
             page.receipts[0].outcome,
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::Failed
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::Failed
         );
         worker.join().unwrap();
     }
@@ -4159,22 +4400,22 @@ mod tests {
             ServerPhysicalDesignMutationReceiptOutcome::RecoveredConflict,
         ];
         let expected_outcomes = [
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::Pending,
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::CreatedIndex { index_id: 1 },
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::CreatedColumnar { projection_id: 2 },
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::AlreadyAppliedIndex { index_id: 3 },
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::AlreadyAppliedColumnar {
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::Pending,
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::CreatedIndex { index_id: 1 },
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::CreatedColumnar { projection_id: 2 },
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::AlreadyAppliedIndex { index_id: 3 },
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::AlreadyAppliedColumnar {
                 projection_id: 4,
             },
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::AlreadyCovered,
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::Rejected,
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::Failed,
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::RecoveredAppliedIndex { index_id: 5 },
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::RecoveredAppliedColumnar {
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::AlreadyCovered,
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::Rejected,
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::Failed,
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::RecoveredAppliedIndex { index_id: 5 },
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::RecoveredAppliedColumnar {
                 projection_id: 6,
             },
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::RecoveredNotApplied,
-            OperatorPhysicalDesignMutationReceiptOutcomeV5::RecoveredConflict,
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::RecoveredNotApplied,
+            OperatorPhysicalDesignMutationReceiptOutcomeV6::RecoveredConflict,
         ];
         for (offset, (outcome, expected_outcome)) in
             outcomes.into_iter().zip(expected_outcomes).enumerate()
@@ -4204,14 +4445,14 @@ mod tests {
             assert_eq!(
                 mapped.source,
                 if offset % 2 == 0 {
-                    OperatorPhysicalDesignMutationReceiptSourceV5::Programmatic
+                    OperatorPhysicalDesignMutationReceiptSourceV6::Programmatic
                 } else {
-                    OperatorPhysicalDesignMutationReceiptSourceV5::LocalOperator
+                    OperatorPhysicalDesignMutationReceiptSourceV6::LocalOperator
                 }
             );
             assert!(matches!(
                 mapped.target,
-                OperatorPhysicalDesignMutationReceiptTargetV5::Index {
+                OperatorPhysicalDesignMutationReceiptTargetV6::Index {
                     table_id: 1,
                     column_id: 3,
                     ..
@@ -4239,9 +4480,9 @@ mod tests {
         );
         assert!(matches!(
             columnar.target,
-            OperatorPhysicalDesignMutationReceiptTargetV5::Columnar {
+            OperatorPhysicalDesignMutationReceiptTargetV6::Columnar {
                 table_id: 1,
-                mode: OperatorPhysicalColumnarDesignModeV5::Incremental,
+                mode: OperatorPhysicalColumnarDesignModeV6::Incremental,
                 ..
             }
         ));
@@ -4264,14 +4505,14 @@ mod tests {
         for (error, expected) in [
             (
                 ServerPhysicalDesignMutationReceiptControlError::NotEnabled,
-                OperatorErrorCodeV5::PhysicalDesignMutationReceiptsNotEnabled,
+                OperatorErrorCodeV6::PhysicalDesignMutationReceiptsNotEnabled,
             ),
             (
                 ServerPhysicalDesignMutationReceiptControlError::InvalidLimit {
                     supplied: 0,
                     maximum: 128,
                 },
-                OperatorErrorCodeV5::InvalidPhysicalDesignMutationReceiptLimit,
+                OperatorErrorCodeV6::InvalidPhysicalDesignMutationReceiptLimit,
             ),
             (
                 ServerPhysicalDesignMutationReceiptControlError::JournalChanged {
@@ -4280,7 +4521,7 @@ mod tests {
                     actual: ServerPhysicalDesignMutationReceiptJournalIncarnation::new([2; 16])
                         .unwrap(),
                 },
-                OperatorErrorCodeV5::PhysicalDesignMutationReceiptJournalChanged,
+                OperatorErrorCodeV6::PhysicalDesignMutationReceiptJournalChanged,
             ),
         ] {
             let mapped = receipt_read_remote_error(error);
@@ -4298,7 +4539,7 @@ mod tests {
             ));
         assert_eq!(
             mapped.code,
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptReadFailed
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptReadFailed
         );
         let encoded = serde_json::to_string(&mapped).unwrap();
         assert!(!encoded.contains("/private/receipts.nbmr"));
@@ -4310,7 +4551,7 @@ mod tests {
                     ServerPhysicalDesignMutationReceiptJournalError::CapacityExceeded,
                 )
             ),
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptCapacityExceeded
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptCapacityExceeded
         );
         assert_eq!(
             mutation_receipt_begin_error_code(
@@ -4318,7 +4559,7 @@ mod tests {
                     ServerPhysicalDesignMutationReceiptJournalError::Corrupt("private")
                 )
             ),
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptUnavailable
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptUnavailable
         );
     }
 
@@ -4342,10 +4583,10 @@ mod tests {
                 outcome: ServerPhysicalDesignMutationReceiptOutcome::Failed,
             },
         );
-        let single = OperatorResponseV5::Ok {
+        let single = OperatorResponseV6::Ok {
             request_id: 1,
-            result: OperatorResultV5::PhysicalDesignMutationReceipts {
-                page: OperatorPhysicalDesignMutationReceiptPageV5 {
+            result: OperatorResultV6::PhysicalDesignMutationReceipts {
+                page: OperatorPhysicalDesignMutationReceiptPageV6 {
                     journal_incarnation: "33".repeat(16),
                     receipts: vec![receipt.clone()],
                     next_after: None,
@@ -4362,10 +4603,10 @@ mod tests {
             4_096
         );
 
-        let oversized = OperatorResponseV5::Ok {
+        let oversized = OperatorResponseV6::Ok {
             request_id: 2,
-            result: OperatorResultV5::PhysicalDesignMutationReceipts {
-                page: OperatorPhysicalDesignMutationReceiptPageV5 {
+            result: OperatorResultV6::PhysicalDesignMutationReceipts {
+                page: OperatorPhysicalDesignMutationReceiptPageV6 {
                     journal_incarnation: "33".repeat(16),
                     receipts: vec![receipt.clone(), receipt],
                     next_after: None,
@@ -4375,11 +4616,12 @@ mod tests {
         let mut bytes = Vec::new();
         write_operator_response(&mut bytes, &oversized).unwrap();
         assert!(matches!(
-            read_frame::<OperatorResponseV5>(&mut bytes.as_slice()).unwrap(),
-            OperatorResponseV5::Error {
+            read_frame::<OperatorResponseV6>(&mut bytes.as_slice()).unwrap(),
+            OperatorResponseV6::Error {
                 request_id: 2,
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::ResponseTooLarge,
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::ResponseTooLarge,
                     receipt: None,
                     ..
                 }
@@ -4437,11 +4679,11 @@ mod tests {
         assert_eq!(status.diagnostics.eligible_query_count, 1);
         assert_eq!(
             status.diagnostics.last_record_outcome,
-            Some(OperatorPhysicalDesignRecordOutcomeV5::SchemaRotatedWithCapacityRejection)
+            Some(OperatorPhysicalDesignRecordOutcomeV6::SchemaRotatedWithCapacityRejection)
         );
         assert_eq!(
             status.diagnostics.last_record_error,
-            Some(OperatorPhysicalDesignRecordErrorV5::OutOfOrderVisibility)
+            Some(OperatorPhysicalDesignRecordErrorV6::OutOfOrderVisibility)
         );
         assert_eq!(
             status.evidence.limits.max_columnar_columns_per_candidate,
@@ -4456,35 +4698,35 @@ mod tests {
         for (reason, expected) in [
             (
                 PhysicalDesignNoActionReason::BelowMinimumReports,
-                OperatorPhysicalDesignNoActionReasonV5::BelowMinimumReports,
+                OperatorPhysicalDesignNoActionReasonV6::BelowMinimumReports,
             ),
             (
                 PhysicalDesignNoActionReason::BelowMinimumShapeDiversity,
-                OperatorPhysicalDesignNoActionReasonV5::BelowMinimumShapeDiversity,
+                OperatorPhysicalDesignNoActionReasonV6::BelowMinimumShapeDiversity,
             ),
             (
                 PhysicalDesignNoActionReason::BelowMinimumActualWork,
-                OperatorPhysicalDesignNoActionReasonV5::BelowMinimumActualWork,
+                OperatorPhysicalDesignNoActionReasonV6::BelowMinimumActualWork,
             ),
             (
                 PhysicalDesignNoActionReason::ExistingDesignCovers,
-                OperatorPhysicalDesignNoActionReasonV5::ExistingDesignCovers,
+                OperatorPhysicalDesignNoActionReasonV6::ExistingDesignCovers,
             ),
             (
                 PhysicalDesignNoActionReason::UnsupportedCurrentLayout,
-                OperatorPhysicalDesignNoActionReasonV5::UnsupportedCurrentLayout,
+                OperatorPhysicalDesignNoActionReasonV6::UnsupportedCurrentLayout,
             ),
             (
                 PhysicalDesignNoActionReason::IncompleteEvidence,
-                OperatorPhysicalDesignNoActionReasonV5::IncompleteEvidence,
+                OperatorPhysicalDesignNoActionReasonV6::IncompleteEvidence,
             ),
             (
                 PhysicalDesignNoActionReason::CurrentProjectionUnavailable,
-                OperatorPhysicalDesignNoActionReasonV5::CurrentProjectionUnavailable,
+                OperatorPhysicalDesignNoActionReasonV6::CurrentProjectionUnavailable,
             ),
             (
                 PhysicalDesignNoActionReason::RecommendationLimitReached,
-                OperatorPhysicalDesignNoActionReasonV5::RecommendationLimitReached,
+                OperatorPhysicalDesignNoActionReasonV6::RecommendationLimitReached,
             ),
         ] {
             assert_eq!(operator_no_action_reason(reason), expected);
@@ -4516,9 +4758,9 @@ mod tests {
         let (adaptive_tx, _adaptive_rx) = std::sync::mpsc::channel();
         let (design_tx, design_rx) = std::sync::mpsc::channel();
         let response = execute_operator_request(
-            OperatorRequestV5 {
+            OperatorRequestV6 {
                 request_id: 91,
-                operation: OperatorOperationV5::ApplyPhysicalIndex {
+                operation: OperatorOperationV6::ApplyPhysicalIndex {
                     expected_runtime_token: "invalid".into(),
                     expected_evidence_epoch: 0,
                     table_id: 1,
@@ -4533,9 +4775,10 @@ mod tests {
         );
         assert!(matches!(
             response,
-            OperatorResponseV5::Error {
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::PhysicalIndexApplyNotEnabled,
+            OperatorResponseV6::Error {
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::PhysicalIndexApplyNotEnabled,
                     ..
                 },
                 ..
@@ -4549,9 +4792,9 @@ mod tests {
         let (adaptive_tx, _adaptive_rx) = std::sync::mpsc::channel();
         let (design_tx, design_rx) = std::sync::mpsc::channel();
         let response = execute_operator_request(
-            OperatorRequestV5 {
+            OperatorRequestV6 {
                 request_id: 92,
-                operation: OperatorOperationV5::ApplyPhysicalIndex {
+                operation: OperatorOperationV6::ApplyPhysicalIndex {
                     expected_runtime_token: encoded,
                     expected_evidence_epoch: 0,
                     table_id: 1,
@@ -4566,9 +4809,10 @@ mod tests {
         );
         assert!(matches!(
             response,
-            OperatorResponseV5::Error {
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::InvalidIndexName,
+            OperatorResponseV6::Error {
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::InvalidIndexName,
                     ..
                 },
                 ..
@@ -4582,9 +4826,9 @@ mod tests {
         let (adaptive_tx, _adaptive_rx) = std::sync::mpsc::channel();
         let (design_tx, design_rx) = std::sync::mpsc::channel();
         let response = execute_operator_request(
-            OperatorRequestV5 {
+            OperatorRequestV6 {
                 request_id: 93,
-                operation: OperatorOperationV5::ApplyPhysicalIndex {
+                operation: OperatorOperationV6::ApplyPhysicalIndex {
                     expected_runtime_token: "00112233445566778899AABBCCDDEEFF".into(),
                     expected_evidence_epoch: 0,
                     table_id: 1,
@@ -4599,9 +4843,10 @@ mod tests {
         );
         assert!(matches!(
             response,
-            OperatorResponseV5::Error {
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::MalformedRequest,
+            OperatorResponseV6::Error {
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::MalformedRequest,
                     ..
                 },
                 ..
@@ -4615,12 +4860,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn raw_v5_empty_column_list_is_malformed_before_worker_forwarding() {
+    fn raw_v6_empty_column_list_is_malformed_before_worker_forwarding() {
         use std::os::unix::net::UnixStream;
 
         let token = OperatorPhysicalDesignRuntimeToken([0x11; 16]);
         let payload = br#"{"request_id":1,"operation":{"type":"apply_physical_columnar","expected_runtime_token":"11111111111111111111111111111111","expected_evidence_epoch":1,"table_id":1,"columns":[],"mode":"snapshot","placement_key":"test"}}"#;
-        let mut frame = b"NBOP\0\x05\0\0".to_vec();
+        let mut frame = b"NBOP\0\x06\0\0".to_vec();
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload);
 
@@ -4648,11 +4893,12 @@ mod tests {
 
         client.write_all(&frame).unwrap();
         assert!(matches!(
-            read_frame::<OperatorResponseV5>(&mut client).unwrap(),
-            OperatorResponseV5::Error {
+            read_frame::<OperatorResponseV6>(&mut client).unwrap(),
+            OperatorResponseV6::Error {
                 request_id: 1,
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::MalformedRequest,
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::MalformedRequest,
                     ref message,
                     receipt: None,
                 },
@@ -4669,7 +4915,7 @@ mod tests {
     fn columnar_server_stop_mapping_preserves_definite_and_uncertain_outcomes() {
         let stopped =
             physical_columnar_remote_error(ServerPhysicalColumnarDesignControlError::ServerStopped);
-        assert_eq!(stopped.code, OperatorErrorCodeV5::ServerStopped);
+        assert_eq!(stopped.code, OperatorErrorCodeV6::ServerStopped);
         assert!(!stopped.message.contains("without creating"));
 
         let uncertain = physical_columnar_remote_error(
@@ -4677,7 +4923,7 @@ mod tests {
         );
         assert_eq!(
             uncertain.code,
-            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
+            OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain
         );
         assert!(uncertain.message.contains("same exact approval"));
         assert!(!uncertain.message.contains("without creating"));
@@ -4697,7 +4943,7 @@ mod tests {
         );
         assert_eq!(
             receipt_uncertain.code,
-            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
+            OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain
         );
         assert!(receipt_uncertain.message.contains("restart/reopen"));
         assert_eq!(receipt_uncertain.receipt, Some(reference.clone()));
@@ -4715,7 +4961,7 @@ mod tests {
         );
         assert_eq!(
             ambiguous_columnar.code,
-            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
+            OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain
         );
         assert_eq!(ambiguous_columnar.receipt, Some(reference.clone()));
         let index_receipt_uncertain = physical_design_remote_error_with_receipt(
@@ -4726,7 +4972,7 @@ mod tests {
         );
         assert_eq!(
             index_receipt_uncertain.code,
-            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
+            OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain
         );
         assert!(index_receipt_uncertain.message.contains("restart/reopen"));
         let ambiguous_index = physical_design_remote_error_with_receipt(
@@ -4739,7 +4985,7 @@ mod tests {
         );
         assert_eq!(
             ambiguous_index.code,
-            OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain
+            OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain
         );
         assert_eq!(ambiguous_index.receipt, Some(reference.clone()));
         let gated_request = physical_design_remote_error_with_receipt(
@@ -4750,7 +4996,7 @@ mod tests {
         );
         assert_eq!(
             gated_request.code,
-            OperatorErrorCodeV5::PhysicalDesignMutationReceiptUnavailable
+            OperatorErrorCodeV6::PhysicalDesignMutationReceiptUnavailable
         );
         assert_eq!(gated_request.receipt, None);
         assert!(gated_request.message.contains("no mutation occurred"));
@@ -4790,15 +5036,16 @@ mod tests {
         ));
         assert!(matches!(
             classify_mutating_client_error(OperatorClientError::Remote(stopped)),
-            OperatorClientError::Remote(OperatorRemoteErrorV5 {
-                code: OperatorErrorCodeV5::ServerStopped,
+            OperatorClientError::Remote(OperatorRemoteErrorV6 {
+                admission: None,
+                code: OperatorErrorCodeV6::ServerStopped,
                 ..
             })
         ));
     }
 
     #[test]
-    fn v5_worker_reply_loss_is_uncertain_without_a_receipt() {
+    fn v6_worker_reply_loss_is_uncertain_without_a_receipt() {
         let token = OperatorPhysicalDesignRuntimeToken::from_bytes([0x51; 16]);
         let encoded_token = token.encode();
         let (adaptive_tx, _adaptive_rx) = std::sync::mpsc::channel();
@@ -4806,9 +5053,9 @@ mod tests {
         let (index_tx, index_rx) = std::sync::mpsc::channel();
         let index_worker = std::thread::spawn(move || drop(index_rx.recv().unwrap()));
         let index = execute_operator_request_with_capabilities(
-            OperatorRequestV5 {
+            OperatorRequestV6 {
                 request_id: 1,
-                operation: OperatorOperationV5::ApplyPhysicalIndex {
+                operation: OperatorOperationV6::ApplyPhysicalIndex {
                     expected_runtime_token: encoded_token.clone(),
                     expected_evidence_epoch: 1,
                     table_id: 2,
@@ -4823,9 +5070,10 @@ mod tests {
         index_worker.join().unwrap();
         assert!(matches!(
             index,
-            OperatorResponseV5::Error {
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain,
+            OperatorResponseV6::Error {
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain,
                     receipt: None,
                     ..
                 },
@@ -4836,14 +5084,14 @@ mod tests {
         let (columnar_tx, columnar_rx) = std::sync::mpsc::channel();
         let columnar_worker = std::thread::spawn(move || drop(columnar_rx.recv().unwrap()));
         let columnar = execute_operator_request_with_capabilities(
-            OperatorRequestV5 {
+            OperatorRequestV6 {
                 request_id: 2,
-                operation: OperatorOperationV5::ApplyPhysicalColumnar {
+                operation: OperatorOperationV6::ApplyPhysicalColumnar {
                     expected_runtime_token: encoded_token,
                     expected_evidence_epoch: 1,
                     table_id: 2,
                     columns: vec![3],
-                    mode: OperatorPhysicalColumnarDesignModeV5::Snapshot,
+                    mode: OperatorPhysicalColumnarDesignModeV6::Snapshot,
                     placement_key: "events".into(),
                 },
             },
@@ -4863,9 +5111,10 @@ mod tests {
         columnar_worker.join().unwrap();
         assert!(matches!(
             columnar,
-            OperatorResponseV5::Error {
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::PhysicalDesignMutationOutcomeUncertain,
+            OperatorResponseV6::Error {
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain,
                     receipt: None,
                     ..
                 },
@@ -4876,12 +5125,12 @@ mod tests {
 
     #[test]
     fn oversized_success_becomes_bounded_response_too_large_error() {
-        let candidate = OperatorPhysicalIndexCandidateV5 {
+        let candidate = OperatorPhysicalIndexCandidateV6 {
             table_id: 1,
             column_id: 2,
             point_report_count: 3,
             range_report_count: 4,
-            evidence: OperatorPhysicalDesignEvidenceSummaryV5 {
+            evidence: OperatorPhysicalDesignEvidenceSummaryV6 {
                 report_count: 5,
                 distinct_query_shapes: 6,
                 total_actual_scan_work_units: 7,
@@ -4890,13 +5139,13 @@ mod tests {
                 incomplete: false,
                 truncated: false,
             },
-            decision: OperatorPhysicalDesignDecisionV5::Recommend {},
+            decision: OperatorPhysicalDesignDecisionV6::Recommend {},
         };
-        let response = OperatorResponseV5::Ok {
+        let response = OperatorResponseV6::Ok {
             request_id: 77,
-            result: OperatorResultV5::PhysicalDesignRecommendations {
+            result: OperatorResultV6::PhysicalDesignRecommendations {
                 runtime_token: None,
-                report: OperatorPhysicalDesignAdvisorReportV5 {
+                report: OperatorPhysicalDesignAdvisorReportV6 {
                     evidence_epoch: 1,
                     schema_generation: 2,
                     first_global_commit_seq: 3,
@@ -4914,11 +5163,12 @@ mod tests {
         write_operator_response(&mut bytes, &response).unwrap();
         assert!(bytes.len() <= OPERATOR_HEADER_BYTES + MAX_OPERATOR_PAYLOAD_BYTES as usize);
         assert!(matches!(
-            read_frame::<OperatorResponseV5>(&mut bytes.as_slice()).unwrap(),
-            OperatorResponseV5::Error {
+            read_frame::<OperatorResponseV6>(&mut bytes.as_slice()).unwrap(),
+            OperatorResponseV6::Error {
                 request_id: 77,
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::ResponseTooLarge,
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::ResponseTooLarge,
                     ..
                 }
             }
@@ -4953,9 +5203,9 @@ mod tests {
         });
 
         let reset = execute_operator_request(
-            OperatorRequestV5 {
+            OperatorRequestV6 {
                 request_id: 11,
-                operation: OperatorOperationV5::ResetFaultedScheduler {},
+                operation: OperatorOperationV6::ResetFaultedScheduler {},
             },
             &control,
             &design_control,
@@ -4964,16 +5214,16 @@ mod tests {
         );
         assert!(matches!(
             reset,
-            OperatorResponseV5::Ok {
+            OperatorResponseV6::Ok {
                 request_id: 11,
-                result: OperatorResultV5::SchedulerReset {}
+                result: OperatorResultV6::SchedulerReset {}
             }
         ));
 
         let stale = execute_operator_request(
-            OperatorRequestV5 {
+            OperatorRequestV6 {
                 request_id: 12,
-                operation: OperatorOperationV5::RotateEvidence {
+                operation: OperatorOperationV6::RotateEvidence {
                     expected_window_epoch: 7,
                 },
             },
@@ -4984,10 +5234,11 @@ mod tests {
         );
         assert!(matches!(
             stale,
-            OperatorResponseV5::Error {
+            OperatorResponseV6::Error {
                 request_id: 12,
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::EvidenceWindowChanged,
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::EvidenceWindowChanged,
                     ..
                 }
             }
@@ -5001,7 +5252,7 @@ mod tests {
         wrong_magic[..4].copy_from_slice(b"NOPE");
         wrong_magic[4..6].copy_from_slice(&3_u16.to_be_bytes());
         assert!(matches!(
-            read_frame::<OperatorRequestV5>(&mut wrong_magic.as_slice()),
+            read_frame::<OperatorRequestV6>(&mut wrong_magic.as_slice()),
             Err(OperatorProtocolError::WrongMagic)
         ));
 
@@ -5009,35 +5260,35 @@ mod tests {
         wrong_version[..4].copy_from_slice(b"NBOP");
         wrong_version[4..6].copy_from_slice(&4_u16.to_be_bytes());
         assert!(matches!(
-            read_frame::<OperatorRequestV5>(&mut wrong_version.as_slice()),
+            read_frame::<OperatorRequestV6>(&mut wrong_version.as_slice()),
             Err(OperatorProtocolError::UnsupportedVersion(4))
         ));
 
         let mut reserved = [0_u8; OPERATOR_HEADER_BYTES];
         reserved[..4].copy_from_slice(b"NBOP");
-        reserved[4..6].copy_from_slice(&5_u16.to_be_bytes());
+        reserved[4..6].copy_from_slice(&OPERATOR_PROTOCOL_VERSION.to_be_bytes());
         reserved[6..8].copy_from_slice(&1_u16.to_be_bytes());
         assert!(matches!(
-            read_frame::<OperatorRequestV5>(&mut reserved.as_slice()),
+            read_frame::<OperatorRequestV6>(&mut reserved.as_slice()),
             Err(OperatorProtocolError::NonzeroReserved(1))
         ));
 
         let mut oversized = [0_u8; OPERATOR_HEADER_BYTES];
         oversized[..4].copy_from_slice(b"NBOP");
-        oversized[4..6].copy_from_slice(&5_u16.to_be_bytes());
+        oversized[4..6].copy_from_slice(&OPERATOR_PROTOCOL_VERSION.to_be_bytes());
         oversized[8..12].copy_from_slice(&(MAX_OPERATOR_PAYLOAD_BYTES + 1).to_be_bytes());
         assert!(matches!(
-            read_frame::<OperatorRequestV5>(&mut oversized.as_slice()),
+            read_frame::<OperatorRequestV6>(&mut oversized.as_slice()),
             Err(OperatorProtocolError::RequestTooLarge(_))
         ));
         assert!(matches!(
-            read_frame::<OperatorRequestV5>(&mut b"NB".as_slice()),
+            read_frame::<OperatorRequestV6>(&mut b"NB".as_slice()),
             Err(OperatorProtocolError::TruncatedHeader)
         ));
 
-        let truncated_payload = b"NBOP\0\x05\0\0\0\0\0\x02{".to_vec();
+        let truncated_payload = b"NBOP\0\x06\0\0\0\0\0\x02{".to_vec();
         assert!(matches!(
-            read_frame::<OperatorRequestV5>(&mut truncated_payload.as_slice()),
+            read_frame::<OperatorRequestV6>(&mut truncated_payload.as_slice()),
             Err(OperatorProtocolError::TruncatedPayload)
         ));
     }
@@ -5067,11 +5318,12 @@ mod tests {
         v3_header[4..6].copy_from_slice(&3_u16.to_be_bytes());
         client.write_all(&v3_header).unwrap();
         assert!(matches!(
-            read_frame::<OperatorResponseV5>(&mut client).unwrap(),
-            OperatorResponseV5::Error {
+            read_frame::<OperatorResponseV6>(&mut client).unwrap(),
+            OperatorResponseV6::Error {
                 request_id: 0,
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::UnsupportedProtocolVersion,
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::UnsupportedProtocolVersion,
                     ..
                 }
             }
@@ -5082,7 +5334,7 @@ mod tests {
     #[test]
     fn strict_request_json_rejects_unknown_fields_and_operations() {
         fn framed(payload: &[u8]) -> Vec<u8> {
-            let mut bytes = Vec::from(b"NBOP\0\x05\0\0".as_slice());
+            let mut bytes = Vec::from(b"NBOP\0\x06\0\0".as_slice());
             bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
             bytes.extend_from_slice(payload);
             bytes
@@ -5096,7 +5348,7 @@ mod tests {
             &[0xff][..],
         ] {
             assert!(matches!(
-                read_frame::<OperatorRequestV5>(&mut framed(payload).as_slice()),
+                read_frame::<OperatorRequestV6>(&mut framed(payload).as_slice()),
                 Err(OperatorProtocolError::InvalidJson(_))
             ));
         }
@@ -5125,9 +5377,9 @@ mod tests {
             let mut bytes = Vec::new();
             write_frame(
                 &mut bytes,
-                &OperatorRequestV5 {
+                &OperatorRequestV6 {
                     request_id,
-                    operation: OperatorOperationV5::ResetFaultedScheduler {},
+                    operation: OperatorOperationV6::ResetFaultedScheduler {},
                 },
             )
             .unwrap();
@@ -5160,8 +5412,8 @@ mod tests {
         assert!(matches!(control_rx.try_recv(), Err(TryRecvError::Empty)));
         first_reply.send(Ok(())).unwrap();
         assert!(matches!(
-            read_frame::<OperatorResponseV5>(&mut first).unwrap(),
-            OperatorResponseV5::Ok { request_id: 1, .. }
+            read_frame::<OperatorResponseV6>(&mut first).unwrap(),
+            OperatorResponseV6::Ok { request_id: 1, .. }
         ));
 
         let second_reply = match control_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
@@ -5172,11 +5424,12 @@ mod tests {
             .send(Err(ServerAdaptiveControlError::SchedulerNotFaulted))
             .unwrap();
         assert!(matches!(
-            read_frame::<OperatorResponseV5>(&mut second).unwrap(),
-            OperatorResponseV5::Error {
+            read_frame::<OperatorResponseV6>(&mut second).unwrap(),
+            OperatorResponseV6::Error {
                 request_id: 2,
-                error: OperatorRemoteErrorV5 {
-                    code: OperatorErrorCodeV5::SchedulerNotFaulted,
+                error: OperatorRemoteErrorV6 {
+                    admission: None,
+                    code: OperatorErrorCodeV6::SchedulerNotFaulted,
                     ..
                 }
             }
@@ -5259,7 +5512,7 @@ mod tests {
         }
     }
     #[test]
-    fn admission_remains_programmatic_and_nbop_v5_rejects_new_policy_or_error_schema() {
+    fn nbop_v6_rejects_caller_policy_and_maps_admission_errors() {
         for operation in [
             serde_json::json!({"type":"apply_physical_index", "expected_runtime_token":"11".repeat(16),
                 "expected_evidence_epoch":0,"table_id":1,"column_id":2,"index_name":"idx"}),
@@ -5267,23 +5520,23 @@ mod tests {
                 "expected_evidence_epoch":0,"table_id":1,"columns":[1],"mode":"snapshot","placement_key":"projection"}),
         ] {
             let mut request = serde_json::json!({"request_id":1, "operation":operation});
-            assert!(serde_json::from_value::<OperatorRequestV5>(request.clone()).is_ok());
+            assert!(serde_json::from_value::<OperatorRequestV6>(request.clone()).is_ok());
             request["operation"]["admission"] = serde_json::json!({"source_work_units":1});
             assert!(
-                serde_json::from_value::<OperatorRequestV5>(request)
+                serde_json::from_value::<OperatorRequestV6>(request)
                     .unwrap_err()
                     .to_string()
                     .contains("unknown field")
             );
         }
         assert!(
-            serde_json::from_value::<OperatorRequestV5>(serde_json::json!({
+            serde_json::from_value::<OperatorRequestV6>(serde_json::json!({
                 "request_id":1, "operation":{"type":"apply_physical_index_with_admission"}
             }))
             .is_err()
         );
         assert!(
-            serde_json::from_value::<OperatorErrorCodeV5>(serde_json::json!(
+            serde_json::from_value::<OperatorErrorCodeV6>(serde_json::json!(
                 "physical_design_admission_rejected"
             ))
             .is_err()
@@ -5298,14 +5551,15 @@ mod tests {
         };
         assert_eq!(
             physical_design_remote_error(ServerPhysicalDesignControlError::Admission(error())).code,
-            OperatorErrorCodeV5::Internal
+            OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected
         );
         assert_eq!(
             physical_columnar_remote_error(ServerPhysicalColumnarDesignControlError::Admission(
                 error()
             ))
             .code,
-            OperatorErrorCodeV5::Internal
+            OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected
         );
     }
+    include!("operator_admission_tests.rs");
 }

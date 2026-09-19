@@ -11,6 +11,24 @@ subprocess recovery-interruption regressions, retaining the prior
 planner or writer-concurrency expansion is included. Real power-loss, hardware
 torn-write and network-filesystem validation remain separate work.
 
+## Operator component admission (Adaptive Operations Phase 35 complete)
+
+- Manifest v11 requires three independent explicit operator admission modes and
+  validates strict six-component policies through Core, including consistency
+  with apply permissions and allowed Columnar modes;
+- NBOP v6 exposes exact configured policies and private typed rejection details,
+  retains frozen public V5 DTOs, and accepts no budget or inspection in apply;
+- the worker selects deployment policy in one existing approved command; Core
+  preserves fresh inspection, no-op precedence and component comparison;
+- retained coarse NBMR v3 Rejected receipts and uncertainty/recovery semantics,
+  independent programmatic authority, Native/PG parity and explicit-only apply.
+
+External component admission is complete. Whole-mutation work bounds,
+output-write bounds, memory limits, CPU limits, filesystem free-space limits,
+cumulative quotas and automatic design remain deferred. Phase36 should first
+justify a new storage-authored bound before extending policy. See
+[`adaptive-operations-phase35.md`](adaptive-operations-phase35.md).
+
 ## Component mutation admission (Adaptive Operations Phase 34 complete)
 
 - added six explicit, no-default component constraints and a validated policy;
@@ -26,9 +44,8 @@ torn-write and network-filesystem validation remain separate work.
 - retained Manifest v10, NBOP v5, NBMR v3, Native Protocol v2, PostgreSQL wire,
   Inspection JSON v7, SDKs, CLI/daemon and every database persistent format.
 
-Phase 35 should externalize deployment/operator component policy through an
-explicitly versioned contract while retaining partial-policy meaning, same-call
-freshness and no-op/Begin ordering. Total mutation work, output-write bounds,
+Phase 35 now externalizes deployment/operator component policy while retaining
+partial-policy meaning, same-call freshness and no-op/Begin ordering. Total mutation work, output-write bounds,
 CPU/memory/free-space budgets and automatic design remain unproven or deferred.
 See [`adaptive-operations-phase34.md`](adaptive-operations-phase34.md).
 

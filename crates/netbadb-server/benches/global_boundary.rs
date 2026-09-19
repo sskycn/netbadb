@@ -130,7 +130,7 @@ fn run(root: &Path) -> BenchResult<()> {
         fs::write(
             &manifest,
             serde_json::to_vec(&json!({
-                "version": 10, "listen": "127.0.0.1:0",
+                "version": 11, "listen": "127.0.0.1:0",
                 "authorization": {"local_plaintext": {"tables": [{"table_id":1,"read":true,"write":false,"transaction":false,"analyze":false}]}, "clients":[]},
                 "tables":[{"path":"data","id":1,"name":"items","columns":[
                     {"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false,"primary_key":false},

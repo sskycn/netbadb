@@ -59,7 +59,7 @@ fn manifest_fixture(
 ) -> Fixture {
     let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
-        "netbadbd-v10-{transport}-{}-{sequence}",
+        "netbadbd-v11-{transport}-{}-{sequence}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&directory);
@@ -77,12 +77,12 @@ fn manifest_fixture(
         std::process::id()
     ));
     let _ = std::fs::remove_file(&socket);
-    let document = include_str!("../../../docs/server-manifest-v10.md");
+    let document = include_str!("../../../docs/server-manifest-v11.md");
     let example = document
         .split_once("```json\n")
         .and_then(|(_, remainder)| remainder.split_once("\n```"))
         .map(|(example, _)| example)
-        .expect("v10 documentation contains a JSON example");
+        .expect("v11 documentation contains a JSON example");
     let mut source: serde_json::Value = serde_json::from_str(example).unwrap();
     source["listen"] = "127.0.0.1:0".into();
     source["tables"][0]["path"] = "data/users.ndb".into();
@@ -129,7 +129,7 @@ fn manifest_fixture(
 struct DaemonProcess {
     child: Child,
     lines: Receiver<String>,
-    reader: JoinHandle<Vec<String>>,
+    reader: Option<JoinHandle<Vec<String>>>,
 }
 
 impl DaemonProcess {
@@ -159,7 +159,7 @@ impl DaemonProcess {
         Self {
             child,
             lines,
-            reader,
+            reader: Some(reader),
         }
     }
 
@@ -224,7 +224,20 @@ impl DaemonProcess {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        (status, self.reader.join().unwrap())
+        (status, self.reader.take().unwrap().join().unwrap())
+    }
+}
+
+// Test failure must not leave a daemon owning a journal or socket.
+impl Drop for DaemonProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -375,7 +388,7 @@ fn native_design_only_daemon_exposes_status_and_conditional_rotation() {
 }
 
 #[test]
-fn postgres_design_only_daemon_exposes_nbop_v5_status() {
+fn postgres_design_only_daemon_exposes_nbop_v6_status() {
     let fixture = manifest_fixture("postgres-design-only", false, true, true);
     let mut daemon = DaemonProcess::spawn(&fixture.manifest, true);
     let ready = daemon.wait_for_readiness();
@@ -403,3 +416,5 @@ fn postgres_design_only_daemon_exposes_nbop_v5_status() {
     assert!(status.success());
     fixture.cleanup();
 }
+
+include!("support/operator_admission.rs");

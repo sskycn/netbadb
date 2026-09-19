@@ -86,7 +86,7 @@ impl Fixture {
         database.close().unwrap();
 
         let manifest = directory.join("server.json");
-        write_manifest(&manifest, 10, "users");
+        write_manifest(&manifest, 11, "users");
         Self {
             directory,
             manifest,
@@ -293,7 +293,7 @@ fn catalog_text_and_json_are_complete_deterministic_and_ignore_network_acl_filte
 }
 
 #[test]
-fn inspect_accepts_and_validates_v10_adaptive_without_rewriting_the_manifest() {
+fn inspect_accepts_and_validates_v11_adaptive_without_rewriting_the_manifest() {
     let fixture = Fixture::new("adaptive-manifest");
     let mut manifest: Value =
         serde_json::from_slice(&std::fs::read(&fixture.manifest).unwrap()).unwrap();
@@ -334,6 +334,27 @@ fn inspect_accepts_and_validates_v10_adaptive_without_rewriting_the_manifest() {
             }
         }
     });
+    std::fs::create_dir_all(fixture.directory.join("columnar")).unwrap();
+    manifest["physical_design"]["columnar_apply"] = json!({
+        "root":"columnar", "allow_snapshot":true, "allow_incremental":true
+    });
+    // Impossible current output-write policy is valid configuration; inspect must
+    // not turn configuration validation into current mutation-work admission.
+    let policy = json!({"mode":"component_limits",
+        "source_work_units":{"kind":"unconstrained"},
+        "source_read_bytes":{"kind":"unconstrained"},
+        "prerequisite_work_units":{"kind":"unconstrained"},
+        "prerequisite_read_bytes":{"kind":"unconstrained"},
+        "prerequisite_write_bytes":{"kind":"unconstrained"},
+        "output_write_bytes":{"kind":"at_most","maximum":0}
+    });
+    manifest["operator"] = json!({"unix_socket":"operator.sock", "io_timeout_ms":1000,
+        "allow_physical_index_apply":true, "allow_physical_columnar_apply":true,
+        "allow_physical_design_receipt_read":false,
+        "physical_index_admission":policy,
+        "physical_columnar_snapshot_admission":policy,
+        "physical_columnar_incremental_admission":policy
+    });
     let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
     std::fs::write(&fixture.manifest, &bytes).unwrap();
 
@@ -357,6 +378,19 @@ fn inspect_accepts_and_validates_v10_adaptive_without_rewriting_the_manifest() {
     assert!(driven.status.success(), "{}", stderr(&driven));
     assert_eq!(std::fs::read(&fixture.manifest).unwrap(), bytes);
 
+    let mut invalid_policy = manifest.clone();
+    invalid_policy["operator"]["physical_index_admission"]["output_write_bytes"] =
+        json!({"kind":"unconstrained"});
+    std::fs::write(
+        &fixture.manifest,
+        serde_json::to_vec(&invalid_policy).unwrap(),
+    )
+    .unwrap();
+    let rejected = catalog(&fixture, "json");
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(stderr(&rejected).contains("physical_index_admission"));
+    assert!(!fixture.directory.join("operator.sock").exists());
     manifest["adaptive"]["feedback"]["limits"]["magic"] = json!(true);
     std::fs::write(
         &fixture.manifest,
@@ -521,7 +555,7 @@ fn manifest_and_input_failures_precede_output_and_schema_mismatch_is_rejected() 
     assert!(stderr(&old_manifest).contains("unsupported deployment manifest version 5"));
 
     let mismatch = fixture.directory.join("mismatch.json");
-    write_manifest(&mismatch, 10, "other_users");
+    write_manifest(&mismatch, 11, "other_users");
     let mismatch = netbadb()
         .args(["inspect", "catalog", "--manifest"])
         .arg(&mismatch)
@@ -599,6 +633,9 @@ fn operator_cli_uses_live_nbop_and_never_infers_rotation_epoch() {
         "io_timeout_ms": 1000,
         "allow_physical_index_apply": false,
         "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false
     });
     std::fs::write(
@@ -767,7 +804,7 @@ fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation(
     let _ = std::fs::remove_file(&socket);
     let manifest_path = directory.join("server.json");
     let mut manifest = json!({
-        "version": 10,
+        "version": 11,
         "listen": "127.0.0.1:0",
         "authorization": {
             "local_plaintext": {
@@ -818,6 +855,9 @@ fn operator_cli_explicitly_applies_and_exactly_retries_a_current_recommendation(
             "io_timeout_ms": 1000,
             "allow_physical_index_apply": true,
             "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false
         }
     });
@@ -1110,6 +1150,9 @@ fn operator_cli_reports_unconfigured_and_offline_planes_without_opening_database
         "io_timeout_ms": 50,
         "allow_physical_index_apply": false,
         "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false
     });
     std::fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();

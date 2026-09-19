@@ -103,9 +103,9 @@
   When NBMR is enabled, durable Begin MUST precede admission. Admission rejection,
   including a fresh work-inspection error, is a terminal Rejected receipt, not
   recovery-required mutation ambiguity; independent Outcome durability failures
-  retain their existing recovery semantics. Phase 34 admission is programmatic-
-  only: local operator mutation continues under frozen NBOP v5 until separately
-  versioned deployment/operator admission is introduced.
+  retain their existing recovery semantics. Local operator admission uses the
+  immutable Manifest v11 deployment policy
+  through NBOP v6; programmatic callers retain their independent per-call policy.
 - A durable Physical Design receipt ID is meaningful only inside one durable
   NBMR journal incarnation. Persisted or external cursors MUST bind both the
   journal incarnation and nonzero receipt ID. Replacing a journal creates a new
@@ -130,11 +130,11 @@
 - Durable physical-index mutation from the local operator plane MUST require
   explicit deployment authorization in addition to filesystem access.
 - Durable physical-Columnar mutation from the local operator plane MUST require
-  both the explicit Manifest v10 `allow_physical_columnar_apply` permission and
+  both the explicit Manifest v11 `allow_physical_columnar_apply` permission and
   the complete `physical_design.columnar_apply` placement policy. The policy
   root MUST already exist, MUST be revalidated before each worker command, and
   MUST never cross the operator wire as a path.
-- NBOP v5 Columnar approval MUST contain an exact runtime token and evidence
+- NBOP v6 Columnar approval MUST contain an exact runtime token and evidence
   epoch, table ID, ordered columns, explicit mode, and logical placement key.
   The listener MUST check permission before forwarding, while the sole
   Database worker MUST perform exact-location retry recognition, mode/token/
@@ -192,3 +192,14 @@
 - Daemon readiness MUST follow successful startup of the database worker, TCP
   listener thread, and configured operator socket. It MUST NOT expose operator
   paths or authorization identities or create a protocol-level health claim.
+
+- Local operator Physical Design admission policy is deployment authority.
+  NBOP callers MUST NOT provide or override mutation admission limits. Index,
+  Snapshot Columnar and Incremental Columnar modes are independent and explicit.
+  A present operator MUST explicitly configure unadmitted behavior; absence or
+  a default MUST NOT silently mean unadmitted. The worker, not the listener,
+  selects the immutable deployment policy and invokes Core admission.
+- NBOP admission rejection MUST expose only typed component diagnostics, never
+  a Core inspection, storage path, private Database error or whole-mutation cost
+  claim. A receipt reference correlates the rejection but remains non-replayable
+  and non-authoritative. Status presents configured policy without live inspection.

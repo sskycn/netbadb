@@ -12,8 +12,10 @@ use netbadb_core::{
     AutomaticMultiSafeModePolicy, AutomaticOrchestrationEnvelope, AutomaticSafeModePolicy,
     AutomaticSchedulerPolicy, AutomaticSchedulerPolicyError, CalibrationRatio,
     CalibrationRatioError, MaintenanceBudget, PhysicalDesignAdvisorPolicy,
-    PhysicalDesignEvidenceLimits, PhysicalDesignRecommendationPolicy, PlannerCalibrationClass,
-    PlannerCalibrationPolicy,
+    PhysicalDesignEvidenceLimits, PhysicalDesignMutationAdmissionConstraint,
+    PhysicalDesignMutationAdmissionLimits, PhysicalDesignMutationAdmissionPolicy,
+    PhysicalDesignMutationAdmissionPolicyError, PhysicalDesignRecommendationPolicy,
+    PlannerCalibrationClass, PlannerCalibrationPolicy,
 };
 use netbadb_schema::{ColumnDef, Schema, SchemaError, TableDef, TypeSpec};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
@@ -22,6 +24,9 @@ use serde::{Deserialize, Deserializer};
 use crate::ServerPhysicalDesignAdvisorConfig;
 use crate::adaptive_driver::ServerAdaptiveStartupMode;
 use crate::authorization::{AuthorizationPolicy, TablePermissions, parse_certificate_sha256};
+use crate::operator::{
+    ServerOperatorMutationAdmissions, ServerOperatorPhysicalDesignMutationAdmission,
+};
 use crate::tls::{MutualTlsConfig, TlsMaterialPaths, TransportSecurity};
 use crate::{
     AuthorizationConfigError, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS,
@@ -38,7 +43,7 @@ use crate::{
 };
 use crate::{TlsConfigError, TransportKind};
 
-pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 10;
+pub const DEPLOYMENT_MANIFEST_VERSION: u32 = 11;
 pub const DEFAULT_LISTEN_ADDRESS: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878);
 
@@ -165,7 +170,9 @@ impl ServerConfig {
             .transpose()?;
         let physical_design = physical_design_manifest.map(ManifestPhysicalDesign::into_config);
         let operator = operator
-            .map(|operator| operator.into_config(&manifest_directory))
+            .map(|operator| {
+                operator.into_config(&manifest_directory, physical_columnar_apply.as_ref())
+            })
             .transpose()?;
         let tls = manifest
             .tls
@@ -391,6 +398,13 @@ pub enum ManifestError {
     OperatorPhysicalDesignReceiptReadRequiresReceiptJournal,
     PhysicalColumnarApplyConfig(ServerPhysicalColumnarApplyConfigError),
     PhysicalDesignMutationReceiptConfig(ServerPhysicalDesignMutationReceiptConfigError),
+    PhysicalDesignMutationAdmissionPolicy {
+        field: &'static str,
+        source: PhysicalDesignMutationAdmissionPolicyError,
+    },
+    OperatorAdmissionRequiresEnabledMode {
+        field: &'static str,
+    },
     OperatorSocketPath(PathBuf),
     OperatorSocketParent {
         path: PathBuf,
@@ -485,6 +499,10 @@ impl fmt::Display for ManifestError {
             ),
             Self::PhysicalColumnarApplyConfig(error) => error.fmt(formatter),
             Self::PhysicalDesignMutationReceiptConfig(error) => error.fmt(formatter),
+            Self::PhysicalDesignMutationAdmissionPolicy { field, source } =>
+                write!(formatter, "invalid operator {field}: {source}"),
+            Self::OperatorAdmissionRequiresEnabledMode { field } =>
+                write!(formatter, "operator {field} component limits require that mutation mode to be enabled"),
             Self::OperatorSocketPath(path) => write!(
                 formatter,
                 "operator Unix socket path `{}` must name a file",
@@ -528,6 +546,8 @@ impl Error for ManifestError {
             Self::Schema(error) => Some(error),
             Self::PhysicalColumnarApplyConfig(error) => Some(error),
             Self::PhysicalDesignMutationReceiptConfig(error) => Some(error),
+            Self::PhysicalDesignMutationAdmissionPolicy { source, .. } => Some(source),
+            Self::OperatorAdmissionRequiresEnabledMode { .. } => None,
             Self::UnsupportedVersion(_)
             | Self::EmptyTables
             | Self::RemoteListenRequiresMutualTls(_)
@@ -731,6 +751,74 @@ impl ManifestPhysicalColumnarApply {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ManifestAdmissionConstraint {
+    Unconstrained {},
+    AtMost { maximum: u64 },
+}
+
+impl From<ManifestAdmissionConstraint> for PhysicalDesignMutationAdmissionConstraint {
+    fn from(value: ManifestAdmissionConstraint) -> Self {
+        match value {
+            ManifestAdmissionConstraint::Unconstrained {} => Self::Unconstrained,
+            ManifestAdmissionConstraint::AtMost { maximum } => Self::AtMost(maximum),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum ManifestMutationAdmission {
+    Unadmitted {},
+    ComponentLimits {
+        source_work_units: ManifestAdmissionConstraint,
+        source_read_bytes: ManifestAdmissionConstraint,
+        prerequisite_work_units: ManifestAdmissionConstraint,
+        prerequisite_read_bytes: ManifestAdmissionConstraint,
+        prerequisite_write_bytes: ManifestAdmissionConstraint,
+        output_write_bytes: ManifestAdmissionConstraint,
+    },
+}
+
+impl ManifestMutationAdmission {
+    fn into_mode(
+        self,
+        field: &'static str,
+        enabled: bool,
+    ) -> Result<ServerOperatorPhysicalDesignMutationAdmission, ManifestError> {
+        match self {
+            Self::Unadmitted {} => Ok(ServerOperatorPhysicalDesignMutationAdmission::Unadmitted),
+            Self::ComponentLimits {
+                source_work_units,
+                source_read_bytes,
+                prerequisite_work_units,
+                prerequisite_read_bytes,
+                prerequisite_write_bytes,
+                output_write_bytes,
+            } => {
+                let policy = PhysicalDesignMutationAdmissionPolicy::new(
+                    PhysicalDesignMutationAdmissionLimits {
+                        source_work_units: source_work_units.into(),
+                        source_read_bytes: source_read_bytes.into(),
+                        prerequisite_work_units: prerequisite_work_units.into(),
+                        prerequisite_read_bytes: prerequisite_read_bytes.into(),
+                        prerequisite_write_bytes: prerequisite_write_bytes.into(),
+                        output_write_bytes: output_write_bytes.into(),
+                    },
+                )
+                .map_err(|source| {
+                    ManifestError::PhysicalDesignMutationAdmissionPolicy { field, source }
+                })?;
+                if !enabled {
+                    return Err(ManifestError::OperatorAdmissionRequiresEnabledMode { field });
+                }
+                Ok(ServerOperatorPhysicalDesignMutationAdmission::ComponentLimits(policy))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestOperator {
     unix_socket: String,
@@ -738,10 +826,36 @@ struct ManifestOperator {
     allow_physical_index_apply: bool,
     allow_physical_columnar_apply: bool,
     allow_physical_design_receipt_read: bool,
+    physical_index_admission: ManifestMutationAdmission,
+    physical_columnar_snapshot_admission: ManifestMutationAdmission,
+    physical_columnar_incremental_admission: ManifestMutationAdmission,
 }
 
 impl ManifestOperator {
-    fn into_config(self, manifest_directory: &Path) -> Result<ServerOperatorConfig, ManifestError> {
+    fn into_config(
+        self,
+        manifest_directory: &Path,
+        columnar: Option<&ServerPhysicalColumnarApplyConfig>,
+    ) -> Result<ServerOperatorConfig, ManifestError> {
+        let admissions = ServerOperatorMutationAdmissions {
+            index: self
+                .physical_index_admission
+                .into_mode("physical_index_admission", self.allow_physical_index_apply)?,
+            snapshot: self.physical_columnar_snapshot_admission.into_mode(
+                "physical_columnar_snapshot_admission",
+                self.allow_physical_columnar_apply
+                    && columnar.is_some_and(|config| {
+                        config.allows(netbadb_core::PhysicalColumnarDesignMode::Snapshot)
+                    }),
+            )?,
+            incremental: self.physical_columnar_incremental_admission.into_mode(
+                "physical_columnar_incremental_admission",
+                self.allow_physical_columnar_apply
+                    && columnar.is_some_and(|config| {
+                        config.allows(netbadb_core::PhysicalColumnarDesignMode::Incremental)
+                    }),
+            )?,
+        };
         let configured = PathBuf::from(self.unix_socket);
         let joined = if configured.is_absolute() {
             configured
@@ -765,12 +879,13 @@ impl ManifestOperator {
         if !parent.is_dir() {
             return Err(ManifestError::OperatorSocketParentNotDirectory(parent));
         }
-        ServerOperatorConfig::new_with_receipt_read(
+        ServerOperatorConfig::new_with_admission(
             parent.join(file_name),
             Duration::from_millis(self.io_timeout_ms),
             self.allow_physical_index_apply,
             self.allow_physical_columnar_apply,
             self.allow_physical_design_receipt_read,
+            admissions,
         )
         .map_err(ManifestError::OperatorConfig)
     }
@@ -1478,7 +1593,7 @@ mod tests {
         let listen = listen.map_or_else(String::new, |listen| format!("\"listen\": \"{listen}\","));
         format!(
             r#"{{
-                "version": 10,
+                "version": 11,
                 {listen}
                 "authorization": {{
                     "local_plaintext": {{
@@ -1701,7 +1816,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_manifest_versions_are_rejected_and_v10_requires_explicit_permissions() {
+    fn historical_manifest_versions_are_rejected_and_v11_requires_explicit_permissions() {
         let directory = test_directory("v7-v10-migration");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
@@ -1716,6 +1831,9 @@ mod tests {
             "io_timeout_ms": 1000,
             "allow_physical_index_apply": false,
             "allow_physical_columnar_apply": false,
+                "physical_index_admission": {"mode": "unadmitted"},
+                "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+                "physical_columnar_incremental_admission": {"mode": "unadmitted"},
                 "allow_physical_design_receipt_read": false,
         });
         let current = serde_json::to_string(&value).unwrap();
@@ -1963,7 +2081,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_v10_columnar_apply_policy_is_strict_relative_and_explicit() {
+    fn manifest_v11_columnar_apply_policy_is_strict_relative_and_explicit() {
         let directory = test_directory("physical-columnar-manifest");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(directory.join("columnar")).unwrap();
@@ -1982,6 +2100,9 @@ mod tests {
             "io_timeout_ms": 1000,
             "allow_physical_index_apply": false,
             "allow_physical_columnar_apply": true,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -2017,7 +2138,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_v10_receipts_are_strict_relative_non_mutating_and_permission_scoped() {
+    fn manifest_v11_receipts_are_strict_relative_non_mutating_and_permission_scoped() {
         let directory = test_directory("physical-design-receipt-manifest");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(directory.join("run")).unwrap();
@@ -2060,6 +2181,9 @@ mod tests {
                 "io_timeout_ms": 5000,
                 "allow_physical_index_apply": false,
                 "allow_physical_columnar_apply": false,
+                "physical_index_admission": {"mode": "unadmitted"},
+                "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+                "physical_columnar_incremental_admission": {"mode": "unadmitted"},
                 "allow_physical_design_receipt_read": read_enabled
             });
             std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -2104,7 +2228,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_v10_receipt_object_rejects_null_incomplete_unsafe_and_too_small_configs() {
+    fn manifest_v11_receipt_object_rejects_null_incomplete_unsafe_and_too_small_configs() {
         let directory = test_directory("physical-design-receipt-invalid");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(directory.join("run")).unwrap();
@@ -2199,6 +2323,9 @@ mod tests {
             "io_timeout_ms": 5000,
             "allow_physical_index_apply": false,
             "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&invalid).unwrap()).unwrap();
@@ -2218,6 +2345,9 @@ mod tests {
                 "io_timeout_ms": 5000,
                 "allow_physical_index_apply": false,
                 "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false
             });
             std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -2238,6 +2368,9 @@ mod tests {
             "io_timeout_ms": 5000,
             "allow_physical_index_apply": false,
             "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&design_only).unwrap()).unwrap();
@@ -2261,6 +2394,9 @@ mod tests {
             "io_timeout_ms": 5000,
             "allow_physical_index_apply": true,
             "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&adaptive_apply).unwrap()).unwrap();
@@ -2300,12 +2436,18 @@ mod tests {
             json!({"unix_socket": "operator.sock"}),
             json!({"unix_socket": "operator.sock", "io_timeout_ms": 1}),
             json!({"unix_socket": "operator.sock", "io_timeout_ms": 0, "allow_physical_index_apply": false, "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false}),
             json!({
                 "unix_socket": "operator.sock",
                 "io_timeout_ms": 1,
                 "allow_physical_index_apply": false,
                 "allow_physical_columnar_apply": false,
+                "physical_index_admission": {"mode": "unadmitted"},
+                "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+                "physical_columnar_incremental_admission": {"mode": "unadmitted"},
                 "allow_physical_design_receipt_read": false,
                 "token": "forbidden"
             }),
@@ -2325,6 +2467,9 @@ mod tests {
             "io_timeout_ms": 1,
             "allow_physical_index_apply": false,
             "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -2373,6 +2518,9 @@ mod tests {
             "io_timeout_ms": 1000,
             "allow_physical_index_apply": false,
             "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -2383,7 +2531,7 @@ mod tests {
         let client = crate::ServerOperatorClient::new(&operator_config);
         let before = client.status().unwrap();
         let adaptive = before.adaptive.as_ref().unwrap();
-        assert_eq!(adaptive.mode, crate::OperatorAdaptiveModeV5::FeedbackOnly);
+        assert_eq!(adaptive.mode, crate::OperatorAdaptiveModeV6::FeedbackOnly);
         assert_eq!(adaptive.feedback.window_epoch, 0);
         assert!(adaptive.driver.is_none());
         assert!(before.physical_design.is_none());
@@ -2399,7 +2547,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let mut frame = b"NBOP\0\x05\0\0".to_vec();
+        let mut frame = b"NBOP\0\x06\0\0".to_vec();
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&payload);
         let mut lost_response = UnixStream::connect(operator_config.unix_socket()).unwrap();
@@ -2432,8 +2580,8 @@ mod tests {
         assert!(matches!(
             client.rotate_evidence(0),
             Err(crate::OperatorClientError::Remote(
-                crate::OperatorRemoteErrorV5 {
-                    code: crate::OperatorErrorCodeV5::EvidenceWindowChanged,
+                crate::OperatorRemoteErrorV6 {
+                    code: crate::OperatorErrorCodeV6::EvidenceWindowChanged,
                     ..
                 }
             ))
@@ -2451,8 +2599,8 @@ mod tests {
         assert!(matches!(
             client.reset_faulted_scheduler(),
             Err(crate::OperatorClientError::Remote(
-                crate::OperatorRemoteErrorV5 {
-                    code: crate::OperatorErrorCodeV5::DriverNotEnabled,
+                crate::OperatorRemoteErrorV6 {
+                    code: crate::OperatorErrorCodeV6::DriverNotEnabled,
                     ..
                 }
             ))
@@ -2487,6 +2635,9 @@ mod tests {
             "io_timeout_ms": 100,
             "allow_physical_index_apply": false,
             "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": false
         });
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -3009,6 +3160,9 @@ mod tests {
             "io_timeout_ms": 1000,
             "allow_physical_index_apply": false,
             "allow_physical_columnar_apply": false,
+            "physical_index_admission": {"mode": "unadmitted"},
+            "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+            "physical_columnar_incremental_admission": {"mode": "unadmitted"},
             "allow_physical_design_receipt_read": true
         });
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -3190,7 +3344,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let manifest = directory.join("server.json");
 
-        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9, 11] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12] {
             std::fs::write(&manifest, format!(r#"{{"version":{version},"tables":[]}}"#)).unwrap();
             assert!(matches!(
                 ServerConfig::from_manifest_path(&manifest),
@@ -3200,7 +3354,7 @@ mod tests {
 
         std::fs::write(
             &manifest,
-            r#"{"version":10,"unexpected":true,"authorization":{"local_plaintext":{"tables":[{"table_id":1,"read":true}]}},"tables":[]}"#,
+            r#"{"version":11,"unexpected":true,"authorization":{"local_plaintext":{"tables":[{"table_id":1,"read":true}]}},"tables":[]}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -3355,6 +3509,7 @@ mod tests {
 
         std::fs::remove_dir_all(directory).unwrap();
     }
+    include!("manifest_admission_tests.rs");
 }
 
 #[cfg(test)]

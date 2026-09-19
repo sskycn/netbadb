@@ -10,6 +10,7 @@ mod metrics;
 mod operator;
 mod operator_v3;
 mod operator_v4;
+mod operator_v5;
 mod physical_design;
 mod physical_design_receipts;
 mod postgres;
@@ -45,29 +46,34 @@ pub use limits::{
 pub use manifest::{DEPLOYMENT_MANIFEST_VERSION, ManifestError, ServerConfig, TableBootstrap};
 pub use metrics::{ServerMetricsHandle, ServerMetricsSnapshot};
 pub use operator::{
-    MAX_OPERATOR_PAYLOAD_BYTES, OPERATOR_PROTOCOL_VERSION, OperatorAdaptiveModeV5,
-    OperatorAdaptiveStatusV5, OperatorClientError, OperatorDriverStatusV5, OperatorErrorCodeV5,
-    OperatorEvidencePoolHealthV5, OperatorEvidenceRecordErrorV5, OperatorEvidenceRecordOutcomeV5,
-    OperatorEvidenceRenewalReasonV5, OperatorEvidenceRotationV5, OperatorFeedbackStatusV5,
-    OperatorOrchestrationStopReasonV5, OperatorPhysicalColumnarApplyCapabilityV5,
-    OperatorPhysicalColumnarApplyOutcomeV5, OperatorPhysicalColumnarApplyResultV5,
-    OperatorPhysicalColumnarApplyStatusV5, OperatorPhysicalColumnarCandidateV5,
-    OperatorPhysicalColumnarDesignModeV5, OperatorPhysicalDesignAdvisorReportV5,
-    OperatorPhysicalDesignDecisionV5, OperatorPhysicalDesignDiagnosticsV5,
-    OperatorPhysicalDesignEvidenceLimitsV5, OperatorPhysicalDesignEvidenceStatusV5,
-    OperatorPhysicalDesignEvidenceSummaryV5, OperatorPhysicalDesignMutationReceiptCapabilityV5,
-    OperatorPhysicalDesignMutationReceiptCursorV5, OperatorPhysicalDesignMutationReceiptOutcomeV5,
-    OperatorPhysicalDesignMutationReceiptPageV5, OperatorPhysicalDesignMutationReceiptRefV5,
-    OperatorPhysicalDesignMutationReceiptSourceV5, OperatorPhysicalDesignMutationReceiptStatusV5,
-    OperatorPhysicalDesignMutationReceiptTargetV5, OperatorPhysicalDesignMutationReceiptV5,
-    OperatorPhysicalDesignNoActionReasonV5, OperatorPhysicalDesignRecommendationsV5,
-    OperatorPhysicalDesignRecordErrorV5, OperatorPhysicalDesignRecordOutcomeV5,
-    OperatorPhysicalDesignRotationV5, OperatorPhysicalDesignStatusV5,
-    OperatorPhysicalIndexApplyCapabilityV5, OperatorPhysicalIndexApplyOutcomeV5,
-    OperatorPhysicalIndexApplyResultV5, OperatorPhysicalIndexApplyStatusV5,
-    OperatorPhysicalIndexCandidateV5, OperatorRemoteErrorV5, OperatorSchedulerDelayClassV5,
-    OperatorSchedulerFaultV5, OperatorSchedulerGateV5, OperatorStatusV5, ServerOperatorClient,
+    MAX_OPERATOR_PAYLOAD_BYTES, OPERATOR_PROTOCOL_VERSION, OperatorAdaptiveModeV6,
+    OperatorAdaptiveStatusV6, OperatorClientError, OperatorDriverStatusV6, OperatorErrorCodeV6,
+    OperatorEvidencePoolHealthV6, OperatorEvidenceRecordErrorV6, OperatorEvidenceRecordOutcomeV6,
+    OperatorEvidenceRenewalReasonV6, OperatorEvidenceRotationV6, OperatorFeedbackStatusV6,
+    OperatorOrchestrationStopReasonV6, OperatorPhysicalColumnarApplyCapabilityV6,
+    OperatorPhysicalColumnarApplyOutcomeV6, OperatorPhysicalColumnarApplyResultV6,
+    OperatorPhysicalColumnarApplyStatusV6, OperatorPhysicalColumnarCandidateV6,
+    OperatorPhysicalColumnarDesignModeV6, OperatorPhysicalDesignAdvisorReportV6,
+    OperatorPhysicalDesignDecisionV6, OperatorPhysicalDesignDiagnosticsV6,
+    OperatorPhysicalDesignEvidenceLimitsV6, OperatorPhysicalDesignEvidenceStatusV6,
+    OperatorPhysicalDesignEvidenceSummaryV6, OperatorPhysicalDesignMutationAdmissionConstraintV6,
+    OperatorPhysicalDesignMutationAdmissionDimensionV6,
+    OperatorPhysicalDesignMutationAdmissionModeV6, OperatorPhysicalDesignMutationAdmissionPolicyV6,
+    OperatorPhysicalDesignMutationAdmissionRejectionV6,
+    OperatorPhysicalDesignMutationReceiptCapabilityV6,
+    OperatorPhysicalDesignMutationReceiptCursorV6, OperatorPhysicalDesignMutationReceiptOutcomeV6,
+    OperatorPhysicalDesignMutationReceiptPageV6, OperatorPhysicalDesignMutationReceiptRefV6,
+    OperatorPhysicalDesignMutationReceiptSourceV6, OperatorPhysicalDesignMutationReceiptStatusV6,
+    OperatorPhysicalDesignMutationReceiptTargetV6, OperatorPhysicalDesignMutationReceiptV6,
+    OperatorPhysicalDesignNoActionReasonV6, OperatorPhysicalDesignRecommendationsV6,
+    OperatorPhysicalDesignRecordErrorV6, OperatorPhysicalDesignRecordOutcomeV6,
+    OperatorPhysicalDesignRotationV6, OperatorPhysicalDesignStatusV6,
+    OperatorPhysicalIndexApplyCapabilityV6, OperatorPhysicalIndexApplyOutcomeV6,
+    OperatorPhysicalIndexApplyResultV6, OperatorPhysicalIndexApplyStatusV6,
+    OperatorPhysicalIndexCandidateV6, OperatorRemoteErrorV6, OperatorSchedulerDelayClassV6,
+    OperatorSchedulerFaultV6, OperatorSchedulerGateV6, OperatorStatusV6, ServerOperatorClient,
     ServerOperatorConfig, ServerOperatorConfigError, ServerOperatorError,
+    ServerOperatorPhysicalDesignMutationAdmission,
 };
 pub use operator_v3::{
     OperatorAdaptiveModeV3, OperatorAdaptiveStatusV3, OperatorDriverStatusV3, OperatorErrorCodeV3,
@@ -103,6 +109,29 @@ pub use operator_v4::{
     OperatorPhysicalIndexApplyStatusV4, OperatorPhysicalIndexCandidateV4, OperatorRemoteErrorV4,
     OperatorSchedulerDelayClassV4, OperatorSchedulerFaultV4, OperatorSchedulerGateV4,
     OperatorStatusV4,
+};
+pub use operator_v5::{
+    OperatorAdaptiveModeV5, OperatorAdaptiveStatusV5, OperatorDriverStatusV5, OperatorErrorCodeV5,
+    OperatorEvidencePoolHealthV5, OperatorEvidenceRecordErrorV5, OperatorEvidenceRecordOutcomeV5,
+    OperatorEvidenceRenewalReasonV5, OperatorEvidenceRotationV5, OperatorFeedbackStatusV5,
+    OperatorOrchestrationStopReasonV5, OperatorPhysicalColumnarApplyCapabilityV5,
+    OperatorPhysicalColumnarApplyOutcomeV5, OperatorPhysicalColumnarApplyResultV5,
+    OperatorPhysicalColumnarApplyStatusV5, OperatorPhysicalColumnarCandidateV5,
+    OperatorPhysicalColumnarDesignModeV5, OperatorPhysicalDesignAdvisorReportV5,
+    OperatorPhysicalDesignDecisionV5, OperatorPhysicalDesignDiagnosticsV5,
+    OperatorPhysicalDesignEvidenceLimitsV5, OperatorPhysicalDesignEvidenceStatusV5,
+    OperatorPhysicalDesignEvidenceSummaryV5, OperatorPhysicalDesignMutationReceiptCapabilityV5,
+    OperatorPhysicalDesignMutationReceiptCursorV5, OperatorPhysicalDesignMutationReceiptOutcomeV5,
+    OperatorPhysicalDesignMutationReceiptPageV5, OperatorPhysicalDesignMutationReceiptRefV5,
+    OperatorPhysicalDesignMutationReceiptSourceV5, OperatorPhysicalDesignMutationReceiptStatusV5,
+    OperatorPhysicalDesignMutationReceiptTargetV5, OperatorPhysicalDesignMutationReceiptV5,
+    OperatorPhysicalDesignNoActionReasonV5, OperatorPhysicalDesignRecommendationsV5,
+    OperatorPhysicalDesignRecordErrorV5, OperatorPhysicalDesignRecordOutcomeV5,
+    OperatorPhysicalDesignRotationV5, OperatorPhysicalDesignStatusV5,
+    OperatorPhysicalIndexApplyCapabilityV5, OperatorPhysicalIndexApplyOutcomeV5,
+    OperatorPhysicalIndexApplyResultV5, OperatorPhysicalIndexApplyStatusV5,
+    OperatorPhysicalIndexCandidateV5, OperatorRemoteErrorV5, OperatorSchedulerDelayClassV5,
+    OperatorSchedulerFaultV5, OperatorSchedulerGateV5, OperatorStatusV5,
 };
 pub use physical_design::{
     ServerPhysicalColumnarApplyConfig, ServerPhysicalColumnarApplyConfigError,

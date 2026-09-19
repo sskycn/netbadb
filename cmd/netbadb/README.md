@@ -1,6 +1,6 @@
 # `netbadb` inspection and local operator CLI
 
-`netbadb inspect` opens the existing tables declared by deployment manifest v10
+`netbadb inspect` opens the existing tables declared by deployment manifest v11
 and reports catalog metadata or the physical plan chosen for one SQL
 statement. It does not create databases, execute queries or DML, start a
 server, connect remotely, refresh `ANALYZE`, create indexes, or checkpoint.
@@ -26,8 +26,8 @@ before the manifest or database is opened. Success writes only the completed
 inspection to stdout. Usage failures exit 2, operational failures exit 1, and
 all failures write diagnostics only to stderr.
 
-`netbadb operator` does not open a Database. It parses the same manifest v10,
-uses only its configured Unix socket, and exchanges one NBOP v5 request:
+`netbadb operator` does not open a Database. It parses the same manifest v11,
+uses only its configured Unix socket, and exchanges one NBOP v6 request:
 
 ```sh
 netbadb operator status --manifest server.json
@@ -56,7 +56,7 @@ netbadb operator physical-design apply-columnar --manifest server.json \
 Rotation and mutation preconditions are required and are never inferred by a
 hidden status or recommendations request. Apply never selects a candidate,
 refreshes a token/epoch, or retries automatically. The human output is not a
-stable machine-readable contract; NBOP v5 is the versioned contract. Receipt
+stable machine-readable contract; NBOP v6 is the versioned contract. Receipt
 commands never infer a cursor, automatically restart after journal replacement,
 or turn a receipt into replay authority. Apply output prints a receipt only when
 the server returned one, and never automatically queries it.
@@ -81,3 +81,10 @@ with filesystem access is outside that boundary, so catalog inspection shows
 the complete manifest catalog even when a configured principal has narrower
 grants. Inspection output contains no manifest paths, listener, TLS material,
 or authorization identities.
+
+Operator status presents independent Index, Columnar Snapshot and Columnar
+Incremental admission modes. Component limits show all six configured dimensions;
+these are partial component limits, not a total mutation budget. Apply accepts
+no budget flags. Structured admission failures name an unproven component or its
+exceeded conservative bound/maximum; inspection failure diagnostics remain
+private. The CLI never relaxes a policy, retries, or queries a receipt automatically.

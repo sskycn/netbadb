@@ -1,14 +1,12 @@
-# NetbaDB local operator protocol v5
+# NetbaDB local operator protocol v6
 
-> Historical contract. Current binaries reject v5; use [NBOP v6](server-operator-protocol-v6.md). Public V5 Rust DTOs retain their exact historical shapes.
-
-NBOP v5 is the current local Unix-domain operator contract. NBOP v4 is
+NBOP v6 is the current local Unix-domain operator contract. NBOP v5 is
 historical and explicitly rejected. Native Protocol v2, PostgreSQL wire,
 Inspection JSON v7, and all database persistent formats are unchanged.
 
 ## Framing and errors
 
-The frame remains exactly 12 bytes: `NBOP`, big-endian `u16` version 5, zero
+The frame remains exactly 12 bytes: `NBOP`, big-endian `u16` version 6, zero
 reserved `u16`, and a big-endian `u32` JSON payload length. The payload cap
 remains 65,536 bytes. Receipt pages are never silently truncated: an encoded
 page above the cap receives the existing bounded `response_too_large` fallback
@@ -16,7 +14,7 @@ and the caller may retry with a smaller limit. One maximum public receipt fits,
 so `limit = 1` always makes progress without truncating Column IDs, an index
 name, or a placement key.
 
-Every v5 remote error has `code`, bounded `message`, and nullable `receipt`.
+Every v6 remote error has `code`, bounded `message`, nullable `receipt`, and nullable `admission`. All non-admission errors carry `admission: null`.
 Preflight/listener failures normally carry `receipt: null`. A worker failure
 after durable Begin may carry the new request's scoped reference. Journal Begin
 capacity rejection maps to
@@ -46,7 +44,8 @@ mutation, retry, replay, or authorization capability.
 
 ## Status and scoped pagination
 
-General Physical Design status adds only the operator capability projection:
+For receipt access, general Physical Design status exposes only the operator
+capability projection:
 
 ```json
 "physical_design_mutation_receipts": {"read_enabled": true}
@@ -88,7 +87,7 @@ journal maps to `physical_design_mutation_receipt_journal_changed`; the server
 never restarts at receipt 1 or searches old journals. Other read failures map
 to path-private `physical_design_mutation_receipt_read_failed`.
 
-Receipt reads require the Manifest v10 read permission. Disabled permission
+Receipt reads require the Manifest v11 read permission. Disabled permission
 maps to `physical_design_mutation_receipt_read_not_allowed` before forwarding;
 a permitted but journal-less defensive state maps to
 `physical_design_mutation_receipts_not_enabled`. Status and list remain pure
@@ -150,7 +149,69 @@ Connect/configuration and request encoding failures before dispatch remain
 ordinary definite local failures; protocol, request-ID, response-shape, or
 response-loss failures after dispatch are local mutation uncertainty.
 
-The remaining v5 operations retain v4 semantics: `status`, `rotate_evidence`,
+The remaining v6 operations retain v5 semantics: `status`, `rotate_evidence`,
 `reset_faulted_scheduler`, `physical_design_recommendations`,
 `rotate_physical_design_evidence`, `apply_physical_index`, and
 `apply_physical_columnar`.
+
+## Deployment-owned component admission
+
+The operator approves only a logical design. Existing apply request fields are
+unchanged; neither Index nor Columnar accepts `budget`, `limits`, `admission`,
+`max_*`, inspection, expected bound, or cached report fields. Unknown fields fail
+strict decoding. No admission operation, SQL syntax or CLI budget flag exists.
+One approved request remains one worker command. The listener forwards logical
+approval only, while the worker selects its immutable Manifest v11 Index,
+Snapshot, or Incremental mode and calls the corresponding Core apply API.
+
+Index status adds `admission`; Columnar status adds `snapshot_admission` and
+`incremental_admission`. Each is either `{"mode":"unadmitted"}` or
+`{"mode":"component_limits","policy":{...}}`. Policy has exactly the six
+explicit constraint objects named in [Manifest v11](server-manifest-v11.md).
+Status presents the same resolved deployment configuration that the worker uses;
+it does not inspect current work, scan sources, ANALYZE, flush, or report current
+bytes/pages/bounds. Recommendations remain workload recommendations only.
+
+Admission failures share code `physical_design_mutation_admission_rejected`.
+The nullable `admission` field carries exactly one typed shape:
+
+```json
+{"kind":"required_bound_not_proven","dimension":"output_write_bytes"}
+```
+
+```json
+{"kind":"limit_exceeded","dimension":"source_read_bytes","conservative_bound":12345,"maximum":10000}
+```
+
+```json
+{"kind":"inspection_failed"}
+```
+
+Dimension tags are `source_work_units`, `source_read_bytes`,
+`prerequisite_work_units`, `prerequisite_read_bytes`,
+`prerequisite_write_bytes`, and `output_write_bytes`. InspectionFailed exposes
+no underlying Database/Storage display, path, or recovery detail. Listener
+rejections have null admission and receipt fields.
+
+Durable Begin remains before semantic processing/admission. Rejection writes a
+coarse NBMR v3 `Rejected` and the remote error carries that exact receipt reference.
+Without NBMR, receipt is null. No policy, dimension, bound, maximum or inspection
+is persisted in receipts. Mutation/Outcome uncertainty and whole-response loss
+retain their independent classifications and never fabricate an admission reason.
+
+Exact AlreadyApplied precedes stale runtime and admission, including after restart
+under stricter limits. AlreadyCovered precedes admission. Runtime/evidence/current
+recommendation errors retain their existing order before admission. Policies do
+not determine token bytes; every daemon lifetime has a new random token.
+Core recomputes current work immediately before a still-needed mutation.
+
+Constrained NotProven fails closed, equality passes, and unconstrained components
+remain outside the policy. This is partial component admission, not a total cost
+model. The CLI renders exact components and structured failures, correlates a
+returned receipt, and never retries, relaxes a limit, switches mode, or queries
+receipts automatically. No automatic design, evidence rotation, stream enablement,
+scheduler action, or client transaction-state change is introduced.
+
+V5 public Rust DTOs are frozen in `operator_v5.rs`; only V6 is accepted on the
+wire. Header size and payload cap, NBMR v3, Native Protocol v2, PostgreSQL wire,
+Inspection JSON v7 and all database persistent formats are unchanged.

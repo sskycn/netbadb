@@ -24,7 +24,9 @@ use crate::authorization::{
     AuthorizationAction, AuthorizationDenied, AuthorizationPolicy, PrincipalAuthorization,
 };
 use crate::manifest::validate_listener_security;
+use crate::operator::ServerOperatorMutationAdmissions;
 use crate::operator::ServerOperatorPlane;
+use crate::physical_design::ServerPhysicalDesignStartupConfig;
 use crate::physical_design::{
     ServerHostObservationConfig, ServerPhysicalColumnarApplyConfig,
     ServerPhysicalColumnarApplyStartupError, ServerPhysicalDesignAdvisorConfig,
@@ -356,9 +358,16 @@ impl TcpServer {
             limits.session_policy(),
             authorization,
             adaptive_mode,
-            physical_design,
-            physical_columnar_apply,
-            physical_design_mutation_receipts,
+            physical_design.map(|advisor| ServerPhysicalDesignStartupConfig {
+                advisor,
+                columnar_apply: physical_columnar_apply,
+                mutation_receipts: physical_design_mutation_receipts,
+                operator_admissions: operator_config
+                    .as_ref()
+                    .map_or(ServerOperatorMutationAdmissions::UNADMITTED, |config| {
+                        config.admissions
+                    }),
+            }),
         )?;
         let metrics = ServerMetricsHandle::new();
         let listener = match TcpListener::bind(listen) {
@@ -637,9 +646,7 @@ impl DatabaseWorker {
         session_policy: SessionPolicy,
         authorization: AuthorizationPolicy,
         adaptive_mode: ServerAdaptiveStartupMode,
-        physical_design_config: Option<ServerPhysicalDesignAdvisorConfig>,
-        physical_columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,
-        physical_design_mutation_receipts: Option<ServerPhysicalDesignMutationReceiptConfig>,
+        physical_design_config: Option<ServerPhysicalDesignStartupConfig>,
     ) -> Result<Self, TcpServerError> {
         let (commands, command_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
@@ -659,24 +666,21 @@ impl DatabaseWorker {
                     }
                 };
                 let physical_design = match physical_design_config {
-                    Some(config) => match ServerPhysicalDesignRuntime::new_with_mutation_receipts(
-                        config,
-                        physical_columnar_apply,
-                        physical_design_mutation_receipts,
-                        &database,
-                    ) {
-                        Ok(runtime) => Some(runtime),
-                        Err(error) => {
-                            let _ = ready_tx.send(Err(
-                                WorkerStartupError::PhysicalDesignMutationReceipts(error),
-                            ));
-                            return database.close().map_err(|error| {
-                                WorkerFatalError::DatabaseCloseFailed {
-                                    message: error.to_string(),
-                                }
-                            });
+                    Some(config) => {
+                        match ServerPhysicalDesignRuntime::from_startup(config, &database) {
+                            Ok(runtime) => Some(runtime),
+                            Err(error) => {
+                                let _ = ready_tx.send(Err(
+                                    WorkerStartupError::PhysicalDesignMutationReceipts(error),
+                                ));
+                                return database.close().map_err(|error| {
+                                    WorkerFatalError::DatabaseCloseFailed {
+                                        message: error.to_string(),
+                                    }
+                                });
+                            }
                         }
-                    },
+                    }
                     None => None,
                 };
                 let adaptive = match ServerAdaptiveWorkerRuntime::new(adaptive_mode, &database) {

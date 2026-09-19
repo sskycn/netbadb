@@ -33,7 +33,9 @@ use crate::adaptive_feedback::{
     ServerAdaptiveFeedbackRuntime, execute_prepared_with_optional_server_observation,
 };
 use crate::authorization::{AuthorizationPolicy, PrincipalAuthorization};
+use crate::operator::ServerOperatorMutationAdmissions;
 use crate::operator::ServerOperatorPlane;
+use crate::physical_design::ServerPhysicalDesignStartupConfig;
 use crate::physical_design::{
     ServerHostObservationConfig, ServerPhysicalColumnarApplyConfig,
     ServerPhysicalColumnarApplyStartupError, ServerPhysicalDesignAdvisorConfig,
@@ -223,9 +225,16 @@ impl PostgresTcpServer {
             limits.session_policy(),
             authorization,
             adaptive_mode,
-            physical_design,
-            physical_columnar_apply,
-            physical_design_mutation_receipts,
+            physical_design.map(|advisor| ServerPhysicalDesignStartupConfig {
+                advisor,
+                columnar_apply: physical_columnar_apply,
+                mutation_receipts: physical_design_mutation_receipts,
+                operator_admissions: operator_config
+                    .as_ref()
+                    .map_or(ServerOperatorMutationAdmissions::UNADMITTED, |config| {
+                        config.admissions
+                    }),
+            }),
         )?;
         let listener = match TcpListener::bind(listen) {
             Ok(listener) => listener,
@@ -838,9 +847,7 @@ impl PgDatabaseWorker {
         policy: SessionPolicy,
         authorization: AuthorizationPolicy,
         adaptive_mode: ServerAdaptiveStartupMode,
-        physical_design_config: Option<ServerPhysicalDesignAdvisorConfig>,
-        physical_columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,
-        physical_design_mutation_receipts: Option<ServerPhysicalDesignMutationReceiptConfig>,
+        physical_design_config: Option<ServerPhysicalDesignStartupConfig>,
     ) -> Result<Self, PostgresTcpServerError> {
         let (commands, receiver) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -859,20 +866,17 @@ impl PgDatabaseWorker {
                     }
                 };
                 let physical_design = match physical_design_config {
-                    Some(config) => match ServerPhysicalDesignRuntime::new_with_mutation_receipts(
-                        config,
-                        physical_columnar_apply,
-                        physical_design_mutation_receipts,
-                        &database,
-                    ) {
-                        Ok(runtime) => Some(runtime),
-                        Err(error) => {
-                            let _ = ready_tx.send(Err(
-                                PgWorkerStartupError::PhysicalDesignMutationReceipts(error),
-                            ));
-                            return database.close().map_err(|error| error.to_string());
+                    Some(config) => {
+                        match ServerPhysicalDesignRuntime::from_startup(config, &database) {
+                            Ok(runtime) => Some(runtime),
+                            Err(error) => {
+                                let _ = ready_tx.send(Err(
+                                    PgWorkerStartupError::PhysicalDesignMutationReceipts(error),
+                                ));
+                                return database.close().map_err(|error| error.to_string());
+                            }
                         }
-                    },
+                    }
                     None => None,
                 };
                 let adaptive = match ServerAdaptiveWorkerRuntime::new(adaptive_mode, &database) {

@@ -270,7 +270,7 @@ fn postgres_server_builder_is_default_disabled_and_explicitly_enabled() {
     fs::write(
         &manifest,
         r#"{
-            "version": 10,
+            "version": 11,
             "listen": "127.0.0.1:0",
             "authorization": {
                 "local_plaintext": {

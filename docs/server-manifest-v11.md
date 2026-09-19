@@ -1,16 +1,14 @@
-# NetbaDB deployment manifest v10
+# NetbaDB deployment manifest v11
 
-> Historical contract. Current binaries reject v10; use [Manifest v11](server-manifest-v11.md). The contract below is preserved as historical documentation.
-
-Deployment Manifest v10 is the only current `netbadbd` startup contract.
-Versions 1 through 9 and future versions are rejected; there is no dual v9/v10
+Deployment Manifest v11 is the only current `netbadbd` startup contract.
+Versions 1 through 10 and future versions are rejected; there is no dual v10/v11
 decoder. The manifest is strict, loaded once, and never watched or rewritten.
 
 ## Complete example
 
 ```json
 {
-  "version": 10,
+  "version": 11,
   "listen": "127.0.0.1:7878",
   "authorization": {
     "local_plaintext": {"schema_admin": true, "tables": []},
@@ -53,7 +51,10 @@ decoder. The manifest is strict, loaded once, and never watched or rewritten.
     "io_timeout_ms": 5000,
     "allow_physical_index_apply": true,
     "allow_physical_columnar_apply": true,
-    "allow_physical_design_receipt_read": false
+    "allow_physical_design_receipt_read": false,
+    "physical_index_admission": {"mode": "unadmitted"},
+    "physical_columnar_snapshot_admission": {"mode": "unadmitted"},
+    "physical_columnar_incremental_admission": {"mode": "unadmitted"}
   }
 }
 ```
@@ -76,7 +77,7 @@ journal. Those actions remain ordered worker-startup work after Database and
 NBPC recovery and before daemon/operator readiness.
 
 The journal is NBMR v3 for writes. The existing v1/v2 readers and migration to
-v3 remain available; Manifest v10 does not change the 44-byte header, database
+v3 remain available; Manifest v11 does not change the 44-byte header, database
 or journal incarnations, record framing, CRC, capacity, repair, or
 reconciliation rules.
 
@@ -98,21 +99,60 @@ permission is false, an embedded host may replace the manifest default with an
 explicit builder configuration. A receipted apply response may still reveal
 its opaque scoped reference, but that reference does not grant list access.
 
-Apply permission alone never requires a receipt journal. A v10 daemon with
-Index or Columnar apply enabled and no `mutation_receipts` preserves v9
-behavior and returns `receipt: null`.
+Apply permission alone never requires a receipt journal. A v11 daemon with
+Index or Columnar apply enabled and no `mutation_receipts` still enforces its
+configured admission mode and returns `receipt: null`.
 
-## Migration from v9
+## Operator component admission
 
-For a v9 manifest without `operator`, change `version` from 9 to 10 and leave
-all other fields unchanged; omit `mutation_receipts`. No journal is created.
-
-For a v9 manifest with `operator`, also add the required field:
+Each present operator object requires three independent modes:
+`physical_index_admission`, `physical_columnar_snapshot_admission`, and
+`physical_columnar_incremental_admission`. There is no omission or null default.
+The exact alternatives are `{"mode":"unadmitted"}` and:
 
 ```json
-"allow_physical_design_receipt_read": false
+{
+  "mode": "component_limits",
+  "source_work_units": {"kind": "at_most", "maximum": 10000},
+  "source_read_bytes": {"kind": "at_most", "maximum": 67108864},
+  "prerequisite_work_units": {"kind": "unconstrained"},
+  "prerequisite_read_bytes": {"kind": "unconstrained"},
+  "prerequisite_write_bytes": {"kind": "at_most", "maximum": 16777216},
+  "output_write_bytes": {"kind": "unconstrained"}
+}
 ```
 
-Keeping it false and omitting `mutation_receipts` preserves v9 operator apply
-behavior. Enabling reads is a separate deployment decision and requires the
-complete receipt object above. See [NBOP v5](server-operator-protocol-v5.md).
+Every component is required. Constraints use exactly the tagged objects above;
+shorthand numbers, nulls, missing or unknown fields/kinds/modes are rejected.
+`maximum` is a u64 including zero and u64::MAX. The parser constructs Core
+`PhysicalDesignMutationAdmissionLimits` and calls its validated policy constructor.
+All six unconstrained is invalid; the typed Manifest error preserves the Core
+policy error as its source. `unadmitted` instead selects the existing apply API
+and explicitly preserves pre-Phase35 mutation behavior.
+
+Component limits require the corresponding apply permission. Snapshot and
+Incremental additionally require their corresponding `columnar_apply` allowed
+mode. A disabled domain must say `unadmitted`. Enabled domains may independently
+choose either mode; no domain inherits another domain's policy. There is no
+operator admission builder override and embedded hosts retain their independent
+per-call Phase34 policy authority.
+
+A constrained NotProven bound rejects, even at u64::MAX. Equality passes.
+Unconstrained components are outside the policy, never proven safe or zero.
+A policy constraining only Snapshot LSM prerequisite writes is **partial
+component admission**: it says nothing about source traversal or total mutation
+cost. Components are never summed. Output writes, whole-mutation work, CPU,
+memory, filesystem free space, and cumulative quotas are not proven limits.
+
+Manifest parsing and `netbadb inspect` validate configuration, not whether current
+data fits. They perform no mutation-work inspection or source scan and do not
+open a Database solely to evaluate a bound. The sole worker recomputes current
+inspection only when an explicitly approved apply still needs a mutation.
+
+## Migration from v10
+
+Without `operator`, change only `version` from 10 to 11. With `operator`, also
+add exactly the three explicit `{"mode":"unadmitted"}` fields in the complete
+example to preserve old behavior. There is no hidden migration default or dual
+decoder. Selecting component limits is a separate deployment decision.
+See [NBOP v6](server-operator-protocol-v6.md).
