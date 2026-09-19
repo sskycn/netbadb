@@ -1,5 +1,8 @@
 # Error handling and concurrency audit — 2026-09-18
 
+> Historical audit. PostgreSQL compatibility referenced below was removed after
+> this audit; retained findings describe the state and evidence at that time.
+
 Baseline: `2da3bc1`. Scope: error propagation, transaction ownership, worker and
 session teardown, retry boundaries, bounded decoding, and filesystem identity.
 The Go SDK cancellation/transaction boundary was also inspected against its

@@ -123,6 +123,6 @@ tamper-proof, rollback-proof, hash-chained, signed, or cryptographically
 authenticated against an administrator who can replace files. A byte-for-byte
 copy intentionally retains the same receipt-history identity.
 
-Manifest v9, NBOP v4, Native Protocol v2, PostgreSQL wire behavior, Inspection
-JSON v7, SDK Schema Spec, `netbadbd`, all CLI surfaces, and all Database
-persistent formats remain unchanged. Receipt wire encoding is deferred.
+Manifest v9, NBOP v4, Native Protocol v2, Inspection JSON v7, SDK Schema Spec,
+`netbadbd`, all CLI surfaces, and all Database persistent formats remain
+unchanged. Receipt wire encoding is deferred.

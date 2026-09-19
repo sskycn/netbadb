@@ -199,7 +199,7 @@ pub enum PhysicalType {
 impl PhysicalType {
     /// Canonical spelling accepted by the SQL parser for this exact type.
     /// This is intentionally separate from the internal [`Display`] name:
-    /// PostgreSQL-compatible `INT8` means Int64, while Int8 is `TINYINT`.
+    /// SQL `INT8` is an alias for Int64, while Int8 is spelled `TINYINT`.
     #[must_use]
     pub const fn sql_name(self) -> &'static str {
         match self {

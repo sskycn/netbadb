@@ -217,14 +217,14 @@ integers; canonical Float32 and Float64; UTF-8 Text; and opaque Bytes. Physical
 identity is exact—there is no implicit numeric widening—and durable tags are
 append-only so the original Bool/Int64/UInt64/Text/NULL bytes remain stable.
 See [Physical Types v2](docs/physical-types-v2.md) for the SQL, storage,
-protocol, pgwire and SDK contract.
+Native Protocol and SDK contract.
 NetbaDB supports explicit deterministic cross-physical casts for checked integer
 families, Text/integer conversion and Bool/Text conversion. NetbaDB also supports
 a bounded `ALTER COLUMN TYPE ... USING` operation for runtime-created Single Heap
 tables. Physical replacement uses a fresh ColumnId, evaluates one typed
 same-table USING expression through the normal CAST/executor semantics, preserves
 the public name, ordinal and nullability, and publishes one atomic Heap
-replacement. This is not PostgreSQL-complete, implicit, online, same-ColumnId,
+replacement. This is not implicit, online, same-ColumnId,
 LSM or constraint-rewriting ALTER TYPE. See the
 [Round 62 production contract](docs/alter-type-using-round62.md) and the
 [Round 60 explicit shadow workflow](docs/deferred-type-conversion-round60.md).
@@ -240,11 +240,11 @@ installation marker and crash-safe publication. [Core transactional Heap table
 creation](docs/core-create-table-round18.md) adds durable identity reservations,
 private transaction schema/DML, coordinator-backed commit, and catalog-only recovery.
 [Round 19](docs/sql-create-table-round19.md) adds transactional basic Heap
-`CREATE TABLE` over native SQL and PostgreSQL. [Round 20](docs/core-drop-table-round20.md)
+`CREATE TABLE` over Native SQL. [Round 20](docs/core-drop-table-round20.md)
 adds exact-identity transactional Core Heap retirement, prepared-dependency
 invalidation, durable retained-resource inventory and deferred physical deletion.
 [Round 21](docs/sql-drop-table-round21.md) adds generic exact-prepared SQL
-`DROP TABLE name` over native and PostgreSQL frontends. [Round 24](docs/core-heap-schema-rewrite-round24.md)
+`DROP TABLE name` over Native SQL. [Round 24](docs/core-heap-schema-rewrite-round24.md)
 implements the typed embedded Core foundation for transactional runtime-created
 Single Heap schema rewrites with the same TableId and a new StorageId. [Round 26](docs/sql-alter-table-round26.md)
 maps six generic SQL `ALTER TABLE` actions through exact typed HIR to that existing
@@ -282,7 +282,6 @@ netbadb/
 │   ├── netbadb-executor/    synchronous physical-plan execution
 │   ├── netbadb-core/        native embedded database API
 │   ├── netbadb-protocol/    versioned language-neutral binary wire contract
-│   ├── netbadb-pgwire/      bounded PostgreSQL v3 codecs and OID adaptation
 │   ├── netbadb-client/      synchronous Protocol v2 remote client
 │   ├── netbadb-inspect/     stable inspection DTOs and deterministic text
 │   ├── netbadb-server/      sessions, worker ownership, and blocking TCP runtime
@@ -317,9 +316,8 @@ storage -> index + schema + types
 executor -> planner + rel + storage + types
 core -> compiler + inspect + planner + rel + executor + storage + schema + types
 protocol -> types
-pgwire -> types
 client -> protocol + schema + types
-server -> core + protocol + pgwire + schema + types
+server -> core + protocol + schema + types
 netbadbd -> server
 netbadb CLI -> Rust SDK embedded + server + serde + serde_json
 netbadb-lsp -> tooling + schema-spec + lsp-server + lsp-types
@@ -396,13 +394,6 @@ The current code genuinely supports:
   three-valued boolean logic, and NULL comparisons;
 - versioned protocol v2 framing, schema-fingerprint handshake, streamed query
   response messages, bounded synchronous codecs, and stable wire errors;
-- experimental PostgreSQL v3 wire framing with bounded Startup, SSLRequest,
-  CancelRequest, Simple Query, and typed-parameter Extended Query codecs,
-  contextual parameter inference, ParameterDescription, selected text/binary
-  scalar formats, SQLSTATE mapping, named statement and portal lifecycles, and
-  PostgreSQL failed-transaction session behavior, plus a read-only ORM metadata
-  projection derived from Canonical Schema and the persistent Heap index
-  registry through the storage-neutral Core inspection boundary;
 - a synchronous transport-neutral `SessionState` for handshake, query/DML,
   explicit table-owned transactions, `ANALYZE`, ping, and disconnect rollback;
 - a blocking TCP runtime with loopback plaintext or mandatory mutual TLS whose
@@ -456,35 +447,13 @@ retained as historical documentation and rejected by current
 `netbadbd`. Phase 5 is complete: mTLS authenticates transport peers, while the
 database worker authorizes compiler-resolved TableIds before execution.
 
-Experimental PostgreSQL wire mode is documented in
-[`docs/postgresql-compatibility.md`](docs/postgresql-compatibility.md). Run
-`netbadbd --manifest server.json --postgres` to use the manifest's listen
-address as a loopback PostgreSQL endpoint. This experimental profile is not a
-claim of general PostgreSQL compatibility. Round 7 supports the transactional
-single-column non-unique Heap BTree `CREATE INDEX` / `DROP INDEX` subset through
-psql, SQLAlchemy, and guarded Alembic index-only apply. This builds on Round 5's psql 17.11 `\d`,
-`\dt`, and `\di` support, including schema/name patterns, and the
-psycopg 3 and SQLAlchemy 2 Core/ORM profile. The PostgreSQL adapter consumes
-stable Core metadata, preserves explicit durable index names while synthesizing
-legacy names/OIDs, and supports index-only Alembic add/remove migration.
-Basic Heap `CREATE TABLE` supports BIGINT/INT64, TEXT and BOOLEAN/BOOL columns
-with NULL/NOT NULL, including real SQLAlchemy `Table.create(checkfirst=False)`
-without constraints/defaults. Network DDL requires explicit `schema_admin`; the
-creator can use its staged table only within the creating transaction, and receives
-no durable DML grant. Exact prepared `DROP TABLE name` is transactional and works
-through psql, psycopg, and SQLAlchemy `Table.drop(checkfirst=False)`; IF EXISTS,
-qualified/multi-table DROP, and general migration execution remain unsupported.
-Basic transactional Heap ALTER supports rename table/column, nullable ADD, restricted
-DROP, and SET/DROP NOT NULL through native SQL and PostgreSQL Simple/Extended Query.
-Real Alembic support includes bounded atomic ALTER + CREATE/DROP INDEX composition
-within current runtime-created Single-Heap limits. The same aggregate accepts
-CREATE/ALTER/CREATE INDEX, DROP/CREATE same-name, ALTER/DROP, and CREATE/DROP
-table-object sequences for managed runtime Heaps. DML materializes and seals the
-aggregate, so DDL after user data access remains unsupported. Imported/bootstrap,
-LSM, and partitioned table composition also remain unsupported; complete `pg_catalog` or `information_schema`,
-TLS/password authentication, actual cancellation, and simultaneous native plus
-PostgreSQL listeners remain unsupported. The reproducible client matrix is in
-[`docs/postgresql-client-matrix.md`](docs/postgresql-client-matrix.md).
+NetbaDB exposes one network database protocol: Native Protocol v2. PostgreSQL
+wire and client compatibility were removed; see
+[`docs/postgresql-removal.md`](docs/postgresql-removal.md). Runtime DDL remains a
+Native SQL/Core capability. Network DDL requires explicit `schema_admin`; a
+creator can use its staged table only within the creating transaction and
+receives no durable DML grant. Imported/bootstrap, LSM, and partitioned table
+composition remain outside the current managed runtime-Heap DDL surface.
 
 One deliberately narrower exception is the Round 36 staged indexed-nullability
 sequence: a prior schema rewrite must first materialize private S2 through DML;
@@ -504,7 +473,7 @@ transaction-visible source before the first schema-writer acquisition; indexed
 survivors retain logical identity and are rebuilt on the one final S2. The first
 accepted refinement closes relational access. This is not arbitrary
 ALTER-after-DML, new-column nullability, online migration, or
-general Alembic support. See [Round 39](docs/drop-first-migration-sql-round39.md),
+general migration-tool compatibility. See [Round 39](docs/drop-first-migration-sql-round39.md),
 [Round 42](docs/drop-first-layout-migration-sql-round42.md), and
 [Round 44](docs/post-dml-source-adoption-round44.md), and
 [Round 46](docs/post-dml-source-nullability-round46.md).
@@ -802,7 +771,7 @@ CREATE TABLE projects (id BIGINT NOT NULL, name TEXT, active BOOLEAN NOT NULL);
 ```
 
 The generic aliases are BOOLEAN/BOOL, BIGINT/INT64/INT8, TEXT/unbounded VARCHAR,
-and native UINT64. PostgreSQL rejects UINT64 before execution. Types are unnamed
+and native UINT64. Types are unnamed
 physical semantic types; column names never imply nominal types. Preparation has
 no identity or storage effects. Explicit transaction CREATE followed by INSERT and
 SELECT sees a private schema; rollback removes it, while commit publishes its
@@ -1298,13 +1267,14 @@ The implementation sequence is intentionally vertical:
     and no outer threshold, executor change, or runtime adaptation was added.
 74. Single Database Worker / Query Resource Boundary — complete; feature-gated
     timing separates worker queue wait, combined worker service, socket write,
-    and total request time for Native and PostgreSQL at 1/4/16 clients. Measured
+    and total request time for Native clients. Historical comparative data is
+    retained in the audit report. Measured
     long reads impose 37–40 ms of head-of-line queue delay on point queries,
     but concurrent reads remain deferred until an owned thread-safe execution
     context can pin snapshot, schema, storage, projection, DDL/GC, cancellation,
     and shutdown lifetimes. Session row policy is now a shared typed Core limit:
     oversized output is refused without partial success and maps to Native
-    `ResponseTooLarge` or PostgreSQL SQLSTATE `54000`. It bounds successful row
+    `ResponseTooLarge`. It bounds successful row
     count, not row bytes or Sort/Aggregate/Join working memory.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and

@@ -3587,7 +3587,7 @@ impl Database {
     }
 
     /// Quiescent admin ownership inventory. Performs no truncate or PageId reuse;
-    /// ordinary catalog inspection and PostgreSQL metadata remain active-only.
+    /// ordinary catalog inspection remains active-only.
     pub fn inspect_index_reclaim(
         &mut self,
         table_id: TableId,

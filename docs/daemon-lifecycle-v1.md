@@ -26,8 +26,7 @@ netbadbd lifecycle supervisor
 netbadb-server's existing operator-first shutdown authority
 ```
 
-`TcpServer::run`, `PostgresTcpServer::run`, and embedded callers remain
-signal-unaware.
+`TcpServer::run` and embedded callers remain signal-unaware.
 
 ## Readiness boundary
 
@@ -37,8 +36,8 @@ The stable readiness marker is one flushed stderr line beginning exactly with:
 netbadbd ready:
 ```
 
-It is written only after the selected Native or PostgreSQL `start()` has
-returned a handle, the handle is not already finished, and no shutdown signal
+It is written only after Native `start()` has returned a handle, the handle is
+not already finished, and no shutdown signal
 has been observed. Successful `start()` includes database-worker startup, TCP
 bind and listener-thread startup, plus operator bind, `0600` mode and identity
 capture when configured. The bounded line identifies the wire transport and
@@ -56,8 +55,8 @@ message.
 
 ## Supervision and exit
 
-`ServerHandle::is_finished()` and `PostgresServerHandle::is_finished()` are
-pure lifecycle observations. They return true when the main server thread or a
+`ServerHandle::is_finished()` is a pure lifecycle observation. It returns true
+when the main server thread or a
 configured operator listener has terminated; they do not report database
 health. The daemon polls this state and the atomic signal intent at one fixed,
 bounded 10 ms interval that is independent of Manifest v6 and Adaptive ticks.
@@ -85,5 +84,5 @@ path using deployment-specific evidence.
 ## Compatibility
 
 This lifecycle adds no manifest field. Deployment Manifest v6, NBOP v1, Native
-Protocol v2, PostgreSQL wire behavior, Inspection JSON v7, metrics, SDK schema,
-and every persistent format remain unchanged.
+Protocol v2, Inspection JSON v7, metrics, SDK schema, and every persistent
+format remain unchanged.

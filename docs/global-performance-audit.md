@@ -1,5 +1,8 @@
 # Global performance attribution and optimization
 
+> Historical audit. PostgreSQL compatibility measurements below remain factual
+> historical data but are not part of the current product or benchmark matrix.
+
 Baseline: `2c1a8bc2e8a2c7a6aa99f6397f6fbd99b75a85de`; investigation 2026-09-18–19.
 This engineering investigation follows the [error/concurrency](error-concurrency-audit.md),
 [crash-consistency](crash-consistency-audit.md), and

@@ -10,8 +10,7 @@ mod phase35 {
         OperatorPhysicalDesignMutationReceiptOutcomeV6 as ReceiptOutcome,
     };
     use serde_json::json;
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpStream};
+    use std::net::SocketAddr;
 
     fn policy(field: &str, maximum: u64) -> serde_json::Value {
         let mut value = json!({"mode":"component_limits"});
@@ -119,74 +118,12 @@ mod phase35 {
             .unwrap()
     }
 
-    fn query(address: SocketAddr, postgres: bool, sql: &str) {
-        if !postgres {
-            let mut client =
-                netbadb_client::Client::connect(netbadb_client::Config::new(address.to_string()))
-                    .unwrap();
-            client.query(sql).unwrap().close().unwrap();
-            client.close().unwrap();
-            return;
-        }
-        if let Some(psql) = std::env::var_os("NETBADB_TEST_PSQL") {
-            let result = Command::new(psql)
-                .env("DYLD_LIBRARY_PATH", "/opt/local/lib/icu/lib")
-                .args([
-                    "-X",
-                    "-v",
-                    "ON_ERROR_STOP=1",
-                    "-h",
-                    "127.0.0.1",
-                    "-p",
-                    &address.port().to_string(),
-                    "-U",
-                    "netbadb",
-                    "-d",
-                    "netbadb",
-                    "-c",
-                    sql,
-                ])
-                .output()
+    fn query(address: SocketAddr, sql: &str) {
+        let mut client =
+            netbadb_client::Client::connect(netbadb_client::Config::new(address.to_string()))
                 .unwrap();
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-            return;
-        }
-        let mut stream = TcpStream::connect(address).unwrap();
-        stream.set_read_timeout(Some(PROCESS_TIMEOUT)).unwrap();
-        let mut startup = 196608_u32.to_be_bytes().to_vec();
-        startup.extend_from_slice(b"user\0netbadb\0database\0netbadb\0\0");
-        stream
-            .write_all(&((startup.len() + 4) as u32).to_be_bytes())
-            .unwrap();
-        stream.write_all(&startup).unwrap();
-        read_ready(&mut stream);
-        let mut body = sql.as_bytes().to_vec();
-        body.push(0);
-        stream.write_all(b"Q").unwrap();
-        stream
-            .write_all(&((body.len() + 4) as u32).to_be_bytes())
-            .unwrap();
-        stream.write_all(&body).unwrap();
-        read_ready(&mut stream);
-        stream.write_all(b"X\0\0\0\x04").unwrap();
-    }
-    fn read_ready(stream: &mut TcpStream) {
-        loop {
-            let mut header = [0; 5];
-            stream.read_exact(&mut header).unwrap();
-            let len = u32::from_be_bytes(header[1..].try_into().unwrap());
-            let mut body = vec![0; usize::try_from(len - 4).unwrap()];
-            stream.read_exact(&mut body).unwrap();
-            assert_ne!(header[0], b'E', "{}", String::from_utf8_lossy(&body));
-            if header[0] == b'Z' {
-                assert_eq!(body, b"I");
-                break;
-            }
-        }
+        client.query(sql).unwrap().close().unwrap();
+        client.close().unwrap();
     }
     fn rejected(
         error: OperatorClientError,
@@ -214,12 +151,12 @@ mod phase35 {
         admission
     }
 
-    fn run(postgres: bool) {
+    fn run() {
         let fixture = fixture();
-        let mut daemon = DaemonProcess::spawn(&fixture.manifest, postgres);
+        let mut daemon = DaemonProcess::spawn(&fixture.manifest);
         let addr = address(&daemon.wait_for_readiness());
-        query(addr, postgres, "SELECT id FROM users WHERE category = 7");
-        query(addr, postgres, "SELECT id FROM users");
+        query(addr, "SELECT id FROM users WHERE category = 7");
+        query(addr, "SELECT id FROM users");
         let config = ServerConfig::from_manifest_path(&fixture.manifest).unwrap();
         let operator = ServerOperatorClient::new(config.operator_config().unwrap());
         let before = operator.status().unwrap();
@@ -279,8 +216,8 @@ mod phase35 {
             operator.status().unwrap().physical_design.unwrap().evidence,
             design.evidence
         );
-        query(addr, postgres, "SELECT id FROM users WHERE category = 7");
-        query(addr, postgres, "SELECT id FROM users");
+        query(addr, "SELECT id FROM users WHERE category = 7");
+        query(addr, "SELECT id FROM users");
         daemon.send_signal("SIGTERM");
         assert!(daemon.wait().0.success());
         assert!(!fixture.socket.as_ref().unwrap().exists());
@@ -290,7 +227,7 @@ mod phase35 {
         source["operator"]["physical_columnar_snapshot_admission"] =
             policy("source_read_bytes", u64::MAX);
         std::fs::write(&fixture.manifest, serde_json::to_vec(&source).unwrap()).unwrap();
-        let mut daemon = DaemonProcess::spawn(&fixture.manifest, postgres);
+        let mut daemon = DaemonProcess::spawn(&fixture.manifest);
         let addr = address(&daemon.wait_for_readiness());
         let config = ServerConfig::from_manifest_path(&fixture.manifest).unwrap();
         let operator = ServerOperatorClient::new(config.operator_config().unwrap());
@@ -300,9 +237,9 @@ mod phase35 {
         assert!(
             matches!(error,OperatorClientError::Remote(remote) if remote.code==OperatorErrorCodeV6::PhysicalDesignRuntimeChanged && remote.admission.is_none())
         );
-        query(addr, postgres, "SELECT id FROM users WHERE category = 7");
-        query(addr, postgres, "SELECT id FROM users");
-        query(addr, postgres, "SELECT other FROM users");
+        query(addr, "SELECT id FROM users WHERE category = 7");
+        query(addr, "SELECT id FROM users");
+        query(addr, "SELECT other FROM users");
         let report = operator.physical_design_recommendations().unwrap();
         let token = report.runtime_token.unwrap();
         let epoch = report.report.evidence_epoch;
@@ -325,15 +262,15 @@ mod phase35 {
             )
             .unwrap();
         assert!(incremental.receipt.is_some());
-        query(addr, postgres, "SELECT id FROM users WHERE category = 7");
-        query(addr, postgres, "SELECT id FROM users");
+        query(addr, "SELECT id FROM users WHERE category = 7");
+        query(addr, "SELECT id FROM users");
         daemon.send_signal("SIGTERM");
         assert!(daemon.wait().0.success());
         source["operator"]["physical_index_admission"] = policy("output_write_bytes", 0);
         source["operator"]["physical_columnar_snapshot_admission"] =
             policy("output_write_bytes", 0);
         std::fs::write(&fixture.manifest, serde_json::to_vec(&source).unwrap()).unwrap();
-        let mut daemon = DaemonProcess::spawn(&fixture.manifest, postgres);
+        let mut daemon = DaemonProcess::spawn(&fixture.manifest);
         daemon.wait_for_readiness();
         let config = ServerConfig::from_manifest_path(&fixture.manifest).unwrap();
         let operator = ServerOperatorClient::new(config.operator_config().unwrap());
@@ -358,10 +295,6 @@ mod phase35 {
     }
     #[test]
     fn phase35_native_daemon_admission_and_restart() {
-        run(false);
-    }
-    #[test]
-    fn phase35_postgres_daemon_admission_and_restart() {
-        run(true);
+        run();
     }
 }

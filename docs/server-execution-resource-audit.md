@@ -1,5 +1,8 @@
 # Server execution and resource-boundary audit
 
+> Historical audit. PostgreSQL compatibility referenced below was removed after
+> this audit; current runtime and benchmark requirements are Native-only.
+
 ## 1. Baseline commit
 
 The audit baseline is `5b2ee5c76e2c16debc6ca4816d48c11c2c6e3ae6`

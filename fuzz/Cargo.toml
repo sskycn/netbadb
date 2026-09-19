@@ -14,7 +14,6 @@ crc32c = "0.6.8"
 libfuzzer-sys = "0.4"
 netbadb-core = { path = "../crates/netbadb-core" }
 netbadb-index = { path = "../crates/netbadb-index" }
-netbadb-pgwire = { path = "../crates/netbadb-pgwire" }
 netbadb-protocol = { path = "../crates/netbadb-protocol" }
 netbadb-schema = { path = "../crates/netbadb-schema" }
 netbadb-storage = { path = "../crates/netbadb-storage" }
@@ -51,13 +50,6 @@ bench = false
 [[bin]]
 name = "protocol_decode"
 path = "fuzz_targets/protocol_decode.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "pgwire_decode"
-path = "fuzz_targets/pgwire_decode.rs"
 test = false
 doc = false
 bench = false

@@ -38,9 +38,8 @@ netbadb-executor -> netbadb-planner + netbadb-rel + netbadb-storage
 netbadb-core -> compiler + inspect + planner + rel + executor + storage
                  + schema + types
 netbadb-protocol -> netbadb-types
-netbadb-pgwire -> netbadb-types
 netbadb-client -> netbadb-protocol + netbadb-schema + netbadb-types
-netbadb-server -> netbadb-core + netbadb-protocol + netbadb-pgwire
+netbadb-server -> netbadb-core + netbadb-protocol + netbadb-schema + netbadb-types
                     + netbadb-schema
                     + netbadb-types
 netbadbd -> netbadb-server
@@ -264,16 +263,16 @@ change.
 
 [Adaptive Operations Phase 15](adaptive-operations-phase15.md) adds an explicit
 Server workload-evidence bridge for successful autocommit Core queries. Each
-current Native or PostgreSQL Database worker owns one optional bounded evidence
+current Native Database worker owns one optional bounded evidence
 pool and synchronously admits the exact Phase 14 report after authorization;
 connections, sessions, `Database`, and protocols own no pool. DML, DDL,
-explicit-transaction queries, and PostgreSQL compatibility queries remain on
+explicit-transaction queries remain on
 ordinary non-instrumented paths. Admission failure is telemetry-only, and the
 bridge performs no retry, automatic rotation, scheduler tick, orchestration,
 maintenance, visibility-mode change, manifest update, or wire change.
 
 [Adaptive Operations Phase 16](adaptive-operations-phase16.md) adds the
-Server host-time to cooperative-scheduler bridge. Native and PostgreSQL accept
+Server host-time to cooperative-scheduler bridge. The Native accept
 loops use wall clock only to offer monotonically numbered logical ticks; a
 single pending reply coalesces missed intervals and prevents maintenance debt.
 The typed tick enters the existing Database worker, where the worker-owned
@@ -281,15 +280,15 @@ Phase 15 evidence pool and Phase 13 scheduler invoke Phase 12 at most once.
 Bounded status, explicit evidence rotation, and fault-only scheduler reset are
 programmatic handle operations routed through the same owner. No Database,
 pool, or scheduler moves to a timer or connection thread, and Manifest v4,
-`netbadbd`, Protocol v2, PostgreSQL wire, and Inspection JSON v7 remain
+`netbadbd`, Protocol v2, and Inspection JSON v7 remain
 unchanged.
 
 [Adaptive Operations Phase 17](adaptive-operations-phase17.md) freezes strict
 deployment manifest v5 as the operator-facing mapping to the existing Server
 runtime. Omitted Adaptive configuration is Disabled; explicit feedback-only
 and driven tagged objects construct the established Phase 15/16 configs with
-all limits, budgets, scopes, and policies required. Both Native and PostgreSQL
-builders consume the manifest-derived mode unless an explicit programmatic
+all limits, budgets, scopes, and policies required. The Native builder consumes
+the manifest-derived mode unless an explicit programmatic
 builder replacement wins. Manifest decoding reuses Core ratio, scheduler, and
 driver validation and adds no safety, scheduling, visibility, coordinator,
 runtime-state persistence, hot reload, metrics, protocol, or daemon admin
@@ -299,7 +298,7 @@ authority.
 strict current deployment contract to Manifest v6 and adds the local Unix-only
 [NetbaDB Operator Protocol v1](server-operator-protocol-v1.md). One dedicated
 serial listener owns only its `0600` socket and calls the existing
-`ServerAdaptiveControlHandle`; the sole Native or PostgreSQL Database worker
+`ServerAdaptiveControlHandle`; the sole Native Database worker
 continues to own the Database, evidence pool, and scheduler. Status is bounded
 and read-only, evidence rotation is conditional on the expected window epoch,
 and scheduler reset acknowledges only a real Phase 13 fault. Existing paths
@@ -310,7 +309,7 @@ format, Server metrics, or Inspection JSON contract changes.
 [Adaptive Operations Phase 19](adaptive-operations-phase19.md) adds the Unix
 [`netbadbd` lifecycle v1](daemon-lifecycle-v1.md) around that existing Server
 authority. SIGINT and SIGTERM record one atomic shutdown intent; the executable
-then invokes the same Native or PostgreSQL operator-first `shutdown()` path.
+then invokes the Native operator-first `shutdown()` path.
 One explicitly flushed `netbadbd ready:` stderr line follows complete startup,
 provided no signal or owned-thread termination has been observed. The Server
 library remains signal-unaware, Manifest v6 and NBOP v1 remain unchanged, and
@@ -328,7 +327,7 @@ creates no design or identity, persists nothing, and does not join the four
 automatic lanes or Server capture.
 
 [Adaptive Operations Phase 21](adaptive-operations-phase21.md) adds an explicit
-programmatic Server bridge for Phase 20. Each Native or PostgreSQL Database
+programmatic Server bridge for Phase 20. Each Native Database
 worker may own one independent `PhysicalDesignEvidenceWindow` beside its
 optional Adaptive runtime. One eligible authorized autocommit query executes
 with feedback once and fans that same formal report out to both enabled concrete
@@ -361,14 +360,14 @@ operator surface, SQL syntax, wire/manifest/inspection contract, or persistent
 format is added.
 
 [Adaptive Operations Phase 24](adaptive-operations-phase24.md) carries that
-narrow Core authority through the existing Native/PostgreSQL programmatic
+narrow Core authority through the existing Native programmatic
 Server control path. The sole Database worker proposes from its own evidence
 window and performs explicit caller-named apply through Core. A private runtime
 identity binds each Server proposal to exactly one evidence-window lifetime;
 the proposal stores only a weak reference, so equal numeric epochs after
 restart cannot alias and retained proposals cannot keep a server alive. FIFO
 worker ownership remains the serialization boundary. Manifest v7, NBOP v2,
-both database wire protocols, the operator/CLI/daemon surfaces, metrics,
+the database wire protocol, the operator/CLI/daemon surfaces, metrics,
 Inspection JSON v7, and persistent formats remain unchanged.
 
 [Adaptive Operations Phase 25](adaptive-operations-phase25.md) introduced the
@@ -413,7 +412,7 @@ publication, refresh, scheduler, Server/operator surface, external contract, or
 persistent format authority is added.
 
 [Adaptive Operations Phase 28](adaptive-operations-phase28.md) carries that
-Core authority through the Native/PostgreSQL embedded-host control path under a
+Core authority through the Native embedded-host control path under a
 separate Server-owned placement policy. The host configures one pre-existing
 canonical root and explicit Snapshot/Incremental permissions; the caller can
 supply only a validated one-component logical key resolving to one direct
@@ -471,8 +470,8 @@ An explicit Columnar Projection Catalog `RecoveryRequired` keeps its typed
 restart/reopen requirement without a journal; with a durable Begin, it retains
 receipt-aware uncertainty and NBMR startup reconciliation.
 Begin failures and recovery-gated new requests do not enter Core. NBMR stays
-v3; Core, SQL, Database formats, Native Protocol v2, PostgreSQL wire, and
-Inspection JSON v7 are unchanged.
+v3; Core, SQL, Database formats, Native Protocol v2, and Inspection JSON v7 are
+unchanged.
 
 [Adaptive Operations Phase 30](adaptive-operations-phase30.md) added the
 optional Server-owned [NBMR v1](physical-design-mutation-receipts-v1.md)
@@ -485,8 +484,8 @@ exact current physical state before readiness. Public pagination omits the
 journal-private absolute Columnar path and all identity, token, SQL, principal,
 session, address, and timestamp data. Receipt ambiguity gates later receipt
 controls but never compensates Database state or changes protocol/session
-health. Manifest v9, NBOP v4, Native Protocol v2, PostgreSQL wire behavior,
-Inspection JSON v7, SDK Schema Spec, and database persistent formats remain
+health. Manifest v9, NBOP v4, Native Protocol v2, Inspection JSON v7, SDK
+Schema Spec, and database persistent formats remain
 unchanged.
 
 [Adaptive Operations Phase 33](adaptive-operations-phase33.md) adds current-state
@@ -505,7 +504,7 @@ future admission must recompute within the mutation command after idempotency
 and coverage checks and cannot approve using an unproven required dimension.
 
 [Adaptive Operations Phase 34](adaptive-operations-phase34.md) adds explicit
-component-scoped admission to Core Index/Columnar apply and the Native/PostgreSQL
+component-scoped admission to Core Index/Columnar apply and the Native
 programmatic Server controls. Old and admitted APIs share preflight and existing
 mutation helpers. Identity, exact retry/conflict, structure, coverage, evidence
 and current recommendation precede fresh Phase 33 inspection; only a needed
@@ -530,7 +529,7 @@ and programmatic per-call authority remain intact. Final recovery hardening keep
 existing Projection Catalog recovery distinct from pre-mutation Heap/LSM
 inspection recovery: the former retains the Columnar reopen code, while the
 latter is a typed `recovery_required` admission rejection. Both durably reject
-an existing Begin without recovery-gating NBMR. NBMR v3, Native v2, PG wire,
+an existing Begin without recovery-gating NBMR. NBMR v3, Native Protocol v2,
 Inspection JSON v7 and all persistent formats remain unchanged.
 
 [Adaptive Operations Phase 36](adaptive-operations-phase36.md) adds a
@@ -556,7 +555,7 @@ and one committed TxnStatus record. Core maps the storage total to the existing
 `output_write_bytes` dimension. Coordinator, NBMR, failure-path writes and
 whole-mutation resources remain outside the component. Inspection scans no row
 or key and walks no BTree. Manifest v11, NBOP v6, NBMR v3, Native Protocol v2,
-PostgreSQL wire and all persistent formats remain unchanged.
+all persistent formats remain unchanged.
 
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
@@ -790,8 +789,7 @@ partial participant order before retiring S1 and publishing S2.
 from a one-table, drop-only `MaterializedIndex` source participant to that
 unchanged lifecycle. The exact typed ALTER, current S1 participant, schema-
 writer owner, managed Single-Heap placement, and absence of S2 are checked in
-Core; PostgreSQL remains a thin authorization/SQLSTATE adapter. Failed native
-SET NOT NULL stays open for repair, successful refinement closes relation
+Core. Failed Native SET NOT NULL stays open for repair, successful refinement closes relation
 execution, and final index DDL is logical until the one late clone at COMMIT.
 No SQL look-ahead or persistent-format change is introduced.
 
@@ -814,8 +812,8 @@ intent; rollback and predecision crashes retain its high-water burn. Nullable
 ADD synthesizes NULL, DROP omits the exact ID, same-name replacement cannot
 alias old data, and Policy B rejects a non-empty newly-NOT-NULL column during
 projection. Effective layouts retain the existing one-S2/one-CORD lifecycle;
-canonical ADD-then-DROP allocates no S2. Native and PostgreSQL SQL admission,
-persistent formats, storage policy, and wire capabilities remain unchanged.
+canonical ADD-then-DROP allocates no S2. Native SQL admission, persistent
+formats, storage policy, and wire capabilities remain unchanged.
 
 [Round 42](drop-first-layout-migration-sql-round42.md) changes only Execute-time
 admission: nullable ADD and exact-ID DROP may enter the same source lifecycle
@@ -823,7 +821,7 @@ after the exact Round 39 DROP-only authority. ADD reserves a durable `ColumnId`
 at Execute, target-ordered projection gives new IDs NULL and omits dropped IDs,
 and prepared DROP cannot rebind to a same-name replacement. Multiple effective
 changes retain one S2 and one source stream; ADD-then-DROP burns its ID with no
-S2. PostgreSQL remains unaware of S1/S2 and recovery remains byte-driven.
+S2. The Native frontend remains unaware of S1/S2 and recovery remains byte-driven.
 
 [Round 44](post-dml-source-adoption-round44.md) productionizes the Round 43
 Candidate B decision. An exact ordinary one-table INSERT/UPDATE/DELETE
@@ -958,8 +956,8 @@ keeps only a logical name/span; HIR resolves the transaction SchemaView to the s
 exact TableId/version/fingerprint target; compiled/prepared DDL retains it until
 Execute calls Round 20 Core. Statement access records schema-write authority and a
 separate exact schema target, so `schema_admin` does not imply or require row DML
-grants. Native and PostgreSQL Simple/Extended paths add no identity or persistent
-format. Same-name replacement fails stale/undefined rather than rebinding.
+grants. The Native path adds no identity or persistent format. Same-name
+replacement fails stale/undefined rather than rebinding.
 
 [Round 22](retired-heap-gc-round22.md) adds explicit physical retirement for one
 exact runtime-created Single Heap. Append-only completed Coordinator decisions
@@ -3428,105 +3426,30 @@ transport-independent binary v1 contract and depends only on shared types.
 optional table-scoped transaction while borrowing the database owner for each
 request.
 
-The experimental PostgreSQL foundation adds a parallel frontend boundary:
-
-```text
-PostgreSQL bytes
-    -> netbadb-pgwire bounded typed messages
-    -> PostgreSQL session / prepared statement / portal state
-    -> ordinary SQL: compiler-owned typed statement and parameter metadata
-    -> metadata SQL: bounded compatibility operation classifier
-    -> ephemeral metadata projection <- Database::inspect_catalog()
-                                      <- Canonical Schema + index registry
-    -> compiler-resolved StatementAccess + authorization
-    -> shared netbadb-server DatabaseSession transaction/execution lifecycle
-    -> netbadb-core
-```
-
-`netbadb-pgwire` depends only on `netbadb-types`; it contains framing, message
-domains, PostgreSQL OIDs, format codes, and scalar text/binary adaptation, but no
-socket listener or database calls. PostgreSQL OIDs and transaction-aborted
-behavior stop at the server adapter. The compiler exposes frontend-neutral
-`ParameterId` expressions, contextual parameter inference, typed logical
-binding, compile error categories, and statement output metadata. Parse
-compiles once; each Bind decodes values once and substitutes typed literals
-without formatting or reparsing SQL, so planning sees concrete predicates.
-PostgreSQL error and RowDescription mapping do not inspect AST/HIR Rust layouts,
-execute a query for metadata, or leak OIDs into HIR, relational IR, planner,
-executor, or storage.
-
-Rounds 3 through 5 keep ORM and psql introspection in a separate, typed
-server-side adapter because
-SQLAlchemy's PostgreSQL catalog SQL uses schema-qualified system relations,
-arrays, `ANY`, `regclass`, and catalog-only functions that would otherwise
-force a premature full PostgreSQL parser into the native compiler. The adapter
-classifies queries from structural relation/function/predicate markers into a
-closed `CompatibilityStatement` domain; it does not compare whole SQL strings
-or execute user-table SQL. Each session derives a bounded read-only snapshot
-from `Database::inspect_catalog()`. The Core DTO combines Canonical Schema
-table/column identity with registered index definitions while excluding B+Tree
-handles, PageIds, optimizer policy, and storage variants. A registered index
-has durable lifecycle identity `(TableId, IndexId)`. The unchanged inspection
-DTO exposes only active `(TableId, ColumnId)` membership,
-`BTree` kind, and `unique=false`; LSM clustering access is not a secondary
-index. Partition-local physical indexes are not projected as logical indexes
-because the current registry cannot prove they form one logical definition.
-Every emitted row is generated from that snapshot and filtered through the
-principal's existing `TableId` visibility.
-There is no PostgreSQL catalog heap, WAL record, or second source of schema
-truth.
-
-Round 5 adds a second entry into that same evaluator for psql Simple Query.
-A bounded tokenizer recognizes semantic catalog relations, columns, functions,
-operators, and literal predicates without implementing general PostgreSQL
-SELECT. Catalog name patterns compile into a small anchored automaton subset
-(`literal`, `.`, and `.*`) with fixed byte/atom/token/nesting limits and a
-non-backtracking dynamic-programming matcher. The adapter therefore supports
-psql 17.11 `\d`, `\dt`, and `\di` without adding regex or PostgreSQL catalog
-syntax to parser, HIR, relational IR, planner, executor, or storage.
-
-Compatibility object OIDs are server-only deterministic identifiers. Separate
-SHA-256 domains cover table and index objects; index identity includes the
-canonical fingerprint, column, kind, and uniqueness. All candidates share one
-high synthetic range and collision set, and deterministic linear probing
-resolves collisions. Index names combine a sanitized readable table/column
-prefix with a stable digest suffix, are bounded to 63 ASCII bytes, and
-collision-check the complete catalog. Built-in PostgreSQL type OIDs stay centralized in
-`netbadb-pgwire`, while object OIDs do not enter types, HIR, relational IR,
-planning, execution, storage, or persistent formats. Stability is guaranteed
-for the same Canonical Schema and index registry across connections and
-restarts; names and OIDs are not persistent contracts across schema/index
-changes.
-
 The generic compiler exposes postfix casts and qualified projection aliases.
 HIR retains the child's real source type, validates the shared explicit pair
 matrix, and emits a typed Cast that survives parameter binding and inspection.
 The executor provides checked integer-to-integer, Text/integer and Bool/Text
 conversion; all other cross-physical pairs are rejected. Planner access,
 zone-map and partition inference does not look through a cross-physical Cast.
-PostgreSQL-only `regclass`, `regtype`, OID, array, and catalog function
-semantics remain confined to the adapter.
 
-Native and PostgreSQL sessions both use the private synchronous
-`DatabaseSession` for the optional database transaction, execute/commit/
-rollback, disconnect rollback, and row-limit policy. PostgreSQL additionally
-owns named/unnamed prepared statements, portals, extended-protocol recovery to
-Sync, and the `I`/`T`/`E` compatibility state. These are frontend semantics and
-do not alter the core transaction state machine.
+Native sessions use the private synchronous `DatabaseSession` for the optional
+database transaction, execute/commit/rollback, disconnect rollback, and
+row-limit policy. Core catalog inspection remains a read-only NetbaDB API; it
+has no alternate SQL catalog projection.
 
 FROM-less scalar queries use the ordinary typed pipeline. Parser/HIR represent
 an optional source, relational and physical IR use a single empty `OneRow`, and
 `ScalarProject` evaluates literal or bound-parameter expressions over it. This
-keeps `SELECT 1`, `SELECT true`, `SELECT 'x'`, and `SELECT NULL` out of the
-PostgreSQL compatibility-query string matcher.
+keeps `SELECT 1`, `SELECT true`, `SELECT 'x'`, and `SELECT NULL` in the ordinary
+typed compiler and executor pipeline.
 
-The first executable boundary is deliberately an exclusive listener mode:
-`netbadbd --postgres` uses manifest v6's existing loopback listen address for
-PostgreSQL instead of Protocol v2. It has the same dedicated synchronous
-Database owner/worker model, compiler-resolved table authorization, connection
-cap, and socket timeouts. A future versioned deployment manifest may configure
-simultaneous native and PostgreSQL listeners backed by one worker; manifest v5
-was not silently reinterpreted to add a second address.
+Native Protocol v2 is the only network database protocol. `netbadbd` exposes
+one manifest-configured Native listener with the dedicated synchronous Database
+owner/worker model, compiler-resolved table authorization, connection cap, and
+socket timeouts. The removed compatibility architecture is recorded in
+[`postgresql-removal.md`](postgresql-removal.md), not retained as a runtime or
+future protocol mode.
 
 The blocking TCP runtime uses one OS thread per accepted connection and one
 dedicated database worker thread. Connection threads own the socket, optional
@@ -3718,11 +3641,11 @@ into planning, expose a new planner API, or change any persistent representation
 ## Error and concurrency audit follow-up
 
 The [2026-09-18 audit](error-concurrency-audit.md) records ownership, waits,
-transaction retries, and regression evidence. PostgreSQL worker cleanup failure
-stops service; worker exit/panic is observed by the listener, and every listener
-exit closes and joins connections before joining the worker. Native and
-PostgreSQL startup preserve both primary and worker-cleanup errors. Native
-operational/internal/transaction-state messages do not expose core diagnostics.
+transaction retries, and regression evidence. Worker exit/panic is observed by
+the listener, and every listener exit closes and joins connections before
+joining the worker. Native startup preserves both primary and worker-cleanup
+errors. Native operational/internal/transaction-state messages do not expose
+core diagnostics.
 
 A failed CORD append whose tail rollback also fails invalidates that open log's
 write authority until reopen, preserving both I/O errors. Later appends cannot
@@ -3745,10 +3668,6 @@ physical-design handles each share one outstanding synchronous command across
 all clones; admission lasts through its reply and occurs before proposal copying.
 The listener forwards at most one command per family per iteration. Connection
 commands remain implicitly bounded by admission and one outstanding reply.
-
-PostgreSQL portals transfer encoded rows to responses and discard completed result
-storage. Read-only savepoint metadata is limited to 1,024 names of at most 63 bytes;
-excess returns SQLSTATE 54000. Suspended portals still own unsent complete results.
 
 LSM pending bytes and mutation counts are validated before each replacement,
 crediting the previous row and accounting for tombstones. Per-write accounting

@@ -1405,7 +1405,7 @@ impl TestPostApplyFailure {
     }
 }
 
-/// Final immutable startup settings shared by the Native and PostgreSQL workers.
+/// Final immutable startup settings for the Native worker.
 pub(crate) struct ServerPhysicalDesignStartupConfig {
     pub(crate) advisor: ServerPhysicalDesignAdvisorConfig,
     pub(crate) columnar_apply: Option<ServerPhysicalColumnarApplyConfig>,

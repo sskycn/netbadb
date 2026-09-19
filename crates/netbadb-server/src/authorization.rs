@@ -109,6 +109,7 @@ impl PrincipalAuthorization {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn schema_admin(&self) -> bool {
         self.schema_admin
     }
@@ -157,14 +158,6 @@ impl PrincipalAuthorization {
         self.tables
             .iter()
             .any(|permissions| permissions.table_id == table_id)
-    }
-
-    pub(crate) fn can_start_transaction(&self) -> bool {
-        self.schema_admin
-            || self
-                .tables
-                .iter()
-                .any(|permissions| permissions.allows(AuthorizationAction::Transaction))
     }
 }
 

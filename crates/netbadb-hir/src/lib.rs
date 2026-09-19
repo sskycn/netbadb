@@ -317,7 +317,7 @@ pub struct TypedCreateIndex {
     pub if_not_exists: bool,
 }
 
-/// Resolved generic identity, independent of PostgreSQL naming and storage pages.
+/// Resolved logical identity, independent of external naming and storage pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropIndexTarget {
     pub table_id: TableId,
@@ -861,7 +861,7 @@ pub struct ParameterMetadata {
 ///
 /// Exact constraints are database type declarations and must agree with SQL
 /// context. Fallbacks describe a frontend representation to use only when SQL
-/// provides no contextual target, such as a PostgreSQL parameter OID.
+/// provides no contextual target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterTypeHint {
     Exact(PhysicalType),
@@ -1195,10 +1195,9 @@ fn lower_query_with_context(
                             span: ast_expr_span(expression),
                         });
                     }
-                    // PostgreSQL and the native frontend both allow a standalone
-                    // `NULL` projection. With no surrounding expression there is
-                    // no contextual carrier type, so use TEXT as the deterministic
-                    // wire-visible carrier while preserving the value as SQL NULL.
+                    // A standalone `NULL` projection has no surrounding expression
+                    // to provide a carrier type. Use TEXT as the deterministic wire
+                    // carrier while preserving the value as SQL NULL.
                     let null_carrier = matches!(
                         expression,
                         netbadb_parser::Expr::Literal {

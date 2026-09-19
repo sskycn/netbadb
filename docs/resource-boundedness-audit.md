@@ -1,5 +1,8 @@
 # Resource exhaustion and boundedness audit
 
+> Historical audit. PostgreSQL compatibility findings below describe the code
+> at the audit baseline; that frontend and its tests were subsequently removed.
+
 Baseline: `3ce00a8` (2026-09-18). This is an engineering audit of the owner's
 NetbaDB implementation. The [error/concurrency](error-concurrency-audit.md) and
 [crash-consistency](crash-consistency-audit.md) audits remain regression contracts.

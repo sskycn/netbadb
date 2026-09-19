@@ -10,12 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use netbadb_server::{
-    PostgresServerHandle, PostgresTcpServer, PostgresTcpServerError, ServerAdaptiveMode,
-    ServerConfig, ServerHandle, TcpServer, TcpServerError,
-};
+use netbadb_server::{ServerAdaptiveMode, ServerConfig, TcpServer, TcpServerError};
 
-const HELP: &str = "Usage: netbadbd --manifest <path> [--postgres]\n\nStarts the manifest-configured native server, or the experimental PostgreSQL wire listener with --postgres.";
+const HELP: &str = "Usage: netbadbd --manifest <path>\n\nStarts the manifest-configured NetbaDB Native Protocol server.";
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn main() -> ExitCode {
@@ -28,7 +25,7 @@ fn main() -> ExitCode {
             println!("netbadbd {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Ok(Action::Run { manifest, postgres }) => match run_daemon(manifest, postgres) {
+        Ok(Action::Run { manifest }) => match run_daemon(manifest) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("netbadbd: {error}");
@@ -42,17 +39,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_daemon(manifest: PathBuf, postgres: bool) -> Result<(), Box<dyn Error>> {
+fn run_daemon(manifest: PathBuf) -> Result<(), Box<dyn Error>> {
     // Registration deliberately precedes manifest parsing and every daemon-owned
     // database, listener, and operator resource.
     let signals = ShutdownSignals::install()?;
     let mut stderr = io::stderr().lock();
-    run_server(manifest, postgres, &signals, &mut stderr)
+    run_server(manifest, &signals, &mut stderr)
 }
 
 fn run_server(
     manifest: PathBuf,
-    postgres: bool,
     signals: &ShutdownSignals,
     readiness: &mut impl Write,
 ) -> Result<(), Box<dyn Error>> {
@@ -77,11 +73,7 @@ fn run_server(
     } else {
         "disabled"
     };
-    let server = if postgres {
-        RunningServer::Postgres(PostgresTcpServer::new(config).start()?)
-    } else {
-        RunningServer::Native(TcpServer::new(config).start()?)
-    };
+    let server = TcpServer::new(config).start()?;
 
     match lifecycle_action(false, signals.requested(), server.is_finished()) {
         LifecycleAction::Shutdown => return server.shutdown().map_err(Into::into),
@@ -89,7 +81,8 @@ fn run_server(
         LifecycleAction::PublishReady => {}
         LifecycleAction::Continue => unreachable!("a server cannot continue before readiness"),
     }
-    if let Err(readiness_error) = server.publish_readiness(
+    if let Err(readiness_error) = publish_readiness(
+        &server,
         readiness,
         max_connections,
         adaptive,
@@ -118,84 +111,24 @@ fn run_server(
     }
 }
 
-enum RunningServer {
-    Native(ServerHandle),
-    Postgres(PostgresServerHandle),
-}
-
-impl RunningServer {
-    fn is_finished(&self) -> bool {
-        match self {
-            Self::Native(server) => server.is_finished(),
-            Self::Postgres(server) => server.is_finished(),
-        }
-    }
-
-    fn publish_readiness(
-        &self,
-        writer: &mut impl Write,
-        max_connections: usize,
-        adaptive: &str,
-        physical_design: &str,
-        physical_index_apply: &str,
-        physical_design_receipts: &str,
-    ) -> io::Result<()> {
-        match self {
-            Self::Native(server) => writeln!(
-                writer,
-                "netbadbd ready: native listener on {}, {} table(s), max {} connections, transport {}, adaptive {adaptive}, physical-design {physical_design}, physical-index-apply {physical_index_apply}, physical-design-receipts {physical_design_receipts}",
-                server.local_addr(),
-                server.table_count(),
-                max_connections,
-                server.transport_kind(),
-            )?,
-            Self::Postgres(server) => writeln!(
-                writer,
-                "netbadbd ready: PostgreSQL listener on {}, max {} connections, transport plaintext-loopback, adaptive {adaptive}, physical-design {physical_design}, physical-index-apply {physical_index_apply}, physical-design-receipts {physical_design_receipts}",
-                server.local_addr(),
-                max_connections,
-            )?,
-        }
-        writer.flush()
-    }
-
-    fn shutdown(self) -> Result<(), RunningServerError> {
-        match self {
-            Self::Native(server) => server.shutdown().map_err(RunningServerError::Native),
-            Self::Postgres(server) => server.shutdown().map_err(RunningServerError::Postgres),
-        }
-    }
-
-    fn wait(self) -> Result<(), RunningServerError> {
-        match self {
-            Self::Native(server) => server.wait().map_err(RunningServerError::Native),
-            Self::Postgres(server) => server.wait().map_err(RunningServerError::Postgres),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum RunningServerError {
-    Native(TcpServerError),
-    Postgres(PostgresTcpServerError),
-}
-
-impl fmt::Display for RunningServerError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Native(error) => error.fmt(formatter),
-            Self::Postgres(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl Error for RunningServerError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Native(error) => Some(error),
-            Self::Postgres(error) => Some(error),
-        }
-    }
+fn publish_readiness(
+    server: &netbadb_server::ServerHandle,
+    writer: &mut impl Write,
+    max_connections: usize,
+    adaptive: &str,
+    physical_design: &str,
+    physical_index_apply: &str,
+    physical_design_receipts: &str,
+) -> io::Result<()> {
+    writeln!(
+        writer,
+        "netbadbd ready: native listener on {}, {} table(s), max {} connections, transport {}, adaptive {adaptive}, physical-design {physical_design}, physical-index-apply {physical_index_apply}, physical-design-receipts {physical_design_receipts}",
+        server.local_addr(),
+        server.table_count(),
+        max_connections,
+        server.transport_kind(),
+    )?;
+    writer.flush()
 }
 
 #[derive(Debug)]
@@ -203,7 +136,7 @@ enum ReadinessError {
     Publish(io::Error),
     PublishAndShutdown {
         publish: io::Error,
-        shutdown: RunningServerError,
+        shutdown: TcpServerError,
     },
 }
 
@@ -305,7 +238,7 @@ const fn adaptive_label(mode: ServerAdaptiveMode) -> &'static str {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
-    Run { manifest: PathBuf, postgres: bool },
+    Run { manifest: PathBuf },
     Help,
     Version,
 }
@@ -322,7 +255,6 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
         return no_extra_arguments(arguments.into_iter().skip(1), Action::Version);
     }
     let mut manifest = None;
-    let mut postgres = false;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].to_str() {
@@ -334,14 +266,12 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<Action, C
                 let value = arguments.get(index).ok_or(CliError::ManifestPathRequired)?;
                 manifest = Some(PathBuf::from(value));
             }
-            Some("--postgres") if !postgres => postgres = true,
             _ => return Err(CliError::UnknownArgument(arguments[index].clone())),
         }
         index += 1;
     }
     Ok(Action::Run {
         manifest: manifest.ok_or(CliError::ManifestRequired)?,
-        postgres,
     })
 }
 
@@ -400,14 +330,6 @@ mod tests {
             parse_args(args(&["--manifest", "server.json"])).unwrap(),
             Action::Run {
                 manifest: PathBuf::from("server.json"),
-                postgres: false,
-            }
-        );
-        assert_eq!(
-            parse_args(args(&["--postgres", "--manifest", "server.json"])).unwrap(),
-            Action::Run {
-                manifest: PathBuf::from("server.json"),
-                postgres: true,
             }
         );
     }

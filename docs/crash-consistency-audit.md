@@ -1,5 +1,8 @@
 # Crash consistency and recovery audit
 
+> Historical audit. PostgreSQL compatibility test counts below remain factual
+> for this audit's baseline; that frontend was removed later.
+
 Audit baseline: `3a9631bba960d4e79aa4cbf92dd708ade3a8fc63` (2026-09-18).
 This audit changes recovery and I/O failure handling, without changing persistent
 versions, the synchronous core, mutation ownership, or planner policy. The

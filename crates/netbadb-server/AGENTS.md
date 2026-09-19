@@ -168,7 +168,7 @@
   `AutomaticScheduler` and the Phase 12 runner.
 - At most one adaptive tick may be pending per worker. Missed host intervals
   MUST coalesce and MUST NOT become a maintenance backlog or catch-up burst.
-- Adaptive scheduler failure MUST NOT corrupt Native or PostgreSQL protocol
+- Adaptive scheduler failure MUST NOT corrupt Native Protocol
   state, fail an unrelated foreground request, kill the worker, or create a
   second Database owner. Evidence-window renewal and faulted-scheduler reset
   remain explicit operator-controlled runtime actions.
@@ -184,10 +184,10 @@
   semantics. An ambiguous transport retry MUST NOT cause a second evidence
   rotation.
 - The first operator plane is local Unix-domain only and MUST NOT be exposed as
-  Native or PostgreSQL SQL or database-protocol traffic.
+  Native SQL or database-protocol traffic.
 - Unix process-signal ownership belongs to `netbadbd`, not this library.
-  `TcpServer::run`, `PostgresTcpServer::run`, database workers, sessions, and
-  the operator listener MUST remain signal-unaware.
+  `TcpServer::run`, database workers, sessions, and the operator listener MUST
+  remain signal-unaware.
 - Server-handle `is_finished` is a pure owned-thread lifecycle observation, not
   a health check. When an operator listener is configured, its termination
   MUST be included so a daemon cannot outlive a failed control plane.

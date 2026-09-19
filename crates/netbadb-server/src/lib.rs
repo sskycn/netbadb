@@ -14,7 +14,6 @@ mod operator_v4;
 mod operator_v5;
 mod physical_design;
 mod physical_design_receipts;
-mod postgres;
 mod runtime;
 mod tls;
 
@@ -162,7 +161,6 @@ pub use physical_design_receipts::{
     ServerPhysicalDesignMutationReceiptStatus, ServerPhysicalDesignMutationSource,
     ServerPhysicalDesignMutationTarget,
 };
-pub use postgres::{PostgresServerHandle, PostgresTcpServer, PostgresTcpServerError};
 pub use runtime::{ServerHandle, SessionId, TcpServer, TcpServerError, WorkerFatalError};
 pub use tls::{AuthenticatedClientIdentity, ClientIdentity, TlsConfigError, TransportKind};
 

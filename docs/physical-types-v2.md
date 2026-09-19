@@ -73,7 +73,7 @@ independent of which physical types may appear in the row payload.
 
 NetbaDB accepts explicit fixed-width names including `TINYINT`, `INT16`,
 `INT32`, `INT64`, `INT128`, `UINT8` through `UINT128`, `FLOAT32`, `FLOAT64`,
-`BYTES`, and their documented PostgreSQL-style aliases. The established SQL
+`BYTES`, and their documented aliases. The established SQL
 alias `INT8` continues to mean 64-bit signed `BIGINT`; native 8-bit signed
 storage is spelled `TINYINT`. `REAL`/`FLOAT4` mean Float32 and
 `DOUBLE`/`FLOAT8` mean Float64. `BYTEA` aliases Bytes.
@@ -104,22 +104,11 @@ uses only the exact lowercase tokens `true` and `false`. See
 [Round 60](deferred-type-conversion-round60.md) for typed errors, optimizer
 boundaries and atomic shadow migration. Durable encodings are unchanged.
 
-## PostgreSQL and Go boundaries
+## Native Protocol and Go boundaries
 
-The pgwire adapter publishes only lossless mappings. Signed Int8/Int16 use
-`INT2`, Int32 uses `INT4`, and Int64 uses `INT8`. UInt8, UInt16 and UInt32 use
-the next wider signed PostgreSQL integer. Float32/Float64 use `FLOAT4`/`FLOAT8`
-and Bytes uses `BYTEA`. UInt64, Int128 and UInt128 result columns return an
-explicit unsupported-type error because PostgreSQL has no lossless built-in
-scalar mapping for them. Parameter narrowing is explicit and range checked.
-
-These PostgreSQL types are value carriers, not NetbaDB type identities. SQL
-context determines the exact NetbaDB parameter type; an OID supplies only a
-fallback when context is absent. Likewise, PostgreSQL introspection followed by
-DDL recreation does not preserve exact NetbaDB physical identity when several
-types share a carrier: both Int8 and Int16 reflect as `smallint`, for example,
-and recreating `smallint` produces Int16. Pgwire guarantees lossless value
-transport where a result mapping exists, not exact type-identity round trips.
+Native Protocol v2 carries NetbaDB physical types directly with stable tags and
+therefore preserves exact type identity. Parameter narrowing remains explicit
+and range checked; no external database type identifier acts as a fallback.
 
 Generated Go models map the supported fixed widths to `int8` through `int64`,
 `uint8` through `uint64`, `float32`, `float64`, `string`, and `[]byte`. Go

@@ -1,5 +1,14 @@
 # NetbaDB roadmap
 
+## PostgreSQL compatibility removal (complete)
+
+NetbaDB no longer treats PostgreSQL wire, dialect, catalog, or client
+compatibility as a current or future product objective. The former compatibility
+crate, server path, daemon mode, tests, scripts, and active documentation were
+removed. Native Protocol v2 is the sole network database protocol. Older entries
+below preserve implementation history only; they do not describe current APIs or
+open compatibility work. See [the removal report](postgresql-removal.md).
+
 ## Crash consistency and recovery audit
 
 The [audit report](crash-consistency-audit.md) covers Heap status publication,
@@ -1221,9 +1230,8 @@ unchanged. See [Daemon lifecycle v1](daemon-lifecycle-v1.md) and
   extended query, portal/statement close, SSL refusal, CancelRequest, and
   compatibility-query integration coverage.
 
-The phase is a foundation, not a general compatibility claim. P1 typed
-parameters, simultaneous listeners, and TLS; P2 catalog-derived `pg_catalog`
-and `information_schema`; and P3 broader PostgreSQL SQL remain open.
+This was an experimental historical direction. Its implementation and all
+uncompleted compatibility targets were later removed.
 
 ### PostgreSQL Compatibility Round 2 — typed Extended Query (complete)
 
@@ -1267,9 +1275,8 @@ and `information_schema`; and P3 broader PostgreSQL SQL remain open.
   autoload, reflected parameterized SELECT, Core CRUD and rollback, and ORM
   SELECT/CRUD against existing NetbaDB tables.
 
-A complete `pg_catalog` or `information_schema`, DDL/migrations, simultaneous
-listeners, PostgreSQL TLS/password authentication, actual cancellation, and
-broader dialect support remain explicit later work.
+The missing compatibility surface described by this historical round was not
+pursued and is no longer roadmap work.
 
 ### PostgreSQL Compatibility Round 4 — index reflection (complete)
 
@@ -1308,9 +1315,8 @@ broader dialect support remain explicit later work.
 - verified `\d users`, qualified/missing/wildcard variants, `\dt`, `\di`, and
   their required patterns with the real psql 17.11 executable.
 
-This remains an existing-schema inspection profile. `\d+`, unrelated slash
-commands, a general PostgreSQL regex engine/parser/catalog, migration DDL, and
-PostgreSQL-only metadata absent from NetbaDB remain unsupported.
+This was an existing-schema inspection profile. Its implementation and omitted
+compatibility extensions were later removed.
 
 ### PostgreSQL Compatibility Round 6 — index DDL lifecycle foundation (complete)
 

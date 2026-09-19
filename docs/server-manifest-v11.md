@@ -94,7 +94,7 @@ Receipt read permission may be true only when the same manifest declares
 missing deployment declaration. When read permission is true, the manifest's
 canonical path and capacity pin the externally visible journal. An explicit
 builder receipt configuration is accepted only when both canonical values are
-exactly equal; a mismatch fails Native and PostgreSQL startup. When read
+exactly equal; a mismatch fails Native startup. When read
 permission is false, an embedded host may replace the manifest default with an
 explicit builder configuration. A receipted apply response may still reveal
 its opaque scoped reference, but that reference does not grant list access.

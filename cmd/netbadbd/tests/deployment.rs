@@ -133,7 +133,7 @@ struct DaemonProcess {
 }
 
 impl DaemonProcess {
-    fn spawn(manifest: &Path, postgres: bool) -> Self {
+    fn spawn(manifest: &Path) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_netbadbd"));
         command
             .arg("--manifest")
@@ -141,9 +141,6 @@ impl DaemonProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        if postgres {
-            command.arg("--postgres");
-        }
         let mut child = command.spawn().unwrap();
         let stderr = child.stderr.take().expect("daemon stderr pipe");
         let (sender, lines) = mpsc::channel();
@@ -252,7 +249,7 @@ fn assert_driven_operator(fixture: &Fixture) {
 #[test]
 fn native_sigterm_gracefully_closes_driven_daemon_and_removes_operator_socket() {
     let fixture = manifest_fixture("native-sigterm", true, true, true);
-    let mut daemon = DaemonProcess::spawn(&fixture.manifest, false);
+    let mut daemon = DaemonProcess::spawn(&fixture.manifest);
     let ready = daemon.wait_for_readiness();
     assert!(ready.contains("native listener"), "readiness line: {ready}");
     assert!(ready.contains("adaptive driven"), "readiness line: {ready}");
@@ -282,7 +279,7 @@ fn native_sigterm_gracefully_closes_driven_daemon_and_removes_operator_socket() 
 #[test]
 fn native_sigint_gracefully_closes_disabled_daemon_without_operator() {
     let fixture = manifest_fixture("native-sigint", false, false, false);
-    let mut daemon = DaemonProcess::spawn(&fixture.manifest, false);
+    let mut daemon = DaemonProcess::spawn(&fixture.manifest);
     let ready = daemon.wait_for_readiness();
     assert!(
         ready.contains("adaptive disabled"),
@@ -304,39 +301,12 @@ fn native_sigint_gracefully_closes_disabled_daemon_without_operator() {
 }
 
 #[test]
-fn postgres_sigterm_gracefully_closes_driven_daemon() {
-    let fixture = manifest_fixture("postgres-sigterm", true, true, true);
-    let mut daemon = DaemonProcess::spawn(&fixture.manifest, true);
-    let ready = daemon.wait_for_readiness();
-    assert!(
-        ready.contains("PostgreSQL listener"),
-        "readiness line: {ready}"
-    );
-    assert!(ready.contains("adaptive driven"), "readiness line: {ready}");
-    assert!(
-        ready.contains("physical-design enabled"),
-        "readiness line: {ready}"
-    );
-    assert!(
-        ready.contains("physical-index-apply enabled"),
-        "readiness line: {ready}"
-    );
-    assert_driven_operator(&fixture);
-
-    daemon.send_signal("SIGTERM");
-    let (status, _) = daemon.wait();
-    assert!(status.success(), "graceful SIGTERM status: {status}");
-    assert!(!fixture.socket.as_ref().unwrap().exists());
-    fixture.cleanup();
-}
-
-#[test]
 fn operator_startup_failure_never_publishes_readiness() {
     let fixture = manifest_fixture("operator-conflict", true, true, true);
     let socket = fixture.socket.as_ref().unwrap();
     std::fs::write(socket, b"owned elsewhere").unwrap();
 
-    let daemon = DaemonProcess::spawn(&fixture.manifest, false);
+    let daemon = DaemonProcess::spawn(&fixture.manifest);
     let (status, lines) = daemon.wait();
     assert!(!status.success());
     assert!(
@@ -352,7 +322,7 @@ fn operator_startup_failure_never_publishes_readiness() {
 #[test]
 fn native_design_only_daemon_exposes_status_and_conditional_rotation() {
     let fixture = manifest_fixture("native-design-only", false, true, true);
-    let mut daemon = DaemonProcess::spawn(&fixture.manifest, false);
+    let mut daemon = DaemonProcess::spawn(&fixture.manifest);
     let ready = daemon.wait_for_readiness();
     assert!(
         ready.contains("adaptive disabled"),
@@ -384,36 +354,6 @@ fn native_design_only_daemon_exposes_status_and_conditional_rotation() {
     let (status, _) = daemon.wait();
     assert!(status.success());
     assert!(!fixture.socket.as_ref().unwrap().exists());
-    fixture.cleanup();
-}
-
-#[test]
-fn postgres_design_only_daemon_exposes_nbop_v6_status() {
-    let fixture = manifest_fixture("postgres-design-only", false, true, true);
-    let mut daemon = DaemonProcess::spawn(&fixture.manifest, true);
-    let ready = daemon.wait_for_readiness();
-    assert!(
-        ready.contains("adaptive disabled"),
-        "readiness line: {ready}"
-    );
-    assert!(
-        ready.contains("physical-design enabled"),
-        "readiness line: {ready}"
-    );
-    assert!(
-        ready.contains("physical-index-apply enabled"),
-        "readiness line: {ready}"
-    );
-    let config = ServerConfig::from_manifest_path(&fixture.manifest).unwrap();
-    let status = ServerOperatorClient::new(config.operator_config().unwrap())
-        .status()
-        .unwrap();
-    assert!(status.adaptive.is_none());
-    assert!(status.physical_design.is_some());
-
-    daemon.send_signal("SIGTERM");
-    let (status, _) = daemon.wait();
-    assert!(status.success());
     fixture.cleanup();
 }
 

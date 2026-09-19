@@ -63,14 +63,6 @@ three independent LSM v1 codecs. Inputs and persistent counts/lengths are
 bounded before allocation; malformed checksums, keys, versions, tombstones,
 and block boundaries return typed errors.
 
-`pgwire_decode` uses one selector byte to exercise either bounded PostgreSQL v3
-startup decoding or tagged frontend-message decoding. Arbitrary lengths,
-counts, C strings, UTF-8, format codes, parameters, and message tags must return
-a typed error without panic or unbounded allocation. The tagged path covers
-Parse, Bind (including text/binary payloads and malformed parameter lengths),
-Describe, Execute, Close, and every parameter/result format-code cardinality;
-the pgwire unit suite supplies valid base-type and exact-width assertions.
-
 Generate the small deterministic seed corpus and run a smoke fuzz with:
 
 ```bash
@@ -79,7 +71,6 @@ cargo +nightly fuzz run wal_recovery -- -runs=1000
 cargo +nightly fuzz run page_decode -- -runs=1000
 cargo +nightly fuzz run btree_decode -- -runs=1000
 cargo +nightly fuzz run index_catalog_decode -- -runs=1000
-cargo +nightly fuzz run pgwire_decode -- -runs=1000
 cargo +nightly fuzz run coordinator_log_decode -- -runs=1000
 cargo +nightly fuzz run partition_catalog_decode -- -runs=1000
 cargo +nightly fuzz run lsm_manifest_decode -- -runs=1000
@@ -166,8 +157,8 @@ cargo +nightly fuzz run schema_catalog_decode /private/tmp/netbadb-schema-corpus
 Copy `fuzz/corpus/schema_catalog_decode` into that temporary corpus first. The
 Core test `schema_catalog_tests::codec_reviewed_seed_export` deterministically
 exports these seeds only when `NETBADB_SCHEMA_SEED_DIR` is explicitly set.
-`btree_decode`, `index_catalog_decode`, `wal_recovery` and `pgwire_decode` remain
-required companion regression targets because catalog loading precedes recovery.
+`btree_decode`, `index_catalog_decode`, and `wal_recovery` remain required
+companion regression targets because catalog loading precedes recovery.
 
 ## Round 18 mutation journal and coordinator
 

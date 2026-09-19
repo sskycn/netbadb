@@ -2613,7 +2613,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn operator_bind_failure_stops_native_and_postgres_workers_without_removing_path() {
+    fn operator_bind_failure_stops_native_worker_without_removing_path() {
         let directory = test_directory("operator-startup-failure");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
@@ -2647,21 +2647,6 @@ mod tests {
         assert!(matches!(
             native,
             Err(crate::TcpServerError::Operator(
-                crate::ServerOperatorError::PathExists(_)
-            ))
-        ));
-        assert_eq!(std::fs::read(&socket).unwrap(), b"must survive");
-        Database::open(&heap, users_table("UserId"))
-            .unwrap()
-            .close()
-            .unwrap();
-
-        let postgres =
-            crate::PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
-                .start();
-        assert!(matches!(
-            postgres,
-            Err(crate::PostgresTcpServerError::Operator(
                 crate::ServerOperatorError::PathExists(_)
             ))
         ));
@@ -2909,7 +2894,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_modes_start_both_transports_and_builder_override_wins() {
+    fn manifest_modes_start_native_transport_and_builder_override_wins() {
         let directory = test_directory("adaptive-startup");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
@@ -2934,19 +2919,6 @@ mod tests {
         );
         native.shutdown().unwrap();
 
-        let postgres = crate::PostgresTcpServer::new(driven_config.clone())
-            .start()
-            .unwrap();
-        assert_eq!(
-            postgres.adaptive_control().status().unwrap().mode,
-            ServerAdaptiveMode::Driven
-        );
-        assert_eq!(
-            wait_for_manifest_driver_tick(&postgres.adaptive_control()).mode,
-            ServerAdaptiveMode::Driven
-        );
-        postgres.shutdown().unwrap();
-
         let feedback_override = ServerAdaptiveFeedbackConfig::new(AdaptiveEvidencePoolLimits {
             max_target_windows: 1,
             workload_limits: AdaptiveWorkloadLimits::new(1, 1),
@@ -2963,16 +2935,6 @@ mod tests {
         assert!(status.feedback.is_some());
         assert!(status.driver.is_none());
         native.shutdown().unwrap();
-        let postgres = crate::PostgresTcpServer::new(driven_config.clone())
-            .with_adaptive_feedback(feedback_override)
-            .start()
-            .unwrap();
-        let status = postgres.adaptive_control().status().unwrap();
-        assert_eq!(status.mode, ServerAdaptiveMode::FeedbackOnly);
-        assert!(status.feedback.is_some());
-        assert!(status.driver.is_none());
-        postgres.shutdown().unwrap();
-
         write_adaptive_manifest(
             &manifest,
             json!({"mode": "feedback_only", "feedback": feedback_json()}),
@@ -2985,14 +2947,6 @@ mod tests {
         assert_eq!(status.mode, ServerAdaptiveMode::FeedbackOnly);
         assert!(status.driver.is_none());
         native.shutdown().unwrap();
-        let postgres = crate::PostgresTcpServer::new(feedback_config.clone())
-            .start()
-            .unwrap();
-        let status = postgres.adaptive_control().status().unwrap();
-        assert_eq!(status.mode, ServerAdaptiveMode::FeedbackOnly);
-        assert!(status.driver.is_none());
-        postgres.shutdown().unwrap();
-
         let native = crate::TcpServer::new(feedback_config.clone())
             .with_adaptive_driver((*driver).clone())
             .start()
@@ -3002,21 +2956,11 @@ mod tests {
             ServerAdaptiveMode::Driven
         );
         native.shutdown().unwrap();
-        let postgres = crate::PostgresTcpServer::new(feedback_config)
-            .with_adaptive_driver((*driver).clone())
-            .start()
-            .unwrap();
-        assert_eq!(
-            postgres.adaptive_control().status().unwrap().mode,
-            ServerAdaptiveMode::Driven
-        );
-        postgres.shutdown().unwrap();
-
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn manifest_physical_design_starts_both_transports_and_builder_override_is_independent() {
+    fn manifest_physical_design_starts_native_transport_and_builder_override_is_independent() {
         let directory = test_directory("physical-design-startup");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
@@ -3046,21 +2990,6 @@ mod tests {
             ServerAdaptiveMode::FeedbackOnly
         );
         native.shutdown().unwrap();
-
-        let postgres = crate::PostgresTcpServer::new(config.clone())
-            .start()
-            .unwrap();
-        assert_eq!(
-            postgres
-                .physical_design_control()
-                .status()
-                .unwrap()
-                .evidence
-                .limits
-                .max_columnar_candidates,
-            12
-        );
-        postgres.shutdown().unwrap();
 
         let replacement = ServerPhysicalDesignAdvisorConfig::new(
             PhysicalDesignEvidenceLimits {
@@ -3112,31 +3041,11 @@ mod tests {
         );
         native.shutdown().unwrap();
 
-        let postgres = crate::PostgresTcpServer::new(config)
-            .with_physical_design_advisor(replacement)
-            .start()
-            .unwrap();
-        assert_eq!(
-            postgres
-                .physical_design_control()
-                .status()
-                .unwrap()
-                .evidence
-                .limits
-                .max_index_candidates,
-            91
-        );
-        assert_eq!(
-            postgres.adaptive_control().status().unwrap().mode,
-            ServerAdaptiveMode::FeedbackOnly
-        );
-        postgres.shutdown().unwrap();
-
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn operator_receipt_scope_pins_equal_native_and_postgres_builder_configs() {
+    fn operator_receipt_scope_pins_native_builder_config() {
         let directory = test_directory("receipt-builder-pinning");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(directory.join("run")).unwrap();
@@ -3177,13 +3086,6 @@ mod tests {
             .start()
             .unwrap();
         native.shutdown().unwrap();
-        let postgres =
-            crate::PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
-                .with_physical_design_mutation_receipts(equal)
-                .start()
-                .unwrap();
-        postgres.shutdown().unwrap();
-
         let different = ServerPhysicalDesignMutationReceiptConfig::new(
             directory.join("run/receipts-a.nbmr"),
             67_108_865,
@@ -3199,17 +3101,6 @@ mod tests {
                     crate::ServerPhysicalDesignMutationReceiptStartupError::OperatorPolicyMismatch
                 )
         ));
-        assert!(matches!(
-            crate::PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
-                .with_physical_design_mutation_receipts(different)
-                .start(),
-            Err(crate::PostgresTcpServerError::PhysicalDesignMutationReceipts(error))
-                if matches!(
-                    *error,
-                    crate::ServerPhysicalDesignMutationReceiptStartupError::OperatorPolicyMismatch
-                )
-        ));
-
         value["operator"]["allow_physical_design_receipt_read"] = json!(false);
         std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
         let native_override = ServerPhysicalDesignMutationReceiptConfig::new(
@@ -3223,19 +3114,6 @@ mod tests {
             .unwrap();
         native.shutdown().unwrap();
         assert!(native_override.path().is_file());
-
-        let postgres_override = ServerPhysicalDesignMutationReceiptConfig::new(
-            directory.join("run/postgres-override.nbmr"),
-            67_108_864,
-        )
-        .unwrap();
-        let postgres =
-            crate::PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
-                .with_physical_design_mutation_receipts(postgres_override.clone())
-                .start()
-                .unwrap();
-        postgres.shutdown().unwrap();
-        assert!(postgres_override.path().is_file());
 
         let _ = std::fs::remove_file(operator_socket);
         std::fs::remove_dir_all(directory).unwrap();

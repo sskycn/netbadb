@@ -2,9 +2,9 @@
 
 Round 17 introduces an experimental database-level full committed snapshot.
 This is a typed binary contract, not serde, SQL text, an event log, or a
-PostgreSQL catalog. The synchronous implementation is in Core alongside the
-existing database coordinator and PartitionCatalog. It depends only on lower
-schema/type/storage layers.
+frontend compatibility catalog. The synchronous implementation is in Core
+alongside the existing database coordinator and PartitionCatalog. It depends
+only on lower schema/type/storage layers.
 
 ## Files and authority
 
