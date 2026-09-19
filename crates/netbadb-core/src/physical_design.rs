@@ -9,8 +9,9 @@ use netbadb_rel::{
 };
 use netbadb_schema::SchemaFingerprint;
 use netbadb_storage::{
-    LsmMaintenanceAnchor, LsmMaintenanceBoundInspection, StorageKind,
-    StoragePhysicalDesignSourceInspection, TableStorage,
+    CheckpointError, LsmMaintenanceAnchor, LsmMaintenanceBoundInspection, StorageError,
+    StorageKind, StoragePhysicalDesignSourceInspection, TableStorage, TransactionError,
+    TxnStatusError,
 };
 use netbadb_types::{
     ChangeStreamGeneration, ColumnId, ColumnarProjectionId, DatabaseCommitSeq, IndexId, IndexName,
@@ -277,6 +278,23 @@ impl Error for PhysicalDesignMutationWorkInspectionError {
             Self::Database(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl PhysicalDesignMutationWorkInspectionError {
+    /// Whether inspection encountered an already recovery-gated storage runtime.
+    /// This says nothing about whether the proposed physical-design mutation ran;
+    /// inspection errors always precede mutation authority.
+    #[must_use]
+    pub const fn requires_recovery(&self) -> bool {
+        matches!(
+            self,
+            Self::Database(DatabaseError::Storage(
+                StorageError::Transaction(TransactionError::RecoveryRequired)
+                    | StorageError::Checkpoint(CheckpointError::RecoveryRequired)
+                    | StorageError::TxnStatus(TxnStatusError::RecoveryRequired)
+            ))
+        )
     }
 }
 
@@ -1817,6 +1835,34 @@ impl From<DatabaseError> for PhysicalDesignAdvisorError {
 }
 
 impl Database {
+    /// Places the selected live storage in its real recovery-required state for
+    /// cross-crate integration tests.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn inject_physical_design_storage_recovery_required(
+        &self,
+        table_id: TableId,
+    ) -> Result<(), PhysicalDesignMutationWorkInspectionError> {
+        let (_, _, storage) = self.mutation_work_source(table_id, &[])?;
+        storage.inject_recovery_required();
+        Ok(())
+    }
+
+    /// Places the live Projection Registry in its real recovery-required state
+    /// for cross-crate integration tests.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn inject_projection_catalog_recovery_required(
+        &mut self,
+        projection_id: ColumnarProjectionId,
+    ) {
+        self.projections.mark_recovery_required(
+            projection_id,
+            "integration test",
+            "injected recovery requirement",
+        );
+    }
+
     /// Inspects the current hypothetical build-capable target independently of
     /// recommendation and existing coverage. Scans no rows, runs no ANALYZE,
     /// reserves no identity, and mutates no storage/evidence/scheduler state.

@@ -802,6 +802,7 @@ pub enum OperatorPhysicalDesignMutationAdmissionRejectionV6 {
         maximum: u64,
     },
     InspectionFailed {},
+    RecoveryRequired {},
 }
 
 impl From<PhysicalDesignMutationAdmissionConstraint>
@@ -3084,6 +3085,9 @@ fn physical_columnar_remote_error_with_receipt(
         ServerPhysicalColumnarDesignControlError::LocationConflict { .. } => {
             OperatorErrorCodeV6::PhysicalColumnarLocationConflict
         }
+        ServerPhysicalColumnarDesignControlError::LocationInspection(
+            DatabaseError::ProjectionCatalog(ProjectionCatalogError::RecoveryRequired { .. }),
+        ) => OperatorErrorCodeV6::PhysicalColumnarRecoveryRequired,
         ServerPhysicalColumnarDesignControlError::PlacementInspection { .. }
         | ServerPhysicalColumnarDesignControlError::LocationInspection(_) => {
             OperatorErrorCodeV6::PhysicalColumnarPlacementUnavailable
@@ -3448,6 +3452,10 @@ fn admission_remote_error(
                 maximum,
             },
             "physical-design mutation component bound exceeds its configured maximum",
+        ),
+        PhysicalDesignMutationAdmissionError::Inspection(error) if error.requires_recovery() => (
+            OperatorPhysicalDesignMutationAdmissionRejectionV6::RecoveryRequired {},
+            "current mutation-work inspection requires restart/reopen before retry",
         ),
         PhysicalDesignMutationAdmissionError::Inspection(_) => (
             OperatorPhysicalDesignMutationAdmissionRejectionV6::InspectionFailed {},

@@ -22,6 +22,7 @@ sha2.workspace = true
 
 [dev-dependencies]
 netbadb-compiler = { path = "../netbadb-compiler" }
+netbadb-core = { path = "../netbadb-core", features = ["test-hooks"] }
 netbadb-parser = { path = "../netbadb-parser" }
 netbadb-storage = { path = "../netbadb-storage" }
 rcgen = "0.13.2"

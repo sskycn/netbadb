@@ -1733,6 +1733,11 @@ impl TransactionManager {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn inject_recovery_required(&self) {
+        self.runtime.writer.set(WriterState::RecoveryRequired);
+    }
+
     pub(crate) fn ensure_clean_close(&self) -> Result<(), StorageError> {
         if self.statuses.borrow().is_poisoned() {
             return Err(TransactionError::RecoveryRequired.into());

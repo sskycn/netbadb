@@ -271,6 +271,158 @@ mod operator_admission_tests {
         }
     }
 
+    fn discard_recovery_fixture(fixture: Fixture) {
+        let Fixture { root, database } = fixture;
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn assert_storage_recovery_rejection(
+        fixture: &mut Fixture,
+        runtime: &mut ServerPhysicalDesignRuntime,
+        target: Target,
+    ) {
+        configure(
+            runtime,
+            target,
+            constraint(Dimension::SourceWorkUnits, u64::MAX),
+        );
+        let before_commit = current_commit_seq(&fixture.database);
+        let epoch = runtime.evidence.epoch().0;
+        let error = apply_wire(
+            fixture,
+            runtime,
+            target,
+            "recovery",
+            true,
+            epoch,
+        )
+        .unwrap_err();
+        let OperatorClientError::Remote(remote) = error else {
+            panic!("recovery inspection must be a definite rejection: {error:?}")
+        };
+        assert_eq!(
+            remote.code,
+            OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected
+        );
+        assert_eq!(
+            serde_json::to_value(remote.admission.as_ref().unwrap()).unwrap(),
+            serde_json::json!({ "kind": "recovery_required" })
+        );
+        assert_eq!(
+            remote.message,
+            "current mutation-work inspection requires restart/reopen before retry"
+        );
+        let reference = remote.receipt.expect("durable Begin is retained");
+        assert_eq!(current_commit_seq(&fixture.database), before_commit);
+        assert!(fixture.database.indexes(TABLE_ID).unwrap().is_empty());
+        assert!(fixture.database.inspect_columnar_projections().is_empty());
+        assert!(!fixture.root.join("placements/recovery").exists());
+        let page = receipts(&mut fixture.database, runtime, None, 128).unwrap();
+        let receipt = page.receipts.last().unwrap();
+        assert_eq!(receipt.id.0, reference.receipt_id);
+        assert_eq!(
+            receipt.outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::Rejected
+        );
+        assert!(!receipt_status(&mut fixture.database, runtime)
+            .unwrap()
+            .recovery_required);
+    }
+
+    #[test]
+    fn nbop_existing_projection_catalog_recovery_requires_reopen() {
+        let mut fixture = Fixture::create("p35-existing-projection-recovery");
+        let mut runtime = runtime(&mut fixture, true);
+        fixture
+            .database
+            .inject_projection_catalog_recovery_required(ColumnarProjectionId(77));
+        let before_commit = current_commit_seq(&fixture.database);
+        let epoch = runtime.evidence.epoch().0;
+        let error = apply_wire(
+            &mut fixture,
+            &mut runtime,
+            Target::Columnar(PhysicalColumnarDesignMode::Snapshot),
+            "recovery",
+            true,
+            epoch,
+        )
+        .unwrap_err();
+        let OperatorClientError::Remote(remote) = error else {
+            panic!("existing catalog recovery is definite: {error:?}")
+        };
+        assert_eq!(
+            remote.code,
+            OperatorErrorCodeV6::PhysicalColumnarRecoveryRequired
+        );
+        assert!(remote.admission.is_none());
+        assert!(remote.message.contains("restart/reopen"));
+        assert!(remote.message.contains("before retrying the exact approval"));
+        let reference = remote.receipt.expect("durable Begin is retained");
+        assert_eq!(current_commit_seq(&fixture.database), before_commit);
+        assert!(fixture.database.inspect_columnar_projections().is_empty());
+        assert!(!fixture.root.join("placements/recovery").exists());
+        let page = receipts(&mut fixture.database, &mut runtime, None, 128).unwrap();
+        let receipt = page.receipts.last().unwrap();
+        assert_eq!(receipt.id.0, reference.receipt_id);
+        assert_eq!(
+            receipt.outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::Rejected
+        );
+        assert!(!receipt_status(&mut fixture.database, &mut runtime)
+            .unwrap()
+            .recovery_required);
+        drop(runtime);
+        fixture.close();
+    }
+
+    #[test]
+    fn operator_index_admission_storage_recovery_requires_reopen() {
+        let mut fixture = Fixture::create("p35-index-storage-recovery");
+        let mut runtime = runtime(&mut fixture, true);
+        fixture
+            .database
+            .inject_physical_design_storage_recovery_required(TABLE_ID)
+            .unwrap();
+        assert_storage_recovery_rejection(&mut fixture, &mut runtime, Target::Index);
+        drop(runtime);
+        discard_recovery_fixture(fixture);
+    }
+
+    #[test]
+    fn operator_heap_columnar_admission_storage_recovery_requires_reopen() {
+        let mut fixture = Fixture::create("p35-heap-columnar-storage-recovery");
+        let mut runtime = runtime(&mut fixture, true);
+        fixture
+            .database
+            .inject_physical_design_storage_recovery_required(TABLE_ID)
+            .unwrap();
+        assert_storage_recovery_rejection(
+            &mut fixture,
+            &mut runtime,
+            Target::Columnar(PhysicalColumnarDesignMode::Snapshot),
+        );
+        drop(runtime);
+        discard_recovery_fixture(fixture);
+    }
+
+    #[test]
+    fn operator_columnar_admission_storage_recovery_requires_reopen() {
+        let mut fixture = lsm_fixture();
+        let mut runtime = runtime(&mut fixture, true);
+        fixture
+            .database
+            .inject_physical_design_storage_recovery_required(TABLE_ID)
+            .unwrap();
+        assert_storage_recovery_rejection(
+            &mut fixture,
+            &mut runtime,
+            Target::Columnar(PhysicalColumnarDesignMode::Snapshot),
+        );
+        drop(runtime);
+        discard_recovery_fixture(fixture);
+    }
+
     #[test]
     fn operator_heap_components_receipts_noops_and_programmatic_authority() {
         for target in [

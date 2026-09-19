@@ -1385,6 +1385,11 @@ impl LsmStorage {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn inject_recovery_required(&self) {
+        self.shared.borrow().runtime.recovery_required.set(true);
+    }
+
     pub fn read_view(&self) -> Result<LsmReadView, StorageError> {
         let shared = self.shared.borrow();
         new_read_view(&shared, None, BTreeMap::new(), shared.maximum_commit_seq())

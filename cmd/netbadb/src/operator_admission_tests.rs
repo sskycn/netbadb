@@ -38,6 +38,7 @@ mod admission_tests {
                 maximum: 10000,
             },
             Rejection::InspectionFailed {},
+            Rejection::RecoveryRequired {},
         ] {
             for receipt in [
                 None,
@@ -58,11 +59,12 @@ mod admission_tests {
                 let output = error.to_string();
                 assert!(output.starts_with("admission rejected:"));
                 assert_eq!(output.contains("receipt"), receipt.is_some());
-                assert!(!output.contains("private") && !output.contains("retry"));
+                assert!(!output.contains("private"));
                 match admission {
                     Rejection::RequiredBoundNotProven { .. } => assert!(output.contains("source_work_units has no proven current conservative bound")),
                     Rejection::LimitExceeded { .. } => assert!(output.contains("source_read_bytes conservative bound 12345 exceeds configured maximum 10000")),
                     Rejection::InspectionFailed {} => assert!(output.contains("current mutation-work inspection failed before mutation")),
+                    Rejection::RecoveryRequired {} => assert!(output.contains("current mutation-work inspection requires restart/reopen before retry")),
                 }
             }
         }

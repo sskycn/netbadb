@@ -368,6 +368,10 @@ fn render_admission_rejection(
         OperatorPhysicalDesignMutationAdmissionRejectionV6::InspectionFailed {} => {
             "admission rejected: current mutation-work inspection failed before mutation".into()
         }
+        OperatorPhysicalDesignMutationAdmissionRejectionV6::RecoveryRequired {} => {
+            "admission rejected: current mutation-work inspection requires restart/reopen before retry"
+                .into()
+        }
     }
 }
 

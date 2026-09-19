@@ -2374,6 +2374,16 @@ impl TableStorage {
         }
     }
 
+    /// Places the live engine in its real recovery-required state for integration tests.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn inject_recovery_required(&self) {
+        match self {
+            Self::Heap(storage) => storage.inject_recovery_required(),
+            Self::Lsm(storage) => storage.inject_recovery_required(),
+        }
+    }
+
     pub fn flush(&self) -> Result<(), StorageError> {
         #[cfg(any(test, feature = "test-hooks"))]
         crate::source_inspection_test_activity::record(|activity| activity.flush_calls += 1);

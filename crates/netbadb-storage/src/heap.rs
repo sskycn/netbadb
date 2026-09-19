@@ -2041,6 +2041,11 @@ impl HeapStorage {
         self.transactions.ensure_recovery_ready()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn inject_recovery_required(&self) {
+        self.transactions.inject_recovery_required();
+    }
+
     /// Pins a committed statement snapshot for a read that is not associated
     /// with an explicit transaction.
     pub fn read_view(&self) -> Result<ReadView, StorageError> {

@@ -526,7 +526,11 @@ deployment modes; approved requests carry no budget or inspection and remain
 one command. Core recomputes current bounds only after no-op/stale/advisor
 checks. Status presents exact configured constraints; typed rejection diagnostics
 expose no private inspection errors. NBMR Begin/Rejected/uncertainty semantics
-and programmatic per-call authority remain intact. NBMR v3, Native v2, PG wire,
+and programmatic per-call authority remain intact. Final recovery hardening keeps
+existing Projection Catalog recovery distinct from pre-mutation Heap/LSM
+inspection recovery: the former retains the Columnar reopen code, while the
+latter is a typed `recovery_required` admission rejection. Both durably reject
+an existing Begin without recovery-gating NBMR. NBMR v3, Native v2, PG wire,
 Inspection JSON v7 and all persistent formats remain unchanged.
 
 Columnar Phase 2D keeps the same one-way boundary but changes physical
