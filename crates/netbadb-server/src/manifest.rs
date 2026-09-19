@@ -1559,6 +1559,11 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn deployment_manifest_version_remains_eleven() {
+        assert_eq!(DEPLOYMENT_MANIFEST_VERSION, 11);
+    }
+
     fn test_directory(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("netbadb-manifest-{name}-{}", std::process::id()))
     }
@@ -2531,7 +2536,7 @@ mod tests {
         let client = crate::ServerOperatorClient::new(&operator_config);
         let before = client.status().unwrap();
         let adaptive = before.adaptive.as_ref().unwrap();
-        assert_eq!(adaptive.mode, crate::OperatorAdaptiveModeV6::FeedbackOnly);
+        assert_eq!(adaptive.mode, crate::OperatorAdaptiveModeV7::FeedbackOnly);
         assert_eq!(adaptive.feedback.window_epoch, 0);
         assert!(adaptive.driver.is_none());
         assert!(before.physical_design.is_none());
@@ -2547,7 +2552,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let mut frame = b"NBOP\0\x06\0\0".to_vec();
+        let mut frame = b"NBOP\0\x07\0\0".to_vec();
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&payload);
         let mut lost_response = UnixStream::connect(operator_config.unix_socket()).unwrap();
@@ -2580,8 +2585,8 @@ mod tests {
         assert!(matches!(
             client.rotate_evidence(0),
             Err(crate::OperatorClientError::Remote(
-                crate::OperatorRemoteErrorV6 {
-                    code: crate::OperatorErrorCodeV6::EvidenceWindowChanged,
+                crate::OperatorRemoteErrorV7 {
+                    code: crate::OperatorErrorCodeV7::EvidenceWindowChanged,
                     ..
                 }
             ))
@@ -2599,8 +2604,8 @@ mod tests {
         assert!(matches!(
             client.reset_faulted_scheduler(),
             Err(crate::OperatorClientError::Remote(
-                crate::OperatorRemoteErrorV6 {
-                    code: crate::OperatorErrorCodeV6::DriverNotEnabled,
+                crate::OperatorRemoteErrorV7 {
+                    code: crate::OperatorErrorCodeV7::DriverNotEnabled,
                     ..
                 }
             ))

@@ -1,6 +1,11 @@
 # NetbaDB local operator protocol v6
 
-NBOP v6 is the current local Unix-domain operator contract. NBOP v5 is
+> Historical contract. Current binaries reject v6; use
+> [NBOP v7](server-operator-protocol-v7.md). Public V6 Rust DTOs retain their
+> exact historical shapes and do not include an admission
+> `recovery_required` variant.
+
+NBOP v6 was the local Unix-domain operator contract. NBOP v5 was already
 historical and explicitly rejected. Native Protocol v2, PostgreSQL wire,
 Inspection JSON v7, and all database persistent formats are unchanged.
 
@@ -216,6 +221,7 @@ returned receipt, and never retries, relaxes a limit, switches mode, or queries
 receipts automatically. No automatic design, evidence rotation, stream enablement,
 scheduler action, or client transaction-state change is introduced.
 
-V5 public Rust DTOs are frozen in `operator_v5.rs`; only V6 is accepted on the
-wire. Header size and payload cap, NBMR v3, Native Protocol v2, PostgreSQL wire,
-Inspection JSON v7 and all database persistent formats are unchanged.
+V5 and V6 public Rust DTOs are frozen in `operator_v5.rs` and `operator_v6.rs`.
+Current binaries accept only V7 on the wire and reject v6, v5, and all other
+versions. Header size and payload cap, NBMR v3, Native Protocol v2, PostgreSQL
+wire, Inspection JSON v7 and all database persistent formats are unchanged.

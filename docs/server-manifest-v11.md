@@ -167,4 +167,5 @@ Without `operator`, change only `version` from 10 to 11. With `operator`, also
 add exactly the three explicit `{"mode":"unadmitted"}` fields in the complete
 example to preserve old behavior. There is no hidden migration default or dual
 decoder. Selecting component limits is a separate deployment decision.
-See [NBOP v6](server-operator-protocol-v6.md).
+See [NBOP v7](server-operator-protocol-v7.md). NBOP v6 is historical and is
+rejected by current binaries.

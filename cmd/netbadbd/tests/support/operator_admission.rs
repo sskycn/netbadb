@@ -3,11 +3,11 @@ mod phase35 {
     use super::*;
     use netbadb_core::{DatabaseCoordinatorConfig, TableStorageCreateSpec};
     use netbadb_server::{
-        OperatorClientError, OperatorErrorCodeV6, OperatorPhysicalColumnarDesignModeV6 as Mode,
-        OperatorPhysicalDesignMutationAdmissionDimensionV6 as AdmissionDimension,
-        OperatorPhysicalDesignMutationAdmissionModeV6 as Admission,
-        OperatorPhysicalDesignMutationAdmissionRejectionV6 as AdmissionRejection,
-        OperatorPhysicalDesignMutationReceiptOutcomeV6 as ReceiptOutcome,
+        OperatorClientError, OperatorErrorCodeV7, OperatorPhysicalColumnarDesignModeV7 as Mode,
+        OperatorPhysicalDesignMutationAdmissionDimensionV7 as AdmissionDimension,
+        OperatorPhysicalDesignMutationAdmissionModeV7 as Admission,
+        OperatorPhysicalDesignMutationAdmissionRejectionV7 as AdmissionRejection,
+        OperatorPhysicalDesignMutationReceiptOutcomeV7 as ReceiptOutcome,
     };
     use serde_json::json;
     use std::io::{Read, Write};
@@ -197,7 +197,7 @@ mod phase35 {
         };
         assert_eq!(
             remote.code,
-            OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected
+            OperatorErrorCodeV7::PhysicalDesignMutationAdmissionRejected
         );
         let admission = remote.admission.unwrap();
         let reference = remote.receipt.unwrap();
@@ -298,7 +298,7 @@ mod phase35 {
             .apply_physical_index(old_token, epoch, 1, 2, "by_category")
             .unwrap_err();
         assert!(
-            matches!(error,OperatorClientError::Remote(remote) if remote.code==OperatorErrorCodeV6::PhysicalDesignRuntimeChanged && remote.admission.is_none())
+            matches!(error,OperatorClientError::Remote(remote) if remote.code==OperatorErrorCodeV7::PhysicalDesignRuntimeChanged && remote.admission.is_none())
         );
         query(addr, postgres, "SELECT id FROM users WHERE category = 7");
         query(addr, postgres, "SELECT id FROM users");
@@ -342,14 +342,14 @@ mod phase35 {
                 .apply_physical_index(token.clone(), epoch, 1, 2, "by_category")
                 .unwrap()
                 .outcome,
-            netbadb_server::OperatorPhysicalIndexApplyOutcomeV6::AlreadyApplied { .. }
+            netbadb_server::OperatorPhysicalIndexApplyOutcomeV7::AlreadyApplied { .. }
         ));
         assert!(matches!(
             operator
                 .apply_physical_columnar(token, epoch, 1, vec![1], Mode::Snapshot, "snapshot")
                 .unwrap()
                 .outcome,
-            netbadb_server::OperatorPhysicalColumnarApplyOutcomeV6::AlreadyApplied { .. }
+            netbadb_server::OperatorPhysicalColumnarApplyOutcomeV7::AlreadyApplied { .. }
         ));
         daemon.send_signal("SIGTERM");
         assert!(daemon.wait().0.success());

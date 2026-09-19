@@ -3,6 +3,12 @@
 Phase 36 proves two previously unknown current-state components without adding
 an admission dimension or changing a persistent or wire format:
 
+> Forward compatibility note: the later NBOP v7 correction changes only the
+> current operator protocol namespace and adds the typed pre-mutation
+> `recovery_required` admission diagnostic. The Phase 36 bounds, Manifest v11,
+> NBMR v3, Native Protocol v2, Inspection JSON v7, and persistent formats are
+> unchanged; NBOP v6 is now a frozen, rejected historical DTO contract.
+
 - application-level bytes written by the initial immutable Columnar base
   artifact writer (`NBCS` plus `NBCM`); and
 - the prospective SSTable extent scanned by Snapshot Columnar after its

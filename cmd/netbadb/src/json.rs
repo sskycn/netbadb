@@ -1398,7 +1398,12 @@ mod tests {
         TableId,
     };
 
-    use super::{render_catalog, render_statement};
+    use super::{INSPECTION_JSON_VERSION, render_catalog, render_statement};
+
+    #[test]
+    fn inspection_json_version_remains_seven() {
+        assert_eq!(INSPECTION_JSON_VERSION, 7);
+    }
 
     fn column(id: u32, name: &str, physical: PhysicalType) -> ColumnReferenceInspection {
         bound_column(0, 1, "users", id, name, physical)

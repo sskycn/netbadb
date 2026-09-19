@@ -518,8 +518,8 @@ terminal `Rejected`. Existing mutation uncertainty and Columnar recovery priorit
 remain unchanged. Manifest v10, NBOP v5, NBMR v3, CLI/daemon, database wire and
 persistent formats gained no admission surface in Phase 34.
 
-[Adaptive Operations Phase 35](adaptive-operations-phase35.md) adds operator
-component mutation admission through Manifest v11 and NBOP v6. Three required,
+[Adaptive Operations Phase 35](adaptive-operations-phase35.md) originally added
+operator component mutation admission through Manifest v11 and NBOP v6. Three required,
 independent Index/Snapshot/Incremental modes select explicit unadmitted behavior
 or a Core-validated six-component policy. The sole worker owns the immutable
 deployment modes; approved requests carry no budget or inspection and remain
@@ -544,8 +544,12 @@ and reuses the existing flush-output theorem to bound Snapshot's prospective
 post-flush SSTable extent. Inspection remains metadata-only and O(columns) or
 O(SSTables + columns). Columnar output and Snapshot-LSM source read populate the
 existing Phase 34/35 dimensions; Index output and LSM source work remain
-`NotProven`. Manifest v11, NBOP v6, NBMR v3 and every persistent format remain
-unchanged.
+`NotProven`. Phase 36 itself left Manifest v11, NBOP v6, NBMR v3 and every
+persistent format unchanged. The later compatibility correction freezes V6 DTOs
+and moves the current operator wire to NBOP v7 solely for the typed
+`recovery_required` admission diagnostic; Manifest v11, NBMR v3, Native
+Protocol v2, Inspection JSON v7, Core/Storage recovery semantics, and persistent
+formats remain unchanged.
 
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta

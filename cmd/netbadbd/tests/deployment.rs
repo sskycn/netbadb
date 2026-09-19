@@ -388,7 +388,7 @@ fn native_design_only_daemon_exposes_status_and_conditional_rotation() {
 }
 
 #[test]
-fn postgres_design_only_daemon_exposes_nbop_v6_status() {
+fn postgres_design_only_daemon_exposes_nbop_v7_status() {
     let fixture = manifest_fixture("postgres-design-only", false, true, true);
     let mut daemon = DaemonProcess::spawn(&fixture.manifest, true);
     let ready = daemon.wait_for_readiness();
