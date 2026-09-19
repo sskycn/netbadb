@@ -34,7 +34,7 @@ A hard count bound is not necessarily a practical deployment memory budget.
 | Programmatic controls | Shared admission per handle family | Hard one queued/forwarded/executing control per family, across clones | Host controls number of blocked callers | Permit spans send and reply; failure/panic releases it |
 | Scheduler ticks | Host driver | Hard one pending reply; coalesced missed cadence | Wall-clock opportunities, not SQL-created queue nodes | Completion clears pending state |
 | Parked prepared participants | Core group / storage transaction handles | Core explicit group ≤1,024 members and ≤1,024 participants total; direct low-level storage API is caller/lifetime bounded | Embedded host APIs, not a streaming network command producer | Ordered commit/abort removes parked IDs and conflict entries; recovery gate on unresolved ownership |
-| QueryResult | Executor/Core, then session/transport | Output bounded only: `O(R × W)`; no byte budget | SQL cardinality, projection, stored values | Drop after response/rejection; suspended PG portals retain unsent results |
+| QueryResult | Executor/Core, then session/transport | Successful Core output rows bounded by SessionState policy; `O(R × W)` within that count and no byte/scalar-slot budget | SQL cardinality, projection, stored values | Drop after response/rejection; suspended PG portals retain unsent results |
 | Full Sort | Executor | Input bounded `O(N × W)` plus sort metadata; no spill | Yes | On result/error/drop |
 | Top-N | Executor | Retained candidates `≤ min(N,K)`; initial reserve `min(K,256)` | Yes | On result/error/drop |
 | Aggregate | Executor accumulator | `O(G × (keys + aggregate states))` plus one batch | Yes | Finish/error/drop; repeated keys do not create new groups |
@@ -44,7 +44,7 @@ A hard count bound is not necessarily a practical deployment memory budget.
 | Index / range lookup results | Storage caller | Input bounded owned `Vec` of matches; not a cursor memory limit | Match count and row width | At caller/probe completion |
 | Native request/response frame | Protocol/connection | Hard 16 MiB payload; 65,536 collection items; frame/payload copies `O(B)` | Yes within validated lengths | Per request/message; malformed frame closes connection |
 | PostgreSQL frame | PG wire / connection | Hard 16 MiB message, 1 MiB string; 1,024 parameters / 4,096 fields; remaining-byte proof before count reserve | Yes | Per message / connection |
-| Native response batch | Connection thread | Complete result batch after row policy; default 100,000 rows, maximum configurable 10,000,000 | Yes; row policy is post-execution | After writing/error; slow consumer retains batch |
+| Native response batch | Connection thread | Complete permitted result batch; default 100,000 rows, maximum configurable 10,000,000; encoder rechecks the Core-owned row policy | Yes within configured row count and frame bounds | After writing/error; slow consumer retains batch |
 | PostgreSQL prepared statements / portals | Worker session | Each map ≤1,024 objects; count bound, not aggregate byte budget | SQL, parameter values, pending results | Close/replace/session teardown; completed portal drops all row storage |
 | Read-only SAVEPOINT metadata | Worker session | Hard 1,024 names, ≤63 bytes/name | SQL transaction | RELEASE/ROLLBACK/COMMIT/session teardown |
 | Heap buffer frames | BufferPool | Hard configured frames, default 8 | Host configuration, not client-created frames | Pins via guards; pool closes/flushed through existing contracts |
@@ -159,8 +159,12 @@ whole-operation deadline.
 Response queues do not accumulate multiple outstanding queries per connection.
 Nevertheless, C slow readers can retain C complete response batches. PG suspended
 portals multiply retained, unsent results by their per-session portal count.
-The post-execution row cap and per-frame byte cap do not jointly provide a
-practical whole-result/global memory budget. This audit does not claim otherwise.
+The Core output-row cap and per-frame byte cap do not jointly provide a
+practical whole-result/global memory budget: row width, operator state and the
+sum of retained responses remain separately unbounded. This audit does not
+claim otherwise. See the later
+[server execution/resource audit](server-execution-resource-audit.md) for the
+enforcement-point correction and measurements.
 
 An idle transaction is closed by socket inactivity timeout or disconnect cleanup,
 but a client making periodic progress can keep its transaction and writer owner
@@ -223,7 +227,7 @@ this audit deliberately does not replace the public result API or add spill.
 | NestedLoop | General `O(N×M)` predicate work and potentially `O(N×M)` output are legitimate for the chosen plan. No optimizer/algorithm rewrite. Existing differential join tests cover results and errors. |
 | Index/range/IndexJoin | Owned Vec match APIs can retain all matches; turning the returned Vec into later chunks would not cap allocation. This remains a storage/API limit. SST iteration itself is block based and metadata bounded. |
 | Projection | Existing pointer tests establish moves for unique/reordered values and clones only for duplicate output ownership. The wide-output experiment quantifies the required multiplication. |
-| PG value conversion | The worker can temporarily own QueryResult together with all encoded rows. Text-format bytea uses `2×bytes + 2` hex bytes, which is required representation expansion. R6 bounds subsequent wire-buffer copying; it does not turn this earlier result/format conversion into a streaming or byte-budgeted API. |
+| PG value conversion | The worker can temporarily own a policy-permitted QueryResult together with all encoded rows. Text-format bytea uses `2×bytes + 2` hex bytes, which is required representation expansion. R6 bounds subsequent wire-buffer copying; neither it nor the output-row cap turns this conversion into a streaming or byte-budgeted API. |
 | Partitioned SeqScan | 1k/10k/100k total rows over six partitions (three empty) always peak at one shared 256-row batch and `ceil(N/256)` deliveries. 64 all-empty partitions emit no batch. Metadata/views remain O(P), not constant total memory. |
 
 The first four-test resource operator run took 105.18 s, exposing LSM's repeated
@@ -307,7 +311,7 @@ Server/SDK request paths do not add an automatic retry loop for resource errors.
 - **Confirmed implementation defects left unfixed:** none from R1–R11 for newly
   admitted operations. Historical oversized LSM rows accepted by earlier versions
   can remain unflushable; no destructive automatic repair or migration is supplied.
-- **Architecture limits:** fully owned QueryResult; C retained response batches;
+- **Architecture limits:** fully owned, row-count-limited but not byte-limited QueryResult; C retained response batches;
   suspended portals retaining unsent results; full Sort; input-sized grouping,
   joins and index/range Vec APIs; non-preemptible worker execution/shutdown;
   long-lived transactions pinning visibility/history; input-sized Heap transaction
@@ -320,10 +324,11 @@ Server/SDK request paths do not add an automatic retry loop for resource errors.
 - **Legitimate expensive workloads:** high-cardinality groups, duplicate-key join
   outputs, wide duplicate projections, many partitions/tables, large DDL and
   maintenance/recovery histories. No silent truncation or semantic weakening.
-- **Future result budgets/streaming:** propagate cancellation/resource failure
-  through Core/executor/transaction ownership before changing API contracts;
-  define blocking-operator and output-byte budgets, and a separate spill design.
-  This task adds neither another worker nor a protocol cancellation surface.
+- **Future result budgets/streaming:** resource refusal now propagates through
+  Core/executor/transaction ownership; define blocking-operator and output-byte
+  budgets, cancellation checkpoints, and a separate spill design before
+  changing result API contracts. The later correction adds neither another
+  worker nor a protocol cancellation surface.
 - **Not reproduced / evidence limits:** no unbounded connection-thread/FD leak in
   the 1,000-connection probe; no actual OOM or stack overflow attempted; no physical
   power-loss claim; file-growth races are bounded by reader construction and not

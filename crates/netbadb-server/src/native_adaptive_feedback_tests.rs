@@ -256,7 +256,7 @@ fn native_authorization_denial_has_no_adaptive_side_effect() {
 }
 
 #[test]
-fn native_row_limit_failure_occurs_after_core_success_capture() {
+fn native_row_limit_is_a_core_execution_failure_without_success_capture() {
     let mut fixture = Fixture::create("row-limit");
     let policy = SessionPolicy::new(1).expect("one row policy");
     let mut session = session(policy, principal(true, false, false));
@@ -276,7 +276,7 @@ fn native_row_limit_failure_occurs_after_core_success_capture() {
         response.batch.messages.as_slice(),
         [ServerMessage::Error { .. }]
     ));
-    assert_eq!(runtime.inspection().progress.recorded_reports, 1);
+    assert_eq!(runtime.inspection().progress.recorded_reports, 0);
     fixture.close();
 }
 

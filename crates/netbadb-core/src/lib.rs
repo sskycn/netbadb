@@ -81,8 +81,8 @@ use netbadb_compiler::{
 };
 use netbadb_executor::{
     ExecutionColumnarProjection, ExecutionError, ExecutionReadView, ExecutionStorage,
-    ExecutionStorageBinding, PreparedMutation, execute_with_columnar_context,
-    execute_with_feedback_context, prepare_mutation_with_storage_context,
+    ExecutionStorageBinding, PreparedMutation, execute_with_columnar_context_and_limits,
+    execute_with_feedback_context_and_limits, prepare_mutation_with_storage_context,
 };
 use netbadb_inspect::StatementInspection;
 use netbadb_planner::{
@@ -208,7 +208,8 @@ pub use maintenance::{
 };
 pub use netbadb_executor::{
     ColumnarExecutionStatistics, ExecutionAccessKind, ExecutionAccessSample, ExecutionFilterSample,
-    ExecutionResult, ExecutionStatistics, ExecutionWork, QueryResult, ResultColumn,
+    ExecutionResult, ExecutionStatistics, ExecutionWork, QueryExecutionLimits, QueryResult,
+    ResultColumn,
 };
 pub use netbadb_inspect::{CatalogInspection, IndexKindInspection, TablePlacementInspection};
 pub use netbadb_planner::{
@@ -993,6 +994,7 @@ pub enum DatabaseErrorKind {
     DuplicateObject,
     UndefinedObject,
     TransactionState,
+    ResourceLimit,
     Operational,
     Internal,
 }
@@ -1033,6 +1035,9 @@ impl DatabaseError {
             }
             Self::Execution(ExecutionError::UnsupportedCast { .. }) => {
                 DatabaseErrorKind::CannotCoerce
+            }
+            Self::Execution(ExecutionError::OutputRowsExceeded { .. }) => {
+                DatabaseErrorKind::ResourceLimit
             }
             Self::Storage(StorageError::Index(
                 netbadb_index::IndexError::IndexAlreadyExists { .. }
@@ -5748,6 +5753,17 @@ impl Database {
         prepared: &PreparedStatement,
         values: &[ScalarValue],
     ) -> Result<ExecutionResult, DatabaseError> {
+        self.execute_prepared_with_limits(prepared, values, QueryExecutionLimits::unlimited())
+    }
+
+    /// Executes a prepared statement with a deterministic bound on externally
+    /// visible query output. The bound does not cover operator working memory.
+    pub fn execute_prepared_with_limits(
+        &mut self,
+        prepared: &PreparedStatement,
+        values: &[ScalarValue],
+        limits: QueryExecutionLimits,
+    ) -> Result<ExecutionResult, DatabaseError> {
         self.validate_prepared_dependencies(prepared, None)?;
         let logical = bind_statement(&prepared.compiled, values)?;
         let physical = self.plan_logical_statement(&logical);
@@ -5755,7 +5771,7 @@ impl Database {
             let storage_ids = self.storage_ids_for_tables(logical.read_tables())?;
             let view = self.autocommit_read_view(&storage_ids)?;
             return self
-                .execute_query_plan(plan, &view, None, None, None)
+                .execute_query_plan_with_limits(plan, &view, None, None, None, limits)
                 .map(ExecutionResult::Query);
         }
 
@@ -5771,6 +5787,19 @@ impl Database {
         prepared: &PreparedStatement,
         values: &[ScalarValue],
     ) -> Result<PreparedExecutionWithFeedback, DatabaseError> {
+        self.execute_prepared_with_feedback_and_limits(
+            prepared,
+            values,
+            QueryExecutionLimits::unlimited(),
+        )
+    }
+
+    pub fn execute_prepared_with_feedback_and_limits(
+        &mut self,
+        prepared: &PreparedStatement,
+        values: &[ScalarValue],
+        limits: QueryExecutionLimits,
+    ) -> Result<PreparedExecutionWithFeedback, DatabaseError> {
         self.validate_prepared_dependencies(prepared, None)?;
         let query_shape = match &prepared.compiled.logical_statement {
             netbadb_rel::LogicalStatement::Query(logical) => {
@@ -5783,11 +5812,12 @@ impl Database {
         if let PhysicalStatement::Query(plan) = &physical {
             let storage_ids = self.storage_ids_for_tables(logical.read_tables())?;
             let view = self.autocommit_read_view(&storage_ids)?;
-            let (result, feedback) = self.execute_planned_query_with_feedback(
+            let (result, feedback) = self.execute_planned_query_with_feedback_and_limits(
                 plan,
                 &view,
                 &estimates,
                 query_shape.ok_or(DatabaseError::ExpectedQuery)?,
+                limits,
             )?;
             return Ok(PreparedExecutionWithFeedback {
                 result: ExecutionResult::Query(result),
@@ -5846,6 +5876,21 @@ impl Database {
         transaction: &mut Transaction,
         prepared: &PreparedStatement,
         values: &[ScalarValue],
+    ) -> Result<ExecutionResult, DatabaseError> {
+        self.execute_prepared_in_with_limits(
+            transaction,
+            prepared,
+            values,
+            QueryExecutionLimits::unlimited(),
+        )
+    }
+
+    pub fn execute_prepared_in_with_limits(
+        &mut self,
+        transaction: &mut Transaction,
+        prepared: &PreparedStatement,
+        values: &[ScalarValue],
+        limits: QueryExecutionLimits,
     ) -> Result<ExecutionResult, DatabaseError> {
         self.validate_transaction(transaction)?;
         self.validate_prepared_dependencies(prepared, Some(transaction))?;
@@ -5929,7 +5974,7 @@ impl Database {
             let storage_ids = self.storage_ids_for_tables_in(logical.read_tables(), transaction)?;
             let view = transaction.begin_read_view(&storage_ids, &mut self.registry)?;
             return self
-                .execute_query_plan_in(plan, &view, transaction)
+                .execute_query_plan_in_with_limits(plan, &view, transaction, limits)
                 .map(ExecutionResult::Query);
         }
         if transaction.has_pending_index_creations() {
@@ -6402,6 +6447,25 @@ impl Database {
         columnar_statistics: Option<&mut ColumnarExecutionStatistics>,
         execution_statistics: Option<&mut ExecutionStatistics>,
     ) -> Result<QueryResult, DatabaseError> {
+        self.execute_query_plan_with_limits(
+            plan,
+            view,
+            staged,
+            columnar_statistics,
+            execution_statistics,
+            QueryExecutionLimits::unlimited(),
+        )
+    }
+
+    fn execute_query_plan_with_limits(
+        &mut self,
+        plan: &netbadb_planner::PhysicalPlan,
+        view: &DatabaseReadView,
+        staged: Option<&mut TableStorage>,
+        columnar_statistics: Option<&mut ColumnarExecutionStatistics>,
+        execution_statistics: Option<&mut ExecutionStatistics>,
+        limits: QueryExecutionLimits,
+    ) -> Result<QueryResult, DatabaseError> {
         let staged_table = staged.as_ref().map(|storage| storage.table().id);
         let mut bindings = self
             .bindings
@@ -6449,22 +6513,24 @@ impl Database {
             })
             .collect::<Vec<_>>();
         if let Some(statistics) = execution_statistics {
-            Ok(execute_with_feedback_context(
+            Ok(execute_with_feedback_context_and_limits(
                 plan,
                 &bindings,
                 &mut storages,
                 &read_views,
                 &projections,
                 statistics,
+                limits,
             )?)
         } else {
-            Ok(execute_with_columnar_context(
+            Ok(execute_with_columnar_context_and_limits(
                 plan,
                 &bindings,
                 &mut storages,
                 &read_views,
                 &projections,
                 columnar_statistics,
+                limits,
             )?)
         }
     }
@@ -6476,13 +6542,37 @@ impl Database {
         estimates: &[netbadb_planner::PlannerAccessEstimate],
         query_shape: LogicalQueryShape,
     ) -> Result<(QueryResult, ExecutionFeedbackReport), DatabaseError> {
+        self.execute_planned_query_with_feedback_and_limits(
+            plan,
+            view,
+            estimates,
+            query_shape,
+            QueryExecutionLimits::unlimited(),
+        )
+    }
+
+    fn execute_planned_query_with_feedback_and_limits(
+        &mut self,
+        plan: &netbadb_planner::PhysicalPlan,
+        view: &DatabaseReadView,
+        estimates: &[netbadb_planner::PlannerAccessEstimate],
+        query_shape: LogicalQueryShape,
+        limits: QueryExecutionLimits,
+    ) -> Result<(QueryResult, ExecutionFeedbackReport), DatabaseError> {
         let plan_variant = PlanVariant::from_plan(plan)?;
         let anchor = ExecutionFeedbackAnchor {
             global_commit_seq: view.snapshot().map(|snapshot| snapshot.commit_seq()),
             schema_generation: self.schema_generation(),
         };
         let mut statistics = ExecutionStatistics::default();
-        let result = self.execute_query_plan(plan, view, None, None, Some(&mut statistics))?;
+        let result = self.execute_query_plan_with_limits(
+            plan,
+            view,
+            None,
+            None,
+            Some(&mut statistics),
+            limits,
+        )?;
         Ok((
             result,
             execution_feedback::correlate_execution_feedback(
@@ -6496,11 +6586,12 @@ impl Database {
         ))
     }
 
-    fn execute_query_plan_in(
+    fn execute_query_plan_in_with_limits(
         &mut self,
         plan: &netbadb_planner::PhysicalPlan,
         view: &DatabaseReadView,
         transaction: &mut Transaction,
+        limits: QueryExecutionLimits,
     ) -> Result<QueryResult, DatabaseError> {
         let staged_tables = transaction
             .schema_composition
@@ -6598,13 +6689,14 @@ impl Database {
                     storage,
                 }),
         );
-        Ok(execute_with_columnar_context(
+        Ok(execute_with_columnar_context_and_limits(
             plan,
             &bindings,
             &mut storages,
             &read_views,
             &[],
             None,
+            limits,
         )?)
     }
 
@@ -7503,8 +7595,8 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        CoordinatorError, Database, DatabaseCoordinatorConfig, DatabaseError, DdlOutcome,
-        ExecutionResult, IsolationLevel, ParticipantMode, PartitionCatalogConfig,
+        CoordinatorError, Database, DatabaseCoordinatorConfig, DatabaseError, DatabaseErrorKind,
+        DdlOutcome, ExecutionResult, IsolationLevel, ParticipantMode, PartitionCatalogConfig,
         PhysicalStatement, RangePartitionSpec, TablePlacementSpec, TableStorageCreateSpec,
         TableStorageOpenSpec, TransactionState, cleanup_created_table_files,
     };
@@ -7512,6 +7604,7 @@ mod tests {
         PhysicalBindings, StorageRegistry, StorageRegistryEntry, StorageRegistryError,
         TablePlacement,
     };
+    use netbadb_executor::QueryExecutionLimits;
     use netbadb_inspect::{
         AggregateOutputInspection, BinaryOpInspection, ExpressionInspection,
         ExpressionKindInspection, IndexKindInspection, NullOrderInspection, PlanNodeInspection,
@@ -9872,6 +9965,98 @@ mod tests {
             vec![vec![ScalarValue::Int64(1)]]
         );
         reopened.close().expect("close reopened database");
+        let wal = netbadb_storage::wal_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));
+        let _ = std::fs::remove_file(wal);
+    }
+
+    #[test]
+    fn prepared_query_output_limit_is_core_owned_and_returns_no_partial_result() {
+        let path = std::env::temp_dir().join(format!(
+            "netbadb-core-query-output-limit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut database = Database::create(&path, table()).expect("create database");
+        for id in 1..=3 {
+            database
+                .execute(&format!(
+                    "INSERT INTO users (id, name) VALUES ({id}, 'row')"
+                ))
+                .expect("seed row");
+        }
+        let prepared = database
+            .prepare_statement("SELECT id FROM users ORDER BY id", &[])
+            .expect("prepare query");
+        let error = database
+            .execute_prepared_with_limits(
+                &prepared,
+                &[],
+                QueryExecutionLimits::with_max_output_rows(2),
+            )
+            .expect_err("reject oversized output");
+        assert_eq!(error.kind(), DatabaseErrorKind::ResourceLimit);
+        assert!(matches!(
+            error,
+            DatabaseError::Execution(netbadb_executor::ExecutionError::OutputRowsExceeded {
+                limit: 2
+            })
+        ));
+
+        let batch_prepared = database
+            .prepare_statement("SELECT id FROM users", &[])
+            .expect("prepare batch query");
+        assert_eq!(
+            database
+                .execute_prepared_with_limits(
+                    &batch_prepared,
+                    &[],
+                    QueryExecutionLimits::with_max_output_rows(2),
+                )
+                .expect_err("reject oversized batch output")
+                .kind(),
+            DatabaseErrorKind::ResourceLimit
+        );
+
+        let mut transaction = database.begin_transaction().expect("begin transaction");
+        let transaction_error = database
+            .execute_prepared_in_with_limits(
+                &mut transaction,
+                &prepared,
+                &[],
+                QueryExecutionLimits::with_max_output_rows(2),
+            )
+            .expect_err("reject oversized transactional output");
+        assert_eq!(transaction_error.kind(), DatabaseErrorKind::ResourceLimit);
+        assert_eq!(transaction.state(), TransactionState::Active);
+        transaction
+            .rollback()
+            .expect("resource refusal leaves transaction rollback-capable");
+
+        let limited = database
+            .prepare_statement("SELECT id FROM users ORDER BY id LIMIT 2", &[])
+            .expect("prepare bounded query");
+        let ExecutionResult::Query(result) = database
+            .execute_prepared_with_limits(
+                &limited,
+                &[],
+                QueryExecutionLimits::with_max_output_rows(2),
+            )
+            .expect("execute bounded query")
+        else {
+            panic!("expected query result");
+        };
+        assert_eq!(result.rows.len(), 2);
+
+        let ExecutionResult::Query(unlimited) = database
+            .execute_prepared(&prepared, &[])
+            .expect("embedded unlimited execution")
+        else {
+            panic!("expected query result");
+        };
+        assert_eq!(unlimited.rows.len(), 3);
+        database.close().expect("close database");
         let wal = netbadb_storage::wal_path(&path);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(netbadb_storage::wal_alternate_path(&wal));

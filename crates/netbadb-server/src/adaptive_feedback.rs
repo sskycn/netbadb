@@ -161,7 +161,11 @@ pub(crate) fn execute_prepared_with_optional_server_observation(
         return session.execute_prepared(database, prepared, values);
     }
 
-    let executed = database.execute_prepared_with_feedback(prepared, values)?;
+    let executed = database.execute_prepared_with_feedback_and_limits(
+        prepared,
+        values,
+        session.query_execution_limits(),
+    )?;
     if let Some(report) = executed.feedback.query_report() {
         // Admissions are deliberately independent. Either sink may reject
         // the report without skipping or rolling back the other sink.

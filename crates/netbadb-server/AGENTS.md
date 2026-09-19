@@ -55,9 +55,11 @@
 - Connection admission, socket timeouts, and runtime metrics belong at the TCP
   runtime boundary. The connection-vector length is the admission-limit truth;
   metrics MUST NOT decide correctness.
-- Result-row policy belongs in transport-neutral `SessionState`, but is checked
-  only after core execution materializes the complete `QueryResult`. Do not
-  describe it as an executor memory limit or statement timeout.
+- Result-row policy belongs in transport-neutral `SessionState` and MUST be
+  passed into Core as `QueryExecutionLimits` for every Core query path. It
+  bounds successful final output rows and common batch accumulation, while the
+  transport encoders retain defense-in-depth checks. Do not describe it as a
+  complete operator-memory, output-byte, or statement-timeout limit.
 - Explicit adaptive feedback capture runs only inside the current Database
   execution owner, after authorization, and only for eligible autocommit Core
   queries. Its bounded `AdaptiveEvidencePool` belongs to that worker, never a

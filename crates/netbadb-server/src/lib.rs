@@ -4,6 +4,7 @@ mod adaptive_driver;
 mod adaptive_feedback;
 mod authorization;
 mod control_admission;
+mod execution_audit;
 mod limits;
 mod manifest;
 mod metrics;
@@ -23,7 +24,8 @@ use std::fmt;
 pub use netbadb_core::AdaptiveEvidenceWindowEpoch;
 use netbadb_core::{
     Database, DatabaseError, DatabaseErrorKind, DatabaseTransaction, DdlOutcome, ExecutionResult,
-    ParameterTypeHint, PreparedDdlStatement, PreparedSqlStatement, QueryResult, TransactionState,
+    ParameterTypeHint, PreparedDdlStatement, PreparedSqlStatement, QueryExecutionLimits,
+    QueryResult, TransactionState,
 };
 use netbadb_protocol::{
     ClientMessage, MAX_ERROR_MESSAGE_BYTES, MAX_FRAME_PAYLOAD, PROTOCOL_VERSION, ProtocolError,
@@ -38,6 +40,8 @@ pub use adaptive_driver::{
 };
 pub use adaptive_feedback::ServerAdaptiveFeedbackConfig;
 pub use authorization::AuthorizationConfigError;
+#[cfg(feature = "execution-audit")]
+pub use execution_audit::ServerExecutionAuditSnapshot;
 pub use limits::{
     DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_RESULT_ROWS, DEFAULT_WRITE_TIMEOUT,
     MAX_CONFIGURED_CONNECTIONS, MAX_CONFIGURED_RESULT_ROWS, MAX_SOCKET_TIMEOUT, ServerLimits,
@@ -279,6 +283,10 @@ impl DatabaseSession {
             })
     }
 
+    fn query_execution_limits(&self) -> QueryExecutionLimits {
+        QueryExecutionLimits::with_max_output_rows(self.policy.max_result_rows())
+    }
+
     fn prepare(
         &self,
         database: &Database,
@@ -353,9 +361,12 @@ impl DatabaseSession {
         prepared: &netbadb_core::PreparedStatement,
         values: &[netbadb_types::ScalarValue],
     ) -> Result<ExecutionResult, DatabaseError> {
+        let limits = self.query_execution_limits();
         let result = match self.transaction.as_mut() {
-            Some(transaction) => database.execute_prepared_in(transaction, prepared, values),
-            None => database.execute_prepared(prepared, values),
+            Some(transaction) => {
+                database.execute_prepared_in_with_limits(transaction, prepared, values, limits)
+            }
+            None => database.execute_prepared_with_limits(prepared, values, limits),
         };
         if self.transaction.as_ref().is_some_and(|transaction| {
             matches!(
@@ -565,7 +576,7 @@ impl SessionState {
                 SessionResponse::standard(self.error_batch(request_id, code, message))
             }
             Err(SessionFailure::Database(error)) => {
-                SessionResponse::standard(self.database_error_batch(request_id, error))
+                self.classified_database_error_batch(request_id, error)
             }
             Err(SessionFailure::Server(error)) => {
                 self.classified_server_error_batch(request_id, error)
@@ -624,7 +635,7 @@ impl SessionState {
                     Err(error) => self.classified_server_error_batch(request_id, error),
                 }
             }
-            Err(error) => SessionResponse::standard(self.database_error_batch(request_id, error)),
+            Err(error) => self.classified_database_error_batch(request_id, error),
         }
     }
 
@@ -718,9 +729,23 @@ impl SessionState {
             DatabaseErrorKind::Operational => "database operation failed".into(),
             DatabaseErrorKind::Internal => "internal database error".into(),
             DatabaseErrorKind::TransactionState => "invalid transaction state".into(),
+            DatabaseErrorKind::ResourceLimit => error.to_string(),
             _ => error.to_string(),
         };
         self.error_batch(request_id, code, &message)
+    }
+
+    fn classified_database_error_batch(
+        &self,
+        request_id: u64,
+        error: DatabaseError,
+    ) -> SessionResponse {
+        let result_row_limit_exceeded = error.kind() == DatabaseErrorKind::ResourceLimit;
+        SessionResponse {
+            batch: self.database_error_batch(request_id, error),
+            result_row_limit_exceeded,
+            authorization_denied: false,
+        }
     }
 
     fn error_batch(
@@ -852,6 +877,9 @@ fn validate_messages(messages: &[ServerMessage]) -> Result<(), ServerError> {
 }
 
 fn database_error_code(error: &DatabaseError) -> ProtocolErrorCode {
+    if error.kind() == DatabaseErrorKind::ResourceLimit {
+        return ProtocolErrorCode::ResponseTooLarge;
+    }
     match error {
         DatabaseError::Compile(_) | DatabaseError::Bind(_) => ProtocolErrorCode::Compile,
         DatabaseError::Schema(_) => ProtocolErrorCode::Schema,

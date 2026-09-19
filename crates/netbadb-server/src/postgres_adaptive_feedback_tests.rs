@@ -518,7 +518,7 @@ fn postgres_denied_query_never_reaches_adaptive_capture() {
 }
 
 #[test]
-fn postgres_core_success_is_captured_before_result_row_policy() {
+fn postgres_row_limit_is_a_core_execution_failure_without_success_capture() {
     let mut fixture = Fixture::create("row-limit", true);
     let mut session = new_session(
         &fixture.database,
@@ -534,7 +534,7 @@ fn postgres_core_success_is_captured_before_result_row_policy() {
     assert!(messages.iter().any(
         |message| matches!(message, BackendMessage::ErrorResponse(error) if error.sqlstate == "54000")
     ));
-    assert_eq!(runtime.inspection().progress.recorded_reports, 1);
+    assert_eq!(runtime.inspection().progress.recorded_reports, 0);
     fixture.close();
 }
 

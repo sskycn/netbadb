@@ -75,6 +75,7 @@ fn abandoned_admission_does_not_leave_a_registered_session() {
         None,
         None,
         receiver,
+        ServerExecutionAudit::default(),
     )
     .unwrap();
     let result = admitted.recv().unwrap();
@@ -101,9 +102,13 @@ fn disconnect_rollback_failure_stops_worker_before_the_next_request() {
             None,
             None,
             receiver,
+            ServerExecutionAudit::default(),
         )
     });
-    let client = PgWorkerClient { commands };
+    let client = PgWorkerClient {
+        commands,
+        execution_audit: ServerExecutionAudit::default(),
+    };
     client.open(1, startup()).unwrap();
     for sql in ["BEGIN", "INSERT INTO items VALUES (1)"] {
         let messages = client
@@ -137,6 +142,7 @@ fn disconnect_rollback_failure_stops_worker_before_the_next_request() {
         session_id: 1,
         message: FrontendMessage::Query("SELECT 1".into()),
         reply,
+        audit: client.execution_audit.submitted(),
     });
     let (reply, _stopped) = mpsc::sync_channel(1);
     let _ = client.commands.send(PgWorkerCommand::Shutdown { reply });
@@ -179,7 +185,10 @@ fn worker_failure_terminates_the_accept_loop_without_external_shutdown() {
             thread::yield_now();
         }
         let worker = PgDatabaseWorker {
-            client: PgWorkerClient { commands },
+            client: PgWorkerClient {
+                commands,
+                execution_audit: ServerExecutionAudit::default(),
+            },
             join,
         };
         let (shutdown, shutdown_rx) = mpsc::channel();
@@ -257,7 +266,10 @@ fn accept_failure_closes_connections_joins_worker_and_retains_both_errors() {
     };
     let (commands, receiver) = mpsc::channel();
     let worker = PgDatabaseWorker {
-        client: PgWorkerClient { commands },
+        client: PgWorkerClient {
+            commands,
+            execution_audit: ServerExecutionAudit::default(),
+        },
         join: thread::spawn(move || {
             let PgWorkerCommand::Shutdown { reply } = receiver.recv().unwrap() else {
                 panic!("missing shutdown command");

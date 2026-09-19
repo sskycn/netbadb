@@ -6,6 +6,8 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+#[cfg(feature = "execution-audit")]
+use std::time::Instant;
 
 use netbadb_core::{
     Database, DatabaseError, DatabaseErrorKind, DdlOutcome, ExecutionResult, IndexKindInspection,
@@ -33,6 +35,7 @@ use crate::adaptive_feedback::{
     ServerAdaptiveFeedbackRuntime, execute_prepared_with_optional_server_observation,
 };
 use crate::authorization::{AuthorizationPolicy, PrincipalAuthorization};
+use crate::execution_audit::{RequestAuditTicket, ServerExecutionAudit};
 use crate::operator::ServerOperatorMutationAdmissions;
 use crate::operator::ServerOperatorPlane;
 use crate::physical_design::ServerPhysicalDesignStartupConfig;
@@ -220,6 +223,7 @@ impl PostgresTcpServer {
             return Err(PostgresTcpServerError::TlsManifestUnsupported);
         }
         let tick_interval = adaptive_mode.tick_interval();
+        let execution_audit = ServerExecutionAudit::default();
         let worker = PgDatabaseWorker::start(
             tables,
             limits.session_policy(),
@@ -235,6 +239,7 @@ impl PostgresTcpServer {
                         config.admissions
                     }),
             }),
+            execution_audit.clone(),
         )?;
         let listener = match TcpListener::bind(listen) {
             Ok(listener) => listener,
@@ -336,6 +341,8 @@ impl PostgresTcpServer {
         };
         Ok(PostgresServerHandle {
             local_addr,
+            #[cfg(feature = "execution-audit")]
+            execution_audit,
             shutdown_tx,
             adaptive_control,
             physical_design_control,
@@ -351,6 +358,8 @@ impl PostgresTcpServer {
 
 pub struct PostgresServerHandle {
     local_addr: SocketAddr,
+    #[cfg(feature = "execution-audit")]
+    execution_audit: ServerExecutionAudit,
     shutdown_tx: Sender<()>,
     adaptive_control: ServerAdaptiveControlHandle,
     physical_design_control: ServerPhysicalDesignControlHandle,
@@ -362,6 +371,17 @@ impl PostgresServerHandle {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    #[cfg(feature = "execution-audit")]
+    #[must_use]
+    pub fn execution_audit(&self) -> crate::ServerExecutionAuditSnapshot {
+        self.execution_audit.snapshot()
+    }
+
+    #[cfg(feature = "execution-audit")]
+    pub fn reset_execution_audit(&self) {
+        self.execution_audit.reset();
     }
 
     #[must_use]
@@ -762,8 +782,19 @@ fn run_pg_connection(
             if matches!(message, FrontendMessage::Terminate) {
                 break;
             }
+            #[cfg(feature = "execution-audit")]
+            let total_started = Instant::now();
             let messages = worker.request(session_id, message)?;
+            #[cfg(feature = "execution-audit")]
+            let write_started = Instant::now();
             write_messages(&mut stream, &messages)?;
+            #[cfg(feature = "execution-audit")]
+            {
+                worker.execution_audit.socket_write(write_started.elapsed());
+                worker
+                    .execution_audit
+                    .total_request(total_started.elapsed());
+            }
         }
         Ok(())
     })();
@@ -786,6 +817,7 @@ fn write_messages(
 #[derive(Clone)]
 struct PgWorkerClient {
     commands: Sender<PgWorkerCommand>,
+    execution_audit: ServerExecutionAudit,
 }
 
 impl PgWorkerClient {
@@ -813,13 +845,20 @@ impl PgWorkerClient {
         message: FrontendMessage,
     ) -> Result<Vec<BackendMessage>, PgConnectionError> {
         let (reply, result) = mpsc::sync_channel(1);
-        self.commands
+        let audit = self.execution_audit.submitted();
+        if self
+            .commands
             .send(PgWorkerCommand::Request {
                 session_id,
                 message,
                 reply,
+                audit,
             })
-            .map_err(|_| PgConnectionError::WorkerStopped)?;
+            .is_err()
+        {
+            self.execution_audit.submission_failed(audit);
+            return Err(PgConnectionError::WorkerStopped);
+        }
         result
             .recv()
             .map_err(|_| PgConnectionError::WorkerStopped)?
@@ -848,9 +887,11 @@ impl PgDatabaseWorker {
         authorization: AuthorizationPolicy,
         adaptive_mode: ServerAdaptiveStartupMode,
         physical_design_config: Option<ServerPhysicalDesignStartupConfig>,
+        execution_audit: ServerExecutionAudit,
     ) -> Result<Self, PostgresTcpServerError> {
         let (commands, receiver) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let client_execution_audit = execution_audit.clone();
         let join = thread::Builder::new()
             .name("netbadb-postgres-database-worker".into())
             .spawn(move || {
@@ -896,12 +937,16 @@ impl PgDatabaseWorker {
                     adaptive,
                     physical_design,
                     receiver,
+                    execution_audit.clone(),
                 )
             })
             .map_err(PostgresTcpServerError::ThreadSpawn)?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
-                client: PgWorkerClient { commands },
+                client: PgWorkerClient {
+                    commands,
+                    execution_audit: client_execution_audit,
+                },
                 join,
             }),
             Ok(Err(error)) => {
@@ -970,6 +1015,7 @@ enum PgWorkerCommand {
         session_id: u64,
         message: FrontendMessage,
         reply: SyncSender<Result<Vec<BackendMessage>, PgConnectionError>>,
+        audit: RequestAuditTicket,
     },
     Close {
         session_id: u64,
@@ -995,6 +1041,7 @@ fn run_pg_worker(
     mut adaptive: Option<ServerAdaptiveWorkerRuntime>,
     mut physical_design: Option<ServerPhysicalDesignRuntime>,
     commands: Receiver<PgWorkerCommand>,
+    execution_audit: ServerExecutionAudit,
 ) -> Result<(), String> {
     let mut sessions: HashMap<u64, PgWorkerSession> = HashMap::new();
     while let Ok(command) = commands.recv() {
@@ -1037,8 +1084,11 @@ fn run_pg_worker(
                 session_id,
                 message,
                 reply,
+                audit,
             } => {
+                let worker_audit = execution_audit.worker_started(audit);
                 let Some(session) = sessions.get_mut(&session_id) else {
+                    execution_audit.worker_completed(worker_audit);
                     let _ = reply.send(Err(PgConnectionError::WorkerStopped));
                     continue;
                 };
@@ -1050,6 +1100,7 @@ fn run_pg_worker(
                     physical_design.as_mut(),
                     message,
                 );
+                execution_audit.worker_completed(worker_audit);
                 if reply.send(Ok(messages)).is_err() {
                     close_pg_session(&mut sessions, session_id)?;
                 }
@@ -3549,6 +3600,7 @@ fn map_create_index_error(error: &DatabaseError) -> ErrorResponse {
         | DatabaseErrorKind::Operational
         | DatabaseErrorKind::Internal
         | DatabaseErrorKind::SchemaBusy
+        | DatabaseErrorKind::ResourceLimit
         | DatabaseErrorKind::DuplicateColumn
         | DatabaseErrorKind::DependentObjects => map_database_error(error),
         DatabaseErrorKind::Syntax
@@ -5302,6 +5354,7 @@ fn map_database_error(error: &DatabaseError) -> ErrorResponse {
         DatabaseErrorKind::FeatureNotSupported => ("0A000", Some(error.to_string())),
         DatabaseErrorKind::DuplicateObject => ("42P07", Some(error.to_string())),
         DatabaseErrorKind::TransactionState => ("25000", Some("invalid transaction state".into())),
+        DatabaseErrorKind::ResourceLimit => ("54000", Some(error.to_string())),
         DatabaseErrorKind::Operational => ("58000", Some("database operation failed".into())),
         DatabaseErrorKind::Internal => ("XX000", Some("internal database error".into())),
     };
@@ -5492,6 +5545,8 @@ mod tests {
         }
         let server = PostgresServerHandle {
             local_addr: "127.0.0.1:1".parse().unwrap(),
+            #[cfg(feature = "execution-audit")]
+            execution_audit: ServerExecutionAudit::default(),
             shutdown_tx,
             adaptive_control: ServerAdaptiveControlHandle::new(adaptive_tx),
             physical_design_control: ServerPhysicalDesignControlHandle::new(physical_design_tx),

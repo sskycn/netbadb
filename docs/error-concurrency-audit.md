@@ -131,8 +131,8 @@ errors.
 
 - **Confirmed unfixed defects:** none from this audit.
 - **Architecture/deployment limits:** one synchronous execution owner; socket
-  timeouts are not statement cancellation; SQL results can materialize before
-  transport row limits; programmatic control queues do not provide a global
+  timeouts are not statement cancellation; the Core output-row limit does not
+  bound operator working memory or output bytes; programmatic control queues do not provide a global
   producer memory budget. Advisory locks and pathname checks assume trusted
   parent directories and cooperative actors. A continuously racing or privileged
   namespace actor remains outside the documented guarantee.

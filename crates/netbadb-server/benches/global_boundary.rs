@@ -17,6 +17,8 @@ use netbadb_protocol::{
     read_server_frame, validate_server_message, write_client_frame,
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
+#[cfg(feature = "execution-audit")]
+use netbadb_server::ServerExecutionAuditSnapshot;
 use netbadb_server::{PostgresTcpServer, ServerConfig, TcpServer};
 use netbadb_types::{ColumnId, PhysicalType, ScalarValue, TableId};
 use serde_json::json;
@@ -37,8 +39,17 @@ fn run(root: &Path) -> BenchResult<()> {
         Ok(value) if value == "1" => true,
         _ => return Err("NETBADB_BOUNDARY_NULLS must be unset or 1".into()),
     };
+    let extended_clients = match std::env::var("NETBADB_BOUNDARY_CLIENTS") {
+        Err(std::env::VarError::NotPresent) => true,
+        Ok(value) if value == "legacy" => false,
+        _ => return Err("NETBADB_BOUNDARY_CLIENTS must be unset or legacy".into()),
+    };
     println!(
         "boundary_csv,scenario,clients,requests,min_ns,median_ns,p95_ns,max_ns,requests_per_second"
+    );
+    #[cfg(feature = "execution-audit")]
+    println!(
+        "audit_csv,scenario,clients,submitted,max_queue_depth,avg_queue_wait_ns,max_queue_wait_ns,avg_worker_busy_ns,worker_idle_ns,avg_socket_write_ns,avg_total_request_ns"
     );
     for width in [8, 128, 1024] {
         let directory = root.join(format!("w{width}"));
@@ -131,7 +142,7 @@ fn run(root: &Path) -> BenchResult<()> {
             &manifest,
             serde_json::to_vec(&json!({
                 "version": 11, "listen": "127.0.0.1:0",
-                "authorization": {"local_plaintext": {"tables": [{"table_id":1,"read":true,"write":false,"transaction":false,"analyze":false}]}, "clients":[]},
+                "authorization": {"local_plaintext": {"tables": [{"table_id":1,"read":true,"write":true,"transaction":true,"analyze":false}]}, "clients":[]},
                 "tables":[{"path":"data","id":1,"name":"items","columns":[
                     {"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false,"primary_key":false},
                     {"id":2,"name":"payload","physical_type":"text","semantic_type":null,"nullable":nullable,"primary_key":false}
@@ -140,7 +151,12 @@ fn run(root: &Path) -> BenchResult<()> {
         )?;
         let native = TcpServer::new(ServerConfig::from_manifest_path(&manifest)?).start()?;
         for (label, sql, expected) in &cases {
-            for clients in [1, 4] {
+            let clients_set: &[usize] = if *label == "result" || !extended_clients {
+                &[1, 4]
+            } else {
+                &[1, 4, 16]
+            };
+            for &clients in clients_set {
                 network(
                     native.local_addr(),
                     false,
@@ -149,6 +165,51 @@ fn run(root: &Path) -> BenchResult<()> {
                     sql,
                     expected,
                     clients,
+                    || {
+                        #[cfg(feature = "execution-audit")]
+                        native.reset_execution_audit();
+                    },
+                )?;
+                #[cfg(feature = "execution-audit")]
+                report_audit(
+                    &format!("native_w{width}_{label}"),
+                    clients,
+                    native.execution_audit(),
+                );
+            }
+        }
+        if width == 8 {
+            #[cfg(feature = "execution-audit")]
+            {
+                for point_clients in [1, 4, 8] {
+                    hol_network(
+                        native.local_addr(),
+                        false,
+                        "SELECT SUM(left_items.id) FROM items AS left_items JOIN items AS right_items ON left_items.id <= right_items.id",
+                        vec![vec![ScalarValue::Int64(166_666_500)]],
+                        "SELECT id, payload FROM items WHERE id = 500",
+                        vec![vec![
+                            ScalarValue::Int64(500),
+                            ScalarValue::Text("00000500".into()),
+                        ]],
+                        point_clients,
+                        || native.execution_audit().worker_active == 1,
+                        || native.reset_execution_audit(),
+                    )?;
+                    report_audit(
+                        "native_hol_long_plus_point",
+                        point_clients,
+                        native.execution_audit(),
+                    );
+                }
+                hol_write(
+                    native.local_addr(),
+                    false,
+                    "SELECT SUM(left_items.id) FROM items AS left_items JOIN items AS right_items ON left_items.id <= right_items.id",
+                    vec![vec![ScalarValue::Int64(166_666_500)]],
+                    || native.execution_audit().worker_active == 1,
+                    || native.reset_execution_audit(),
+                    || native.execution_audit(),
                 )?;
             }
         }
@@ -156,7 +217,12 @@ fn run(root: &Path) -> BenchResult<()> {
         let postgres =
             PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest)?).start()?;
         for (label, sql, expected) in &cases {
-            for clients in [1, 4] {
+            let clients_set: &[usize] = if *label == "result" || !extended_clients {
+                &[1, 4]
+            } else {
+                &[1, 4, 16]
+            };
+            for &clients in clients_set {
                 network(
                     postgres.local_addr(),
                     true,
@@ -165,12 +231,73 @@ fn run(root: &Path) -> BenchResult<()> {
                     sql,
                     expected,
                     clients,
+                    || {
+                        #[cfg(feature = "execution-audit")]
+                        postgres.reset_execution_audit();
+                    },
+                )?;
+                #[cfg(feature = "execution-audit")]
+                report_audit(
+                    &format!("pg_w{width}_{label}"),
+                    clients,
+                    postgres.execution_audit(),
+                );
+            }
+        }
+        if width == 8 {
+            #[cfg(feature = "execution-audit")]
+            {
+                for point_clients in [1, 4, 8] {
+                    hol_network(
+                        postgres.local_addr(),
+                        true,
+                        "SELECT SUM(left_items.id) FROM items AS left_items JOIN items AS right_items ON left_items.id <= right_items.id",
+                        vec![vec![ScalarValue::Int64(166_666_500)]],
+                        "SELECT id, payload FROM items WHERE id = 500",
+                        vec![vec![
+                            ScalarValue::Int64(500),
+                            ScalarValue::Text("00000500".into()),
+                        ]],
+                        point_clients,
+                        || postgres.execution_audit().worker_active == 1,
+                        || postgres.reset_execution_audit(),
+                    )?;
+                    report_audit(
+                        "pg_hol_long_plus_point",
+                        point_clients,
+                        postgres.execution_audit(),
+                    );
+                }
+                hol_write(
+                    postgres.local_addr(),
+                    true,
+                    "SELECT SUM(left_items.id) FROM items AS left_items JOIN items AS right_items ON left_items.id <= right_items.id",
+                    vec![vec![ScalarValue::Int64(166_666_500)]],
+                    || postgres.execution_audit().worker_active == 1,
+                    || postgres.reset_execution_audit(),
+                    || postgres.execution_audit(),
                 )?;
             }
         }
         postgres.shutdown()?;
     }
     Ok(())
+}
+
+#[cfg(feature = "execution-audit")]
+fn report_audit(scenario: &str, clients: usize, snapshot: ServerExecutionAuditSnapshot) {
+    let completed = snapshot.completed_requests.max(1);
+    println!(
+        "audit_csv,{scenario},{clients},{},{},{},{},{},{},{},{}",
+        snapshot.submitted_requests,
+        snapshot.max_queue_depth,
+        snapshot.queue_wait_ns / completed,
+        snapshot.max_queue_wait_ns,
+        snapshot.worker_busy_ns / completed,
+        snapshot.worker_idle_ns,
+        snapshot.socket_write_ns / completed,
+        snapshot.total_request_ns / completed,
+    );
 }
 
 fn report(name: &str, clients: usize, durations: &[Duration], wall: Duration) -> BenchResult<()> {
@@ -300,6 +427,7 @@ fn network(
     sql: &str,
     expected: &[Vec<ScalarValue>],
     clients: usize,
+    reset_audit: impl FnOnce(),
 ) -> BenchResult<()> {
     let mut connections = Vec::new();
     for _ in 0..clients {
@@ -309,6 +437,7 @@ fn network(
         }
         connections.push(connection);
     }
+    reset_audit();
     let barrier = Arc::new(Barrier::new(clients + 1));
     let expected = Arc::new(expected.to_vec());
     let handles = connections
@@ -351,6 +480,131 @@ fn network(
         clients,
         &durations,
         start.elapsed(),
+    )
+}
+
+#[cfg(feature = "execution-audit")]
+#[allow(clippy::too_many_arguments)]
+fn hol_network(
+    address: SocketAddr,
+    postgres: bool,
+    long_sql: &str,
+    long_expected: Vec<Vec<ScalarValue>>,
+    point_sql: &str,
+    point_expected: Vec<Vec<ScalarValue>>,
+    point_clients: usize,
+    worker_active: impl Fn() -> bool,
+    reset_audit: impl FnOnce(),
+) -> BenchResult<()> {
+    let mut long = Connection::open(address, postgres)?;
+    let mut points = Vec::with_capacity(point_clients);
+    for _ in 0..point_clients {
+        points.push(Connection::open(address, postgres)?);
+    }
+    reset_audit();
+    let long_sql = long_sql.to_owned();
+    let long_handle = std::thread::spawn(move || -> Result<Duration, String> {
+        let started = Instant::now();
+        long.query(&long_sql, &long_expected)
+            .map_err(|error| error.to_string())?;
+        Ok(started.elapsed())
+    });
+    let wait_started = Instant::now();
+    while !worker_active() {
+        if wait_started.elapsed() > Duration::from_secs(5) {
+            return Err("long query did not enter the worker".into());
+        }
+        std::thread::yield_now();
+    }
+    let mut handles = Vec::with_capacity(point_clients);
+    for mut point in points {
+        let point_sql = point_sql.to_owned();
+        let point_expected = point_expected.clone();
+        handles.push(std::thread::spawn(move || -> Result<Duration, String> {
+            let started = Instant::now();
+            point
+                .query(&point_sql, &point_expected)
+                .map_err(|error| error.to_string())?;
+            Ok(started.elapsed())
+        }));
+    }
+    let mut durations = Vec::with_capacity(point_clients);
+    for handle in handles {
+        durations.push(
+            handle
+                .join()
+                .map_err(|_| "HOL point client panicked")?
+                .map_err(|error| format!("HOL point client: {error}"))?,
+        );
+    }
+    let long_duration = long_handle
+        .join()
+        .map_err(|_| "HOL long client panicked")?
+        .map_err(|error| format!("HOL long client: {error}"))?;
+    report(
+        if postgres {
+            "pg_hol_long_plus_point"
+        } else {
+            "native_hol_long_plus_point"
+        },
+        point_clients,
+        &durations,
+        long_duration,
+    )
+}
+
+#[cfg(feature = "execution-audit")]
+fn hol_write(
+    address: SocketAddr,
+    postgres: bool,
+    long_sql: &str,
+    long_expected: Vec<Vec<ScalarValue>>,
+    worker_active: impl Fn() -> bool,
+    reset_audit: impl FnOnce(),
+    audit_snapshot: impl Fn() -> ServerExecutionAuditSnapshot,
+) -> BenchResult<()> {
+    let mut long = Connection::open(address, postgres)?;
+    let mut writer = Connection::open(address, postgres)?;
+    writer.transaction_control(true)?;
+    reset_audit();
+    let long_sql = long_sql.to_owned();
+    let long_handle = std::thread::spawn(move || -> Result<(), String> {
+        long.query(&long_sql, &long_expected)
+            .map_err(|error| error.to_string())
+    });
+    let wait_started = Instant::now();
+    while !worker_active() {
+        if wait_started.elapsed() > Duration::from_secs(5) {
+            return Err("long query did not enter the worker".into());
+        }
+        std::thread::yield_now();
+    }
+    let started = Instant::now();
+    writer.execute_affected("UPDATE items SET payload = payload WHERE id = 500", 1)?;
+    let elapsed = started.elapsed();
+    long_handle
+        .join()
+        .map_err(|_| "HOL long client panicked")?
+        .map_err(|error| format!("HOL long client: {error}"))?;
+    report_audit(
+        if postgres {
+            "pg_hol_long_plus_write"
+        } else {
+            "native_hol_long_plus_write"
+        },
+        1,
+        audit_snapshot(),
+    );
+    writer.transaction_control(false)?;
+    report(
+        if postgres {
+            "pg_hol_long_plus_write"
+        } else {
+            "native_hol_long_plus_write"
+        },
+        1,
+        &[elapsed],
+        elapsed,
     )
 }
 
@@ -433,6 +687,7 @@ impl Connection {
                         }
                         let text = match value {
                             ScalarValue::Int64(i) => i.to_string(),
+                            ScalarValue::UInt64(i) => i.to_string(),
                             ScalarValue::Text(t) => t.clone(),
                             _ => return Err("unexpected benchmark scalar".into()),
                         };
@@ -484,6 +739,94 @@ impl Connection {
                     }
                     message => return Err(format!("unexpected native response {message:?}").into()),
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "execution-audit")]
+    fn execute_affected(&mut self, sql: &str, expected: u64) -> BenchResult<()> {
+        self.request += 1;
+        if self.postgres {
+            let mut bytes = vec![b'Q'];
+            bytes.extend_from_slice(&u32::try_from(sql.len() + 5)?.to_be_bytes());
+            bytes.extend_from_slice(sql.as_bytes());
+            bytes.push(0);
+            self.stream.write_all(&bytes)?;
+            let expected_suffix = expected.to_string();
+            loop {
+                let (tag, payload) = pg_message(&mut self.stream)?;
+                if tag == b'C' {
+                    let tag = std::str::from_utf8(payload.strip_suffix(&[0]).unwrap_or(&payload))?;
+                    if !tag.ends_with(&expected_suffix) {
+                        return Err("PG affected-row count differs".into());
+                    }
+                } else if tag == b'E' {
+                    return Err(format!("PG error: {}", String::from_utf8_lossy(&payload)).into());
+                } else if tag == b'Z' {
+                    break;
+                }
+            }
+        } else {
+            write_client_frame(
+                &mut self.stream,
+                &Frame {
+                    request_id: self.request,
+                    message: ClientMessage::Execute { sql: sql.into() },
+                },
+            )?;
+            let frame = read_server_frame(&mut self.stream)?.ok_or("native EOF")?;
+            if frame.request_id != self.request
+                || !matches!(frame.message, ServerMessage::AffectedRows { count } if count == expected)
+            {
+                return Err("native affected-row response differs".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "execution-audit")]
+    fn transaction_control(&mut self, begin: bool) -> BenchResult<()> {
+        self.request += 1;
+        if self.postgres {
+            let sql = if begin { "BEGIN" } else { "ROLLBACK" };
+            let mut bytes = vec![b'Q'];
+            bytes.extend_from_slice(&u32::try_from(sql.len() + 5)?.to_be_bytes());
+            bytes.extend_from_slice(sql.as_bytes());
+            bytes.push(0);
+            self.stream.write_all(&bytes)?;
+            loop {
+                let (tag, payload) = pg_message(&mut self.stream)?;
+                if tag == b'E' {
+                    return Err(format!("PG error: {}", String::from_utf8_lossy(&payload)).into());
+                }
+                if tag == b'Z' {
+                    break;
+                }
+            }
+        } else {
+            let message = if begin {
+                ClientMessage::Begin {
+                    table_id: TableId(1),
+                }
+            } else {
+                ClientMessage::Rollback
+            };
+            write_client_frame(
+                &mut self.stream,
+                &Frame {
+                    request_id: self.request,
+                    message,
+                },
+            )?;
+            let frame = read_server_frame(&mut self.stream)?.ok_or("native EOF")?;
+            let expected = if begin {
+                ServerMessage::TransactionStarted
+            } else {
+                ServerMessage::TransactionRolledBack
+            };
+            if frame.request_id != self.request || frame.message != expected {
+                return Err("native transaction response differs".into());
             }
         }
         Ok(())

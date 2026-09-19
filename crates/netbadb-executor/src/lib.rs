@@ -163,6 +163,35 @@ pub struct QueryResult {
     pub rows: Vec<Vec<ScalarValue>>,
 }
 
+/// Deterministic limits applied while producing the externally visible query
+/// result. These limits do not bound operator working memory such as sort,
+/// aggregate, or hash-join state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryExecutionLimits {
+    max_output_rows: Option<usize>,
+}
+
+impl QueryExecutionLimits {
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_output_rows: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_max_output_rows(max_output_rows: usize) -> Self {
+        Self {
+            max_output_rows: Some(max_output_rows),
+        }
+    }
+
+    #[must_use]
+    pub const fn max_output_rows(self) -> Option<usize> {
+        self.max_output_rows
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionResult {
     Query(QueryResult),
@@ -218,6 +247,9 @@ pub enum ExecutionError {
     },
     TransactionRequired,
     AffectedRowsOverflow,
+    OutputRowsExceeded {
+        limit: usize,
+    },
     AggregateOverflow {
         function: AggregateFunction,
         output: String,
@@ -284,6 +316,10 @@ impl fmt::Display for ExecutionError {
                 formatter.write_str("a mutating statement requires an active transaction")
             }
             Self::AffectedRowsOverflow => formatter.write_str("affected row count overflowed u64"),
+            Self::OutputRowsExceeded { limit } => write!(
+                formatter,
+                "query output exceeds the configured execution limit of {limit} rows"
+            ),
             Self::AggregateOverflow { function, output } => write!(
                 formatter,
                 "{} overflowed while computing `{output}`",
@@ -426,7 +462,28 @@ pub fn execute_with_columnar_context(
     projections: &[ExecutionColumnarProjection<'_>],
     columnar_statistics: Option<&mut ColumnarExecutionStatistics>,
 ) -> Result<QueryResult, ExecutionError> {
+    execute_with_columnar_context_and_limits(
+        plan,
+        bindings,
+        storages,
+        read_views,
+        projections,
+        columnar_statistics,
+        QueryExecutionLimits::unlimited(),
+    )
+}
+
+pub fn execute_with_columnar_context_and_limits(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+    projections: &[ExecutionColumnarProjection<'_>],
+    columnar_statistics: Option<&mut ColumnarExecutionStatistics>,
+    limits: QueryExecutionLimits,
+) -> Result<QueryResult, ExecutionError> {
     if let Some(rows) = execute_columnar_subtree(plan, projections, columnar_statistics)? {
+        ensure_output_rows(rows.rows.len(), limits)?;
         return Ok(QueryResult {
             columns: rows
                 .fields
@@ -440,7 +497,7 @@ pub fn execute_with_columnar_context(
             rows: rows.rows.into_iter().map(|row| row.values).collect(),
         });
     }
-    let result = execute_rows_with_views(plan, bindings, storages, read_views)?;
+    let result = execute_rows_with_views(plan, bindings, storages, read_views, limits)?;
     Ok(QueryResult {
         columns: result
             .fields
@@ -466,6 +523,26 @@ pub fn execute_with_feedback_context(
     projections: &[ExecutionColumnarProjection<'_>],
     statistics: &mut ExecutionStatistics,
 ) -> Result<QueryResult, ExecutionError> {
+    execute_with_feedback_context_and_limits(
+        plan,
+        bindings,
+        storages,
+        read_views,
+        projections,
+        statistics,
+        QueryExecutionLimits::unlimited(),
+    )
+}
+
+pub fn execute_with_feedback_context_and_limits(
+    plan: &PhysicalPlan,
+    bindings: &[ExecutionStorageBinding],
+    storages: &mut [ExecutionStorage<'_>],
+    read_views: &[ExecutionReadView<'_>],
+    projections: &[ExecutionColumnarProjection<'_>],
+    statistics: &mut ExecutionStatistics,
+    limits: QueryExecutionLimits,
+) -> Result<QueryResult, ExecutionError> {
     statistics.accesses.clear();
     statistics.filters.clear();
     statistics.overflowed = false;
@@ -473,6 +550,7 @@ pub fn execute_with_feedback_context(
 
     let mut columnar = ColumnarExecutionStatistics::default();
     if let Some(rows) = execute_columnar_subtree(plan, projections, Some(&mut columnar))? {
+        ensure_output_rows(rows.rows.len(), limits)?;
         record_columnar_access(plan, &columnar, statistics);
         summarize_statistics(statistics);
         return Ok(QueryResult {
@@ -496,6 +574,7 @@ pub fn execute_with_feedback_context(
         statistics,
         PlanNodeOrdinal(0),
     )?;
+    ensure_output_rows(rows.rows.len(), limits)?;
     summarize_statistics(statistics);
     Ok(QueryResult {
         columns: rows
@@ -509,6 +588,15 @@ pub fn execute_with_feedback_context(
             .collect(),
         rows: rows.rows.into_iter().map(|row| row.values).collect(),
     })
+}
+
+fn ensure_output_rows(rows: usize, limits: QueryExecutionLimits) -> Result<(), ExecutionError> {
+    if let Some(limit) = limits.max_output_rows() {
+        if rows > limit {
+            return Err(ExecutionError::OutputRowsExceeded { limit });
+        }
+    }
+    Ok(())
 }
 
 fn summarize_statistics(statistics: &mut ExecutionStatistics) {
@@ -1604,7 +1692,13 @@ fn execute_rows(
             view,
         })
         .collect::<Vec<_>>();
-    execute_rows_with_views(plan, &bindings, &mut execution_storages, &execution_views)
+    execute_rows_with_views(
+        plan,
+        &bindings,
+        &mut execution_storages,
+        &execution_views,
+        QueryExecutionLimits::unlimited(),
+    )
 }
 
 #[cfg(test)]
@@ -1680,19 +1774,25 @@ fn execute_rows_with_views(
     bindings: &[ExecutionStorageBinding],
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
+    limits: QueryExecutionLimits,
 ) -> Result<ExecutionRows, ExecutionError> {
-    if let Some(result) = try_execute_top_n(plan, bindings, storages, read_views)? {
+    if let Some(result) = try_execute_top_n(plan, bindings, storages, read_views, limits)? {
         return Ok(result);
     }
-    if let Some(result) =
-        try_execute_streaming_filter_pipeline(plan, bindings, storages, read_views)?
+    if limits.max_output_rows().is_none() {
+        if let Some(result) =
+            try_execute_streaming_filter_pipeline(plan, bindings, storages, read_views)?
+        {
+            return Ok(result);
+        }
+    }
+    if let Some(result) = try_execute_batch_pipeline(plan, bindings, storages, read_views, limits)?
     {
         return Ok(result);
     }
-    if let Some(result) = try_execute_batch_pipeline(plan, bindings, storages, read_views)? {
-        return Ok(result);
-    }
-    execute_rows_legacy_with_views(plan, bindings, storages, read_views)
+    let result = execute_rows_legacy_with_views(plan, bindings, storages, read_views)?;
+    ensure_output_rows(result.rows.len(), limits)?;
+    Ok(result)
 }
 
 fn try_execute_top_n(
@@ -1700,6 +1800,7 @@ fn try_execute_top_n(
     bindings: &[ExecutionStorageBinding],
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
+    limits: QueryExecutionLimits,
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(TopNPlan {
         mut pipeline,
@@ -1712,7 +1813,10 @@ fn try_execute_top_n(
     else {
         return Ok(None);
     };
-    let mut state = TopNState::new(limit, keys, &sort_positions);
+    let retained_limit = limits.max_output_rows().map_or(limit, |max_output_rows| {
+        limit.min(max_output_rows.saturating_add(1))
+    });
+    let mut state = TopNState::new(retained_limit, keys, &sort_positions);
     let _ = visit_batch_pipeline(&mut pipeline, bindings, storages, read_views, |batch| {
         for row in batch.rows.drain(..) {
             state.consider(row)?;
@@ -1724,6 +1828,7 @@ fn try_execute_top_n(
         .into_iter()
         .map(|row| project_execution_row(row, &projection))
         .collect::<Result<Vec<_>, _>>()?;
+    ensure_output_rows(rows.len(), limits)?;
     Ok(Some(ExecutionRows { fields, rows }))
 }
 
@@ -1856,12 +1961,19 @@ fn try_execute_batch_pipeline(
     bindings: &[ExecutionStorageBinding],
     storages: &mut [ExecutionStorage<'_>],
     read_views: &[ExecutionReadView<'_>],
+    limits: QueryExecutionLimits,
 ) -> Result<Option<ExecutionRows>, ExecutionError> {
     let Some(mut pipeline) = build_batch_pipeline(plan)? else {
         return Ok(None);
     };
     let mut result_rows = Vec::new();
     let _ = visit_batch_pipeline(&mut pipeline, bindings, storages, read_views, |batch| {
+        let next_len = result_rows.len().checked_add(batch.rows.len()).ok_or(
+            ExecutionError::OutputRowsExceeded {
+                limit: limits.max_output_rows().unwrap_or(usize::MAX),
+            },
+        )?;
+        ensure_output_rows(next_len, limits)?;
         result_rows.append(&mut batch.rows);
         Ok(ControlFlow::Continue(()))
     })?;

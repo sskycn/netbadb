@@ -42,7 +42,10 @@ authorization, and PostgreSQL transaction-aborted behavior.
 
 Native Protocol v2 and PostgreSQL share the server's private synchronous
 `DatabaseSession`: optional transaction ownership, execute/commit/rollback,
-disconnect rollback, and result-row policy. They also share the dedicated
+disconnect rollback, and a Core-owned typed result-row limit. Oversized Core
+results are refused without partial success; PostgreSQL maps that resource
+failure to SQLSTATE `54000`, while its encoder retains a defense-in-depth row
+check. They also share the dedicated
 worker ownership rule: the worker constructs and exclusively owns `Database`,
 all sessions, and all transaction handles. PostgreSQL OIDs, format codes,
 prepared statement names, portal names, and `I`/`T`/`E` state never enter the

@@ -3607,10 +3607,15 @@ blocked response delivery. Timeout cleanup uses the same fallible
 `SessionState::close` path as every other disconnect.
 
 The database worker remains synchronous and cannot be safely preempted. Socket
-read inactivity is therefore not a statement execution timeout. Likewise,
-`max_result_rows` is checked by SessionState only after core execution has
-fully materialized QueryResult. It prevents expansion into an excessive number
-of protocol messages but is not a complete executor-memory limit.
+read inactivity is therefore not a statement execution timeout.
+`max_result_rows` is owned by SessionState and passed into Core as a typed
+execution limit for every Core query path. Common Heap batch pipelines stop
+before appending the first over-limit batch, and all paths reject before
+returning a successful oversized QueryResult. The limit still does not bound
+row width, encoded bytes, Sort/Aggregate/Join working state, owned index/range
+matches, or statement duration; transport encoders retain a defense-in-depth
+row check. The measured ownership and deferral analysis is in the
+[server execution/resource audit](server-execution-resource-audit.md).
 
 Runtime metrics use only standard-library atomics and expose read-only
 snapshots. They count admitted, rejected, active, and closed connections;

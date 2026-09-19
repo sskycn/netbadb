@@ -1296,6 +1296,16 @@ The implementation sequence is intentionally vertical:
     from 32 onward both paired states select Hash, so no forced Hash crossover
     is claimed. Heap hints remain `None`, LSM dynamic hints remain unchanged,
     and no outer threshold, executor change, or runtime adaptation was added.
+74. Single Database Worker / Query Resource Boundary — complete; feature-gated
+    timing separates worker queue wait, combined worker service, socket write,
+    and total request time for Native and PostgreSQL at 1/4/16 clients. Measured
+    long reads impose 37–40 ms of head-of-line queue delay on point queries,
+    but concurrent reads remain deferred until an owned thread-safe execution
+    context can pin snapshot, schema, storage, projection, DDL/GC, cancellation,
+    and shutdown lifetimes. Session row policy is now a shared typed Core limit:
+    oversized output is refused without partial success and maps to Native
+    `ResponseTooLarge` or PostgreSQL SQLSTATE `54000`. It bounds successful row
+    count, not row bytes or Sort/Aggregate/Join working memory.
 
 Serializable isolation, concurrent writers, one-sided/Text range costing, and
 broader join enumeration remain roadmap items. A general typed column-oriented batch
@@ -1317,8 +1327,10 @@ contract remains documented in [`docs/lsm-format-v1.md`](docs/lsm-format-v1.md).
 
 The [resource exhaustion and boundedness audit](docs/resource-boundedness-audit.md)
 records resource ownership, queue admission, decoder/encoder bounds, LSM pending
-budgets, portal cleanup, and measured 1k/10k/100k-row memory growth. Result-row
-policy remains a post-execution transport check, not an executor memory budget.
+budgets, portal cleanup, and measured 1k/10k/100k-row memory growth. The later
+[server execution and resource-boundary audit](docs/server-execution-resource-audit.md)
+measures the sole worker's queueing and corrects result-row enforcement at the
+Core boundary. The row count is bounded; output bytes and operator memory are not.
 
 The [global performance audit](docs/global-performance-audit.md) adds a measured
 Heap/LSM, executor, transaction, recovery and transport workload matrix. Its

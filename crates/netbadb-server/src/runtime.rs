@@ -6,6 +6,8 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+#[cfg(feature = "execution-audit")]
+use std::time::Instant;
 
 use netbadb_core::{Database, DatabaseError};
 use netbadb_protocol::{
@@ -23,6 +25,7 @@ use crate::adaptive_feedback::ServerAdaptiveFeedbackRuntime;
 use crate::authorization::{
     AuthorizationAction, AuthorizationDenied, AuthorizationPolicy, PrincipalAuthorization,
 };
+use crate::execution_audit::{RequestAuditTicket, ServerExecutionAudit};
 use crate::manifest::validate_listener_security;
 use crate::operator::ServerOperatorMutationAdmissions;
 use crate::operator::ServerOperatorPlane;
@@ -353,6 +356,7 @@ impl TcpServer {
         let table_count = tables.len();
         let transport_kind = security.kind();
         let tick_interval = adaptive_mode.tick_interval();
+        let execution_audit = ServerExecutionAudit::default();
         let worker = DatabaseWorker::start(
             tables,
             limits.session_policy(),
@@ -368,6 +372,7 @@ impl TcpServer {
                         config.admissions
                     }),
             }),
+            execution_audit.clone(),
         )?;
         let metrics = ServerMetricsHandle::new();
         let listener = match TcpListener::bind(listen) {
@@ -476,6 +481,8 @@ impl TcpServer {
             table_count,
             transport_kind,
             metrics,
+            #[cfg(feature = "execution-audit")]
+            execution_audit,
             shutdown_tx,
             adaptive_control,
             physical_design_control,
@@ -494,6 +501,8 @@ pub struct ServerHandle {
     table_count: usize,
     transport_kind: TransportKind,
     metrics: ServerMetricsHandle,
+    #[cfg(feature = "execution-audit")]
+    execution_audit: ServerExecutionAudit,
     shutdown_tx: Sender<()>,
     adaptive_control: ServerAdaptiveControlHandle,
     physical_design_control: ServerPhysicalDesignControlHandle,
@@ -525,6 +534,17 @@ impl ServerHandle {
     #[must_use]
     pub fn metrics_handle(&self) -> ServerMetricsHandle {
         self.metrics.clone()
+    }
+
+    #[cfg(feature = "execution-audit")]
+    #[must_use]
+    pub fn execution_audit(&self) -> crate::ServerExecutionAuditSnapshot {
+        self.execution_audit.snapshot()
+    }
+
+    #[cfg(feature = "execution-audit")]
+    pub fn reset_execution_audit(&self) {
+        self.execution_audit.reset();
     }
 
     #[must_use]
@@ -588,6 +608,7 @@ fn combine_operator_and_server(
 #[derive(Clone)]
 struct WorkerClient {
     commands: Sender<WorkerCommand>,
+    execution_audit: ServerExecutionAudit,
 }
 
 impl WorkerClient {
@@ -614,13 +635,20 @@ impl WorkerClient {
         metrics: &ServerMetricsHandle,
     ) -> Result<SessionResponse, WorkerRequestError> {
         let (reply, response) = mpsc::sync_channel(1);
-        self.commands
+        let audit = self.execution_audit.submitted();
+        if self
+            .commands
             .send(WorkerCommand::Request {
                 session_id,
                 frame,
                 reply,
+                audit,
             })
-            .map_err(|_| WorkerRequestError::Stopped)?;
+            .is_err()
+        {
+            self.execution_audit.submission_failed(audit);
+            return Err(WorkerRequestError::Stopped);
+        }
         metrics.worker_request();
         response.recv().map_err(|_| WorkerRequestError::Stopped)?
     }
@@ -647,10 +675,12 @@ impl DatabaseWorker {
         authorization: AuthorizationPolicy,
         adaptive_mode: ServerAdaptiveStartupMode,
         physical_design_config: Option<ServerPhysicalDesignStartupConfig>,
+        execution_audit: ServerExecutionAudit,
     ) -> Result<Self, TcpServerError> {
         let (commands, command_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let client_execution_audit = execution_audit.clone();
         let join = thread::Builder::new()
             .name("netbadb-database-worker".into())
             .spawn(move || {
@@ -701,20 +731,23 @@ impl DatabaseWorker {
                         }
                     });
                 }
-                run_database_worker(
+                let state = DatabaseWorkerState::new(
                     database,
                     session_policy,
                     authorization,
                     adaptive,
                     physical_design,
-                    command_rx,
-                    events_tx,
-                )
+                    execution_audit.clone(),
+                );
+                run_database_worker(state, command_rx, events_tx)
             })
             .map_err(TcpServerError::ThreadSpawn)?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
-                client: WorkerClient { commands },
+                client: WorkerClient {
+                    commands,
+                    execution_audit: client_execution_audit,
+                },
                 events,
                 join: Some(join),
             }),
@@ -828,6 +861,7 @@ enum WorkerCommand {
         session_id: SessionId,
         frame: Frame<ClientMessage>,
         reply: SyncSender<Result<SessionResponse, WorkerRequestError>>,
+        audit: RequestAuditTicket,
     },
     CloseSession {
         session_id: SessionId,
@@ -882,6 +916,7 @@ struct DatabaseWorkerState {
     sessions: HashMap<SessionId, WorkerSession>,
     session_policy: SessionPolicy,
     authorization: AuthorizationPolicy,
+    execution_audit: ServerExecutionAudit,
 }
 
 struct WorkerSession {
@@ -1048,6 +1083,7 @@ impl DatabaseWorkerState {
         authorization: AuthorizationPolicy,
         adaptive: Option<ServerAdaptiveWorkerRuntime>,
         physical_design: Option<ServerPhysicalDesignRuntime>,
+        execution_audit: ServerExecutionAudit,
     ) -> Self {
         Self {
             database: Some(database),
@@ -1056,6 +1092,7 @@ impl DatabaseWorkerState {
             sessions: HashMap::new(),
             session_policy,
             authorization,
+            execution_audit,
         }
     }
 
@@ -1097,21 +1134,10 @@ impl DatabaseWorkerState {
 }
 
 fn run_database_worker(
-    database: Database,
-    session_policy: SessionPolicy,
-    authorization: AuthorizationPolicy,
-    adaptive: Option<ServerAdaptiveWorkerRuntime>,
-    physical_design: Option<ServerPhysicalDesignRuntime>,
+    mut state: DatabaseWorkerState,
     commands: Receiver<WorkerCommand>,
     events: Sender<WorkerFatalError>,
 ) -> Result<(), WorkerFatalError> {
-    let mut state = DatabaseWorkerState::new(
-        database,
-        session_policy,
-        authorization,
-        adaptive,
-        physical_design,
-    );
     while let Ok(command) = commands.recv() {
         match command {
             WorkerCommand::OpenSession {
@@ -1144,12 +1170,16 @@ fn run_database_worker(
                 session_id,
                 frame,
                 reply,
+                audit,
             } => {
+                let worker_audit = state.execution_audit.worker_started(audit);
                 let Some(session) = state.sessions.get_mut(&session_id) else {
+                    state.execution_audit.worker_completed(worker_audit);
                     let _ = reply.send(Err(WorkerRequestError::MissingSession(session_id)));
                     continue;
                 };
                 let Some(database) = state.database.as_mut() else {
+                    state.execution_audit.worker_completed(worker_audit);
                     let error = WorkerFatalError::DatabaseCloseFailed {
                         message: "database is unavailable before worker shutdown".into(),
                     };
@@ -1167,6 +1197,7 @@ fn run_database_worker(
                     frame.request_id,
                     frame.message,
                 );
+                state.execution_audit.worker_completed(worker_audit);
                 let _ = reply.send(Ok(response));
             }
             WorkerCommand::CloseSession { session_id, reply } => {
@@ -1467,6 +1498,8 @@ fn run_connection_requests(
             Ok(None) => return Ok(()),
             Err(error) => return Err(ConnectionError::Read(error)),
         };
+        #[cfg(feature = "execution-audit")]
+        let total_started = Instant::now();
         let response = worker
             .request(session_id, frame, metrics)
             .map_err(ConnectionError::Worker)?;
@@ -1477,6 +1510,8 @@ fn run_connection_requests(
             metrics.authorization_denial();
         }
         let response = response.batch;
+        #[cfg(feature = "execution-audit")]
+        let write_started = Instant::now();
         for message in response.messages {
             write_server_frame(
                 stream,
@@ -1488,6 +1523,13 @@ fn run_connection_requests(
             .map_err(ConnectionError::WriteProtocol)?;
         }
         stream.flush().map_err(ConnectionError::Flush)?;
+        #[cfg(feature = "execution-audit")]
+        {
+            worker.execution_audit.socket_write(write_started.elapsed());
+            worker
+                .execution_audit
+                .total_request(total_started.elapsed());
+        }
     }
 }
 
@@ -1630,7 +1672,10 @@ mod tests {
         drop(receiver);
         let (_events, events) = mpsc::channel();
         let worker = DatabaseWorker {
-            client: WorkerClient { commands },
+            client: WorkerClient {
+                commands,
+                execution_audit: ServerExecutionAudit::default(),
+            },
             events,
             join: Some(thread::spawn(|| {
                 Err(WorkerFatalError::DatabaseCloseFailed {
@@ -1686,6 +1731,8 @@ mod tests {
             table_count: 0,
             transport_kind: TransportKind::PlaintextLoopback,
             metrics: ServerMetricsHandle::new(),
+            #[cfg(feature = "execution-audit")]
+            execution_audit: ServerExecutionAudit::default(),
             shutdown_tx,
             adaptive_control: ServerAdaptiveControlHandle::new(adaptive_tx),
             physical_design_control: ServerPhysicalDesignControlHandle::new(physical_design_tx),
