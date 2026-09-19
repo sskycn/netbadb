@@ -134,8 +134,15 @@ mutation uncertainty and retains the original error as its source. Without a
 receipt, the client reports `recovery_required = false`; the exact same approval
 may be used for idempotent discovery. Definite pre-mutation rejections retain
 their existing typed errors, and no automatic retry or evidence refresh occurs.
-With `receipt` present, the Server knows a durable Begin exists and startup
-reconciliation is required.
+An explicit Columnar `Database(ProjectionCatalog::RecoveryRequired)` takes
+precedence over generic unjournaled uncertainty. Without a journal, the Server
+preserves the original typed apply error and returns the existing
+`physical_columnar_recovery_required` code with `receipt: null` and mandatory
+restart/reopen-before-retry guidance. The client preserves this as `Remote`,
+not `MutationOutcomeUncertain { recovery_required: false, .. }`.
+With `receipt` present, this Core recovery error still uses receipt-aware
+mutation uncertainty: the Server knows a durable Begin exists, gates the
+journal, and requires startup reconciliation followed by receipt inspection.
 Client classification uses the code and nullable receipt, never message text.
 Connect/configuration and request encoding failures before dispatch remain
 ordinary definite local failures; protocol, request-ID, response-shape, or

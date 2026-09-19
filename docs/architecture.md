@@ -464,9 +464,12 @@ gating, Outcome-durability ambiguity is explicit, response loss invents no
 identity, and no receipt becomes replay or mutation authority. Uncertainty with
 a receipt means a durable Begin is known and reconciliation is required;
 reply/response loss has no observed receipt and does not assert recovery.
-Ambiguous Core Index/Columnar apply errors also remain typed mutation
+Generic Core Index/Columnar apply errors also remain typed mutation
 uncertainty when the optional journal is disabled, with no receipt or journal
 recovery gate; definite pre-mutation rejections keep their original errors.
+An explicit Columnar Projection Catalog `RecoveryRequired` keeps its typed
+restart/reopen requirement without a journal; with a durable Begin, it retains
+receipt-aware uncertainty and NBMR startup reconciliation.
 Begin failures and recovery-gated new requests do not enter Core. NBMR stays
 v3; Core, SQL, Database formats, Native Protocol v2, PostgreSQL wire, and
 Inspection JSON v7 are unchanged.

@@ -17,7 +17,7 @@ use netbadb_core::{
     PhysicalDesignEvidenceWindow, PhysicalDesignEvidenceWindowInspection,
     PhysicalDesignNoActionReason, PhysicalIndexCandidate, PhysicalIndexDesignApplyError,
     PhysicalIndexDesignApplyOutcome, PhysicalIndexDesignApplyReport, PhysicalIndexDesignNameState,
-    PhysicalIndexDesignProposal, PhysicalIndexDesignProposalError,
+    PhysicalIndexDesignProposal, PhysicalIndexDesignProposalError, ProjectionCatalogError,
 };
 use netbadb_schema::SchemaFingerprint;
 use netbadb_types::{
@@ -1307,6 +1307,23 @@ pub(crate) enum ServerPhysicalDesignWorkerCommand {
 enum TestPostApplyFailure {
     Database,
     AdvisorDatabase,
+    ProjectionCatalogRecoveryRequired,
+}
+
+#[cfg(test)]
+impl TestPostApplyFailure {
+    fn database_error(self) -> DatabaseError {
+        match self {
+            Self::Database | Self::AdvisorDatabase => DatabaseError::UndefinedIndex,
+            Self::ProjectionCatalogRecoveryRequired => {
+                DatabaseError::ProjectionCatalog(ProjectionCatalogError::RecoveryRequired {
+                    projection_id: ColumnarProjectionId(99),
+                    operation: "publish test projection",
+                    detail: "ambiguous test publication".into(),
+                })
+            }
+        }
+    }
 }
 
 /// Independent runtime owned beside, never inside, the adaptive runtime.
@@ -1655,12 +1672,13 @@ impl ServerPhysicalDesignRuntime {
             None => Ok(report),
             Some(failure) => Err(ServerPhysicalDesignControlError::Apply(Box::new(
                 match failure {
-                    TestPostApplyFailure::Database => {
-                        PhysicalIndexDesignApplyError::Database(DatabaseError::UndefinedIndex)
+                    TestPostApplyFailure::Database
+                    | TestPostApplyFailure::ProjectionCatalogRecoveryRequired => {
+                        PhysicalIndexDesignApplyError::Database(failure.database_error())
                     }
                     TestPostApplyFailure::AdvisorDatabase => {
                         PhysicalIndexDesignApplyError::Advisor(
-                            PhysicalDesignAdvisorError::Database(DatabaseError::UndefinedIndex),
+                            PhysicalDesignAdvisorError::Database(failure.database_error()),
                         )
                     }
                 },
@@ -1751,12 +1769,13 @@ impl ServerPhysicalDesignRuntime {
             None => Ok(report),
             Some(failure) => Err(ServerPhysicalColumnarDesignControlError::Apply(Box::new(
                 match failure {
-                    TestPostApplyFailure::Database => {
-                        PhysicalColumnarDesignApplyError::Database(DatabaseError::UndefinedIndex)
+                    TestPostApplyFailure::Database
+                    | TestPostApplyFailure::ProjectionCatalogRecoveryRequired => {
+                        PhysicalColumnarDesignApplyError::Database(failure.database_error())
                     }
                     TestPostApplyFailure::AdvisorDatabase => {
                         PhysicalColumnarDesignApplyError::Advisor(
-                            PhysicalDesignAdvisorError::Database(DatabaseError::UndefinedIndex),
+                            PhysicalDesignAdvisorError::Database(failure.database_error()),
                         )
                     }
                 },
@@ -1775,6 +1794,21 @@ impl ServerPhysicalDesignRuntime {
                         )?;
                 }
                 Ok(report)
+            }
+            // Preserve explicit Core recovery before generic unjournaled uncertainty.
+            // With a durable Begin, fall through to receipt-aware recovery instead.
+            Err(ServerPhysicalColumnarDesignControlError::Apply(error))
+                if receipt_id.is_none()
+                    && matches!(
+                        error.as_ref(),
+                        PhysicalColumnarDesignApplyError::Database(
+                            DatabaseError::ProjectionCatalog(
+                                ProjectionCatalogError::RecoveryRequired { .. }
+                            )
+                        )
+                    ) =>
+            {
+                Err(ServerPhysicalColumnarDesignControlError::Apply(error))
             }
             Err(error) => {
                 let Some(outcome) = columnar_error_receipt_outcome(&error) else {
@@ -2537,7 +2571,7 @@ mod tests {
         DatabaseCoordinatorConfig, PhysicalColumnarDesignApplyOutcome, PhysicalColumnarDesignMode,
         PhysicalDesignAdvisorError, PhysicalDesignRecommendationPolicy,
         PhysicalIndexDesignApplyOutcome, PhysicalIndexDesignProposalError,
-        PreparedExecutionFeedback, ProjectionCatalogError, TableStorageCreateSpec,
+        PreparedExecutionFeedback, TableStorageCreateSpec,
     };
     use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
     use netbadb_types::{ColumnId, ColumnarProjectionId, PhysicalType, TableId};
@@ -2693,6 +2727,135 @@ mod tests {
     }
 
     #[test]
+    fn no_journal_columnar_projection_catalog_recovery_remains_typed() {
+        let mut fixture = Fixture::create("no-journal-catalog-recovery");
+        let placements = fixture.root.join("placements");
+        fs::create_dir(&placements).unwrap();
+        let mut runtime = columnar_runtime(&placements);
+        record_columnar_candidate(&mut fixture.database, &mut runtime);
+        let proposal = propose_columnar(
+            &mut fixture.database,
+            &mut runtime,
+            PhysicalColumnarDesignMode::Snapshot,
+            "ambiguous",
+        )
+        .unwrap();
+        runtime.post_apply_failure = Some(TestPostApplyFailure::ProjectionCatalogRecoveryRequired);
+        let (tx, rx) = mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            ServerPhysicalDesignControlHandle::new(tx).apply_columnar(&proposal)
+        });
+        handle_one_apply(&mut fixture, &mut runtime, rx.recv().unwrap());
+        let error = caller.join().unwrap().unwrap_err();
+        assert!(runtime.mutation_receipts.is_none());
+        assert!(runtime.post_apply_failure.is_none());
+        assert_eq!(fixture.database.inspect_columnar_projections().len(), 1);
+        fixture.close();
+        let ServerPhysicalColumnarDesignControlError::Apply(core) = error else {
+            panic!("expected original typed recovery error, got {error:?}");
+        };
+        assert!(matches!(*core, PhysicalColumnarDesignApplyError::Database(
+            DatabaseError::ProjectionCatalog(ProjectionCatalogError::RecoveryRequired {
+                projection_id: ColumnarProjectionId(99), operation: "publish test projection", ref detail,
+            })) if detail == "ambiguous test publication"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nbop_no_journal_columnar_projection_catalog_recovery_preserves_restart_guidance() {
+        use crate::operator::{OperatorClientError, OperatorErrorCodeV5};
+
+        let error = nbop_no_journal_post_apply_error(
+            true,
+            TestPostApplyFailure::ProjectionCatalogRecoveryRequired,
+        );
+        let OperatorClientError::Remote(remote) = error else {
+            panic!("expected typed remote recovery, not generic uncertainty: {error:?}");
+        };
+        assert_eq!(
+            remote.code,
+            OperatorErrorCodeV5::PhysicalColumnarRecoveryRequired
+        );
+        let wire = serde_json::to_value(&remote).unwrap();
+        assert_eq!(wire["code"], "physical_columnar_recovery_required");
+        assert_eq!(wire.get("receipt"), Some(&serde_json::Value::Null));
+        assert!(remote.message.contains("restart/reopen"));
+        assert!(remote.message.contains("before retrying"));
+    }
+
+    #[test]
+    fn receipted_columnar_projection_catalog_recovery_preserves_receipt_recovery_contract() {
+        let mut fixture = Fixture::create("receipted-catalog-recovery");
+        let placements = fixture.root.join("placements");
+        fs::create_dir(&placements).unwrap();
+        let receipt_config = ServerPhysicalDesignMutationReceiptConfig::new(
+            fixture.root.join("physical-design.nbmr"),
+            1_000_000,
+        )
+        .unwrap();
+        let columnar = ServerPhysicalColumnarApplyConfig::new(&placements, true, false).unwrap();
+        let mut runtime = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            Some(columnar.clone()),
+            Some(receipt_config.clone()),
+            &fixture.database,
+        )
+        .unwrap();
+        record_columnar_candidate(&mut fixture.database, &mut runtime);
+        runtime.post_apply_failure = Some(TestPostApplyFailure::ProjectionCatalogRecoveryRequired);
+        let epoch = runtime.evidence.epoch();
+        let reply = runtime.apply_approved_columnar(
+            &mut fixture.database,
+            true,
+            epoch,
+            columnar_candidate(),
+            PhysicalColumnarDesignMode::Snapshot,
+            ServerPhysicalColumnarPlacementKey::new("ambiguous").unwrap(),
+        );
+        let reference = reply
+            .receipt
+            .expect("durable Begin correlation survives Core recovery");
+        assert!(matches!(reply.result,
+            Err(ServerPhysicalColumnarDesignControlError::PostBeginMutationOutcomeUncertain(source))
+            if matches!(*source, ServerPhysicalColumnarDesignControlError::Apply(ref core)
+                if matches!(core.as_ref(), PhysicalColumnarDesignApplyError::Database(
+                    DatabaseError::ProjectionCatalog(ProjectionCatalogError::RecoveryRequired { .. }))))));
+        assert!(runtime.post_apply_failure.is_none());
+        let status = receipt_status(&mut fixture.database, &mut runtime).unwrap();
+        assert!(status.recovery_required);
+        assert_eq!(status.journal_incarnation, reference.journal_incarnation());
+        assert_eq!(status.latest_receipt_id, Some(reference.receipt_id()));
+        let page = receipts(&mut fixture.database, &mut runtime, None, 1).unwrap();
+        assert_eq!(page.receipts[0].id, reference.receipt_id());
+        assert_eq!(
+            page.receipts[0].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::Pending
+        );
+        let projection_id = fixture.database.inspect_columnar_projections()[0]
+            .projection_id
+            .unwrap();
+        drop(runtime);
+        let mut reopened = ServerPhysicalDesignRuntime::new_with_mutation_receipts(
+            config(),
+            Some(columnar),
+            Some(receipt_config),
+            &fixture.database,
+        )
+        .unwrap();
+        let status = receipt_status(&mut fixture.database, &mut reopened).unwrap();
+        assert!(!status.recovery_required);
+        assert_eq!(status.journal_incarnation, reference.journal_incarnation());
+        let page = receipts(&mut fixture.database, &mut reopened, None, 1).unwrap();
+        assert_eq!(page.receipts[0].id, reference.receipt_id());
+        assert_eq!(
+            page.receipts[0].outcome,
+            ServerPhysicalDesignMutationReceiptOutcome::RecoveredAppliedColumnar { projection_id }
+        );
+        drop(reopened);
+        fixture.close();
+    }
+
+    #[test]
     fn no_journal_pre_mutation_rejections_remain_definite() {
         let mut fixture = Fixture::create("no-journal-rejections");
         let placements = fixture.root.join("placements");
@@ -2728,11 +2891,13 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_nbop_no_journal_ambiguity(columnar: bool, failure: TestPostApplyFailure) {
+    fn nbop_no_journal_post_apply_error(
+        columnar: bool,
+        failure: TestPostApplyFailure,
+    ) -> crate::operator::OperatorClientError {
         use crate::operator::{
-            OperatorClientError, OperatorErrorCodeV5, OperatorListenerPolicy,
-            OperatorPhysicalColumnarDesignModeV5, OperatorPhysicalDesignRuntimeToken,
-            ServerOperatorClient, ServerOperatorConfig,
+            OperatorListenerPolicy, OperatorPhysicalColumnarDesignModeV5,
+            OperatorPhysicalDesignRuntimeToken, ServerOperatorClient, ServerOperatorConfig,
             serve_operator_connection_with_capabilities,
         };
         use std::os::unix::net::UnixListener;
@@ -2816,6 +2981,14 @@ mod tests {
             assert_eq!(fixture.database.indexes(TABLE_ID).unwrap().len(), 1);
         }
         fixture.close();
+        error
+    }
+
+    #[cfg(unix)]
+    fn assert_nbop_no_journal_ambiguity(columnar: bool, failure: TestPostApplyFailure) {
+        use crate::operator::{OperatorClientError, OperatorErrorCodeV5};
+
+        let error = nbop_no_journal_post_apply_error(columnar, failure);
         let OperatorClientError::MutationOutcomeUncertain {
             recovery_required: false,
             receipt: None,
