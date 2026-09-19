@@ -139,6 +139,55 @@ pub enum StorageKind {
     Lsm,
 }
 
+/// Current main-file geometry, independent of optimizer ANALYZE snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapPhysicalDesignSourceInspection {
+    pub storage_id: StorageId,
+    /// Committed read horizon only; this is not a physical-layout token.
+    pub visibility_boundary: StorageVisibilityBoundary,
+    /// All managed pages, including access-method/catalog/free pages that the
+    /// production sequential scan validates and skips. No row-count claim.
+    pub managed_page_upper_bound: u64,
+    /// Full aligned main-file extent, including its header. A format-level
+    /// source footprint, not device I/O, cache misses, or elapsed time.
+    pub main_file_bytes_upper_bound: u64,
+    /// One production Index backfill pass starts after empty-tree allocation
+    /// and bounded pre-scan catalog growth (including legacy re-encoding).
+    /// Excludes allocator/catalog traversal, tree inserts and output writes.
+    pub index_backfill_page_upper_bound: u64,
+    /// Main-file extent addressable by that backfill pass, including bounded
+    /// pre-scan growth. Later tree splits are outside its fixed limit.
+    pub index_backfill_bytes_upper_bound: u64,
+}
+
+/// Exact current runtime/manifest structure; versions and tombstones count as
+/// physical entries, never as current logical rows. No source rows are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LsmPhysicalDesignSourceInspection {
+    pub anchor: crate::LsmMaintenanceAnchor,
+    pub visibility_boundary: StorageVisibilityBoundary,
+    pub memtable_entry_count: u64,
+    /// Resident encoded-payload accounting (40 bytes per version plus value
+    /// length), not allocator/RSS usage and not persistent read I/O.
+    pub memtable_bytes: u64,
+    pub sstable_count: u64,
+    pub sstable_entry_count: u64,
+    /// Current persistent SSTable file extents. One full source traversal
+    /// reads only blocks inside these files, at most once per block.
+    pub total_sstable_bytes: u64,
+    /// Existing production flush theorem. None means precisely an empty
+    /// MemTable (no flush output), not an unknown or zero resource bound.
+    pub flush_conservative_bound: Option<crate::LsmMaintenanceBoundInspection>,
+}
+
+/// Runtime observation of the current source; not durable mutation permission.
+/// Recompute after DML or physical maintenance. No optimizer statistics enter it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoragePhysicalDesignSourceInspection {
+    Heap(HeapPhysicalDesignSourceInspection),
+    Lsm(LsmPhysicalDesignSourceInspection),
+}
+
 /// Opaque committed visibility boundary for one physical storage.
 ///
 /// The numeric value is meaningful only with both the storage identity and
@@ -182,7 +231,7 @@ impl StorageVisibilityBoundary {
         self.value
     }
 
-    fn from_local_horizon(
+    pub(crate) fn from_local_horizon(
         storage_id: StorageId,
         storage_kind: StorageKind,
         horizon: u64,
@@ -1183,6 +1232,22 @@ impl TableStorage {
         }
     }
 
+    /// Metadata-only current source inspection: O(1) for Heap, O(SSTables)
+    /// for LSM. Does not scan, ANALYZE, flush, pin a view, or touch read counters.
+    pub fn inspect_physical_design_source(
+        &self,
+    ) -> Result<StoragePhysicalDesignSourceInspection, StorageError> {
+        self.ensure_recovery_ready()?;
+        match self {
+            Self::Heap(storage) => storage
+                .inspect_physical_design_source()
+                .map(StoragePhysicalDesignSourceInspection::Heap),
+            Self::Lsm(storage) => storage
+                .inspect_physical_design_source()
+                .map(StoragePhysicalDesignSourceInspection::Lsm),
+        }
+    }
+
     #[must_use]
     pub fn lsm_inspection(&self) -> Option<LsmInspection> {
         match self {
@@ -1451,6 +1516,15 @@ impl TableStorage {
         }
     }
 
+    /// O(1) identity/health observation without retained-history accounting.
+    #[must_use]
+    pub fn inspect_change_stream_source(&self) -> crate::ChangeStreamSourceInspection {
+        match self {
+            Self::Heap(storage) => storage.change_stream_source_inspection(),
+            Self::Lsm(storage) => storage.change_stream_source_inspection(),
+        }
+    }
+
     #[must_use]
     pub fn inspect_change_stream(&self) -> crate::ChangeStreamInspection {
         match self {
@@ -1685,6 +1759,8 @@ impl TableStorage {
         columns: &[ColumnId],
         view: &StorageReadView,
     ) -> Result<Vec<(StorageRowHandle, Vec<ScalarValue>)>, StorageError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::source_inspection_test_activity::record(|activity| activity.scan_columns_calls += 1);
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
@@ -1723,6 +1799,10 @@ impl TableStorage {
         columns: &[ColumnId],
         view: &StorageReadView,
     ) -> Result<Vec<(crate::StorageVersionKey, Vec<ScalarValue>)>, StorageError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::source_inspection_test_activity::record(|activity| {
+            activity.scan_versioned_columns_calls += 1
+        });
         self.scan_columns_with_view(columns, view)?
             .into_iter()
             .map(|(handle, values)| Ok((handle.committed_version_key()?, values)))
@@ -2267,6 +2347,8 @@ impl TableStorage {
     }
 
     pub fn analyze(&mut self) -> Result<(), StorageError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::source_inspection_test_activity::record(|activity| activity.analyze_calls += 1);
         match self {
             Self::Heap(storage) => storage.analyze(),
             Self::Lsm(storage) => storage.analyze(),
@@ -2293,6 +2375,8 @@ impl TableStorage {
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::source_inspection_test_activity::record(|activity| activity.flush_calls += 1);
         match self {
             Self::Heap(storage) => storage.flush(),
             Self::Lsm(storage) => storage.flush(),

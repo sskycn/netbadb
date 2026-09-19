@@ -8,7 +8,10 @@ use netbadb_rel::{
     BinaryOp, LogicalQueryShape, QueryColumnShape, QueryExpressionShape, QueryExpressionShapeKind,
 };
 use netbadb_schema::SchemaFingerprint;
-use netbadb_storage::StorageKind;
+use netbadb_storage::{
+    LsmMaintenanceAnchor, LsmMaintenanceBoundInspection, StorageKind,
+    StoragePhysicalDesignSourceInspection, TableStorage,
+};
 use netbadb_types::{
     ChangeStreamGeneration, ColumnId, ColumnarProjectionId, DatabaseCommitSeq, IndexId, IndexName,
     SchemaGeneration, StorageId, TableId, TableSchemaVersion,
@@ -126,6 +129,224 @@ pub struct PhysicalColumnarCandidate {
 pub enum PhysicalColumnarDesignMode {
     Snapshot,
     Incremental,
+}
+
+/// A proven upper bound for a stated production component at the inspected
+/// state. Neither variant predicts device I/O or time; overflow is an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalDesignMutationConservativeBound {
+    /// Successful execution cannot exceed this number under the documented
+    /// accounting definition, while the inspected state remains unchanged.
+    Bounded(u64),
+    /// No trustworthy metadata-only bound is proven. Never zero or permission.
+    NotProven,
+}
+
+/// Bounds for the mutation's source traversal and output, excluding separately
+/// reported prerequisite work. Heap work units are managed main-file pages;
+/// no cross-engine conversion to LSM work units is claimed. Index bounds cover
+/// its single backfill pass, including empty-tree and catalog growth before
+/// that pass. They exclude allocator/catalog walks and tree insertion work,
+/// so do not bound total mutation work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicalDesignMutationResourceBounds {
+    pub source_work_units: PhysicalDesignMutationConservativeBound,
+    /// Persistent format bytes covered by the source traversal, not device I/O.
+    /// Snapshot LSM with pending flush is NotProven: current SSTable extents
+    /// and the flush output bound remain separately identified components.
+    pub source_read_bytes: PhysicalDesignMutationConservativeBound,
+    pub output_write_bytes: PhysicalDesignMutationConservativeBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalColumnarMutationPrerequisiteInspection {
+    None,
+    /// The Snapshot production path will flush this nonempty MemTable before
+    /// scanning. Inspection does not execute the flush or check admission.
+    LsmFlush {
+        anchor: LsmMaintenanceAnchor,
+        conservative_bound: LsmMaintenanceBoundInspection,
+    },
+}
+
+/// Current hypothetical single-column Heap B+Tree build footprint. Observation
+/// only: no name, ID, recommendation, coverage decision, or apply authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalIndexDesignMutationWorkInspection {
+    pub candidate: PhysicalIndexCandidate,
+    pub schema_generation: SchemaGeneration,
+    pub table_schema_version: TableSchemaVersion,
+    pub table_fingerprint: SchemaFingerprint,
+    pub storage_id: StorageId,
+    pub source: StoragePhysicalDesignSourceInspection,
+    pub bounds: PhysicalDesignMutationResourceBounds,
+}
+
+/// Current hypothetical Columnar build footprint. No placement or projection
+/// identity is reserved. DML/maintenance can invalidate this observation at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalColumnarDesignMutationWorkInspection {
+    pub candidate: PhysicalColumnarCandidate,
+    pub mode: PhysicalColumnarDesignMode,
+    pub schema_generation: SchemaGeneration,
+    pub table_schema_version: TableSchemaVersion,
+    pub table_fingerprint: SchemaFingerprint,
+    pub storage_id: StorageId,
+    pub source: StoragePhysicalDesignSourceInspection,
+    pub prerequisite: PhysicalColumnarMutationPrerequisiteInspection,
+    pub bounds: PhysicalDesignMutationResourceBounds,
+}
+
+#[derive(Debug)]
+pub enum PhysicalDesignMutationWorkInspectionError {
+    GlobalVisibilityRequired,
+    DurableCatalogRequired,
+    TableNotFound(TableId),
+    ColumnNotFound {
+        table_id: TableId,
+        column_id: ColumnId,
+    },
+    EmptyColumnarColumns,
+    DuplicateColumnarColumn(ColumnId),
+    RequiresSingleStorage(TableId),
+    UnsupportedIndexLayout,
+    IncrementalChangeStreamNotEnabled {
+        storage_id: StorageId,
+    },
+    IncrementalChangeStreamUnavailable {
+        storage_id: StorageId,
+    },
+    /// Preserves typed schema/storage errors, including checked bound overflow.
+    Database(DatabaseError),
+}
+
+impl fmt::Display for PhysicalDesignMutationWorkInspectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GlobalVisibilityRequired => {
+                formatter.write_str("mutation work inspection requires global visibility")
+            }
+            Self::DurableCatalogRequired => {
+                formatter.write_str("mutation work inspection requires a managed durable catalog")
+            }
+            Self::TableNotFound(table) => {
+                write!(formatter, "mutation work table {} does not exist", table.0)
+            }
+            Self::ColumnNotFound {
+                table_id,
+                column_id,
+            } => write!(
+                formatter,
+                "mutation work column {} does not exist in table {}",
+                column_id.0, table_id.0
+            ),
+            Self::EmptyColumnarColumns => {
+                formatter.write_str("Columnar mutation work requires at least one column")
+            }
+            Self::DuplicateColumnarColumn(column) => write!(
+                formatter,
+                "Columnar mutation work repeats column {}",
+                column.0
+            ),
+            Self::RequiresSingleStorage(table) => write!(
+                formatter,
+                "mutation work table {} requires single storage",
+                table.0
+            ),
+            Self::UnsupportedIndexLayout => {
+                formatter.write_str("index mutation work requires single-storage Heap")
+            }
+            Self::IncrementalChangeStreamNotEnabled { storage_id } => write!(
+                formatter,
+                "incremental source {} has no enabled Change Stream",
+                storage_id.0
+            ),
+            Self::IncrementalChangeStreamUnavailable { storage_id } => write!(
+                formatter,
+                "incremental source {} has an unavailable Change Stream",
+                storage_id.0
+            ),
+            Self::Database(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PhysicalDesignMutationWorkInspectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Database(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<DatabaseError> for PhysicalDesignMutationWorkInspectionError {
+    fn from(error: DatabaseError) -> Self {
+        Self::Database(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncrementalDesignSourceError {
+    Disabled,
+    Unavailable,
+}
+
+/// One definition shared by Phase 27 proposal/apply and current work inspection.
+fn incremental_design_source_generation(
+    storage_id: StorageId,
+    stream: netbadb_storage::ChangeStreamSourceInspection,
+    table_id: TableId,
+    fingerprint: SchemaFingerprint,
+) -> Result<ChangeStreamGeneration, IncrementalDesignSourceError> {
+    match stream.status {
+        netbadb_storage::ChangeStreamStatus::Disabled => {
+            return Err(IncrementalDesignSourceError::Disabled);
+        }
+        netbadb_storage::ChangeStreamStatus::Unavailable => {
+            return Err(IncrementalDesignSourceError::Unavailable);
+        }
+        netbadb_storage::ChangeStreamStatus::Enabled => {}
+    }
+    if stream.storage_id != storage_id
+        || stream.table_id != table_id
+        || stream.schema_fingerprint != fingerprint
+    {
+        return Err(IncrementalDesignSourceError::Unavailable);
+    }
+    stream
+        .generation
+        .filter(|generation| generation.0 != 0)
+        .ok_or(IncrementalDesignSourceError::Unavailable)
+}
+
+fn mutation_source_bounds(
+    source: StoragePhysicalDesignSourceInspection,
+    prerequisite: PhysicalColumnarMutationPrerequisiteInspection,
+) -> PhysicalDesignMutationResourceBounds {
+    use PhysicalDesignMutationConservativeBound::{Bounded, NotProven};
+    let (source_work_units, source_read_bytes) = match source {
+        StoragePhysicalDesignSourceInspection::Heap(heap) => (
+            Bounded(heap.managed_page_upper_bound),
+            Bounded(heap.main_file_bytes_upper_bound),
+        ),
+        StoragePhysicalDesignSourceInspection::Lsm(lsm) => (
+            NotProven,
+            if matches!(
+                prerequisite,
+                PhysicalColumnarMutationPrerequisiteInspection::None
+            ) {
+                Bounded(lsm.total_sstable_bytes)
+            } else {
+                NotProven
+            },
+        ),
+    };
+    PhysicalDesignMutationResourceBounds {
+        source_work_units,
+        source_read_bytes,
+        output_write_bytes: NotProven,
+    }
 }
 
 /// Work paid by executions structurally relevant to a candidate. Work can
@@ -1303,6 +1524,185 @@ impl From<DatabaseError> for PhysicalDesignAdvisorError {
 }
 
 impl Database {
+    /// Inspects the current hypothetical build-capable target independently of
+    /// recommendation and existing coverage. Scans no rows, runs no ANALYZE,
+    /// reserves no identity, and mutates no storage/evidence/scheduler state.
+    /// Future admission must call this after idempotency/coverage checks, in
+    /// the same execution-owner command immediately before mutation; retaining
+    /// this report grants no permission and makes no freshness guarantee.
+    pub fn inspect_physical_index_design_mutation_work(
+        &self,
+        candidate: PhysicalIndexCandidate,
+    ) -> Result<PhysicalIndexDesignMutationWorkInspection, PhysicalDesignMutationWorkInspectionError>
+    {
+        let (table_schema_version, table_fingerprint, storage) =
+            self.mutation_work_source(candidate.table_id, &[candidate.column_id])?;
+        if storage.kind() != StorageKind::Heap {
+            return Err(PhysicalDesignMutationWorkInspectionError::UnsupportedIndexLayout);
+        }
+        let source = storage
+            .inspect_physical_design_source()
+            .map_err(DatabaseError::from)?;
+        let StoragePhysicalDesignSourceInspection::Heap(heap) = source else {
+            return Err(PhysicalDesignMutationWorkInspectionError::UnsupportedIndexLayout);
+        };
+        Ok(PhysicalIndexDesignMutationWorkInspection {
+            candidate,
+            schema_generation: self.schema_generation(),
+            table_schema_version,
+            table_fingerprint,
+            storage_id: storage.storage_id(),
+            source,
+            bounds: PhysicalDesignMutationResourceBounds {
+                source_work_units: PhysicalDesignMutationConservativeBound::Bounded(
+                    heap.index_backfill_page_upper_bound,
+                ),
+                source_read_bytes: PhysicalDesignMutationConservativeBound::Bounded(
+                    heap.index_backfill_bytes_upper_bound,
+                ),
+                output_write_bytes: PhysicalDesignMutationConservativeBound::NotProven,
+            },
+        })
+    }
+
+    /// Metadata-only source inspection; never captures rows, flushes LSM,
+    /// changes a stream, or allocates a projection. Snapshot's pending LSM
+    /// flush is a separate component. This report is immediately stale-able,
+    /// runtime-only observation, never a reusable apply/admission token.
+    pub fn inspect_physical_columnar_design_mutation_work(
+        &self,
+        candidate: &PhysicalColumnarCandidate,
+        mode: PhysicalColumnarDesignMode,
+    ) -> Result<
+        PhysicalColumnarDesignMutationWorkInspection,
+        PhysicalDesignMutationWorkInspectionError,
+    > {
+        let (table_schema_version, table_fingerprint, storage) =
+            self.mutation_work_source(candidate.table_id, &candidate.columns)?;
+        if !self.projections.is_managed() {
+            return Err(PhysicalDesignMutationWorkInspectionError::DurableCatalogRequired);
+        }
+        self.projections
+            .ensure_mutation_available()
+            .map_err(DatabaseError::from)?;
+        if candidate.columns.is_empty() {
+            return Err(PhysicalDesignMutationWorkInspectionError::EmptyColumnarColumns);
+        }
+        let mut columns = std::collections::BTreeSet::new();
+        for column in &candidate.columns {
+            if !columns.insert(*column) {
+                return Err(
+                    PhysicalDesignMutationWorkInspectionError::DuplicateColumnarColumn(*column),
+                );
+            }
+        }
+        if mode == PhysicalColumnarDesignMode::Incremental {
+            incremental_design_source_generation(
+                storage.storage_id(),
+                storage.inspect_change_stream_source(),
+                candidate.table_id,
+                table_fingerprint,
+            )
+            .map_err(|error| match error {
+                IncrementalDesignSourceError::Disabled => {
+                    PhysicalDesignMutationWorkInspectionError::IncrementalChangeStreamNotEnabled {
+                        storage_id: storage.storage_id(),
+                    }
+                }
+                IncrementalDesignSourceError::Unavailable => {
+                    PhysicalDesignMutationWorkInspectionError::IncrementalChangeStreamUnavailable {
+                        storage_id: storage.storage_id(),
+                    }
+                }
+            })?;
+        }
+        let source = storage
+            .inspect_physical_design_source()
+            .map_err(DatabaseError::from)?;
+        let prerequisite = match (mode, source) {
+            (
+                PhysicalColumnarDesignMode::Snapshot,
+                StoragePhysicalDesignSourceInspection::Lsm(lsm),
+            ) => match lsm.flush_conservative_bound {
+                Some(conservative_bound) => {
+                    PhysicalColumnarMutationPrerequisiteInspection::LsmFlush {
+                        anchor: lsm.anchor,
+                        conservative_bound,
+                    }
+                }
+                None => PhysicalColumnarMutationPrerequisiteInspection::None,
+            },
+            _ => PhysicalColumnarMutationPrerequisiteInspection::None,
+        };
+        Ok(PhysicalColumnarDesignMutationWorkInspection {
+            candidate: candidate.clone(),
+            mode,
+            schema_generation: self.schema_generation(),
+            table_schema_version,
+            table_fingerprint,
+            storage_id: storage.storage_id(),
+            source,
+            prerequisite,
+            bounds: mutation_source_bounds(source, prerequisite),
+        })
+    }
+
+    fn mutation_work_source(
+        &self,
+        table_id: TableId,
+        columns: &[ColumnId],
+    ) -> Result<
+        (TableSchemaVersion, SchemaFingerprint, &TableStorage),
+        PhysicalDesignMutationWorkInspectionError,
+    > {
+        use PhysicalDesignMutationWorkInspectionError as WorkError;
+        if self.visibility_mode() != crate::DatabaseVisibilityMode::Global {
+            return Err(WorkError::GlobalVisibilityRequired);
+        }
+        self.ensure_schema_available(None)?;
+        if self.catalog_path.is_none() {
+            return Err(WorkError::DurableCatalogRequired);
+        }
+        let table = self
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == table_id)
+            .ok_or(WorkError::TableNotFound(table_id))?;
+        let version = self
+            .table_schema_version(table_id)
+            .ok_or(WorkError::TableNotFound(table_id))?;
+        for column_id in columns {
+            if table.column_by_id(*column_id).is_none() {
+                return Err(WorkError::ColumnNotFound {
+                    table_id,
+                    column_id: *column_id,
+                });
+            }
+        }
+        let storage_id = match self
+            .bindings
+            .placement(table_id)
+            .map_err(DatabaseError::from)?
+        {
+            TablePlacement::Single { storage_id, .. } => *storage_id,
+            TablePlacement::RangePartitioned { .. } => {
+                return Err(WorkError::RequiresSingleStorage(table_id));
+            }
+        };
+        let storage = self
+            .registry
+            .get(storage_id)
+            .ok_or(crate::StorageRegistryError::UnknownStorageId { storage_id })
+            .map_err(DatabaseError::from)?;
+        Ok((
+            version,
+            table.fingerprint().map_err(DatabaseError::from)?,
+            storage,
+        ))
+    }
+
     /// Returns the existing durable Schema Catalog incarnation without
     /// changing database, catalog, filesystem, visibility, or evidence state.
     pub fn physical_design_database_identity(
@@ -1489,43 +1889,35 @@ impl Database {
 
         let (table_schema_version, table_fingerprint, storage_id) =
             self.current_columnar_table_anchor(&candidate)?;
-        let change_stream_generation =
-            match mode {
-                PhysicalColumnarDesignMode::Snapshot => None,
-                PhysicalColumnarDesignMode::Incremental => {
-                    let stream = self
-                        .registry
-                        .get(storage_id)
-                        .ok_or(crate::StorageRegistryError::UnknownStorageId { storage_id })
-                        .map_err(DatabaseError::from)?
-                        .inspect_change_stream();
-                    match stream.status {
-                        netbadb_storage::ChangeStreamStatus::Disabled => {
-                            return Err(PhysicalColumnarDesignProposalError::
-                            IncrementalChangeStreamNotEnabled { storage_id });
-                        }
-                        netbadb_storage::ChangeStreamStatus::Unavailable => {
-                            return Err(PhysicalColumnarDesignProposalError::
-                            IncrementalChangeStreamUnavailable { storage_id });
-                        }
-                        netbadb_storage::ChangeStreamStatus::Enabled => {}
-                    }
-                    if stream.storage_id != storage_id
-                        || stream.table_id != candidate.table_id
-                        || stream.schema_fingerprint != table_fingerprint
-                    {
-                        return Err(PhysicalColumnarDesignProposalError::
-                        IncrementalChangeStreamUnavailable { storage_id });
-                    }
-                    match stream.generation {
-                        Some(generation) if generation.0 != 0 => Some(generation),
-                        _ => {
-                            return Err(PhysicalColumnarDesignProposalError::
-                            IncrementalChangeStreamUnavailable { storage_id });
+        let change_stream_generation = match mode {
+            PhysicalColumnarDesignMode::Snapshot => None,
+            PhysicalColumnarDesignMode::Incremental => {
+                let storage = self
+                    .registry
+                    .get(storage_id)
+                    .ok_or(crate::StorageRegistryError::UnknownStorageId { storage_id })
+                    .map_err(DatabaseError::from)?;
+                let generation = incremental_design_source_generation(
+                    storage.storage_id(),
+                    storage.inspect_change_stream_source(),
+                    candidate.table_id,
+                    table_fingerprint,
+                )
+                .map_err(|error| match error {
+                    IncrementalDesignSourceError::Disabled => {
+                        PhysicalColumnarDesignProposalError::IncrementalChangeStreamNotEnabled {
+                            storage_id,
                         }
                     }
-                }
-            };
+                    IncrementalDesignSourceError::Unavailable => {
+                        PhysicalColumnarDesignProposalError::IncrementalChangeStreamUnavailable {
+                            storage_id,
+                        }
+                    }
+                })?;
+                Some(generation)
+            }
+        };
         let proposed_at_global_commit_seq = self.current_global_commit_seq()?;
 
         Ok(PhysicalColumnarDesignProposal {
@@ -1985,34 +2377,23 @@ impl Database {
             ));
         }
         if proposal.mode == PhysicalColumnarDesignMode::Incremental {
-            let stream = storage.inspect_change_stream();
-            match stream.status {
-                netbadb_storage::ChangeStreamStatus::Disabled => {
-                    return Err(PhysicalColumnarDesignApplyError::StaleProposal(
-                        PhysicalColumnarDesignProposalStaleReason::ChangeStreamDisabled,
-                    ));
-                }
-                netbadb_storage::ChangeStreamStatus::Unavailable => {
-                    return Err(PhysicalColumnarDesignApplyError::StaleProposal(
-                        PhysicalColumnarDesignProposalStaleReason::ChangeStreamUnavailable,
-                    ));
-                }
-                netbadb_storage::ChangeStreamStatus::Enabled => {}
-            }
-            if stream.storage_id != current_storage
-                || stream.table_id != proposal.candidate.table_id
-                || stream.schema_fingerprint != proposal.table_fingerprint
-            {
-                return Err(PhysicalColumnarDesignApplyError::StaleProposal(
-                    PhysicalColumnarDesignProposalStaleReason::ChangeStreamUnavailable,
-                ));
-            }
+            let actual = incremental_design_source_generation(
+                storage.storage_id(),
+                storage.inspect_change_stream_source(),
+                proposal.candidate.table_id,
+                proposal.table_fingerprint,
+            )
+            .map_err(|error| {
+                PhysicalColumnarDesignApplyError::StaleProposal(match error {
+                    IncrementalDesignSourceError::Disabled => {
+                        PhysicalColumnarDesignProposalStaleReason::ChangeStreamDisabled
+                    }
+                    IncrementalDesignSourceError::Unavailable => {
+                        PhysicalColumnarDesignProposalStaleReason::ChangeStreamUnavailable
+                    }
+                })
+            })?;
             let Some(expected) = proposal.change_stream_generation else {
-                return Err(PhysicalColumnarDesignApplyError::StaleProposal(
-                    PhysicalColumnarDesignProposalStaleReason::ChangeStreamUnavailable,
-                ));
-            };
-            let Some(actual) = stream.generation else {
                 return Err(PhysicalColumnarDesignApplyError::StaleProposal(
                     PhysicalColumnarDesignProposalStaleReason::ChangeStreamUnavailable,
                 ));
@@ -2847,4 +3228,64 @@ fn checked_add(target: &mut u64, value: u64, overflowed: &mut bool) {
 
 fn u64_len(length: usize) -> u64 {
     u64::try_from(length).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod mutation_work_stream_tests {
+    use super::*;
+    use netbadb_storage::{ChangeStreamSourceInspection, ChangeStreamStatus};
+
+    #[test]
+    fn mutation_work_and_phase27_share_exact_stream_capability_validation() {
+        let fingerprint = SchemaFingerprint::from_bytes([1; 32]);
+        let healthy = ChangeStreamSourceInspection {
+            storage_id: StorageId(7),
+            table_id: TableId(8),
+            status: ChangeStreamStatus::Enabled,
+            generation: Some(ChangeStreamGeneration(9)),
+            schema_fingerprint: fingerprint,
+        };
+        let validate = |source| {
+            incremental_design_source_generation(StorageId(7), source, TableId(8), fingerprint)
+        };
+        assert_eq!(validate(healthy), Ok(ChangeStreamGeneration(9)));
+        for invalid in [
+            ChangeStreamSourceInspection {
+                storage_id: StorageId(6),
+                ..healthy
+            },
+            ChangeStreamSourceInspection {
+                table_id: TableId(6),
+                ..healthy
+            },
+            ChangeStreamSourceInspection {
+                schema_fingerprint: SchemaFingerprint::from_bytes([2; 32]),
+                ..healthy
+            },
+            ChangeStreamSourceInspection {
+                generation: None,
+                ..healthy
+            },
+            ChangeStreamSourceInspection {
+                generation: Some(ChangeStreamGeneration(0)),
+                ..healthy
+            },
+            ChangeStreamSourceInspection {
+                status: ChangeStreamStatus::Unavailable,
+                ..healthy
+            },
+        ] {
+            assert_eq!(
+                validate(invalid),
+                Err(IncrementalDesignSourceError::Unavailable)
+            );
+        }
+        assert_eq!(
+            validate(ChangeStreamSourceInspection {
+                status: ChangeStreamStatus::Disabled,
+                ..healthy
+            }),
+            Err(IncrementalDesignSourceError::Disabled)
+        );
+    }
 }

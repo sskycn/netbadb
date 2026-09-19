@@ -78,3 +78,15 @@ The storage test suite as a whole SHOULD cover:
 Each storage change MUST add or update tests for the invariants it changes; it
 does not need to duplicate every baseline case. A fuzz- or property-test failure
 MUST receive a deterministic regression test.
+
+## Current physical mutation evidence
+
+Physical Design hard resource evidence MUST be authored by the owning engine
+from current structural/runtime metadata. Optimizer ANALYZE snapshots MUST NOT
+be reused as mutation admission authority. Inspection MUST NOT scan rows,
+iterate MemTable values or retained Change Stream history, heat the page cache,
+flush/compact storage, or change amplification counters. A conservative bound
+MUST be tied to the stated production component; account for work prerequisites
+such as Index empty-tree allocation before backfill. Unknown dimensions MUST
+remain explicit, and arithmetic overflow MUST return a typed error rather than
+saturate or masquerade as an unproven bound.

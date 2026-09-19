@@ -59,6 +59,13 @@ and target placement are explicit caller approvals, and Incremental apply MUST
 NOT enable or replace a Change Stream. Mutation may begin only through an
 existing `Database` Columnar build API.
 
+Physical Design mutation-work inspection is observation only. It MUST NOT
+reserve identity, run ANALYZE, scan/materialize source rows or retained Change
+Stream history, flush storage, mutate evidence, or become an apply capability.
+Future admission MUST recompute current inspection after idempotency/coverage
+checks immediately before mutation in the same execution-owner command.
+Component source bounds MUST NOT be represented as whole-mutation bounds.
+
 ## Library quality
 
 - Public types MUST have stable, documented invariants and domain-specific

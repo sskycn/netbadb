@@ -34,8 +34,11 @@ and offered as a Columnar access path.
 
 Both builds canonicalize and preflight the caller location, reject an existing
 final manifest, and capture the authoritative source before consuming an ID.
-Capture remains read-only, so unsupported schema, scan, or Change Stream errors
-do not burn allocator state. Core then durably begins an NBPC v2 intent with ID,
+Capture precedes identity allocation, so unsupported schema, scan, or Change
+Stream errors do not burn allocator state. Snapshot capture on LSM may flush
+the MemTable before scanning; Incremental capture does not. Phase 33
+[inspection](adaptive-operations-phase33.md) reports that prerequisite without
+executing it. Core then durably begins an NBPC v2 intent with ID,
 table, source storage, generation, fingerprint, relative locator, explicit
 snapshot/incremental mode, and exact ordered columns.
 

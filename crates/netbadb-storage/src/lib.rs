@@ -26,8 +26,9 @@ pub use change_stream::{
     ChangeBatchMaintenanceInspection, ChangeReadResult, ChangeStorageKind, ChangeStreamCursor,
     ChangeStreamError, ChangeStreamGcStorageReport, ChangeStreamInspection,
     ChangeStreamMaintenanceInspection, ChangeStreamRetentionPin,
-    ChangeStreamRetentionPinInspection, ChangeStreamStatus, StorageChange, StorageVersionKey,
-    change_stream_guard_path, heap_change_log_path, lsm_change_log_path, validate_change_log_file,
+    ChangeStreamRetentionPinInspection, ChangeStreamSourceInspection, ChangeStreamStatus,
+    StorageChange, StorageVersionKey, change_stream_guard_path, heap_change_log_path,
+    lsm_change_log_path, validate_change_log_file,
 };
 pub use columnar::{
     ColumnarBatch, ColumnarBatchColumn, ColumnarColumnSpec, ColumnarColumnStatistics,
@@ -64,11 +65,13 @@ pub use recovery::{
     RecoveryError,
 };
 pub use table::{
-    AccessPathCapabilities, CommittedReadAnchor, HeapResourceComponent, HeapResourceComponentKind,
-    HeapRewriteIndex, HeapRewriteIndexes, StorageAccessCostHints, StorageAccessPath,
+    AccessPathCapabilities, CommittedReadAnchor, HeapPhysicalDesignSourceInspection,
+    HeapResourceComponent, HeapResourceComponentKind, HeapRewriteIndex, HeapRewriteIndexes,
+    LsmPhysicalDesignSourceInspection, StorageAccessCostHints, StorageAccessPath,
     StorageChangeFinalizeBatchReport, StorageChangePrepareBatchReport, StorageCommitBatchReport,
-    StorageKind, StoragePrepareBatchReport, StorageReadView, StorageRowHandle, StorageTransaction,
-    StorageVisibilityBoundary, StorageVisibilityPin, TableStorage, heap_resource_components,
+    StorageKind, StoragePhysicalDesignSourceInspection, StoragePrepareBatchReport, StorageReadView,
+    StorageRowHandle, StorageTransaction, StorageVisibilityBoundary, StorageVisibilityPin,
+    TableStorage, heap_resource_components,
 };
 pub use transaction::{Transaction, TransactionState};
 pub use txn_status::{TxnStatus, TxnStatusError, txn_status_path};
@@ -76,6 +79,43 @@ pub use wal::{
     WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager, WalRecord,
     WalRecordKind, wal_alternate_path, wal_path,
 };
+
+/// Thread-local production-path instrumentation for deterministic inspection
+/// purity/bound proofs. Absent from ordinary builds.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod source_inspection_test_activity {
+    use std::cell::Cell;
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Activity {
+        pub scan_columns_calls: u64,
+        pub scan_versioned_columns_calls: u64,
+        pub change_stream_history_inspections: u64,
+        pub analyze_calls: u64,
+        pub flush_calls: u64,
+        pub buffer_page_reads: u64,
+        pub heap_backfill_pages: u64,
+        pub heap_backfill_max_byte_end: u64,
+        pub heap_scan_pages: u64,
+        pub heap_scan_max_byte_end: u64,
+        pub lsm_scan_block_bytes: u64,
+    }
+
+    thread_local! { static ACTIVITY: Cell<Activity> = Cell::new(Activity::default()); }
+
+    pub fn take() -> Activity {
+        ACTIVITY.with(|value| value.replace(Activity::default()))
+    }
+
+    pub(crate) fn record(update: impl FnOnce(&mut Activity)) {
+        ACTIVITY.with(|value| {
+            let mut current = value.get();
+            update(&mut current);
+            value.set(current);
+        });
+    }
+}
 
 use std::error::Error;
 use std::fmt;

@@ -1039,6 +1039,13 @@ impl HeapStorage {
             let mut entries = Vec::new();
             {
                 let page = self.buffer.read_page(page_id)?;
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::source_inspection_test_activity::record(|activity| {
+                    activity.heap_backfill_pages += 1;
+                    activity.heap_backfill_max_byte_end = activity
+                        .heap_backfill_max_byte_end
+                        .max((page_number + 1) * PAGE_SIZE as u64);
+                });
                 let validated = page.page().validated()?;
                 let header = validated.header();
                 if header.page_type != PageType::Heap {
@@ -2128,6 +2135,10 @@ impl HeapStorage {
         self.change_stream.borrow_mut().gc_through(frontier)
     }
 
+    pub(crate) fn change_stream_source_inspection(&self) -> crate::ChangeStreamSourceInspection {
+        self.change_stream.borrow().source_inspection()
+    }
+
     pub(crate) fn change_stream_inspection(&self) -> crate::ChangeStreamInspection {
         self.change_stream.borrow().inspection()
     }
@@ -2686,6 +2697,58 @@ impl HeapStorage {
         self.scan_columns_with_view(columns, &view)
     }
 
+    pub(crate) fn inspect_physical_design_source(
+        &self,
+    ) -> Result<crate::HeapPhysicalDesignSourceInspection, StorageError> {
+        self.ensure_recovery_ready()?;
+        let pages = self.buffer.validated_page_count()?;
+        if pages < 3 {
+            return Err(crate::invalid_format(
+                "Heap lacks its mandatory initial pages",
+            ));
+        }
+        // Before backfill, the production named-index path performs at most
+        // two floor writes and one owner-detach write per empty-tree page.
+        // Catalog-wide owner uniqueness limits each detach to one changed node;
+        // write_catalog_node_in can append at most one continuation per call.
+        // Include this even for legacy catalog re-encoding. The empty tree
+        // itself appends at most EMPTY_TREE_PAGE_COUNT pages; later splits are
+        // outside backfill's captured limit. This bounds one backfill pass,
+        // not allocator/catalog reads or total build work.
+        let empty_tree_pages = u64::try_from(crate::btree::EMPTY_TREE_PAGE_COUNT)
+            .map_err(|_| StorageError::CountOverflow)?;
+        let pre_scan_growth = empty_tree_pages
+            .checked_mul(2)
+            .and_then(|growth| growth.checked_add(2))
+            .ok_or(StorageError::CountOverflow)?;
+        let index_pages = pages
+            .checked_add(pre_scan_growth)
+            .ok_or(StorageError::CountOverflow)?;
+        // scan_columns_with_view visits exactly FIRST_MANAGED_PAGE..page_count.
+        // Allocation extends the file before publishing page_count; tail reclaim
+        // updates both. validated_page_count rejects misalignment and disagreement.
+        Ok(crate::HeapPhysicalDesignSourceInspection {
+            storage_id: self.storage_id,
+            visibility_boundary: crate::StorageVisibilityBoundary::from_local_horizon(
+                self.storage_id,
+                crate::StorageKind::Heap,
+                self.current_commit_seq().0,
+            )?,
+            managed_page_upper_bound: pages
+                .checked_sub(FIRST_MANAGED_PAGE.0)
+                .ok_or(StorageError::CountOverflow)?,
+            main_file_bytes_upper_bound: pages
+                .checked_mul(PAGE_SIZE as u64)
+                .ok_or(StorageError::CountOverflow)?,
+            index_backfill_page_upper_bound: index_pages
+                .checked_sub(FIRST_MANAGED_PAGE.0)
+                .ok_or(StorageError::CountOverflow)?,
+            index_backfill_bytes_upper_bound: index_pages
+                .checked_mul(PAGE_SIZE as u64)
+                .ok_or(StorageError::CountOverflow)?,
+        })
+    }
+
     pub fn scan_columns_with_view(
         &mut self,
         columns: &[ColumnId],
@@ -2696,6 +2759,13 @@ impl HeapStorage {
         for page_number in FIRST_MANAGED_PAGE.0..self.buffer.page_count() {
             let page_id = PageId(page_number);
             let page = self.buffer.read_page(page_id)?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            crate::source_inspection_test_activity::record(|activity| {
+                activity.heap_scan_pages += 1;
+                activity.heap_scan_max_byte_end = activity
+                    .heap_scan_max_byte_end
+                    .max((page_number + 1) * PAGE_SIZE as u64);
+            });
             let validated = page.page().validated()?;
             let header = validated.header();
             if header.page_type != PageType::Heap {
@@ -3833,6 +3903,160 @@ mod tests {
         let wal = wal_path(path);
         let _ = std::fs::remove_file(wal_alternate_path(&wal));
         let _ = std::fs::remove_file(wal);
+    }
+
+    #[test]
+    fn physical_design_source_tracks_current_geometry_and_bounds_production_scan() {
+        use crate::source_inspection_test_activity as activity;
+        let path = test_path("phase33-heap-source");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).unwrap();
+        let empty = storage.inspect_physical_design_source().unwrap();
+        assert_eq!(
+            empty.main_file_bytes_upper_bound,
+            3 * crate::PAGE_SIZE as u64
+        );
+        assert_eq!(empty.managed_page_upper_bound, 2);
+        storage.analyze().unwrap();
+        let stale_statistics = storage.table_statistics;
+        let mut transaction = storage.begin_transaction().unwrap();
+        let mut rows = Vec::new();
+        for id in 0..160 {
+            rows.push(
+                storage
+                    .insert_in(
+                        &mut transaction,
+                        &[
+                            ScalarValue::Int64(id),
+                            ScalarValue::Text(format!("{id:04}-{}", "x".repeat(200))),
+                        ],
+                    )
+                    .unwrap(),
+            );
+        }
+        transaction.commit().unwrap();
+        drop(transaction);
+        let grown = storage.inspect_physical_design_source().unwrap();
+        assert!(grown.managed_page_upper_bound > empty.managed_page_upper_bound);
+        assert_eq!(storage.table_statistics, stale_statistics);
+        activity::take();
+        let index = storage.create_index(ColumnId(2)).unwrap();
+        let backfill = activity::take();
+        assert!(backfill.heap_backfill_pages > grown.managed_page_upper_bound);
+        assert!(backfill.heap_backfill_pages <= grown.index_backfill_page_upper_bound);
+        assert!(backfill.heap_backfill_max_byte_end <= grown.index_backfill_bytes_upper_bound);
+        let indexed = storage.inspect_physical_design_source().unwrap();
+        assert!(indexed.managed_page_upper_bound > grown.managed_page_upper_bound);
+        storage.flush().unwrap();
+        let before = crate::heap_resource_components(&path)
+            .into_iter()
+            .map(|component| (component.path.clone(), std::fs::read(component.path).ok()))
+            .collect::<Vec<_>>();
+        let floor = storage.index_catalog_root;
+        activity::take();
+        for _ in 0..3 {
+            assert_eq!(storage.inspect_physical_design_source().unwrap(), indexed);
+        }
+        assert_eq!(activity::take(), activity::Activity::default());
+        assert_eq!(storage.index_catalog_root, floor);
+        for (path, contents) in before {
+            assert_eq!(std::fs::read(path).ok(), contents);
+        }
+        let view = storage.read_view().unwrap();
+        let actual = storage
+            .scan_columns_with_view(&[ColumnId(1)], &view)
+            .unwrap();
+        assert_eq!(actual.len(), 160);
+        let scanned = activity::take();
+        assert_eq!(scanned.heap_scan_pages, indexed.managed_page_upper_bound);
+        assert_eq!(
+            scanned.heap_scan_max_byte_end,
+            indexed.main_file_bytes_upper_bound
+        );
+        drop(view);
+        storage.drop_index(index.id).unwrap();
+        storage.compact_index_catalog().unwrap();
+        storage.reclaim_retired_index_tail().unwrap();
+        let reclaimed = storage.inspect_physical_design_source().unwrap();
+        assert!(reclaimed.main_file_bytes_upper_bound < indexed.main_file_bytes_upper_bound);
+        for row in rows {
+            storage.delete(row).unwrap();
+        }
+        storage.vacuum().unwrap();
+        let vacuumed = storage.inspect_physical_design_source().unwrap();
+        assert_eq!(
+            vacuumed.main_file_bytes_upper_bound,
+            std::fs::metadata(&path).unwrap().len()
+        );
+        let view = storage.read_view().unwrap();
+        activity::take();
+        assert!(
+            storage
+                .scan_columns_with_view(&[ColumnId(1)], &view)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            activity::take().heap_scan_pages,
+            vacuumed.managed_page_upper_bound
+        );
+        drop(view);
+        storage.close().unwrap();
+        let reopened = HeapStorage::open(&path, table()).unwrap();
+        assert_eq!(reopened.inspect_physical_design_source().unwrap(), vacuumed);
+        reopened.close().unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn physical_design_source_bounds_legacy_catalog_growth_before_index_backfill() {
+        use crate::source_inspection_test_activity as activity;
+        for version in [2, 3] {
+            let path = test_path(&format!("phase33-legacy-backfill-{version}"));
+            cleanup(&path);
+            let mut storage = HeapStorage::create(&path, indexed_table()).unwrap();
+            storage.create_index(ColumnId(1)).unwrap();
+            storage.create_index(ColumnId(2)).unwrap();
+            storage.checkpoint().unwrap();
+            storage.close().unwrap();
+            maintenance::legacy_catalog(&path, version);
+            let mut storage = HeapStorage::open(&path, indexed_table()).unwrap();
+            // A full legacy-sized node grows when IDs are encoded explicitly.
+            storage.index_catalog_payload_capacity = Some(48 + 2 * 40);
+            let before = storage.inspect_physical_design_source().unwrap();
+            activity::take();
+            storage.create_index(ColumnId(3)).unwrap();
+            let backfill = activity::take();
+            assert!(
+                backfill.heap_backfill_pages
+                    > before.managed_page_upper_bound + crate::btree::EMPTY_TREE_PAGE_COUNT as u64
+            );
+            assert!(backfill.heap_backfill_pages <= before.index_backfill_page_upper_bound);
+            assert!(backfill.heap_backfill_max_byte_end <= before.index_backfill_bytes_upper_bound);
+            storage.close().unwrap();
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn physical_design_source_rejects_partial_and_inconsistent_heap_geometry() {
+        let path = test_path("phase33-heap-invalid-geometry");
+        cleanup(&path);
+        let storage = HeapStorage::create(&path, table()).unwrap();
+        storage.flush().unwrap();
+        let original = std::fs::metadata(&path).unwrap().len();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        for length in [original - 1, original + crate::PAGE_SIZE as u64, 0] {
+            file.set_len(length).unwrap();
+            assert!(matches!(
+                storage.inspect_physical_design_source(),
+                Err(StorageError::InvalidFormat(_))
+            ));
+        }
+        // Close and remove only this deliberately malformed-file fixture.
+        drop(file);
+        drop(storage);
+        cleanup(&path);
     }
 
     fn audit_retarget_heap_metadata(path: &std::path::Path, table: &TableDef, id: StorageId) {

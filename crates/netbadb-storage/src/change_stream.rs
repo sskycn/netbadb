@@ -252,6 +252,17 @@ pub enum ChangeStreamStatus {
     Unavailable,
 }
 
+/// Constant-time current stream identity and availability, independent of
+/// retained batch history. Observation only; does not pin or advance a cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeStreamSourceInspection {
+    pub storage_id: StorageId,
+    pub table_id: TableId,
+    pub status: ChangeStreamStatus,
+    pub generation: Option<ChangeStreamGeneration>,
+    pub schema_fingerprint: SchemaFingerprint,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeStreamInspection {
     pub storage_id: StorageId,
@@ -1523,7 +1534,26 @@ impl ChangeStreamManager {
         })
     }
 
+    pub(crate) fn source_inspection(&self) -> ChangeStreamSourceInspection {
+        let (status, generation) = match &self.state {
+            State::Disabled { generation } => (ChangeStreamStatus::Disabled, Some(*generation)),
+            State::Enabled { header, .. } => (ChangeStreamStatus::Enabled, Some(header.generation)),
+            State::Unavailable { generation, .. } => (ChangeStreamStatus::Unavailable, *generation),
+        };
+        ChangeStreamSourceInspection {
+            storage_id: self.storage_id,
+            table_id: self.table_id,
+            schema_fingerprint: self.fingerprint,
+            status,
+            generation,
+        }
+    }
+
     pub(crate) fn inspection(&self) -> ChangeStreamInspection {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::source_inspection_test_activity::record(|activity| {
+            activity.change_stream_history_inspections += 1
+        });
         let (
             status,
             generation,

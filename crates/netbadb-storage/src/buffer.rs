@@ -409,6 +409,8 @@ impl BufferPool {
     }
 
     pub fn read_page(&self, page_id: PageId) -> Result<ReadPageGuard, StorageError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::source_inspection_test_activity::record(|activity| activity.buffer_page_reads += 1);
         let page = self.state.borrow_mut().pin_read(page_id)?;
         Ok(ReadPageGuard {
             state: Rc::clone(&self.state),

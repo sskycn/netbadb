@@ -11,6 +11,27 @@ subprocess recovery-interruption regressions, retaining the prior
 planner or writer-concurrency expansion is included. Real power-loss, hardware
 torn-write and network-filesystem validation remain separate work.
 
+## Current mutation source work (Adaptive Operations Phase 33 complete)
+
+- added metadata-only storage/Core work inspection for single-storage Heap
+  Index and Heap/LSM Snapshot or Incremental Columnar targets;
+- proved current Heap scan extents and Index backfill bounds, including
+  empty-tree and legacy catalog growth before the fixed backfill limit;
+- exposed exact current LSM runtime/manifest structure independently of stale
+  ANALYZE, keeping physical versions, resident bytes and persistent bytes distinct;
+- modeled Snapshot LSM's implicit flush through the existing conservative
+  maintenance bound without executing it, and reused Incremental stream checks
+  without traversing retained history;
+- made proven component bounds and unproven dimensions explicit, with checked
+  overflow, no output-write claim, and no durable inspection or mutation authority;
+- verified inspection purity, current-state changes, production scan/build
+  accounting and reopen behavior without changing wire or persistent formats.
+
+Admission policy remains deferred. Phase 34 must recompute inspection after
+idempotency/coverage checks inside the same execution-owner command immediately
+before mutation; source-component bounds are not whole-mutation bounds. See
+[`adaptive-operations-phase33.md`](adaptive-operations-phase33.md).
+
 ## Durable receipt exposure (Adaptive Operations Phase 32 complete)
 
 - upgraded the strict deployment contract to Manifest v10 with optional

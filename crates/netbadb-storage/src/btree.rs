@@ -19,6 +19,9 @@ use netbadb_types::{IndexId, PageId, PageRef, RowId, ScalarValue};
 
 use crate::{HeapStorage, Page, PageType, StorageError, Transaction};
 
+// Metadata and the initial empty root; backfill begins after these allocations.
+pub(crate) const EMPTY_TREE_PAGE_COUNT: usize = 2;
+
 #[derive(Debug)]
 struct PreparedPage {
     page_id: BTreePageRef,
@@ -156,11 +159,11 @@ impl<'a> BTree<'a> {
         }
         let root_payload =
             encode_leaf_generation(&spec, &LeafNode::empty(), owner, root_page.generation())?;
-        let changes = vec![
+        let changes: [_; EMPTY_TREE_PAGE_COUNT] = [
             prepare_new_page(meta_allocation, PageType::BTreeMeta, &meta_payload, owner)?,
             prepare_new_page(root_allocation, PageType::BTreeLeaf, &root_payload, owner)?,
         ];
-        self.apply_changes(transaction, changes)?;
+        self.apply_changes(transaction, changes.into())?;
         Ok(BTreeHandle { owner, meta_page })
     }
 

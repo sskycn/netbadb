@@ -1582,3 +1582,602 @@ fn physical_design_database_identity_is_stable_and_read_only() {
     );
     fixture.close();
 }
+
+fn mutation_work_file_image(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut image = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            image.extend(mutation_work_file_image(&path));
+        } else {
+            image.insert(path.clone(), fs::read(path).unwrap());
+        }
+    }
+    image
+}
+
+fn mutation_work_lsm_fixture(name: &str) -> Fixture {
+    use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
+    use netbadb_types::PhysicalType;
+    let suffix = crate::execution_feedback_tests::NEXT_PATH
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "netbadb-phase33-{name}-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("lsm");
+    let table = TableDef::new(
+        TABLE_ID,
+        "events",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(
+                ColumnId(2),
+                "category",
+                TypeSpec::Physical(PhysicalType::Int64),
+            ),
+        ],
+    );
+    let mut database = crate::Database::create_catalog(
+        root.join("catalog"),
+        vec![crate::TableStorageCreateSpec::lsm(
+            &source,
+            table,
+            ColumnId(1),
+        )],
+        Some(
+            crate::DatabaseCoordinatorConfig::new(root.join("coordinator"))
+                .with_global_visibility(),
+        ),
+    )
+    .unwrap();
+    database
+        .execute("INSERT INTO events VALUES (1, 1)")
+        .unwrap();
+    Fixture {
+        root,
+        source,
+        database,
+    }
+}
+
+#[test]
+fn mutation_work_all_engine_modes_are_repeatable_pure_and_not_recommendation_gated() {
+    use crate::{
+        PhysicalColumnarMutationPrerequisiteInspection as Prerequisite,
+        PhysicalDesignMutationConservativeBound as Bound,
+    };
+    use netbadb_storage::{
+        StoragePhysicalDesignSourceInspection as Source,
+        source_inspection_test_activity as activity,
+    };
+    for lsm in [false, true] {
+        let mut fixture = if lsm {
+            mutation_work_lsm_fixture("purity")
+        } else {
+            Fixture::create("phase33-purity", false)
+        };
+        fixture.database.enable_change_stream(TABLE_ID).unwrap();
+        let window = columnar_window(&mut fixture);
+        let window_before = window.clone();
+        let pool = crate::AdaptiveEvidencePool::new(crate::AdaptiveEvidencePoolLimits::default());
+        let pool_before = pool.progress_token();
+        let scheduler = crate::AutomaticScheduler::new(
+            crate::AutomaticSchedulerPolicy::new(1, 1, 1, 1).unwrap(),
+        );
+        let scheduler_before = scheduler.clone();
+        let g = fixture
+            .database
+            .current_database_snapshot()
+            .unwrap()
+            .unwrap()
+            .commit_seq();
+        let schema = fixture.database.schema_generation();
+        let catalog = fixture.database.inspect_catalog().unwrap();
+        let projections = fixture.database.inspect_columnar_projection_catalog();
+        let stream = fixture.database.inspect_change_stream(TABLE_ID).unwrap();
+        let safe_mode = fixture.database.automatic_safe_mode_state();
+        let calibration = fixture.database.planner_calibration_profile();
+        let files = mutation_work_file_image(&fixture.root);
+        activity::take();
+        for mode in [
+            PhysicalColumnarDesignMode::Snapshot,
+            PhysicalColumnarDesignMode::Incremental,
+        ] {
+            let first = fixture
+                .database
+                .inspect_physical_columnar_design_mutation_work(&columnar_candidate(), mode)
+                .unwrap();
+            assert_eq!(first.candidate, columnar_candidate());
+            assert_eq!(first.mode, mode);
+            assert_eq!(first.schema_generation, schema);
+            assert_eq!(
+                Some(first.table_schema_version),
+                fixture.database.table_schema_version(TABLE_ID)
+            );
+            assert_eq!(first.bounds.output_write_bytes, Bound::NotProven);
+            match first.source {
+                Source::Heap(heap) => {
+                    assert!(!lsm);
+                    assert_eq!(heap.storage_id, first.storage_id);
+                    assert_eq!(
+                        first.bounds.source_work_units,
+                        Bound::Bounded(heap.managed_page_upper_bound)
+                    );
+                    assert_eq!(
+                        first.bounds.source_read_bytes,
+                        Bound::Bounded(heap.main_file_bytes_upper_bound)
+                    );
+                    assert_eq!(first.prerequisite, Prerequisite::None);
+                    let index = fixture
+                        .database
+                        .inspect_physical_index_design_mutation_work(index_candidate())
+                        .unwrap();
+                    assert_eq!(index.candidate, index_candidate());
+                    assert_eq!(index.source, first.source);
+                    assert_eq!(
+                        index.bounds.source_work_units,
+                        Bound::Bounded(heap.index_backfill_page_upper_bound)
+                    );
+                    assert_eq!(
+                        index.bounds.source_read_bytes,
+                        Bound::Bounded(heap.index_backfill_bytes_upper_bound)
+                    );
+                    assert_eq!(index.bounds.output_write_bytes, Bound::NotProven);
+                    assert_eq!(index.table_fingerprint, first.table_fingerprint);
+                }
+                Source::Lsm(source) => {
+                    assert!(lsm);
+                    assert_eq!(source.memtable_entry_count, 1, "inspection cannot flush");
+                    assert_eq!(source.sstable_count, 0);
+                    assert_eq!(source.anchor.storage_id, first.storage_id);
+                    assert_eq!(first.bounds.source_work_units, Bound::NotProven);
+                    if mode == PhysicalColumnarDesignMode::Snapshot {
+                        assert_eq!(
+                            first.prerequisite,
+                            Prerequisite::LsmFlush {
+                                anchor: source.anchor,
+                                conservative_bound: source.flush_conservative_bound.unwrap()
+                            }
+                        );
+                        assert_eq!(first.bounds.source_read_bytes, Bound::NotProven);
+                    } else {
+                        assert_eq!(first.prerequisite, Prerequisite::None);
+                        assert_eq!(first.bounds.source_read_bytes, Bound::Bounded(0));
+                    }
+                }
+            }
+            for _ in 0..3 {
+                assert_eq!(
+                    fixture
+                        .database
+                        .inspect_physical_columnar_design_mutation_work(&columnar_candidate(), mode)
+                        .unwrap(),
+                    first
+                );
+            }
+        }
+        assert_eq!(
+            activity::take(),
+            activity::Activity::default(),
+            "no source scan, ANALYZE, flush or cache access"
+        );
+        assert_eq!(
+            fixture
+                .database
+                .current_database_snapshot()
+                .unwrap()
+                .unwrap()
+                .commit_seq(),
+            g
+        );
+        assert_eq!(fixture.database.schema_generation(), schema);
+        assert_eq!(fixture.database.inspect_catalog().unwrap(), catalog);
+        assert_eq!(
+            fixture.database.inspect_columnar_projection_catalog(),
+            projections
+        );
+        assert_eq!(
+            fixture.database.inspect_change_stream(TABLE_ID).unwrap(),
+            stream
+        );
+        assert_eq!(fixture.database.automatic_safe_mode_state(), safe_mode);
+        assert_eq!(fixture.database.planner_calibration_profile(), calibration);
+        assert_eq!(
+            mutation_work_file_image(&fixture.root),
+            files,
+            "includes NBPC, schema/index high-waters, WAL, stream and all storage files"
+        );
+        assert_eq!(window, window_before);
+        assert_eq!(pool.progress_token(), pool_before);
+        assert_eq!(scheduler, scheduler_before);
+        fixture.close();
+    }
+}
+
+#[test]
+fn mutation_work_rejects_impossible_targets_and_preserves_typed_sources() {
+    use crate::PhysicalDesignMutationWorkInspectionError as WorkError;
+    let mut fixture = Fixture::create("phase33-invalid", false);
+    assert!(matches!(
+        fixture
+            .database
+            .inspect_physical_index_design_mutation_work(PhysicalIndexCandidate {
+                table_id: netbadb_types::TableId(u64::MAX),
+                column_id: ColumnId(1)
+            }),
+        Err(WorkError::TableNotFound(_))
+    ));
+    assert!(matches!(
+        fixture
+            .database
+            .inspect_physical_index_design_mutation_work(PhysicalIndexCandidate {
+                table_id: TABLE_ID,
+                column_id: ColumnId(99)
+            }),
+        Err(WorkError::ColumnNotFound { .. })
+    ));
+    assert!(matches!(
+        fixture
+            .database
+            .inspect_physical_columnar_design_mutation_work(
+                &columnar_candidate(),
+                PhysicalColumnarDesignMode::Incremental
+            ),
+        Err(WorkError::IncrementalChangeStreamNotEnabled { .. })
+    ));
+    for (columns, duplicate) in [(vec![], false), (vec![ColumnId(1), ColumnId(1)], true)] {
+        let error = fixture
+            .database
+            .inspect_physical_columnar_design_mutation_work(
+                &PhysicalColumnarCandidate {
+                    table_id: TABLE_ID,
+                    columns,
+                },
+                PhysicalColumnarDesignMode::Snapshot,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            (duplicate, error),
+            (false, WorkError::EmptyColumnarColumns)
+                | (true, WorkError::DuplicateColumnarColumn(_))
+        ));
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&fixture.source)
+        .unwrap();
+    let length = file.metadata().unwrap().len();
+    file.set_len(length + 1).unwrap();
+    let storage_error = fixture
+        .database
+        .inspect_physical_index_design_mutation_work(index_candidate())
+        .unwrap_err();
+    assert!(matches!(
+        &storage_error,
+        WorkError::Database(DatabaseError::Storage(
+            netbadb_storage::StorageError::InvalidFormat(_)
+        ))
+    ));
+    assert!(
+        std::error::Error::source(std::error::Error::source(&storage_error).unwrap())
+            .unwrap()
+            .downcast_ref::<netbadb_storage::StorageError>()
+            .is_some()
+    );
+    file.set_len(length).unwrap();
+    drop(file);
+    fixture.database.projections.mark_recovery_required(
+        netbadb_types::ColumnarProjectionId(1),
+        "test",
+        "test",
+    );
+    let error = fixture
+        .database
+        .inspect_physical_columnar_design_mutation_work(
+            &columnar_candidate(),
+            PhysicalColumnarDesignMode::Snapshot,
+        )
+        .unwrap_err();
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<DatabaseError>()
+            .is_some()
+    );
+    assert!(matches!(
+        error,
+        WorkError::Database(DatabaseError::ProjectionCatalog(
+            ProjectionCatalogError::RecoveryRequired { .. }
+        ))
+    ));
+    fixture.close();
+    let fixture = mutation_work_lsm_fixture("unsupported-index");
+    assert!(matches!(
+        fixture
+            .database
+            .inspect_physical_index_design_mutation_work(index_candidate()),
+        Err(WorkError::UnsupportedIndexLayout)
+    ));
+    fixture.close();
+}
+
+#[test]
+fn mutation_work_rejects_legacy_and_partitioned_targets() {
+    use crate::PhysicalDesignMutationWorkInspectionError as WorkError;
+    use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
+    use netbadb_types::{PartitionId, PhysicalType};
+    let fixture = Fixture::create("phase33-layout-paths", false);
+    let table = TableDef::new(
+        TABLE_ID,
+        "events",
+        vec![
+            ColumnDef::new(ColumnId(1), "id", TypeSpec::Physical(PhysicalType::Int64)),
+            ColumnDef::new(
+                ColumnId(2),
+                "category",
+                TypeSpec::Physical(PhysicalType::Int64),
+            ),
+        ],
+    );
+    let mut partitioned = crate::Database::create_catalog_with_placements(
+        fixture.root.join("range-catalog"),
+        vec![crate::TablePlacementSpec::range_partitioned(
+            table,
+            ColumnId(1),
+            vec![crate::RangePartitionSpec::new(
+                PartitionId(1),
+                fixture.root.join("range-heap"),
+                None,
+                None,
+            )],
+        )],
+        crate::PartitionCatalogConfig::new(
+            fixture.root.join("partitions"),
+            fixture.root.join("range-coordinator"),
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        partitioned.inspect_physical_index_design_mutation_work(index_candidate()),
+        Err(WorkError::GlobalVisibilityRequired)
+    ));
+    assert!(matches!(
+        partitioned.inspect_physical_columnar_design_mutation_work(
+            &columnar_candidate(),
+            PhysicalColumnarDesignMode::Snapshot
+        ),
+        Err(WorkError::GlobalVisibilityRequired)
+    ));
+    partitioned.enable_global_visibility().unwrap();
+    assert!(matches!(
+        partitioned.inspect_physical_index_design_mutation_work(index_candidate()),
+        Err(WorkError::RequiresSingleStorage(TABLE_ID))
+    ));
+    assert!(matches!(
+        partitioned.inspect_physical_columnar_design_mutation_work(
+            &columnar_candidate(),
+            PhysicalColumnarDesignMode::Snapshot
+        ),
+        Err(WorkError::RequiresSingleStorage(TABLE_ID))
+    ));
+    partitioned.close().unwrap();
+    fixture.close();
+}
+
+#[test]
+fn mutation_work_follows_lsm_dml_and_flush_without_refreshing_analyze() {
+    use crate::PhysicalColumnarMutationPrerequisiteInspection as Prerequisite;
+    use netbadb_storage::StoragePhysicalDesignSourceInspection as Source;
+    let mut fixture = mutation_work_lsm_fixture("stale-analyze");
+    fixture.database.analyze(TABLE_ID).unwrap();
+    let analyzed = fixture.database.inspect_catalog().unwrap();
+    let before = fixture
+        .database
+        .inspect_physical_columnar_design_mutation_work(
+            &columnar_candidate(),
+            PhysicalColumnarDesignMode::Snapshot,
+        )
+        .unwrap();
+    fixture
+        .database
+        .execute("INSERT INTO events VALUES (2, 2)")
+        .unwrap();
+    let after = fixture
+        .database
+        .inspect_physical_columnar_design_mutation_work(
+            &columnar_candidate(),
+            PhysicalColumnarDesignMode::Snapshot,
+        )
+        .unwrap();
+    assert_ne!(before.source, after.source);
+    assert_eq!(fixture.database.inspect_catalog().unwrap(), analyzed);
+    let storage = fixture.database.registry.get(after.storage_id).unwrap();
+    storage.flush().unwrap();
+    let flushed = fixture
+        .database
+        .inspect_physical_columnar_design_mutation_work(
+            &columnar_candidate(),
+            PhysicalColumnarDesignMode::Snapshot,
+        )
+        .unwrap();
+    assert_eq!(flushed.prerequisite, Prerequisite::None);
+    let Source::Lsm(source) = flushed.source else {
+        panic!("LSM source")
+    };
+    assert_eq!(source.memtable_entry_count, 0);
+    assert!(source.total_sstable_bytes > 0);
+    assert_eq!(fixture.database.inspect_catalog().unwrap(), analyzed);
+    fixture.close();
+}
+
+#[test]
+fn mutation_work_does_not_change_ordinary_index_or_columnar_builds_or_coverage() {
+    use netbadb_storage::source_inspection_test_activity as activity;
+    for lsm in [false, true] {
+        for mode in [
+            PhysicalColumnarDesignMode::Snapshot,
+            PhysicalColumnarDesignMode::Incremental,
+        ] {
+            let mut results = Vec::new();
+            for inspect in [false, true] {
+                let mut fixture = if lsm {
+                    mutation_work_lsm_fixture("build")
+                } else {
+                    Fixture::create("phase33-build", false)
+                };
+                fixture.database.enable_change_stream(TABLE_ID).unwrap();
+                if inspect {
+                    fixture
+                        .database
+                        .inspect_physical_columnar_design_mutation_work(&columnar_candidate(), mode)
+                        .unwrap();
+                }
+                let g = fixture
+                    .database
+                    .current_database_snapshot()
+                    .unwrap()
+                    .unwrap()
+                    .commit_seq();
+                let schema = fixture.database.schema_generation();
+                activity::take();
+                let spec = ColumnarProjectionSpec::new(
+                    TABLE_ID,
+                    fixture.root.join("result"),
+                    columnar_candidate().columns,
+                );
+                let id = match mode {
+                    PhysicalColumnarDesignMode::Snapshot => {
+                        fixture.database.build_columnar_projection(spec).unwrap()
+                    }
+                    PhysicalColumnarDesignMode::Incremental => fixture
+                        .database
+                        .build_incremental_columnar_projection(spec)
+                        .unwrap(),
+                };
+                let actual = activity::take();
+                assert_eq!(actual.scan_columns_calls, 1);
+                assert_eq!(
+                    actual.scan_versioned_columns_calls,
+                    u64::from(mode == PhysicalColumnarDesignMode::Incremental)
+                );
+                assert_eq!(
+                    actual.flush_calls,
+                    u64::from(lsm && mode == PhysicalColumnarDesignMode::Snapshot)
+                );
+                assert_eq!(
+                    fixture
+                        .database
+                        .current_database_snapshot()
+                        .unwrap()
+                        .unwrap()
+                        .commit_seq(),
+                    g
+                );
+                assert_eq!(fixture.database.schema_generation(), schema);
+                fixture
+                    .database
+                    .inspect_physical_columnar_design_mutation_work(&columnar_candidate(), mode)
+                    .expect("coverage never suppresses hypothetical footprint");
+                if !lsm {
+                    if inspect {
+                        fixture
+                            .database
+                            .inspect_physical_index_design_mutation_work(index_candidate())
+                            .unwrap();
+                    }
+                    fixture
+                        .database
+                        .create_named_index(
+                            netbadb_types::IndexName::new("phase33_category").unwrap(),
+                            TABLE_ID,
+                            ColumnId(2),
+                        )
+                        .unwrap();
+                    fixture
+                        .database
+                        .inspect_physical_index_design_mutation_work(index_candidate())
+                        .expect("existing index does not return AlreadyCovered");
+                }
+                let rows = fixture
+                    .database
+                    .query("SELECT id, category FROM events ORDER BY id")
+                    .unwrap();
+                let indexes = fixture.database.indexes(TABLE_ID).unwrap().to_vec();
+                results.push((
+                    id,
+                    rows,
+                    indexes,
+                    fixture
+                        .database
+                        .inspect_columnar_projection_catalog()
+                        .next_projection_id,
+                ));
+                let Fixture {
+                    root,
+                    source: _,
+                    database,
+                } = fixture;
+                database.close().unwrap();
+                let reopened = crate::Database::open_catalog(root.join("catalog")).unwrap();
+                reopened
+                    .inspect_physical_columnar_design_mutation_work(&columnar_candidate(), mode)
+                    .unwrap();
+                assert_eq!(reopened.inspect_columnar_projections().len(), 1);
+                reopened.close().unwrap();
+                fs::remove_dir_all(root).unwrap();
+            }
+            assert_eq!(results[0], results[1]);
+        }
+    }
+}
+
+#[test]
+fn mutation_work_incremental_rejects_unavailable_stream_without_repair() {
+    use crate::PhysicalDesignMutationWorkInspectionError as WorkError;
+    for lsm in [false, true] {
+        let mut fixture = if lsm {
+            mutation_work_lsm_fixture("unavailable")
+        } else {
+            Fixture::create("phase33-unavailable", false)
+        };
+        fixture.database.enable_change_stream(TABLE_ID).unwrap();
+        let Fixture {
+            root,
+            source,
+            database,
+        } = fixture;
+        database.close().unwrap();
+        let log = if lsm {
+            netbadb_storage::lsm_change_log_path(&source)
+        } else {
+            netbadb_storage::heap_change_log_path(&source)
+        };
+        fs::remove_file(log).unwrap();
+        let database = crate::Database::open_catalog(root.join("catalog")).unwrap();
+        let before = mutation_work_file_image(&root);
+        assert!(matches!(
+            database.inspect_physical_columnar_design_mutation_work(
+                &columnar_candidate(),
+                PhysicalColumnarDesignMode::Incremental
+            ),
+            Err(WorkError::IncrementalChangeStreamUnavailable { .. })
+        ));
+        database
+            .inspect_physical_columnar_design_mutation_work(
+                &columnar_candidate(),
+                PhysicalColumnarDesignMode::Snapshot,
+            )
+            .unwrap();
+        assert_eq!(mutation_work_file_image(&root), before);
+        assert_eq!(
+            database.inspect_change_stream(TABLE_ID).unwrap().status,
+            netbadb_storage::ChangeStreamStatus::Unavailable
+        );
+        database.close().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}

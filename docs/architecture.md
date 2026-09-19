@@ -483,6 +483,21 @@ health. Manifest v9, NBOP v4, Native Protocol v2, PostgreSQL wire behavior,
 Inspection JSON v7, SDK Schema Spec, and database persistent formats remain
 unchanged.
 
+[Adaptive Operations Phase 33](adaptive-operations-phase33.md) adds current-state
+Physical Design mutation-work inspection in Core/storage only. The owning Heap
+reports validated current file/page geometry and a separate Index backfill bound
+including empty-tree allocation; LSM reports current runtime/manifest structure,
+with resident MemTable accounting separate from persistent SSTable bytes.
+Metadata-only inspection scans no rows and never runs ANALYZE, flushes storage,
+reserves identity or changes evidence. Incremental reuses Phase 27 stream
+capability validation through a constant-time identity inspection. Snapshot LSM
+reports the existing conservative flush prerequisite without executing it.
+`Bounded` and `NotProven` remain distinct; component source bounds do not claim
+total mutation cost. Reports are immediately stale-able observations, never
+apply tokens. There is no admission policy or Server/wire/persistent change;
+future admission must recompute within the mutation command after idempotency
+and coverage checks and cannot approve using an unproven required dimension.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

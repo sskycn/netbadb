@@ -380,9 +380,9 @@ impl BloomFilter {
         Ok(filter)
     }
 
-    fn for_distinct_keys(distinct: u64) -> Result<Self, StorageError> {
+    fn bit_count_for_distinct_keys(distinct: u64) -> Result<u64, StorageError> {
         if distinct == 0 {
-            return Ok(Self::empty());
+            return Ok(0);
         }
         let requested =
             distinct
@@ -405,6 +405,14 @@ impl BloomFilter {
                 limit: BLOOM_MAX_BITS,
             });
         }
+        Ok(bit_count)
+    }
+
+    fn for_distinct_keys(distinct: u64) -> Result<Self, StorageError> {
+        if distinct == 0 {
+            return Ok(Self::empty());
+        }
+        let bit_count = Self::bit_count_for_distinct_keys(distinct)?;
         let byte_count =
             usize::try_from(bit_count / 8).map_err(|_| StorageError::ResourceLimit {
                 resource: "LSM Bloom bytes",
@@ -610,7 +618,7 @@ struct LsmShared {
     wal: LsmWal,
     sstables: Vec<Sstable>,
     memtable: BTreeMap<PhysicalKey, BTreeMap<LsmCommitSeq, EntryValue>>,
-    memtable_bytes: u64,
+    memtable_footprint: MemtableFootprint,
     next_row_id: u64,
     next_txn_id: u64,
     next_commit_seq: u64,
@@ -989,7 +997,7 @@ impl LsmStorage {
                     wal,
                     sstables: Vec::new(),
                     memtable: BTreeMap::new(),
-                    memtable_bytes: 0,
+                    memtable_footprint: MemtableFootprint::default(),
                     next_row_id: 1,
                     next_txn_id: 1,
                     next_commit_seq: 1,
@@ -1117,7 +1125,7 @@ impl LsmStorage {
                 .checked_add(1)
                 .ok_or(LsmError::AllocatorExhausted("commit sequence"))?,
         );
-        let memtable_bytes = estimate_memtable_bytes(&memtable)?;
+        let memtable_footprint = measure_memtable_footprint(&memtable)?;
         let runtime = Rc::new(Runtime {
             writer: Cell::new(None),
             recovery_required: Cell::new(false),
@@ -1155,7 +1163,7 @@ impl LsmStorage {
                 wal,
                 sstables,
                 memtable,
-                memtable_bytes,
+                memtable_footprint,
                 next_row_id: manifest.row_reservation_end,
                 next_txn_id: manifest.txn_reservation_end,
                 next_commit_seq: manifest.commit_reservation_end.max(max_commit + 1),
@@ -1280,11 +1288,7 @@ impl LsmStorage {
                 .sum(),
             read_amplification: shared.runtime.amplification.read_snapshot(),
             write_amplification: shared.runtime.amplification.write_snapshot(),
-            memtable_entry_count: shared
-                .memtable
-                .values()
-                .map(|versions| versions.len() as u64)
-                .sum(),
+            memtable_entry_count: shared.memtable_footprint.entry_count,
             sstable_entry_count: shared
                 .sstables
                 .iter()
@@ -1302,17 +1306,53 @@ impl LsmStorage {
         }
     }
 
+    pub(crate) fn inspect_physical_design_source(
+        &self,
+    ) -> Result<crate::LsmPhysicalDesignSourceInspection, StorageError> {
+        self.ensure_recovery_ready()?;
+        let shared = self.shared.borrow();
+        let (sstable_entry_count, total_sstable_bytes) =
+            shared
+                .sstables
+                .iter()
+                .try_fold((0_u64, 0_u64), |(entries, bytes), sstable| {
+                    Ok::<_, StorageError>((
+                        entries
+                            .checked_add(sstable.reference.entry_count)
+                            .ok_or(StorageError::CountOverflow)?,
+                        bytes
+                            .checked_add(sstable.reference.file_bytes)
+                            .ok_or(StorageError::CountOverflow)?,
+                    ))
+                })?;
+        Ok(crate::LsmPhysicalDesignSourceInspection {
+            anchor: maintenance_anchor(&shared),
+            visibility_boundary: crate::StorageVisibilityBoundary::from_local_horizon(
+                shared.manifest.storage_id,
+                crate::StorageKind::Lsm,
+                shared.maximum_commit_seq().0,
+            )?,
+            memtable_entry_count: shared.memtable_footprint.entry_count,
+            memtable_bytes: shared.memtable_footprint.bytes,
+            sstable_count: u64::try_from(shared.sstables.len())
+                .map_err(|_| StorageError::CountOverflow)?,
+            sstable_entry_count,
+            total_sstable_bytes,
+            flush_conservative_bound: if shared.memtable_footprint.entry_count == 0 {
+                None
+            } else {
+                Some(flush_conservative_bound(&shared)?)
+            },
+        })
+    }
+
     pub fn maintenance_inspection(&self) -> Result<LsmMaintenanceInspection, StorageError> {
         let shared = self.shared.borrow();
-        let memtable_entry_count = shared
-            .memtable
-            .values()
-            .map(|versions| versions.len() as u64)
-            .sum::<u64>();
+        let memtable_entry_count = shared.memtable_footprint.entry_count;
         let flush_cost = (memtable_entry_count != 0).then_some(LsmMaintenanceCostInspection {
             work_units: memtable_entry_count,
-            read_bytes: shared.memtable_bytes,
-            write_bytes: shared.memtable_bytes,
+            read_bytes: shared.memtable_footprint.bytes,
+            write_bytes: shared.memtable_footprint.bytes,
         });
         let flush_conservative_bound = if memtable_entry_count == 0 {
             None
@@ -1324,15 +1364,10 @@ impl LsmStorage {
             .transpose()?;
         let next_compaction_cost = next_compaction.as_ref().map(|plan| plan.estimated_cost);
         Ok(LsmMaintenanceInspection {
-            anchor: LsmMaintenanceAnchor {
-                storage_id: shared.manifest.storage_id,
-                manifest_generation: shared.manifest.generation,
-                wal_generation: shared.manifest.wal_generation,
-                visible_commit_sequence: shared.visible_commit_seq.0,
-            },
+            anchor: maintenance_anchor(&shared),
             safety_blocker: maintenance_safety_blocker(&shared),
             memtable_entry_count,
-            memtable_bytes: shared.memtable_bytes,
+            memtable_bytes: shared.memtable_footprint.bytes,
             memtable_flush_threshold_bytes: shared.flush_threshold,
             flush_cost,
             flush_conservative_bound,
@@ -1455,6 +1490,10 @@ impl LsmStorage {
             .into());
         }
         shared.change_stream.gc_through(frontier)
+    }
+
+    pub(crate) fn change_stream_source_inspection(&self) -> crate::ChangeStreamSourceInspection {
+        self.shared.borrow().change_stream.source_inspection()
     }
 
     pub(crate) fn change_stream_inspection(&self) -> crate::ChangeStreamInspection {
@@ -2167,7 +2206,7 @@ impl LsmTransaction {
                 .as_ref()
                 .ok_or(LsmError::InvalidWal("pending commit batch is missing"))?;
             apply_mutations(&mut shared.memtable, batch, commit_seq)?;
-            shared.memtable_bytes = estimate_memtable_bytes(&shared.memtable)?;
+            shared.memtable_footprint = measure_memtable_footprint(&shared.memtable)?;
             shared.visible_commit_seq = shared.visible_commit_seq.max(commit_seq);
             if let Some(prepared) = self.prepared_change {
                 shared
@@ -2478,7 +2517,7 @@ impl LsmTransaction {
                 .as_ref()
                 .ok_or(LsmError::InvalidWal("prepared mutation batch is missing"))?;
             apply_mutations(&mut shared.memtable, batch, commit_seq)?;
-            shared.memtable_bytes = estimate_memtable_bytes(&shared.memtable)?;
+            shared.memtable_footprint = measure_memtable_footprint(&shared.memtable)?;
             shared.visible_commit_seq = shared.visible_commit_seq.max(commit_seq);
             if let Some(prepared) = self.prepared_change {
                 shared
@@ -2621,7 +2660,7 @@ impl LsmTransaction {
                     .as_ref()
                     .ok_or(LsmError::InvalidWal("prepared mutation batch is missing"))?;
                 apply_mutations(&mut shared.memtable, batch, commit_seq)?;
-                shared.memtable_bytes = estimate_memtable_bytes(&shared.memtable)?;
+                shared.memtable_footprint = measure_memtable_footprint(&shared.memtable)?;
                 shared.visible_commit_seq = shared.visible_commit_seq.max(commit_seq);
             }
             participant.state = TransactionState::ChangeFinalizePending;
@@ -2917,7 +2956,7 @@ impl LsmTransaction {
         }
         {
             let mut shared = self.shared.borrow_mut();
-            if shared.memtable_bytes >= shared.flush_threshold
+            if shared.memtable_footprint.bytes >= shared.flush_threshold
                 && shared.runtime.writer.get().is_none()
             {
                 // Pending writes live only in this transaction and are not in
@@ -3841,6 +3880,11 @@ impl<'a> SstableEntryCursor<'a> {
                 }
                 .into());
             }
+            #[cfg(any(test, feature = "test-hooks"))]
+            crate::source_inspection_test_activity::record(|activity| {
+                activity.lsm_scan_block_bytes +=
+                    SST_BLOCK_HEADER_SIZE as u64 + u64::from(actual.payload_length) + 4;
+            });
             if let Some(counters) = self.counters {
                 increment(&counters.data_blocks_read, 1);
             }
@@ -3959,22 +4003,46 @@ fn bloom_allows(shared: &LsmShared, sstable: &Sstable, range: Option<&KeyRange>)
     }
 }
 
-fn estimate_memtable_bytes(
+/// Runtime structure maintained in the existing post-commit/recovery accounting
+/// pass. This is MemTable metadata, not a cached Physical Design inspection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MemtableFootprint {
+    bytes: u64,
+    entry_count: u64,
+    distinct_clustering_keys: u64,
+}
+
+fn measure_memtable_footprint(
     memtable: &BTreeMap<PhysicalKey, BTreeMap<LsmCommitSeq, EntryValue>>,
-) -> Result<u64, StorageError> {
-    let mut bytes = 0_u64;
-    for versions in memtable.values() {
+) -> Result<MemtableFootprint, StorageError> {
+    let mut footprint = MemtableFootprint::default();
+    let mut previous = None;
+    for (key, versions) in memtable {
+        // PhysicalKey orders clustering first. Every key has at least one
+        // version; counting transitions needs no auxiliary key allocation.
+        if previous != Some(key.clustering) {
+            footprint.distinct_clustering_keys = footprint
+                .distinct_clustering_keys
+                .checked_add(1)
+                .ok_or(StorageError::CountOverflow)?;
+            previous = Some(key.clustering);
+        }
+        footprint.entry_count = footprint
+            .entry_count
+            .checked_add(u64::try_from(versions.len()).map_err(|_| StorageError::CountOverflow)?)
+            .ok_or(StorageError::CountOverflow)?;
         for value in versions.values() {
-            bytes =
-                bytes
-                    .checked_add(40 + value_size(value))
-                    .ok_or(StorageError::ResourceLimit {
-                        resource: "LSM MemTable bytes",
-                        limit: u64::MAX,
-                    })?;
+            footprint.bytes = footprint
+                .bytes
+                .checked_add(40)
+                .and_then(|bytes| bytes.checked_add(value_size(value)))
+                .ok_or(StorageError::ResourceLimit {
+                    resource: "LSM MemTable bytes",
+                    limit: u64::MAX,
+                })?;
         }
     }
-    Ok(bytes)
+    Ok(footprint)
 }
 
 fn value_size(value: &EntryValue) -> u64 {
@@ -5276,7 +5344,7 @@ fn flush_memtable(shared: &mut LsmShared) -> Result<(), StorageError> {
             shared.sstables.push(sstable);
             canonicalize_sstables(&mut shared.sstables);
             shared.memtable.clear();
-            shared.memtable_bytes = 0;
+            shared.memtable_footprint = MemtableFootprint::default();
             shared.runtime.recovery_required.set(true);
             drop(old_wal);
             return Err(source);
@@ -5285,7 +5353,7 @@ fn flush_memtable(shared: &mut LsmShared) -> Result<(), StorageError> {
     shared.sstables.push(sstable);
     canonicalize_sstables(&mut shared.sstables);
     shared.memtable.clear();
-    shared.memtable_bytes = 0;
+    shared.memtable_footprint = MemtableFootprint::default();
     increment_write_counter(
         &shared.runtime.amplification,
         &shared.runtime.amplification.flush_input_bytes,
@@ -5354,12 +5422,7 @@ fn conservative_sstable_output_bound(
         }
         .into());
     }
-    let bloom_bytes = u64::try_from(
-        BloomFilter::for_distinct_keys(distinct_clustering_keys)?
-            .bits
-            .len(),
-    )
-    .map_err(|_| StorageError::CountOverflow)?;
+    let bloom_bytes = BloomFilter::bit_count_for_distinct_keys(distinct_clustering_keys)? / 8;
     // Every real block contains at least one entry. Charging one block header,
     // checksum and index record per entry is therefore a conservative bound
     // independent of the production chunking decisions.
@@ -5382,29 +5445,34 @@ fn conservative_sstable_output_bound(
         .ok_or(StorageError::CountOverflow)
 }
 
+fn maintenance_anchor(shared: &LsmShared) -> LsmMaintenanceAnchor {
+    LsmMaintenanceAnchor {
+        storage_id: shared.manifest.storage_id,
+        manifest_generation: shared.manifest.generation,
+        wal_generation: shared.manifest.wal_generation,
+        visible_commit_sequence: shared.visible_commit_seq.0,
+    }
+}
+
 fn flush_conservative_bound(
     shared: &LsmShared,
 ) -> Result<LsmMaintenanceBoundInspection, StorageError> {
-    let mut entry_count = 0_u64;
-    let mut encoded_entry_bytes = 0_u64;
-    let mut distinct = BTreeSet::new();
-    for (key, versions) in &shared.memtable {
-        distinct.insert(key.clustering);
-        for value in versions.values() {
-            entry_count = entry_count
-                .checked_add(1)
-                .ok_or(StorageError::CountOverflow)?;
-            encoded_entry_bytes = encoded_entry_bytes
-                .checked_add(32)
-                .and_then(|bytes| bytes.checked_add(value_size(value)))
-                .ok_or(StorageError::CountOverflow)?;
-        }
-    }
-    let distinct = u64::try_from(distinct.len()).map_err(|_| StorageError::CountOverflow)?;
+    let footprint = shared.memtable_footprint;
+    // Runtime bytes charge 40 per entry; the exact encoded entry size charges
+    // 32. Reuse the production bound, with metadata from the same accounting pass.
+    let encoded_entry_bytes = footprint
+        .entry_count
+        .checked_mul(8)
+        .and_then(|overhead| footprint.bytes.checked_sub(overhead))
+        .ok_or(StorageError::CountOverflow)?;
     Ok(LsmMaintenanceBoundInspection {
-        work_units: entry_count,
-        read_bytes: shared.memtable_bytes,
-        write_bytes: conservative_sstable_output_bound(entry_count, distinct, encoded_entry_bytes)?,
+        work_units: footprint.entry_count,
+        read_bytes: footprint.bytes,
+        write_bytes: conservative_sstable_output_bound(
+            footprint.entry_count,
+            footprint.distinct_clustering_keys,
+            encoded_entry_bytes,
+        )?,
     })
 }
 
@@ -7754,6 +7822,217 @@ mod tests {
         vec![ScalarValue::Int64(key), ScalarValue::Text(payload.into())]
     }
 
+    fn assert_physical_design_source(
+        storage: &mut LsmStorage,
+    ) -> crate::LsmPhysicalDesignSourceInspection {
+        use crate::source_inspection_test_activity as activity;
+        let before = storage.inspection();
+        let maintenance = storage.maintenance_inspection().unwrap();
+        activity::take();
+        let inspected = storage.inspect_physical_design_source().unwrap();
+        for _ in 0..3 {
+            assert_eq!(storage.inspect_physical_design_source().unwrap(), inspected);
+        }
+        assert_eq!(activity::take(), activity::Activity::default());
+        assert_eq!(storage.inspection(), before);
+        assert_eq!(inspected.anchor, maintenance.anchor);
+        assert_eq!(
+            inspected.flush_conservative_bound,
+            maintenance.flush_conservative_bound
+        );
+        let shared = storage.shared.borrow();
+        assert_eq!(
+            shared.memtable_footprint,
+            super::measure_memtable_footprint(&shared.memtable).unwrap()
+        );
+        assert_eq!(
+            inspected.memtable_entry_count,
+            shared
+                .memtable
+                .values()
+                .map(|versions| versions.len() as u64)
+                .sum()
+        );
+        assert_eq!(
+            inspected.memtable_bytes,
+            shared
+                .memtable
+                .values()
+                .flat_map(|versions| versions.values())
+                .map(|value| 40 + super::value_size(value))
+                .sum()
+        );
+        assert_eq!(
+            inspected.sstable_count,
+            shared.manifest.sstables.len() as u64
+        );
+        assert_eq!(
+            inspected.sstable_entry_count,
+            shared
+                .manifest
+                .sstables
+                .iter()
+                .map(|reference| reference.entry_count)
+                .sum()
+        );
+        assert_eq!(
+            inspected.total_sstable_bytes,
+            shared
+                .sstables
+                .iter()
+                .map(|sstable| std::fs::metadata(&sstable.path).unwrap().len())
+                .sum()
+        );
+        // Open validated contiguous, nonoverlapping blocks inside each exact file
+        // extent. The production full cursor advances next_block monotonically.
+        for sstable in &shared.sstables {
+            let mut previous_end = super::SST_HEADER_SIZE as u64;
+            for block in &sstable.blocks {
+                assert!(block.offset >= previous_end);
+                previous_end = block.offset
+                    + super::SST_BLOCK_HEADER_SIZE as u64
+                    + u64::from(block.payload_length)
+                    + 4;
+                assert!(previous_end <= sstable.reference.file_bytes);
+            }
+        }
+        drop(shared);
+        let view = storage.read_view().unwrap();
+        storage
+            .scan_columns_with_view(&[ColumnId(1)], &view)
+            .unwrap();
+        assert!(activity::take().lsm_scan_block_bytes <= inspected.total_sstable_bytes);
+        inspected
+    }
+
+    #[test]
+    fn physical_design_source_is_current_across_versions_flush_compaction_and_reopen() {
+        let root = root("phase33-source");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        assert_eq!(assert_physical_design_source(&mut storage).sstable_count, 0);
+        let first = storage.insert(&row(1, "old")).unwrap();
+        let memtable = assert_physical_design_source(&mut storage);
+        assert_eq!(memtable.memtable_entry_count, 1);
+        assert_eq!(memtable.total_sstable_bytes, 0);
+        let bound = memtable.flush_conservative_bound.unwrap();
+        let writes = storage.inspection().write_amplification;
+        storage.flush().unwrap();
+        let flushed = assert_physical_design_source(&mut storage);
+        let after = storage.inspection().write_amplification;
+        assert_eq!(flushed.sstable_count, 1);
+        assert_eq!(flushed.memtable_entry_count, 0);
+        assert!(after.flush_input_bytes - writes.flush_input_bytes <= bound.read_bytes);
+        assert!(after.flush_output_bytes - writes.flush_output_bytes <= bound.write_bytes);
+        assert!(flushed.sstable_entry_count <= bound.work_units);
+        storage.analyze().unwrap();
+        let analyzed = storage.table_statistics();
+        let first = storage
+            .read_view()
+            .and_then(|view| storage.refresh_handle(first.row_id, &view))
+            .unwrap();
+        let updated = storage.update(first, &row(2, "new")).unwrap();
+        let update = assert_physical_design_source(&mut storage);
+        assert_eq!(
+            update.memtable_entry_count, 2,
+            "new key plus old-key tombstone"
+        );
+        storage.flush().unwrap();
+        let second = assert_physical_design_source(&mut storage);
+        assert_eq!(second.sstable_count, 2);
+        let current = storage
+            .read_view()
+            .and_then(|view| storage.refresh_handle(updated.row_id, &view))
+            .unwrap();
+        storage.delete(current).unwrap();
+        storage.insert(&row(3, "survivor")).unwrap();
+        storage.flush().unwrap();
+        let obsolete = assert_physical_design_source(&mut storage);
+        assert_eq!(obsolete.sstable_count, 3);
+        assert_eq!(
+            obsolete.sstable_entry_count, 5,
+            "physical versions, not live rows"
+        );
+        storage.compact_full().unwrap();
+        let compacted = assert_physical_design_source(&mut storage);
+        assert_eq!(compacted.sstable_count, 1);
+        assert_eq!(compacted.sstable_entry_count, 1);
+        assert_eq!(
+            compacted.anchor.visible_commit_sequence,
+            obsolete.anchor.visible_commit_sequence
+        );
+        assert_eq!(compacted.visibility_boundary, obsolete.visibility_boundary);
+        assert!(compacted.anchor.manifest_generation > obsolete.anchor.manifest_generation);
+        assert_eq!(
+            storage.table_statistics(),
+            analyzed,
+            "ANALYZE is not current safety authority"
+        );
+        storage.close().unwrap();
+        let mut reopened = LsmStorage::open(&root, table()).unwrap();
+        assert_eq!(assert_physical_design_source(&mut reopened), compacted);
+        reopened.close().unwrap();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn physical_design_source_rebuilds_memtable_metadata_from_wal_without_analyze() {
+        let root = root("phase33-runtime-metadata-recovery");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let first = storage.insert(&row(7, "first")).unwrap();
+        storage
+            .insert(&row(7, "same clustering, different row"))
+            .unwrap();
+        let first = storage
+            .read_view()
+            .and_then(|view| storage.refresh_handle(first.row_id, &view))
+            .unwrap();
+        storage.update(first, &row(7, "new version")).unwrap();
+        let before = assert_physical_design_source(&mut storage);
+        assert_eq!(before.memtable_entry_count, 3);
+        assert_eq!(
+            storage
+                .shared
+                .borrow()
+                .memtable_footprint
+                .distinct_clustering_keys,
+            1
+        );
+        assert_eq!(storage.table_statistics(), None);
+        drop(storage); // LSM Drop closes handles; only explicit close/flush drains MemTable.
+        let mut reopened = LsmStorage::open(&root, table()).unwrap();
+        assert_eq!(assert_physical_design_source(&mut reopened), before);
+        reopened.close().unwrap();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn physical_design_source_reports_overflow_as_typed_error() {
+        let root = root("phase33-overflow");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        storage.insert(&row(1, "one")).unwrap();
+        storage.flush().unwrap();
+        storage.insert(&row(2, "two")).unwrap();
+        storage.flush().unwrap();
+        let original = storage.shared.borrow().sstables[0].reference.file_bytes;
+        storage.shared.borrow_mut().sstables[0].reference.file_bytes = u64::MAX;
+        assert!(matches!(
+            storage.inspect_physical_design_source(),
+            Err(StorageError::CountOverflow)
+        ));
+        storage.shared.borrow_mut().sstables[0].reference.file_bytes = original;
+        storage.shared.borrow_mut().memtable_footprint.entry_count = u64::MAX;
+        assert!(matches!(
+            storage.inspect_physical_design_source(),
+            Err(StorageError::CountOverflow)
+        ));
+        storage.shared.borrow_mut().memtable_footprint = super::MemtableFootprint::default();
+        storage.close().unwrap();
+        cleanup(&root);
+    }
+
     fn uint_table() -> TableDef {
         TableDef::new(
             TableId(12),
@@ -9519,6 +9798,7 @@ mod tests {
             }
         }
         storage.compact().expect("drive leveled compaction");
+        assert_physical_design_source(&mut storage);
         let inspection = storage.inspection();
         assert!(inspection.level_count >= 2);
         assert!(inspection.levels.iter().any(|level| level.level >= 2));
