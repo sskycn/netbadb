@@ -1374,3 +1374,185 @@ fn drop_index_requires_table_write_authorization() {
     database.close().unwrap();
     cleanup(&directory);
 }
+
+#[test]
+fn postgres_programmatic_admission_uses_current_bounds_and_preserves_client_protocol() {
+    use netbadb_core::{
+        PhysicalDesignMutationAdmissionConstraint::{AtMost, Unconstrained},
+        PhysicalDesignMutationAdmissionLimits, PhysicalDesignMutationAdmissionPolicy,
+        PhysicalDesignMutationConservativeBound, PhysicalIndexCandidate,
+        PhysicalIndexDesignApplyOutcome,
+    };
+    use netbadb_server::{
+        ServerPhysicalColumnarDesignControlError, ServerPhysicalDesignMutationReceiptConfig,
+        ServerPhysicalDesignMutationReceiptOutcome as Outcome,
+    };
+    use netbadb_types::IndexName;
+    let admission = |maximum| {
+        PhysicalDesignMutationAdmissionPolicy::new(PhysicalDesignMutationAdmissionLimits {
+            source_work_units: AtMost(maximum),
+            source_read_bytes: Unconstrained,
+            prerequisite_work_units: AtMost(0),
+            prerequisite_read_bytes: AtMost(0),
+            prerequisite_write_bytes: AtMost(0),
+            output_write_bytes: Unconstrained,
+        })
+        .unwrap()
+    };
+    let directory = test_directory("phase34-admission");
+    cleanup(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let placements = directory.join("columnar");
+    std::fs::create_dir(&placements).unwrap();
+    let mut database = Database::create_catalog(
+        directory.join("catalog"),
+        vec![TableStorageCreateSpec::heap(
+            directory.join("users.ndb"),
+            users_table(),
+        )],
+        Some(
+            DatabaseCoordinatorConfig::new(directory.join("coordinator")).with_global_visibility(),
+        ),
+    )
+    .unwrap();
+    database
+        .execute("INSERT INTO users (id, name, active) VALUES (1, 'Ada', true)")
+        .unwrap();
+    let candidate = PhysicalIndexCandidate {
+        table_id: TableId(1),
+        column_id: ColumnId(2),
+    };
+    let PhysicalDesignMutationConservativeBound::Bounded(n) = database
+        .inspect_physical_index_design_mutation_work(candidate)
+        .unwrap()
+        .bounds
+        .source_work_units
+    else {
+        panic!("Heap bound")
+    };
+    database.close().unwrap();
+    let manifest = directory.join("server.json");
+    let mut value: serde_json::Value = serde_json::from_str(
+        r#"{
+            "version": 10,
+            "listen": "127.0.0.1:0",
+            "authorization": {
+                "local_plaintext": {"schema_admin": false,
+                    "tables": [{"table_id":1,"read":true,"write":false,"transaction":false,"analyze":false}]
+                },
+                "clients": []
+            },
+            "tables": [{
+                "path":"users.ndb","id":1,"name":"users",
+                "columns":[
+                    {"id":1,"name":"id","physical_type":"int64","semantic_type":null,"nullable":false,"primary_key":true},
+                    {"id":2,"name":"name","physical_type":"text","semantic_type":null,"nullable":true,"primary_key":false},
+                    {"id":3,"name":"active","physical_type":"bool","semantic_type":null,"nullable":false,"primary_key":false}
+                ]
+            }]
+        }"#,
+    )
+    .unwrap();
+    value["physical_design"] = physical_design_manifest();
+    // Phase 34 creates no Manifest v10 admission configuration.
+    value["physical_design"]["mutation_admission"] = serde_json::json!({});
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(
+        ServerConfig::from_manifest_path(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field")
+    );
+    value["physical_design"]
+        .as_object_mut()
+        .unwrap()
+        .remove("mutation_admission");
+    std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    let server = PostgresTcpServer::new(ServerConfig::from_manifest_path(&manifest).unwrap())
+        .with_physical_columnar_apply(
+            ServerPhysicalColumnarApplyConfig::new(&placements, true, false).unwrap(),
+        )
+        .with_physical_design_mutation_receipts(
+            ServerPhysicalDesignMutationReceiptConfig::new(
+                directory.join("admission.nbmr"),
+                1_000_000,
+            )
+            .unwrap(),
+        )
+        .start()
+        .unwrap();
+    let control = server.physical_design_control();
+    let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+    startup(&mut stream);
+    for sql in [
+        "SELECT id FROM users WHERE name = 'Ada'",
+        "SELECT id FROM users",
+    ] {
+        let messages = query(&mut stream, sql);
+        assert_eq!(messages.last().map(|message| message.0), Some(b'Z'));
+        assert!(messages.iter().any(|message| message.0 == b'D'));
+    }
+    let index = control.propose_index(candidate).unwrap();
+    let columnar = control
+        .propose_columnar(
+            PhysicalColumnarCandidate {
+                table_id: TableId(1),
+                columns: vec![ColumnId(1)],
+            },
+            PhysicalColumnarDesignMode::Snapshot,
+            ServerPhysicalColumnarPlacementKey::new("admitted").unwrap(),
+        )
+        .unwrap();
+    let before = control.status().unwrap();
+    assert!(matches!(
+        control.apply_index_with_admission(
+            &index,
+            IndexName::new("admitted_name").unwrap(),
+            admission(n - 1)
+        ),
+        Err(ServerPhysicalDesignControlError::Admission(_))
+    ));
+    assert!(matches!(
+        control.apply_columnar_with_admission(&columnar, admission(0)),
+        Err(ServerPhysicalColumnarDesignControlError::Admission(_))
+    ));
+    assert!(!control.mutation_receipt_status().unwrap().recovery_required);
+    assert_eq!(control.status().unwrap(), before);
+    assert!(matches!(
+        control
+            .apply_index_with_admission(
+                &index,
+                IndexName::new("admitted_name").unwrap(),
+                admission(n)
+            )
+            .unwrap()
+            .outcome,
+        PhysicalIndexDesignApplyOutcome::Created { .. }
+    ));
+    assert!(matches!(
+        control
+            .apply_columnar_with_admission(&columnar, admission(u64::MAX))
+            .unwrap()
+            .outcome,
+        PhysicalColumnarDesignApplyOutcome::Created { .. }
+    ));
+    let receipts = control.mutation_receipts(None, 8).unwrap();
+    assert_eq!(receipts.receipts.len(), 4);
+    assert_eq!(receipts.receipts[0].outcome, Outcome::Rejected);
+    assert_eq!(receipts.receipts[1].outcome, Outcome::Rejected);
+    assert!(matches!(
+        receipts.receipts[2].outcome,
+        Outcome::CreatedIndex { .. }
+    ));
+    assert!(matches!(
+        receipts.receipts[3].outcome,
+        Outcome::CreatedColumnar { .. }
+    ));
+    let messages = query(&mut stream, "SELECT id FROM users");
+    assert_eq!(messages.last().map(|message| message.0), Some(b'Z'));
+    assert!(messages.iter().any(|message| message.0 == b'D'));
+    stream.write_all(&frontend(b'X', &[])).unwrap();
+    drop(stream);
+    server.shutdown().unwrap();
+    cleanup(&directory);
+}

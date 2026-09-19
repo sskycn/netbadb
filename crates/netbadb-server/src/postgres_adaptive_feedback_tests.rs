@@ -698,6 +698,7 @@ fn postgres_design_only_extended_portal_records_once_and_keeps_eligibility() {
     design.handle(
         &mut fixture.database,
         ServerPhysicalDesignWorkerCommand::ApplyIndex {
+            admission: None,
             proposal: Box::new(proposal),
             index_name: IndexName::new("events_category_idx").unwrap(),
             reply,

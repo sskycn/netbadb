@@ -2181,3 +2181,752 @@ fn mutation_work_incremental_rejects_unavailable_stream_without_repair() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+mod admission {
+    use super::*;
+    use crate::{
+        Database, PhysicalColumnarDesignAdmissionApplyError as ColumnarError,
+        PhysicalColumnarDesignProposal,
+        PhysicalColumnarMutationPrerequisiteInspection as Prerequisite,
+        PhysicalDesignMutationAdmissionConstraint::{AtMost, Unconstrained},
+        PhysicalDesignMutationAdmissionDimension as Dimension,
+        PhysicalDesignMutationAdmissionError as AdmissionError,
+        PhysicalDesignMutationAdmissionLimits as Limits,
+        PhysicalDesignMutationAdmissionPolicy as Admission,
+        PhysicalDesignMutationConservativeBound as Bound,
+        PhysicalIndexDesignAdmissionApplyError as IndexError,
+    };
+    use netbadb_storage::source_inspection_test_activity as activity;
+    use netbadb_types::IndexName;
+    use std::error::Error;
+
+    fn constraint(dimension: Dimension, maximum: u64) -> Admission {
+        let mut limits = Limits {
+            source_work_units: Unconstrained,
+            source_read_bytes: Unconstrained,
+            prerequisite_work_units: Unconstrained,
+            prerequisite_read_bytes: Unconstrained,
+            prerequisite_write_bytes: Unconstrained,
+            output_write_bytes: Unconstrained,
+        };
+        match dimension {
+            Dimension::SourceWorkUnits => limits.source_work_units = AtMost(maximum),
+            Dimension::SourceReadBytes => limits.source_read_bytes = AtMost(maximum),
+            Dimension::PrerequisiteWorkUnits => limits.prerequisite_work_units = AtMost(maximum),
+            Dimension::PrerequisiteReadBytes => limits.prerequisite_read_bytes = AtMost(maximum),
+            Dimension::PrerequisiteWriteBytes => limits.prerequisite_write_bytes = AtMost(maximum),
+            Dimension::OutputWriteBytes => limits.output_write_bytes = AtMost(maximum),
+        }
+        Admission::new(limits).unwrap()
+    }
+
+    fn bound(value: Bound) -> u64 {
+        let Bound::Bounded(value) = value else {
+            panic!("expected proven bound")
+        };
+        value
+    }
+
+    fn name() -> IndexName {
+        IndexName::new("phase34_category").unwrap()
+    }
+
+    fn evidence_window(fixture: &mut Fixture) -> PhysicalDesignEvidenceWindow {
+        let mut window = PhysicalDesignEvidenceWindow::default();
+        for sql in [
+            "SELECT id FROM events WHERE category = 3",
+            "SELECT id FROM events",
+        ] {
+            window
+                .record_execution_feedback(&feedback(fixture, sql))
+                .unwrap();
+        }
+        window
+    }
+
+    fn candidate() -> PhysicalColumnarCandidate {
+        PhysicalColumnarCandidate {
+            table_id: TABLE_ID,
+            columns: vec![ColumnId(1)],
+        }
+    }
+
+    fn columnar_proposal(
+        fixture: &Fixture,
+        window: &PhysicalDesignEvidenceWindow,
+        mode: PhysicalColumnarDesignMode,
+        placement: &str,
+    ) -> PhysicalColumnarDesignProposal {
+        fixture
+            .database
+            .propose_physical_columnar_design(
+                window,
+                policy(1, 1, 0, 8),
+                candidate(),
+                mode,
+                fixture.root.join(placement),
+            )
+            .unwrap()
+    }
+
+    // Snapshot all authoritative persistent bytes, high-waters and observable
+    // runtime state around each rejection, including LSM flush counters.
+    fn pure_rejection(
+        fixture: &mut Fixture,
+        window: &PhysicalDesignEvidenceWindow,
+        operation: impl FnOnce(&mut Database) -> AdmissionError,
+    ) -> AdmissionError {
+        let files = mutation_work_file_image(&fixture.root);
+        let g = fixture
+            .database
+            .current_database_snapshot()
+            .unwrap()
+            .unwrap()
+            .commit_seq();
+        let schema = fixture.database.schema_generation();
+        let catalog = fixture.database.inspect_catalog().unwrap();
+        let projections = fixture.database.inspect_columnar_projection_catalog();
+        let lsm = fixture.database.inspect_lsm_storage(TABLE_ID).unwrap();
+        let stream = fixture.database.inspect_change_stream(TABLE_ID).unwrap();
+        let evidence = window.clone();
+        let calibration = fixture.database.planner_calibration_profile();
+        let safe_mode = fixture.database.automatic_safe_mode_state();
+        activity::take();
+        let error = operation(&mut fixture.database);
+        assert_eq!(activity::take(), activity::Activity::default());
+        assert_eq!(mutation_work_file_image(&fixture.root), files);
+        assert_eq!(
+            fixture
+                .database
+                .current_database_snapshot()
+                .unwrap()
+                .unwrap()
+                .commit_seq(),
+            g
+        );
+        assert_eq!(fixture.database.schema_generation(), schema);
+        assert_eq!(fixture.database.inspect_catalog().unwrap(), catalog);
+        assert_eq!(
+            fixture.database.inspect_columnar_projection_catalog(),
+            projections
+        );
+        assert_eq!(fixture.database.inspect_lsm_storage(TABLE_ID).unwrap(), lsm);
+        assert_eq!(
+            fixture.database.inspect_change_stream(TABLE_ID).unwrap(),
+            stream
+        );
+        assert_eq!(fixture.database.planner_calibration_profile(), calibration);
+        assert_eq!(fixture.database.automatic_safe_mode_state(), safe_mode);
+        assert_eq!(*window, evidence);
+        error
+    }
+
+    fn columnar_rejection(
+        fixture: &mut Fixture,
+        window: &PhysicalDesignEvidenceWindow,
+        proposal: &PhysicalColumnarDesignProposal,
+        admission: Admission,
+    ) -> AdmissionError {
+        pure_rejection(fixture, window, |database| {
+            let error = database
+                .apply_physical_columnar_design_with_admission(window, proposal, admission)
+                .unwrap_err();
+            assert!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<AdmissionError>()
+                    .is_some()
+            );
+            let ColumnarError::Admission(error) = error else {
+                panic!("expected admission error: {error:?}")
+            };
+            *error
+        })
+    }
+
+    fn assert_limit(error: AdmissionError, dimension: Dimension, n: u64, maximum: u64) {
+        assert!(
+            matches!(error, AdmissionError::LimitExceeded { dimension: actual, conservative_bound, maximum: actual_maximum }
+            if actual == dimension && conservative_bound == n && actual_maximum == maximum),
+            "{error:?}"
+        );
+    }
+
+    fn assert_unknown(error: AdmissionError, dimension: Dimension) {
+        assert!(
+            matches!(error, AdmissionError::RequiredBoundNotProven { dimension: actual } if actual == dimension),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn admission_heap_index_bounds_reject_below_accept_equal_and_never_bound_output() {
+        for dimension in [Dimension::SourceWorkUnits, Dimension::SourceReadBytes] {
+            let mut fixture = Fixture::create("phase34-index", false);
+            let window = evidence_window(&mut fixture);
+            let proposal = fixture
+                .database
+                .propose_physical_index_design(&window, policy(1, 1, 0, 8), index_candidate())
+                .unwrap();
+            let inspection = fixture
+                .database
+                .inspect_physical_index_design_mutation_work(index_candidate())
+                .unwrap();
+            let n = bound(if dimension == Dimension::SourceWorkUnits {
+                inspection.bounds.source_work_units
+            } else {
+                inspection.bounds.source_read_bytes
+            });
+            for (d, maximum) in [(dimension, n - 1), (Dimension::OutputWriteBytes, u64::MAX)] {
+                let error = pure_rejection(&mut fixture, &window, |database| {
+                    let error = database
+                        .apply_physical_index_design_with_admission(
+                            &window,
+                            &proposal,
+                            name(),
+                            constraint(d, maximum),
+                        )
+                        .unwrap_err();
+                    assert!(
+                        error
+                            .source()
+                            .unwrap()
+                            .downcast_ref::<AdmissionError>()
+                            .is_some()
+                    );
+                    let IndexError::Admission(error) = error else {
+                        panic!("admission error")
+                    };
+                    *error
+                });
+                if d == dimension {
+                    assert_limit(error, d, n, maximum);
+                } else {
+                    assert_unknown(error, d);
+                }
+            }
+            activity::take();
+            let report = fixture
+                .database
+                .apply_physical_index_design_with_admission(
+                    &window,
+                    &proposal,
+                    name(),
+                    constraint(dimension, n),
+                )
+                .unwrap();
+            assert!(matches!(
+                report.outcome,
+                PhysicalIndexDesignApplyOutcome::Created {
+                    index_id: netbadb_types::IndexId(1)
+                }
+            ));
+            let actual = activity::take();
+            assert!(actual.heap_backfill_pages > 0);
+            assert!(actual.heap_backfill_pages <= bound(inspection.bounds.source_work_units));
+            assert_eq!(actual.heap_scan_pages, 0);
+            assert_eq!(actual.scan_columns_calls, 0);
+            assert_eq!(actual.analyze_calls, 0);
+            fixture.close();
+        }
+    }
+
+    #[test]
+    fn admission_heap_columnar_source_limits_and_zero_prerequisites_in_both_modes() {
+        for mode in [
+            PhysicalColumnarDesignMode::Snapshot,
+            PhysicalColumnarDesignMode::Incremental,
+        ] {
+            for dimension in [Dimension::SourceWorkUnits, Dimension::SourceReadBytes] {
+                let mut fixture = Fixture::create("phase34-heap-columnar", false);
+                fixture.database.enable_change_stream(TABLE_ID).unwrap();
+                let window = evidence_window(&mut fixture);
+                let proposal = columnar_proposal(&fixture, &window, mode, "admitted");
+                let inspection = fixture
+                    .database
+                    .inspect_physical_columnar_design_mutation_work(&candidate(), mode)
+                    .unwrap();
+                let n = bound(if dimension == Dimension::SourceWorkUnits {
+                    inspection.bounds.source_work_units
+                } else {
+                    inspection.bounds.source_read_bytes
+                });
+                let error = columnar_rejection(
+                    &mut fixture,
+                    &window,
+                    &proposal,
+                    constraint(dimension, n - 1),
+                );
+                assert_limit(error, dimension, n, n - 1);
+                let error = columnar_rejection(
+                    &mut fixture,
+                    &window,
+                    &proposal,
+                    constraint(Dimension::OutputWriteBytes, u64::MAX),
+                );
+                assert_unknown(error, Dimension::OutputWriteBytes);
+                let mut limits = constraint(dimension, n).limits();
+                limits.prerequisite_work_units = AtMost(0);
+                limits.prerequisite_read_bytes = AtMost(0);
+                limits.prerequisite_write_bytes = AtMost(0);
+                activity::take();
+                let report = fixture
+                    .database
+                    .apply_physical_columnar_design_with_admission(
+                        &window,
+                        &proposal,
+                        Admission::new(limits).unwrap(),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    report.outcome,
+                    PhysicalColumnarDesignApplyOutcome::Created {
+                        projection_id: netbadb_types::ColumnarProjectionId(1)
+                    }
+                ));
+                let actual = activity::take();
+                assert_eq!(actual.scan_columns_calls, 1);
+                assert_eq!(
+                    actual.scan_versioned_columns_calls,
+                    u64::from(mode == PhysicalColumnarDesignMode::Incremental)
+                );
+                assert_eq!(actual.flush_calls, 0);
+                assert_eq!(actual.analyze_calls, 0);
+                fixture.close();
+            }
+        }
+    }
+
+    #[test]
+    fn admission_lsm_incremental_and_empty_snapshot_bound_sstables_only() {
+        for mode in [
+            PhysicalColumnarDesignMode::Snapshot,
+            PhysicalColumnarDesignMode::Incremental,
+        ] {
+            let mut fixture = mutation_work_lsm_fixture("phase34-lsm-source");
+            fixture.database.enable_change_stream(TABLE_ID).unwrap();
+            let window = evidence_window(&mut fixture);
+            let proposal = columnar_proposal(&fixture, &window, mode, "admitted");
+            let storage_id = proposal.storage_id();
+            fixture
+                .database
+                .registry
+                .get(storage_id)
+                .unwrap()
+                .flush()
+                .unwrap();
+            // Incremental retains resident data but still never flushes.
+            if mode == PhysicalColumnarDesignMode::Incremental {
+                fixture
+                    .database
+                    .execute("INSERT INTO events VALUES (2, 2)")
+                    .unwrap();
+            }
+            let inspection = fixture
+                .database
+                .inspect_physical_columnar_design_mutation_work(&candidate(), mode)
+                .unwrap();
+            let n = bound(inspection.bounds.source_read_bytes);
+            assert!(n > 0);
+            for d in [Dimension::SourceWorkUnits, Dimension::OutputWriteBytes] {
+                let error =
+                    columnar_rejection(&mut fixture, &window, &proposal, constraint(d, u64::MAX));
+                assert_unknown(error, d);
+            }
+            let error = columnar_rejection(
+                &mut fixture,
+                &window,
+                &proposal,
+                constraint(Dimension::SourceReadBytes, n - 1),
+            );
+            assert_limit(error, Dimension::SourceReadBytes, n, n - 1);
+            let mut limits = constraint(Dimension::SourceReadBytes, n).limits();
+            limits.prerequisite_work_units = AtMost(0);
+            limits.prerequisite_read_bytes = AtMost(0);
+            limits.prerequisite_write_bytes = AtMost(0);
+            activity::take();
+            fixture
+                .database
+                .apply_physical_columnar_design_with_admission(
+                    &window,
+                    &proposal,
+                    Admission::new(limits).unwrap(),
+                )
+                .unwrap();
+            let actual = activity::take();
+            assert_eq!(actual.scan_columns_calls, 1);
+            // Snapshot's ordinary flush is called even when its MemTable is empty.
+            assert_eq!(
+                actual.flush_calls,
+                u64::from(mode == PhysicalColumnarDesignMode::Snapshot)
+            );
+            let source = fixture
+                .database
+                .inspect_lsm_storage(TABLE_ID)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                source.memtable_entry_count,
+                u64::from(mode == PhysicalColumnarDesignMode::Incremental)
+            );
+            fixture.close();
+        }
+    }
+
+    #[test]
+    fn admission_lsm_snapshot_partial_flush_limits_never_preflush_on_rejection() {
+        for dimension in [
+            Dimension::PrerequisiteWorkUnits,
+            Dimension::PrerequisiteReadBytes,
+            Dimension::PrerequisiteWriteBytes,
+        ] {
+            let mut fixture = mutation_work_lsm_fixture("phase34-lsm-flush");
+            let window = evidence_window(&mut fixture);
+            let proposal = columnar_proposal(
+                &fixture,
+                &window,
+                PhysicalColumnarDesignMode::Snapshot,
+                "admitted",
+            );
+            let inspection = fixture
+                .database
+                .inspect_physical_columnar_design_mutation_work(&candidate(), proposal.mode())
+                .unwrap();
+            let Prerequisite::LsmFlush {
+                conservative_bound: flush,
+                ..
+            } = inspection.prerequisite
+            else {
+                panic!("flush prerequisite")
+            };
+            for d in [
+                Dimension::SourceWorkUnits,
+                Dimension::SourceReadBytes,
+                Dimension::OutputWriteBytes,
+            ] {
+                let error =
+                    columnar_rejection(&mut fixture, &window, &proposal, constraint(d, u64::MAX));
+                assert_unknown(error, d);
+            }
+            let n = match dimension {
+                Dimension::PrerequisiteWorkUnits => flush.work_units,
+                Dimension::PrerequisiteReadBytes => flush.read_bytes,
+                Dimension::PrerequisiteWriteBytes => flush.write_bytes,
+                _ => unreachable!(),
+            };
+            if n > 0 {
+                let error = columnar_rejection(
+                    &mut fixture,
+                    &window,
+                    &proposal,
+                    constraint(dimension, n - 1),
+                );
+                assert_limit(error, dimension, n, n - 1);
+            } else {
+                // The flush read component is exactly zero, so no u64 maximum
+                // exists one below it. Equality at zero is the boundary test.
+                assert_eq!(dimension, Dimension::PrerequisiteReadBytes);
+            }
+            activity::take();
+            fixture
+                .database
+                .apply_physical_columnar_design_with_admission(
+                    &window,
+                    &proposal,
+                    constraint(dimension, n),
+                )
+                .unwrap();
+            let actual = activity::take();
+            assert_eq!(actual.flush_calls, 1);
+            assert_eq!(actual.scan_columns_calls, 1);
+            assert_eq!(actual.analyze_calls, 0);
+            let source = fixture
+                .database
+                .inspect_lsm_storage(TABLE_ID)
+                .unwrap()
+                .unwrap();
+            assert_eq!(source.memtable_entry_count, 0);
+            assert_eq!(source.sstable_count, 1);
+            fixture.close();
+        }
+    }
+
+    #[test]
+    fn admission_recomputes_after_analyze_dml_and_ignores_retained_work_report() {
+        let mut fixture = Fixture::create("phase34-fresh-index", false);
+        fixture.database.analyze(TABLE_ID).unwrap();
+        let window = evidence_window(&mut fixture);
+        let proposal = fixture
+            .database
+            .propose_physical_index_design(&window, policy(1, 1, 0, 8), index_candidate())
+            .unwrap();
+        let old = fixture
+            .database
+            .inspect_physical_index_design_mutation_work(index_candidate())
+            .unwrap();
+        let catalog = fixture.database.inspect_catalog().unwrap();
+        let mut transaction = fixture.database.begin_transaction().unwrap();
+        for id in 512..1024 {
+            fixture
+                .database
+                .insert_in(
+                    &mut transaction,
+                    &[
+                        netbadb_types::ScalarValue::Int64(id),
+                        netbadb_types::ScalarValue::Int64(3),
+                        netbadb_types::ScalarValue::Text("x".repeat(256)),
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        assert_eq!(fixture.database.inspect_catalog().unwrap(), catalog);
+        let current = fixture
+            .database
+            .inspect_physical_index_design_mutation_work(index_candidate())
+            .unwrap();
+        assert!(bound(current.bounds.source_work_units) > bound(old.bounds.source_work_units));
+        let error = pure_rejection(&mut fixture, &window, |database| {
+            let IndexError::Admission(error) = database
+                .apply_physical_index_design_with_admission(
+                    &window,
+                    &proposal,
+                    name(),
+                    constraint(
+                        Dimension::SourceWorkUnits,
+                        bound(old.bounds.source_work_units),
+                    ),
+                )
+                .unwrap_err()
+            else {
+                panic!("admission error")
+            };
+            *error
+        });
+        assert_limit(
+            error,
+            Dimension::SourceWorkUnits,
+            bound(current.bounds.source_work_units),
+            bound(old.bounds.source_work_units),
+        );
+        fixture.close();
+
+        let mut fixture = mutation_work_lsm_fixture("phase34-fresh-columnar");
+        fixture.database.analyze(TABLE_ID).unwrap();
+        let window = evidence_window(&mut fixture);
+        let proposal = columnar_proposal(
+            &fixture,
+            &window,
+            PhysicalColumnarDesignMode::Snapshot,
+            "admitted",
+        );
+        let old = fixture
+            .database
+            .inspect_physical_columnar_design_mutation_work(&candidate(), proposal.mode())
+            .unwrap();
+        let Prerequisite::LsmFlush {
+            conservative_bound: old_flush,
+            ..
+        } = old.prerequisite
+        else {
+            panic!("flush")
+        };
+        fixture
+            .database
+            .execute("INSERT INTO events VALUES (2, 2)")
+            .unwrap();
+        let current = fixture
+            .database
+            .inspect_physical_columnar_design_mutation_work(&candidate(), proposal.mode())
+            .unwrap();
+        let Prerequisite::LsmFlush {
+            conservative_bound: current_flush,
+            ..
+        } = current.prerequisite
+        else {
+            panic!("flush")
+        };
+        let error = columnar_rejection(
+            &mut fixture,
+            &window,
+            &proposal,
+            constraint(Dimension::PrerequisiteWorkUnits, old_flush.work_units),
+        );
+        assert_limit(
+            error,
+            Dimension::PrerequisiteWorkUnits,
+            current_flush.work_units,
+            old_flush.work_units,
+        );
+        fixture.close();
+    }
+
+    #[test]
+    fn admission_exact_and_coverage_noops_precede_even_failing_work_inspection() {
+        let mut fixture = Fixture::create("phase34-noops", false);
+        let mut window = evidence_window(&mut fixture);
+        let index = fixture
+            .database
+            .propose_physical_index_design(&window, policy(1, 1, 0, 8), index_candidate())
+            .unwrap();
+        let columnar = columnar_proposal(
+            &fixture,
+            &window,
+            PhysicalColumnarDesignMode::Snapshot,
+            "exact",
+        );
+        let covered = columnar_proposal(
+            &fixture,
+            &window,
+            PhysicalColumnarDesignMode::Snapshot,
+            "covered",
+        );
+        fixture
+            .database
+            .apply_physical_index_design(&window, &index, name())
+            .unwrap();
+        fixture
+            .database
+            .apply_physical_columnar_design(&window, &columnar)
+            .unwrap();
+        window.rotate_window().unwrap();
+        // Metadata corruption would fail a fresh inspection. No-op paths must
+        // never invoke it, even with impossible constrained output and work.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.source)
+            .unwrap();
+        let length = file.metadata().unwrap().len();
+        file.set_len(length + 1).unwrap();
+        assert!(
+            fixture
+                .database
+                .inspect_physical_index_design_mutation_work(index_candidate())
+                .is_err()
+        );
+        assert!(
+            fixture
+                .database
+                .inspect_physical_columnar_design_mutation_work(&candidate(), columnar.mode())
+                .is_err()
+        );
+        for d in [Dimension::SourceWorkUnits, Dimension::OutputWriteBytes] {
+            let admission = constraint(d, 0);
+            activity::take();
+            assert!(matches!(
+                fixture
+                    .database
+                    .apply_physical_index_design_with_admission(&window, &index, name(), admission)
+                    .unwrap()
+                    .outcome,
+                PhysicalIndexDesignApplyOutcome::AlreadyApplied { .. }
+            ));
+            assert_eq!(
+                fixture
+                    .database
+                    .apply_physical_index_design_with_admission(
+                        &window,
+                        &index,
+                        IndexName::new("covered").unwrap(),
+                        admission
+                    )
+                    .unwrap()
+                    .outcome,
+                PhysicalIndexDesignApplyOutcome::AlreadyCovered
+            );
+            assert!(matches!(
+                fixture
+                    .database
+                    .apply_physical_columnar_design_with_admission(&window, &columnar, admission)
+                    .unwrap()
+                    .outcome,
+                PhysicalColumnarDesignApplyOutcome::AlreadyApplied { .. }
+            ));
+            assert_eq!(
+                fixture
+                    .database
+                    .apply_physical_columnar_design_with_admission(&window, &covered, admission)
+                    .unwrap()
+                    .outcome,
+                PhysicalColumnarDesignApplyOutcome::AlreadyCovered
+            );
+            assert_eq!(activity::take(), activity::Activity::default());
+        }
+        file.set_len(length).unwrap();
+        drop(file);
+        fixture.close();
+    }
+
+    #[test]
+    fn admission_preserves_preflight_errors_and_inspection_source_chains() {
+        let mut fixture = Fixture::create("phase34-errors", false);
+        fixture.database.enable_change_stream(TABLE_ID).unwrap();
+        let mut window = evidence_window(&mut fixture);
+        let index = fixture
+            .database
+            .propose_physical_index_design(&window, policy(1, 1, 0, 8), index_candidate())
+            .unwrap();
+        let columnar = columnar_proposal(
+            &fixture,
+            &window,
+            PhysicalColumnarDesignMode::Incremental,
+            "admitted",
+        );
+        let admission = constraint(Dimension::OutputWriteBytes, 0);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.source)
+            .unwrap();
+        let length = file.metadata().unwrap().len();
+        file.set_len(length + 1).unwrap();
+        let index_error = fixture
+            .database
+            .apply_physical_index_design_with_admission(&window, &index, name(), admission)
+            .unwrap_err();
+        let columnar_error = fixture
+            .database
+            .apply_physical_columnar_design_with_admission(&window, &columnar, admission)
+            .unwrap_err();
+        for error in [&index_error as &dyn Error, &columnar_error as &dyn Error] {
+            let admission = error
+                .source()
+                .unwrap()
+                .downcast_ref::<AdmissionError>()
+                .unwrap();
+            let AdmissionError::Inspection(inspection) = admission else {
+                panic!("inspection error")
+            };
+            assert!(
+                inspection
+                    .source()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<netbadb_storage::StorageError>()
+                    .is_some()
+            );
+        }
+        file.set_len(length).unwrap();
+        drop(file);
+        window.rotate_window().unwrap();
+        assert!(
+            matches!(fixture.database.apply_physical_index_design_with_admission(&window, &index, name(), admission), Err(IndexError::Apply(error)) if matches!(*error, PhysicalIndexDesignApplyError::EvidenceEpochChanged { .. }))
+        );
+        assert!(
+            matches!(fixture.database.apply_physical_columnar_design_with_admission(&window, &columnar, admission), Err(ColumnarError::Apply(error)) if matches!(*error, PhysicalColumnarDesignApplyError::EvidenceEpochChanged { .. }))
+        );
+        fixture.database.disable_change_stream(TABLE_ID).unwrap();
+        assert!(
+            matches!(fixture.database.apply_physical_columnar_design_with_admission(&window, &columnar, admission), Err(ColumnarError::Apply(error)) if matches!(*error, PhysicalColumnarDesignApplyError::StaleProposal(PhysicalColumnarDesignProposalStaleReason::ChangeStreamDisabled)))
+        );
+        fixture
+            .database
+            .create_named_index(name(), TABLE_ID, ColumnId(1))
+            .unwrap();
+        assert!(
+            matches!(fixture.database.apply_physical_index_design_with_admission(&window, &index, name(), admission), Err(IndexError::Apply(error)) if matches!(*error, PhysicalIndexDesignApplyError::IndexNameConflict(_)))
+        );
+        fixture.close();
+    }
+}

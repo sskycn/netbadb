@@ -62,9 +62,13 @@ existing `Database` Columnar build API.
 Physical Design mutation-work inspection is observation only. It MUST NOT
 reserve identity, run ANALYZE, scan/materialize source rows or retained Change
 Stream history, flush storage, mutate evidence, or become an apply capability.
-Future admission MUST recompute current inspection after idempotency/coverage
-checks immediately before mutation in the same execution-owner command.
-Component source bounds MUST NOT be represented as whole-mutation bounds.
+Mutation admission MUST consume freshly recomputed current-state inspection
+inside the same execution-owner call that can enter mutation, only after
+idempotency, coverage and current recommendation checks prove mutation is
+needed. A constrained NotProven dimension MUST fail closed. An unconstrained
+dimension is explicitly outside the policy and MUST NOT be described as proven
+safe or zero. Component bounds MUST NOT be summed into an unproven whole-
+mutation budget.
 
 ## Library quality
 

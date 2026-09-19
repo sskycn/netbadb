@@ -2925,6 +2925,8 @@ fn physical_columnar_remote_error_with_receipt(
         ServerPhysicalColumnarDesignControlError::PlacementInvariantViolated => {
             OperatorErrorCodeV5::PhysicalColumnarApplyFailed
         }
+        // Programmatic-only; NBOP never carries a component admission policy.
+        ServerPhysicalColumnarDesignControlError::Admission(_) => OperatorErrorCodeV5::Internal,
         ServerPhysicalColumnarDesignControlError::ServerStopped => {
             OperatorErrorCodeV5::ServerStopped
         }
@@ -3178,6 +3180,8 @@ fn physical_design_remote_error_with_receipt(
         ServerPhysicalDesignControlError::PhysicalIndexNameConflict(_) => {
             OperatorErrorCodeV5::PhysicalIndexNameConflict
         }
+        // Programmatic-only; NBOP never carries a component admission policy.
+        ServerPhysicalDesignControlError::Admission(_) => OperatorErrorCodeV5::Internal,
         ServerPhysicalDesignControlError::ServerStopped => OperatorErrorCodeV5::ServerStopped,
         ServerPhysicalDesignControlError::MutationOutcomeUncertain
         | ServerPhysicalDesignControlError::UnjournaledMutationOutcomeUncertain(_)
@@ -5253,5 +5257,55 @@ mod tests {
             assert!(std::fs::symlink_metadata(&path).is_ok());
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+    #[test]
+    fn admission_remains_programmatic_and_nbop_v5_rejects_new_policy_or_error_schema() {
+        for operation in [
+            serde_json::json!({"type":"apply_physical_index", "expected_runtime_token":"11".repeat(16),
+                "expected_evidence_epoch":0,"table_id":1,"column_id":2,"index_name":"idx"}),
+            serde_json::json!({"type":"apply_physical_columnar", "expected_runtime_token":"11".repeat(16),
+                "expected_evidence_epoch":0,"table_id":1,"columns":[1],"mode":"snapshot","placement_key":"projection"}),
+        ] {
+            let mut request = serde_json::json!({"request_id":1, "operation":operation});
+            assert!(serde_json::from_value::<OperatorRequestV5>(request.clone()).is_ok());
+            request["operation"]["admission"] = serde_json::json!({"source_work_units":1});
+            assert!(
+                serde_json::from_value::<OperatorRequestV5>(request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown field")
+            );
+        }
+        assert!(
+            serde_json::from_value::<OperatorRequestV5>(serde_json::json!({
+                "request_id":1, "operation":{"type":"apply_physical_index_with_admission"}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<OperatorErrorCodeV5>(serde_json::json!(
+                "physical_design_admission_rejected"
+            ))
+            .is_err()
+        );
+        let error = || {
+            Box::new(
+                netbadb_core::PhysicalDesignMutationAdmissionError::RequiredBoundNotProven {
+                    dimension:
+                        netbadb_core::PhysicalDesignMutationAdmissionDimension::OutputWriteBytes,
+                },
+            )
+        };
+        assert_eq!(
+            physical_design_remote_error(ServerPhysicalDesignControlError::Admission(error())).code,
+            OperatorErrorCodeV5::Internal
+        );
+        assert_eq!(
+            physical_columnar_remote_error(ServerPhysicalColumnarDesignControlError::Admission(
+                error()
+            ))
+            .code,
+            OperatorErrorCodeV5::Internal
+        );
     }
 }

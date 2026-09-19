@@ -286,6 +286,299 @@ impl From<DatabaseError> for PhysicalDesignMutationWorkInspectionError {
     }
 }
 
+/// One explicit component constraint. Unconstrained means outside this policy,
+/// never proven safe or zero. There is deliberately no default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalDesignMutationAdmissionConstraint {
+    Unconstrained,
+    /// Requires a proven current bound no greater than this maximum.
+    AtMost(u64),
+}
+
+/// Admission evaluates dimensions in this documented order, without summing
+/// components or converting their accounting units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalDesignMutationAdmissionDimension {
+    SourceWorkUnits,
+    SourceReadBytes,
+    PrerequisiteWorkUnits,
+    PrerequisiteReadBytes,
+    PrerequisiteWriteBytes,
+    OutputWriteBytes,
+}
+
+/// Explicit limits for individual Phase 33 components, not total mutation work,
+/// device I/O, memory, CPU, time, or free space. Every dimension is caller chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicalDesignMutationAdmissionLimits {
+    pub source_work_units: PhysicalDesignMutationAdmissionConstraint,
+    pub source_read_bytes: PhysicalDesignMutationAdmissionConstraint,
+    pub prerequisite_work_units: PhysicalDesignMutationAdmissionConstraint,
+    pub prerequisite_read_bytes: PhysicalDesignMutationAdmissionConstraint,
+    pub prerequisite_write_bytes: PhysicalDesignMutationAdmissionConstraint,
+    pub output_write_bytes: PhysicalDesignMutationAdmissionConstraint,
+}
+
+/// Immutable per-mutation policy with at least one constrained component.
+/// A successful comparison is local to the apply call, never a reusable permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicalDesignMutationAdmissionPolicy {
+    limits: PhysicalDesignMutationAdmissionLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalDesignMutationAdmissionPolicyError {
+    NoConstrainedDimension,
+}
+
+impl fmt::Display for PhysicalDesignMutationAdmissionPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("mutation admission requires at least one constrained dimension")
+    }
+}
+
+impl Error for PhysicalDesignMutationAdmissionPolicyError {}
+
+#[derive(Debug)]
+pub enum PhysicalDesignMutationAdmissionError {
+    RequiredBoundNotProven {
+        dimension: PhysicalDesignMutationAdmissionDimension,
+    },
+    LimitExceeded {
+        dimension: PhysicalDesignMutationAdmissionDimension,
+        conservative_bound: u64,
+        maximum: u64,
+    },
+    /// Inspection failed before entering any mutation authority.
+    Inspection(Box<PhysicalDesignMutationWorkInspectionError>),
+}
+
+impl fmt::Display for PhysicalDesignMutationAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequiredBoundNotProven { dimension } => write!(
+                formatter,
+                "mutation admission requires a proven {dimension:?} bound"
+            ),
+            Self::LimitExceeded {
+                dimension,
+                conservative_bound,
+                maximum,
+            } => write!(
+                formatter,
+                "mutation admission {dimension:?} bound {conservative_bound} exceeds maximum {maximum}"
+            ),
+            Self::Inspection(error) => write!(formatter, "mutation admission inspection: {error}"),
+        }
+    }
+}
+
+impl Error for PhysicalDesignMutationAdmissionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Inspection(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<PhysicalDesignMutationWorkInspectionError> for PhysicalDesignMutationAdmissionError {
+    fn from(error: PhysicalDesignMutationWorkInspectionError) -> Self {
+        Self::Inspection(Box::new(error))
+    }
+}
+
+impl PhysicalDesignMutationAdmissionPolicy {
+    /// Rejects an all-Unconstrained policy. Zero and u64::MAX maxima are legal;
+    /// neither permits an unproven constrained bound.
+    pub fn new(
+        limits: PhysicalDesignMutationAdmissionLimits,
+    ) -> Result<Self, PhysicalDesignMutationAdmissionPolicyError> {
+        use PhysicalDesignMutationAdmissionConstraint::Unconstrained;
+        if [
+            limits.source_work_units,
+            limits.source_read_bytes,
+            limits.prerequisite_work_units,
+            limits.prerequisite_read_bytes,
+            limits.prerequisite_write_bytes,
+            limits.output_write_bytes,
+        ]
+        .into_iter()
+        .all(|constraint| constraint == Unconstrained)
+        {
+            return Err(PhysicalDesignMutationAdmissionPolicyError::NoConstrainedDimension);
+        }
+        Ok(Self { limits })
+    }
+
+    #[must_use]
+    pub const fn limits(&self) -> PhysicalDesignMutationAdmissionLimits {
+        self.limits
+    }
+
+    // Private: callers cannot turn a stale work report into mutation authority.
+    fn evaluate(
+        self,
+        bounds: PhysicalDesignMutationResourceBounds,
+        prerequisite: PhysicalColumnarMutationPrerequisiteInspection,
+    ) -> Result<(), PhysicalDesignMutationAdmissionError> {
+        use PhysicalDesignMutationAdmissionConstraint::AtMost;
+        use PhysicalDesignMutationAdmissionDimension as Dimension;
+        use PhysicalDesignMutationConservativeBound::{Bounded, NotProven};
+        let (work, read, write) = match prerequisite {
+            // Formally absent prerequisite work is proven zero; no unknown
+            // resource dimension is normalized to zero.
+            PhysicalColumnarMutationPrerequisiteInspection::None => (0, 0, 0),
+            PhysicalColumnarMutationPrerequisiteInspection::LsmFlush {
+                conservative_bound, ..
+            } => (
+                conservative_bound.work_units,
+                conservative_bound.read_bytes,
+                conservative_bound.write_bytes,
+            ),
+        };
+        let limits = self.limits;
+        for (dimension, constraint, bound) in [
+            (
+                Dimension::SourceWorkUnits,
+                limits.source_work_units,
+                bounds.source_work_units,
+            ),
+            (
+                Dimension::SourceReadBytes,
+                limits.source_read_bytes,
+                bounds.source_read_bytes,
+            ),
+            (
+                Dimension::PrerequisiteWorkUnits,
+                limits.prerequisite_work_units,
+                Bounded(work),
+            ),
+            (
+                Dimension::PrerequisiteReadBytes,
+                limits.prerequisite_read_bytes,
+                Bounded(read),
+            ),
+            (
+                Dimension::PrerequisiteWriteBytes,
+                limits.prerequisite_write_bytes,
+                Bounded(write),
+            ),
+            (
+                Dimension::OutputWriteBytes,
+                limits.output_write_bytes,
+                bounds.output_write_bytes,
+            ),
+        ] {
+            let AtMost(maximum) = constraint else {
+                continue;
+            };
+            match bound {
+                NotProven => {
+                    return Err(
+                        PhysicalDesignMutationAdmissionError::RequiredBoundNotProven { dimension },
+                    );
+                }
+                Bounded(conservative_bound) if conservative_bound > maximum => {
+                    return Err(PhysicalDesignMutationAdmissionError::LimitExceeded {
+                        dimension,
+                        conservative_bound,
+                        maximum,
+                    });
+                }
+                Bounded(_) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Additive admitted-apply error; existing Index apply errors retain their
+/// original semantics and typed source chain.
+#[derive(Debug)]
+pub enum PhysicalIndexDesignAdmissionApplyError {
+    Apply(Box<PhysicalIndexDesignApplyError>),
+    Admission(Box<PhysicalDesignMutationAdmissionError>),
+}
+
+impl fmt::Display for PhysicalIndexDesignAdmissionApplyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Apply(error) => error.fmt(formatter),
+            Self::Admission(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PhysicalIndexDesignAdmissionApplyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Apply(error) => Some(error.as_ref()),
+            Self::Admission(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<PhysicalIndexDesignApplyError> for PhysicalIndexDesignAdmissionApplyError {
+    fn from(error: PhysicalIndexDesignApplyError) -> Self {
+        Self::Apply(Box::new(error))
+    }
+}
+
+impl From<PhysicalDesignMutationAdmissionError> for PhysicalIndexDesignAdmissionApplyError {
+    fn from(error: PhysicalDesignMutationAdmissionError) -> Self {
+        Self::Admission(Box::new(error))
+    }
+}
+
+enum IndexDesignApplyPreflight {
+    Complete(PhysicalIndexDesignApplyReport),
+    Ready { current_before: DatabaseCommitSeq },
+}
+
+/// Additive admitted-apply error; existing Columnar apply errors retain their
+/// original semantics and typed source chain.
+#[derive(Debug)]
+pub enum PhysicalColumnarDesignAdmissionApplyError {
+    Apply(Box<PhysicalColumnarDesignApplyError>),
+    Admission(Box<PhysicalDesignMutationAdmissionError>),
+}
+
+impl fmt::Display for PhysicalColumnarDesignAdmissionApplyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Apply(error) => error.fmt(formatter),
+            Self::Admission(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PhysicalColumnarDesignAdmissionApplyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Apply(error) => Some(error.as_ref()),
+            Self::Admission(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<PhysicalColumnarDesignApplyError> for PhysicalColumnarDesignAdmissionApplyError {
+    fn from(error: PhysicalColumnarDesignApplyError) -> Self {
+        Self::Apply(Box::new(error))
+    }
+}
+
+impl From<PhysicalDesignMutationAdmissionError> for PhysicalColumnarDesignAdmissionApplyError {
+    fn from(error: PhysicalDesignMutationAdmissionError) -> Self {
+        Self::Admission(Box::new(error))
+    }
+}
+
+enum ColumnarDesignApplyPreflight {
+    Complete(PhysicalColumnarDesignApplyReport),
+    Ready { current_before: DatabaseCommitSeq },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncrementalDesignSourceError {
     Disabled,
@@ -1992,6 +2285,45 @@ impl Database {
         evidence: &PhysicalDesignEvidenceWindow,
         proposal: &PhysicalColumnarDesignProposal,
     ) -> Result<PhysicalColumnarDesignApplyReport, PhysicalColumnarDesignApplyError> {
+        match self.preflight_physical_columnar_design(evidence, proposal)? {
+            ColumnarDesignApplyPreflight::Complete(report) => Ok(report),
+            ColumnarDesignApplyPreflight::Ready { current_before } => {
+                self.mutate_physical_columnar_design(proposal, current_before)
+            }
+        }
+    }
+
+    /// Applies only after fresh current component bounds satisfy the explicit
+    /// policy. Exact retries and coverage no-ops precede admission. Unconstrained
+    /// components remain outside the policy; this is not a total mutation limit.
+    pub fn apply_physical_columnar_design_with_admission(
+        &mut self,
+        evidence: &PhysicalDesignEvidenceWindow,
+        proposal: &PhysicalColumnarDesignProposal,
+        admission: PhysicalDesignMutationAdmissionPolicy,
+    ) -> Result<PhysicalColumnarDesignApplyReport, PhysicalColumnarDesignAdmissionApplyError> {
+        match self.preflight_physical_columnar_design(evidence, proposal)? {
+            ColumnarDesignApplyPreflight::Complete(report) => Ok(report),
+            ColumnarDesignApplyPreflight::Ready { current_before } => {
+                let inspection = self
+                    .inspect_physical_columnar_design_mutation_work(
+                        &proposal.candidate,
+                        proposal.mode,
+                    )
+                    .map_err(PhysicalDesignMutationAdmissionError::from)?;
+                admission.evaluate(inspection.bounds, inspection.prerequisite)?;
+                // No callback or source-changing operation may intervene here.
+                self.mutate_physical_columnar_design(proposal, current_before)
+                    .map_err(Into::into)
+            }
+        }
+    }
+
+    fn preflight_physical_columnar_design(
+        &self,
+        evidence: &PhysicalDesignEvidenceWindow,
+        proposal: &PhysicalColumnarDesignProposal,
+    ) -> Result<ColumnarDesignApplyPreflight, PhysicalColumnarDesignApplyError> {
         let Some(catalog_path) = self.catalog_path.as_deref() else {
             return Err(PhysicalColumnarDesignApplyError::DatabaseIdentityChanged);
         };
@@ -2018,11 +2350,13 @@ impl Database {
         )? {
             PhysicalColumnarDesignLocationState::Available => {}
             PhysicalColumnarDesignLocationState::AlreadyApplied { projection_id } => {
-                return Ok(self.columnar_design_report(
-                    proposal,
-                    current_before,
-                    current_before,
-                    PhysicalColumnarDesignApplyOutcome::AlreadyApplied { projection_id },
+                return Ok(ColumnarDesignApplyPreflight::Complete(
+                    self.columnar_design_report(
+                        proposal,
+                        current_before,
+                        current_before,
+                        PhysicalColumnarDesignApplyOutcome::AlreadyApplied { projection_id },
+                    ),
                 ));
             }
             PhysicalColumnarDesignLocationState::Conflict { projection_id } => {
@@ -2037,11 +2371,13 @@ impl Database {
 
         self.revalidate_columnar_proposal(proposal)?;
         if self.current_columnar_design_covers(&proposal.candidate)? {
-            return Ok(self.columnar_design_report(
-                proposal,
-                current_before,
-                current_before,
-                PhysicalColumnarDesignApplyOutcome::AlreadyCovered,
+            return Ok(ColumnarDesignApplyPreflight::Complete(
+                self.columnar_design_report(
+                    proposal,
+                    current_before,
+                    current_before,
+                    PhysicalColumnarDesignApplyOutcome::AlreadyCovered,
+                ),
             ));
         }
         if evidence.epoch() != proposal.evidence_epoch {
@@ -2063,11 +2399,13 @@ impl Database {
             PhysicalDesignCandidateDecision::NoAction(
                 PhysicalDesignNoActionReason::ExistingDesignCovers,
             ) => {
-                return Ok(self.columnar_design_report(
-                    proposal,
-                    current_before,
-                    current_before,
-                    PhysicalColumnarDesignApplyOutcome::AlreadyCovered,
+                return Ok(ColumnarDesignApplyPreflight::Complete(
+                    self.columnar_design_report(
+                        proposal,
+                        current_before,
+                        current_before,
+                        PhysicalColumnarDesignApplyOutcome::AlreadyCovered,
+                    ),
                 ));
             }
             PhysicalDesignCandidateDecision::NoAction(reason) => {
@@ -2075,6 +2413,14 @@ impl Database {
             }
         }
 
+        Ok(ColumnarDesignApplyPreflight::Ready { current_before })
+    }
+
+    fn mutate_physical_columnar_design(
+        &mut self,
+        proposal: &PhysicalColumnarDesignProposal,
+        current_before: DatabaseCommitSeq,
+    ) -> Result<PhysicalColumnarDesignApplyReport, PhysicalColumnarDesignApplyError> {
         let spec = ColumnarProjectionSpec::new(
             proposal.candidate.table_id,
             proposal.directory.clone(),
@@ -2104,6 +2450,47 @@ impl Database {
         proposal: &PhysicalIndexDesignProposal,
         index_name: IndexName,
     ) -> Result<PhysicalIndexDesignApplyReport, PhysicalIndexDesignApplyError> {
+        match self.preflight_physical_index_design(evidence, proposal, &index_name)? {
+            IndexDesignApplyPreflight::Complete(report) => Ok(report),
+            IndexDesignApplyPreflight::Ready { current_before } => {
+                self.mutate_physical_index_design(evidence, proposal, index_name, current_before)
+            }
+        }
+    }
+
+    /// Applies only after fresh current component bounds satisfy the explicit
+    /// policy. Exact retries and coverage no-ops precede admission. Unconstrained
+    /// components remain outside the policy; this is not a total mutation limit.
+    pub fn apply_physical_index_design_with_admission(
+        &mut self,
+        evidence: &PhysicalDesignEvidenceWindow,
+        proposal: &PhysicalIndexDesignProposal,
+        index_name: IndexName,
+        admission: PhysicalDesignMutationAdmissionPolicy,
+    ) -> Result<PhysicalIndexDesignApplyReport, PhysicalIndexDesignAdmissionApplyError> {
+        match self.preflight_physical_index_design(evidence, proposal, &index_name)? {
+            IndexDesignApplyPreflight::Complete(report) => Ok(report),
+            IndexDesignApplyPreflight::Ready { current_before } => {
+                let inspection = self
+                    .inspect_physical_index_design_mutation_work(proposal.candidate)
+                    .map_err(PhysicalDesignMutationAdmissionError::from)?;
+                admission.evaluate(
+                    inspection.bounds,
+                    PhysicalColumnarMutationPrerequisiteInspection::None,
+                )?;
+                // No callback or source-changing operation may intervene here.
+                self.mutate_physical_index_design(evidence, proposal, index_name, current_before)
+                    .map_err(Into::into)
+            }
+        }
+    }
+
+    fn preflight_physical_index_design(
+        &self,
+        evidence: &PhysicalDesignEvidenceWindow,
+        proposal: &PhysicalIndexDesignProposal,
+        index_name: &IndexName,
+    ) -> Result<IndexDesignApplyPreflight, PhysicalIndexDesignApplyError> {
         let current_incarnation = self.current_catalog_incarnation()?;
         if current_incarnation != proposal.database_incarnation {
             return Err(PhysicalIndexDesignApplyError::DatabaseIdentityChanged);
@@ -2118,20 +2505,24 @@ impl Database {
             ));
         }
 
-        match self.inspect_physical_index_design_name(proposal.candidate, &index_name) {
+        match self.inspect_physical_index_design_name(proposal.candidate, index_name) {
             PhysicalIndexDesignNameState::Available => {}
             PhysicalIndexDesignNameState::AlreadyApplied { index_id } => {
-                return Ok(self.index_design_report(
-                    evidence,
-                    proposal,
-                    index_name,
-                    current_before,
-                    current_before,
-                    PhysicalIndexDesignApplyOutcome::AlreadyApplied { index_id },
+                return Ok(IndexDesignApplyPreflight::Complete(
+                    self.index_design_report(
+                        evidence,
+                        proposal,
+                        index_name.clone(),
+                        current_before,
+                        current_before,
+                        PhysicalIndexDesignApplyOutcome::AlreadyApplied { index_id },
+                    ),
                 ));
             }
             PhysicalIndexDesignNameState::Conflict => {
-                return Err(PhysicalIndexDesignApplyError::IndexNameConflict(index_name));
+                return Err(PhysicalIndexDesignApplyError::IndexNameConflict(
+                    index_name.clone(),
+                ));
             }
         }
 
@@ -2141,13 +2532,15 @@ impl Database {
             proposal.point_report_count,
             proposal.range_report_count,
         )? {
-            return Ok(self.index_design_report(
-                evidence,
-                proposal,
-                index_name,
-                current_before,
-                current_before,
-                PhysicalIndexDesignApplyOutcome::AlreadyCovered,
+            return Ok(IndexDesignApplyPreflight::Complete(
+                self.index_design_report(
+                    evidence,
+                    proposal,
+                    index_name.clone(),
+                    current_before,
+                    current_before,
+                    PhysicalIndexDesignApplyOutcome::AlreadyCovered,
+                ),
             ));
         }
 
@@ -2170,13 +2563,15 @@ impl Database {
             PhysicalDesignCandidateDecision::NoAction(
                 PhysicalDesignNoActionReason::ExistingDesignCovers,
             ) => {
-                return Ok(self.index_design_report(
-                    evidence,
-                    proposal,
-                    index_name,
-                    current_before,
-                    current_before,
-                    PhysicalIndexDesignApplyOutcome::AlreadyCovered,
+                return Ok(IndexDesignApplyPreflight::Complete(
+                    self.index_design_report(
+                        evidence,
+                        proposal,
+                        index_name.clone(),
+                        current_before,
+                        current_before,
+                        PhysicalIndexDesignApplyOutcome::AlreadyCovered,
+                    ),
                 ));
             }
             PhysicalDesignCandidateDecision::NoAction(reason) => {
@@ -2186,6 +2581,16 @@ impl Database {
             }
         }
 
+        Ok(IndexDesignApplyPreflight::Ready { current_before })
+    }
+
+    fn mutate_physical_index_design(
+        &mut self,
+        evidence: &PhysicalDesignEvidenceWindow,
+        proposal: &PhysicalIndexDesignProposal,
+        index_name: IndexName,
+        current_before: DatabaseCommitSeq,
+    ) -> Result<PhysicalIndexDesignApplyReport, PhysicalIndexDesignApplyError> {
         let definition = self.create_named_index(
             index_name.clone(),
             proposal.candidate.table_id,
@@ -3287,5 +3692,107 @@ mod mutation_work_stream_tests {
             }),
             Err(IncrementalDesignSourceError::Disabled)
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_policy_tests {
+    use super::*;
+    use PhysicalDesignMutationAdmissionConstraint::{AtMost, Unconstrained};
+    use PhysicalDesignMutationAdmissionDimension as Dimension;
+    use PhysicalDesignMutationConservativeBound::{Bounded, NotProven};
+
+    #[test]
+    fn admission_policy_is_explicit_and_compares_components_in_fixed_order() {
+        let mut limits = PhysicalDesignMutationAdmissionLimits {
+            source_work_units: Unconstrained,
+            source_read_bytes: Unconstrained,
+            prerequisite_work_units: Unconstrained,
+            prerequisite_read_bytes: Unconstrained,
+            prerequisite_write_bytes: Unconstrained,
+            output_write_bytes: Unconstrained,
+        };
+        assert_eq!(
+            PhysicalDesignMutationAdmissionPolicy::new(limits),
+            Err(PhysicalDesignMutationAdmissionPolicyError::NoConstrainedDimension)
+        );
+        for maximum in [0, u64::MAX] {
+            limits.source_work_units = AtMost(maximum);
+            assert_eq!(
+                PhysicalDesignMutationAdmissionPolicy::new(limits)
+                    .unwrap()
+                    .limits(),
+                limits
+            );
+        }
+        limits = PhysicalDesignMutationAdmissionLimits {
+            source_work_units: AtMost(0),
+            source_read_bytes: AtMost(0),
+            prerequisite_work_units: AtMost(0),
+            prerequisite_read_bytes: AtMost(0),
+            prerequisite_write_bytes: AtMost(0),
+            output_write_bytes: AtMost(u64::MAX),
+        };
+        let bounds = PhysicalDesignMutationResourceBounds {
+            source_work_units: Bounded(1),
+            source_read_bytes: Bounded(1),
+            output_write_bytes: NotProven,
+        };
+        let prerequisite = PhysicalColumnarMutationPrerequisiteInspection::LsmFlush {
+            anchor: LsmMaintenanceAnchor {
+                storage_id: StorageId(1),
+                manifest_generation: 1,
+                wal_generation: 1,
+                visible_commit_sequence: 1,
+            },
+            conservative_bound: LsmMaintenanceBoundInspection {
+                work_units: 1,
+                read_bytes: 1,
+                write_bytes: 1,
+            },
+        };
+        for dimension in [
+            Dimension::SourceWorkUnits,
+            Dimension::SourceReadBytes,
+            Dimension::PrerequisiteWorkUnits,
+            Dimension::PrerequisiteReadBytes,
+            Dimension::PrerequisiteWriteBytes,
+            Dimension::OutputWriteBytes,
+        ] {
+            let error = PhysicalDesignMutationAdmissionPolicy::new(limits)
+                .unwrap()
+                .evaluate(bounds, prerequisite)
+                .unwrap_err();
+            if dimension == Dimension::OutputWriteBytes {
+                assert!(
+                    matches!(error, PhysicalDesignMutationAdmissionError::RequiredBoundNotProven { dimension: actual } if actual == dimension)
+                );
+            } else {
+                assert!(
+                    matches!(error, PhysicalDesignMutationAdmissionError::LimitExceeded { dimension: actual, conservative_bound: 1, maximum: 0 } if actual == dimension)
+                );
+            }
+            match dimension {
+                Dimension::SourceWorkUnits => limits.source_work_units = AtMost(1),
+                Dimension::SourceReadBytes => limits.source_read_bytes = AtMost(1),
+                Dimension::PrerequisiteWorkUnits => limits.prerequisite_work_units = AtMost(1),
+                Dimension::PrerequisiteReadBytes => limits.prerequisite_read_bytes = AtMost(1),
+                Dimension::PrerequisiteWriteBytes => limits.prerequisite_write_bytes = AtMost(1),
+                Dimension::OutputWriteBytes => limits.output_write_bytes = Unconstrained,
+            }
+        }
+        // Each read/work component is 1 and its own maximum is 1. Their sum is
+        // 2, but there is no combined resource contract or hidden total budget.
+        PhysicalDesignMutationAdmissionPolicy::new(limits)
+            .unwrap()
+            .evaluate(bounds, prerequisite)
+            .unwrap();
+        limits.prerequisite_work_units = AtMost(0);
+        limits.prerequisite_read_bytes = AtMost(0);
+        limits.prerequisite_write_bytes = AtMost(0);
+        PhysicalDesignMutationAdmissionPolicy::new(limits)
+            .unwrap()
+            .evaluate(bounds, PhysicalColumnarMutationPrerequisiteInspection::None)
+            .unwrap();
     }
 }

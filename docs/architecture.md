@@ -504,6 +504,21 @@ apply tokens. There is no admission policy or Server/wire/persistent change;
 future admission must recompute within the mutation command after idempotency
 and coverage checks and cannot approve using an unproven required dimension.
 
+[Adaptive Operations Phase 34](adaptive-operations-phase34.md) adds explicit
+component-scoped admission to Core Index/Columnar apply and the Native/PostgreSQL
+programmatic Server controls. Old and admitted APIs share preflight and existing
+mutation helpers. Identity, exact retry/conflict, structure, coverage, evidence
+and current recommendation precede fresh Phase 33 inspection; only a needed
+mutation compares six explicit component constraints immediately before entering
+its existing authority. Constrained `NotProven` fails closed, `Unconstrained`
+means outside the policy, and components are never summed into a total budget.
+No-op results bypass admission. The immutable policy travels in one worker
+command; NBMR Begin remains first and admission/inspection rejection writes
+terminal `Rejected`. Existing mutation uncertainty and Columnar recovery priority
+remain unchanged. Manifest v10, NBOP v5, NBMR v3, CLI/daemon, database wire and
+persistent formats gain no admission surface. Deployment/operator externalization
+is reserved for a separately versioned Phase 35 contract.
+
 Columnar Phase 2D keeps the same one-way boundary but changes physical
 ownership. NBCM v3 selects an indexed NBCS v3 Base and optional NBCD v2 Delta
 chain. Open validates and retains only checksummed directories, zone maps,

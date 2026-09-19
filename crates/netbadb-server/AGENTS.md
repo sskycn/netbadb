@@ -99,6 +99,13 @@
   bounded logical targets and MUST NOT expose the journal path, absolute
   Columnar recovery path, database incarnation, runtime token, SQL, principal,
   session, or network address.
+- Server programmatic admitted apply MUST remain one Database-worker command.
+  When NBMR is enabled, durable Begin MUST precede admission. Admission rejection,
+  including a fresh work-inspection error, is a terminal Rejected receipt, not
+  recovery-required mutation ambiguity; independent Outcome durability failures
+  retain their existing recovery semantics. Phase 34 admission is programmatic-
+  only: local operator mutation continues under frozen NBOP v5 until separately
+  versioned deployment/operator admission is introduced.
 - A durable Physical Design receipt ID is meaningful only inside one durable
   NBMR journal incarnation. Persisted or external cursors MUST bind both the
   journal incarnation and nonzero receipt ID. Replacing a journal creates a new

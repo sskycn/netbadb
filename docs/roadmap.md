@@ -11,6 +11,27 @@ subprocess recovery-interruption regressions, retaining the prior
 planner or writer-concurrency expansion is included. Real power-loss, hardware
 torn-write and network-filesystem validation remain separate work.
 
+## Component mutation admission (Adaptive Operations Phase 34 complete)
+
+- added six explicit, no-default component constraints and a validated policy;
+  constrained unknown bounds reject, equality passes, and no total is invented;
+- shared existing Core Index/Columnar preflight and mutation authorities with
+  additive admitted APIs; retry, coverage and existing rejection precedence stay
+  ahead of fresh inspection inside the same synchronous execution-owner call;
+- admitted partial LSM Snapshot prerequisite policies without pre-flushing on
+  rejection or adding a source scan, stream action, scheduler or identity owner;
+- carried each programmatic Server admitted apply through one worker command,
+  preserving durable NBMR Begin before admission and terminal Rejected receipts
+  for admission/inspection failure, plus existing mutation uncertainty semantics;
+- retained Manifest v10, NBOP v5, NBMR v3, Native Protocol v2, PostgreSQL wire,
+  Inspection JSON v7, SDKs, CLI/daemon and every database persistent format.
+
+Phase 35 should externalize deployment/operator component policy through an
+explicitly versioned contract while retaining partial-policy meaning, same-call
+freshness and no-op/Begin ordering. Total mutation work, output-write bounds,
+CPU/memory/free-space budgets and automatic design remain unproven or deferred.
+See [`adaptive-operations-phase34.md`](adaptive-operations-phase34.md).
+
 ## Current mutation source work (Adaptive Operations Phase 33 complete)
 
 - added metadata-only storage/Core work inspection for single-storage Heap
@@ -27,9 +48,9 @@ torn-write and network-filesystem validation remain separate work.
 - verified inspection purity, current-state changes, production scan/build
   accounting and reopen behavior without changing wire or persistent formats.
 
-Admission policy remains deferred. Phase 34 must recompute inspection after
-idempotency/coverage checks inside the same execution-owner command immediately
-before mutation; source-component bounds are not whole-mutation bounds. See
+Phase 34 now recomputes this inspection after idempotency, coverage and current
+recommendation inside the mutation call. Source-component bounds remain distinct
+from whole-mutation bounds. See
 [`adaptive-operations-phase33.md`](adaptive-operations-phase33.md).
 
 ## Durable receipt exposure (Adaptive Operations Phase 32 complete)
