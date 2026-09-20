@@ -2663,6 +2663,11 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn nbmr_version_remains_three() {
+        assert_eq!(CURRENT_VERSION, 3);
+    }
+
     static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 
     fn index_begin(id: u64) -> MutationReceiptBegin {

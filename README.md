@@ -410,7 +410,7 @@ The current code genuinely supports:
   embedded inspection API, with deterministic human text and explicit
   current versioned Inspection JSON v7 output (with v1-v6 retained
   historically);
-- a local Unix-only NBOP v6 operator plane, configured by manifest v11, whose
+- a local Unix-only NBOP v7 operator plane, configured by manifest v11, whose
   `0600` socket exposes bounded multi-domain status, Adaptive controls,
   current-inventory physical-design recommendations, conditional design-evidence
   rotation, manifest-authorized explicit physical-index or Columnar approval,
@@ -438,7 +438,7 @@ in [`docs/protocol-v1.md`](docs/protocol-v1.md). Current standalone
 configuration is documented in
 [`docs/server-manifest-v11.md`](docs/server-manifest-v11.md), and the local
 operator contract is specified in
-[`docs/server-operator-protocol-v6.md`](docs/server-operator-protocol-v6.md).
+[`docs/server-operator-protocol-v7.md`](docs/server-operator-protocol-v7.md).
 The generated SDK
 input contract is documented in
 [`docs/sdk-schema-v2.md`](docs/sdk-schema-v2.md), with v1 retained as a readable

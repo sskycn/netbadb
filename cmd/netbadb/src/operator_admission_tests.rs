@@ -1,10 +1,10 @@
 mod admission_tests {
     use super::*;
-    use OperatorPhysicalDesignMutationAdmissionConstraintV6::{AtMost, Unconstrained};
-    use OperatorPhysicalDesignMutationAdmissionDimensionV6 as Dimension;
-    use OperatorPhysicalDesignMutationAdmissionModeV6::{ComponentLimits, Unadmitted};
-    use OperatorPhysicalDesignMutationAdmissionRejectionV6 as Rejection;
-    use netbadb_server::OperatorPhysicalDesignMutationAdmissionPolicyV6 as Policy;
+    use OperatorPhysicalDesignMutationAdmissionConstraintV7::{AtMost, Unconstrained};
+    use OperatorPhysicalDesignMutationAdmissionDimensionV7 as Dimension;
+    use OperatorPhysicalDesignMutationAdmissionModeV7::{ComponentLimits, Unadmitted};
+    use OperatorPhysicalDesignMutationAdmissionRejectionV7 as Rejection;
+    use netbadb_server::OperatorPhysicalDesignMutationAdmissionPolicyV7 as Policy;
 
     #[test]
     fn cli_renders_explicit_component_policies_and_definitive_rejections() {
@@ -42,14 +42,14 @@ mod admission_tests {
         ] {
             for receipt in [
                 None,
-                Some(OperatorPhysicalDesignMutationReceiptRefV6 {
+                Some(OperatorPhysicalDesignMutationReceiptRefV7 {
                     journal_incarnation: "11".repeat(16),
                     receipt_id: 7,
                 }),
             ] {
                 let error = classify_operator_apply_error(OperatorClientError::Remote(
-                    OperatorRemoteErrorV6 {
-                        code: OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected,
+                    OperatorRemoteErrorV7 {
+                        code: OperatorErrorCodeV7::PhysicalDesignMutationAdmissionRejected,
                         message: "private server message must not be used".into(),
                         receipt: receipt.clone(),
                         admission: Some(admission.clone()),

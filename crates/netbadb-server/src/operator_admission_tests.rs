@@ -6,21 +6,24 @@ mod phase35_tests {
     };
 
     #[test]
-    fn v6_budget_injection_is_rejected_and_v5_header_is_rejected() {
+    fn v7_budget_injection_is_rejected_and_historical_headers_are_rejected() {
         for operation in [
             serde_json::json!({"type":"apply_physical_index","expected_runtime_token":"11".repeat(16),"expected_evidence_epoch":7,"table_id":1,"column_id":3,"index_name":"idx"}),
             serde_json::json!({"type":"apply_physical_columnar","expected_runtime_token":"11".repeat(16),"expected_evidence_epoch":7,"table_id":1,"columns":[2,3],"mode":"snapshot","placement_key":"projection"}),
         ] {
             let request = serde_json::json!({"request_id":1,"operation":operation});
             let bytes = encode_frame(&request).unwrap();
-            assert_eq!(&bytes[..8], b"NBOP\0\x06\0\0");
-            assert!(read_frame::<OperatorRequestV6>(&mut bytes.as_slice()).is_ok());
-            let mut old = bytes.clone();
-            old[4..6].copy_from_slice(&5_u16.to_be_bytes());
-            assert!(matches!(
-                read_frame::<OperatorRequestV6>(&mut old.as_slice()),
-                Err(OperatorProtocolError::UnsupportedVersion(5))
-            ));
+            assert_eq!(&bytes[..8], b"NBOP\0\x07\0\0");
+            assert!(read_frame::<OperatorRequestV7>(&mut bytes.as_slice()).is_ok());
+            for version in [5_u16, 6] {
+                let mut old = bytes.clone();
+                old[4..6].copy_from_slice(&version.to_be_bytes());
+                assert!(matches!(
+                    read_frame::<OperatorRequestV7>(&mut old.as_slice()),
+                    Err(OperatorProtocolError::UnsupportedVersion(rejected))
+                        if rejected == version
+                ));
+            }
             for field in [
                 "budget",
                 "limits",
@@ -35,7 +38,7 @@ mod phase35_tests {
                 let mut injected = request.clone();
                 injected["operation"][field] = serde_json::json!({});
                 assert!(
-                    serde_json::from_value::<OperatorRequestV6>(injected).is_err(),
+                    serde_json::from_value::<OperatorRequestV7>(injected).is_err(),
                     "{field}"
                 );
             }
@@ -43,7 +46,7 @@ mod phase35_tests {
     }
 
     #[test]
-    fn v6_status_presents_exact_independent_policies_and_errors_are_private() {
+    fn v7_status_presents_exact_independent_policies_and_errors_are_private() {
         let limits = PhysicalDesignMutationAdmissionLimits {
             source_work_units: AtMost(0),
             source_read_bytes: AtMost(u64::MAX),
@@ -55,7 +58,7 @@ mod phase35_tests {
         let admitted = ServerOperatorPhysicalDesignMutationAdmission::ComponentLimits(
             PhysicalDesignMutationAdmissionPolicy::new(limits).unwrap(),
         );
-        let dto = OperatorPhysicalDesignMutationAdmissionModeV6::from(admitted);
+        let dto = OperatorPhysicalDesignMutationAdmissionModeV7::from(admitted);
         let json = serde_json::to_value(dto).unwrap();
         assert_eq!(
             json,
@@ -69,7 +72,7 @@ mod phase35_tests {
             }})
         );
         assert_eq!(
-            serde_json::from_value::<OperatorPhysicalDesignMutationAdmissionModeV6>(json).unwrap(),
+            serde_json::from_value::<OperatorPhysicalDesignMutationAdmissionModeV7>(json).unwrap(),
             dto
         );
         for (dimension, tag) in [
@@ -100,7 +103,7 @@ mod phase35_tests {
         ] {
             for receipt in [
                 None,
-                Some(OperatorPhysicalDesignMutationReceiptRefV6 {
+                Some(OperatorPhysicalDesignMutationReceiptRefV7 {
                     journal_incarnation: "11".repeat(16),
                     receipt_id: 7,
                 }),
@@ -116,13 +119,13 @@ mod phase35_tests {
                     let remote = admission_remote_error(error, receipt.clone());
                     assert_eq!(
                         remote.code,
-                        OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected
+                        OperatorErrorCodeV7::PhysicalDesignMutationAdmissionRejected
                     );
                     assert_eq!(remote.receipt, receipt);
                     let json = serde_json::to_value(&remote).unwrap();
                     assert_eq!(json["admission"]["dimension"], tag);
                     assert_eq!(
-                        serde_json::from_value::<OperatorRemoteErrorV6>(json).unwrap(),
+                        serde_json::from_value::<OperatorRemoteErrorV7>(json).unwrap(),
                         remote
                     );
                 }
@@ -135,5 +138,70 @@ mod phase35_tests {
             serde_json::to_value(non_admission).unwrap()["admission"],
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn v7_recovery_required_admission_json_is_exact_with_nullable_receipt() {
+        fn kind(
+            rejection: OperatorPhysicalDesignMutationAdmissionRejectionV7,
+        ) -> &'static str {
+            match rejection {
+                OperatorPhysicalDesignMutationAdmissionRejectionV7::RequiredBoundNotProven {
+                    ..
+                } => "required_bound_not_proven",
+                OperatorPhysicalDesignMutationAdmissionRejectionV7::LimitExceeded { .. } => {
+                    "limit_exceeded"
+                }
+                OperatorPhysicalDesignMutationAdmissionRejectionV7::InspectionFailed {} => {
+                    "inspection_failed"
+                }
+                OperatorPhysicalDesignMutationAdmissionRejectionV7::RecoveryRequired {} => {
+                    "recovery_required"
+                }
+            }
+        }
+
+        assert_eq!(
+            kind(
+                serde_json::from_str::<OperatorPhysicalDesignMutationAdmissionRejectionV7>(
+                    r#"{"kind":"recovery_required"}"#,
+                )
+                .unwrap(),
+            ),
+            "recovery_required"
+        );
+
+        for receipt in [
+            None,
+            Some(OperatorPhysicalDesignMutationReceiptRefV7 {
+                journal_incarnation: "00112233445566778899aabbccddeeff".to_owned(),
+                receipt_id: 41,
+            }),
+        ] {
+            let remote = OperatorRemoteErrorV7 {
+                admission: Some(
+                    OperatorPhysicalDesignMutationAdmissionRejectionV7::RecoveryRequired {},
+                ),
+                code: OperatorErrorCodeV7::PhysicalDesignMutationAdmissionRejected,
+                message:
+                    "current mutation-work inspection requires restart/reopen before retry"
+                        .to_owned(),
+                receipt: receipt.clone(),
+            };
+            let expected = serde_json::json!({
+                "admission": {"kind": "recovery_required"},
+                "code": "physical_design_mutation_admission_rejected",
+                "message": "current mutation-work inspection requires restart/reopen before retry",
+                "receipt": receipt.as_ref().map(|receipt| serde_json::json!({
+                    "journal_incarnation": receipt.journal_incarnation,
+                    "receipt_id": receipt.receipt_id,
+                })),
+            });
+            assert_eq!(serde_json::to_value(&remote).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<OperatorRemoteErrorV7>(expected).unwrap(),
+                remote
+            );
+        }
     }
 }

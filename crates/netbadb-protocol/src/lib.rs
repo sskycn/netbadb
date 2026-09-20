@@ -1006,6 +1006,11 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn native_protocol_version_remains_two() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
     fn frame_header(kind: u16, payload_length: u32, request_id: u64) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"NDBP");

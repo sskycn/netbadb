@@ -107,7 +107,7 @@
   recovery-required mutation ambiguity; independent Outcome durability failures
   retain their existing recovery semantics. Local operator admission uses the
   immutable Manifest v11 deployment policy
-  through NBOP v6; programmatic callers retain their independent per-call policy.
+  through NBOP v7; programmatic callers retain their independent per-call policy.
 - A durable Physical Design receipt ID is meaningful only inside one durable
   NBMR journal incarnation. Persisted or external cursors MUST bind both the
   journal incarnation and nonzero receipt ID. Replacing a journal creates a new
@@ -136,7 +136,7 @@
   the complete `physical_design.columnar_apply` placement policy. The policy
   root MUST already exist, MUST be revalidated before each worker command, and
   MUST never cross the operator wire as a path.
-- NBOP v6 Columnar approval MUST contain an exact runtime token and evidence
+- NBOP v7 Columnar approval MUST contain an exact runtime token and evidence
   epoch, table ID, ordered columns, explicit mode, and logical placement key.
   The listener MUST check permission before forwarding, while the sole
   Database worker MUST perform exact-location retry recognition, mode/token/

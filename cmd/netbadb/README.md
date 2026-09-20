@@ -27,7 +27,7 @@ inspection to stdout. Usage failures exit 2, operational failures exit 1, and
 all failures write diagnostics only to stderr.
 
 `netbadb operator` does not open a Database. It parses the same manifest v11,
-uses only its configured Unix socket, and exchanges one NBOP v6 request:
+uses only its configured Unix socket, and exchanges one NBOP v7 request:
 
 ```sh
 netbadb operator status --manifest server.json
@@ -56,7 +56,7 @@ netbadb operator physical-design apply-columnar --manifest server.json \
 Rotation and mutation preconditions are required and are never inferred by a
 hidden status or recommendations request. Apply never selects a candidate,
 refreshes a token/epoch, or retries automatically. The human output is not a
-stable machine-readable contract; NBOP v6 is the versioned contract. Receipt
+stable machine-readable contract; NBOP v7 is the versioned contract. Receipt
 commands never infer a cursor, automatically restart after journal replacement,
 or turn a receipt into replay authority. Apply output prints a receipt only when
 the server returned one, and never automatically queries it.

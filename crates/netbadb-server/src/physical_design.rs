@@ -2934,7 +2934,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nbop_no_journal_columnar_projection_catalog_recovery_preserves_restart_guidance() {
-        use crate::operator::{OperatorClientError, OperatorErrorCodeV6};
+        use crate::operator::{OperatorClientError, OperatorErrorCodeV7};
 
         let error = nbop_no_journal_post_apply_error(
             true,
@@ -2945,7 +2945,7 @@ mod tests {
         };
         assert_eq!(
             remote.code,
-            OperatorErrorCodeV6::PhysicalColumnarRecoveryRequired
+            OperatorErrorCodeV7::PhysicalColumnarRecoveryRequired
         );
         let wire = serde_json::to_value(&remote).unwrap();
         assert_eq!(wire["code"], "physical_columnar_recovery_required");
@@ -3067,7 +3067,7 @@ mod tests {
         failure: TestPostApplyFailure,
     ) -> crate::operator::OperatorClientError {
         use crate::operator::{
-            OperatorListenerPolicy, OperatorPhysicalColumnarDesignModeV6,
+            OperatorListenerPolicy, OperatorPhysicalColumnarDesignModeV7,
             OperatorPhysicalDesignRuntimeToken, ServerOperatorClient, ServerOperatorConfig,
             serve_operator_connection_with_capabilities,
         };
@@ -3130,7 +3130,7 @@ mod tests {
                         epoch,
                         TABLE_ID.0,
                         vec![1],
-                        OperatorPhysicalColumnarDesignModeV6::Snapshot,
+                        OperatorPhysicalColumnarDesignModeV7::Snapshot,
                         "ambiguous",
                     )
                     .unwrap_err()
@@ -3157,7 +3157,7 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_nbop_no_journal_ambiguity(columnar: bool, failure: TestPostApplyFailure) {
-        use crate::operator::{OperatorClientError, OperatorErrorCodeV6};
+        use crate::operator::{OperatorClientError, OperatorErrorCodeV7};
 
         let error = nbop_no_journal_post_apply_error(columnar, failure);
         let OperatorClientError::MutationOutcomeUncertain {
@@ -3173,7 +3173,7 @@ mod tests {
         };
         assert_eq!(
             remote.code,
-            OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain
+            OperatorErrorCodeV7::PhysicalDesignMutationOutcomeUncertain
         );
         let wire = serde_json::to_value(&remote).unwrap();
         assert_eq!(wire["code"], "physical_design_mutation_outcome_uncertain");
@@ -5140,13 +5140,13 @@ mod tests {
             evidence_epoch,
             TABLE_ID.0
         );
-        let mut frame = b"NBOP\0\x06\0\0".to_vec();
+        let mut frame = b"NBOP\0\x07\0\0".to_vec();
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload.as_bytes());
         client.write_all(&frame).unwrap();
         let mut header = [0_u8; 12];
         client.read_exact(&mut header).unwrap();
-        assert_eq!(&header[..8], b"NBOP\0\x06\0\0");
+        assert_eq!(&header[..8], b"NBOP\0\x07\0\0");
         let length = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
         let mut response = vec![0_u8; length];
         client.read_exact(&mut response).unwrap();

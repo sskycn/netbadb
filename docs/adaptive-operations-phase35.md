@@ -1,11 +1,13 @@
 # Adaptive Operations Phase 35 — Operator component mutation admission
 
-Phase 35 exposes Phase 34 admission to the local operator while keeping budget
-authority with the deployment. Manifest v11 and NBOP v6 are the sole current
-contracts; v10/v5 are historical and rejected. V5 public Rust DTOs are frozen
-unchanged in `operator_v5.rs`.
+Phase 35 exposed Phase 34 admission to the local operator while keeping budget
+authority with the deployment. At completion, Manifest v11 and NBOP v6 were the
+current contracts; v10/v5 were historical and rejected. A later compatibility
+correction freezes those V6 DTOs in `operator_v6.rs`, introduces NBOP v7 for the
+typed pre-mutation `recovery_required` diagnostic, and makes v6 historical and
+wire-rejected. Manifest v11 and NBMR v3 remain unchanged.
 The exact external schemas and migration instructions are in
-[Manifest v11](server-manifest-v11.md) and [NBOP v6](server-operator-protocol-v6.md).
+[Manifest v11](server-manifest-v11.md) and [NBOP v7](server-operator-protocol-v7.md).
 
 ```text
 deployment config -> worker-owned immutable policy

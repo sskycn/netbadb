@@ -6,11 +6,11 @@ mod operator_admission_tests {
         serve_operator_connection_with_capabilities,
     };
     use crate::{
-        OperatorClientError, OperatorErrorCodeV6, OperatorPhysicalColumnarApplyOutcomeV6,
-        OperatorPhysicalColumnarDesignModeV6,
-        OperatorPhysicalDesignMutationAdmissionDimensionV6 as WireDimension,
-        OperatorPhysicalDesignMutationAdmissionRejectionV6 as Rejection,
-        OperatorPhysicalIndexApplyOutcomeV6, ServerOperatorClient, ServerOperatorConfig,
+        OperatorClientError, OperatorErrorCodeV7, OperatorPhysicalColumnarApplyOutcomeV7,
+        OperatorPhysicalColumnarDesignModeV7,
+        OperatorPhysicalDesignMutationAdmissionDimensionV7 as WireDimension,
+        OperatorPhysicalDesignMutationAdmissionRejectionV7 as Rejection,
+        OperatorPhysicalIndexApplyOutcomeV7, ServerOperatorClient, ServerOperatorConfig,
     };
     use netbadb_core::{
         PhysicalColumnarMutationPrerequisiteInspection as Prerequisite,
@@ -149,13 +149,13 @@ mod operator_admission_tests {
                 Target::Index => client
                     .apply_physical_index(token, epoch, TABLE_ID.0, 2, name)
                     .map(|report| match report.outcome {
-                        OperatorPhysicalIndexApplyOutcomeV6::Created { index_id } => {
+                        OperatorPhysicalIndexApplyOutcomeV7::Created { index_id } => {
                             Outcome::Created(index_id)
                         }
-                        OperatorPhysicalIndexApplyOutcomeV6::AlreadyApplied { index_id } => {
+                        OperatorPhysicalIndexApplyOutcomeV7::AlreadyApplied { index_id } => {
                             Outcome::AlreadyApplied(index_id)
                         }
-                        OperatorPhysicalIndexApplyOutcomeV6::AlreadyCovered => {
+                        OperatorPhysicalIndexApplyOutcomeV7::AlreadyCovered => {
                             Outcome::AlreadyCovered
                         }
                     }),
@@ -167,22 +167,22 @@ mod operator_admission_tests {
                         vec![1],
                         match mode {
                             PhysicalColumnarDesignMode::Snapshot => {
-                                OperatorPhysicalColumnarDesignModeV6::Snapshot
+                                OperatorPhysicalColumnarDesignModeV7::Snapshot
                             }
                             PhysicalColumnarDesignMode::Incremental => {
-                                OperatorPhysicalColumnarDesignModeV6::Incremental
+                                OperatorPhysicalColumnarDesignModeV7::Incremental
                             }
                         },
                         name,
                     )
                     .map(|report| match report.outcome {
-                        OperatorPhysicalColumnarApplyOutcomeV6::Created { projection_id } => {
+                        OperatorPhysicalColumnarApplyOutcomeV7::Created { projection_id } => {
                             Outcome::Created(projection_id)
                         }
-                        OperatorPhysicalColumnarApplyOutcomeV6::AlreadyApplied {
+                        OperatorPhysicalColumnarApplyOutcomeV7::AlreadyApplied {
                             projection_id,
                         } => Outcome::AlreadyApplied(projection_id),
-                        OperatorPhysicalColumnarApplyOutcomeV6::AlreadyCovered => {
+                        OperatorPhysicalColumnarApplyOutcomeV7::AlreadyCovered => {
                             Outcome::AlreadyCovered
                         }
                     }),
@@ -233,7 +233,7 @@ mod operator_admission_tests {
         };
         assert_eq!(
             remote.code,
-            OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected
+            OperatorErrorCodeV7::PhysicalDesignMutationAdmissionRejected
         );
         let json = serde_json::to_string(&remote).unwrap();
         assert!(!json.contains(fixture.root.to_str().unwrap()));
@@ -281,6 +281,7 @@ mod operator_admission_tests {
         fixture: &mut Fixture,
         runtime: &mut ServerPhysicalDesignRuntime,
         target: Target,
+        journal: bool,
     ) {
         configure(
             runtime,
@@ -303,7 +304,7 @@ mod operator_admission_tests {
         };
         assert_eq!(
             remote.code,
-            OperatorErrorCodeV6::PhysicalDesignMutationAdmissionRejected
+            OperatorErrorCodeV7::PhysicalDesignMutationAdmissionRejected
         );
         assert_eq!(
             serde_json::to_value(remote.admission.as_ref().unwrap()).unwrap(),
@@ -313,114 +314,133 @@ mod operator_admission_tests {
             remote.message,
             "current mutation-work inspection requires restart/reopen before retry"
         );
-        let reference = remote.receipt.expect("durable Begin is retained");
         assert_eq!(current_commit_seq(&fixture.database), before_commit);
         assert!(fixture.database.indexes(TABLE_ID).unwrap().is_empty());
         assert!(fixture.database.inspect_columnar_projections().is_empty());
         assert!(!fixture.root.join("placements/recovery").exists());
-        let page = receipts(&mut fixture.database, runtime, None, 128).unwrap();
-        let receipt = page.receipts.last().unwrap();
-        assert_eq!(receipt.id.0, reference.receipt_id);
-        assert_eq!(
-            receipt.outcome,
-            ServerPhysicalDesignMutationReceiptOutcome::Rejected
-        );
-        assert!(!receipt_status(&mut fixture.database, runtime)
-            .unwrap()
-            .recovery_required);
+        assert_eq!(remote.receipt.is_some(), journal);
+        if let Some(reference) = remote.receipt {
+            let page = receipts(&mut fixture.database, runtime, None, 128).unwrap();
+            let receipt = page.receipts.last().unwrap();
+            assert_eq!(receipt.id.0, reference.receipt_id);
+            assert_eq!(
+                receipt.outcome,
+                ServerPhysicalDesignMutationReceiptOutcome::Rejected
+            );
+            assert!(!receipt_status(&mut fixture.database, runtime)
+                .unwrap()
+                .recovery_required);
+        }
     }
 
     #[test]
     fn nbop_existing_projection_catalog_recovery_requires_reopen() {
-        let mut fixture = Fixture::create("p35-existing-projection-recovery");
-        let mut runtime = runtime(&mut fixture, true);
-        fixture
-            .database
-            .inject_projection_catalog_recovery_required(ColumnarProjectionId(77));
-        let before_commit = current_commit_seq(&fixture.database);
-        let epoch = runtime.evidence.epoch().0;
-        let error = apply_wire(
-            &mut fixture,
-            &mut runtime,
-            Target::Columnar(PhysicalColumnarDesignMode::Snapshot),
-            "recovery",
-            true,
-            epoch,
-        )
-        .unwrap_err();
-        let OperatorClientError::Remote(remote) = error else {
-            panic!("existing catalog recovery is definite: {error:?}")
-        };
-        assert_eq!(
-            remote.code,
-            OperatorErrorCodeV6::PhysicalColumnarRecoveryRequired
-        );
-        assert!(remote.admission.is_none());
-        assert!(remote.message.contains("restart/reopen"));
-        assert!(remote.message.contains("before retrying the exact approval"));
-        let reference = remote.receipt.expect("durable Begin is retained");
-        assert_eq!(current_commit_seq(&fixture.database), before_commit);
-        assert!(fixture.database.inspect_columnar_projections().is_empty());
-        assert!(!fixture.root.join("placements/recovery").exists());
-        let page = receipts(&mut fixture.database, &mut runtime, None, 128).unwrap();
-        let receipt = page.receipts.last().unwrap();
-        assert_eq!(receipt.id.0, reference.receipt_id);
-        assert_eq!(
-            receipt.outcome,
-            ServerPhysicalDesignMutationReceiptOutcome::Rejected
-        );
-        assert!(!receipt_status(&mut fixture.database, &mut runtime)
-            .unwrap()
-            .recovery_required);
-        drop(runtime);
-        fixture.close();
+        for journal in [false, true] {
+            let mut fixture = Fixture::create("p35-existing-projection-recovery");
+            let mut runtime = runtime(&mut fixture, journal);
+            fixture
+                .database
+                .inject_projection_catalog_recovery_required(ColumnarProjectionId(77));
+            let before_commit = current_commit_seq(&fixture.database);
+            let epoch = runtime.evidence.epoch().0;
+            let error = apply_wire(
+                &mut fixture,
+                &mut runtime,
+                Target::Columnar(PhysicalColumnarDesignMode::Snapshot),
+                "recovery",
+                true,
+                epoch,
+            )
+            .unwrap_err();
+            let OperatorClientError::Remote(remote) = error else {
+                panic!("existing catalog recovery is definite: {error:?}")
+            };
+            assert_eq!(
+                remote.code,
+                OperatorErrorCodeV7::PhysicalColumnarRecoveryRequired
+            );
+            assert!(remote.admission.is_none());
+            assert!(remote.message.contains("restart/reopen"));
+            assert!(remote.message.contains("before retrying the exact approval"));
+            assert_eq!(remote.receipt.is_some(), journal);
+            assert_eq!(current_commit_seq(&fixture.database), before_commit);
+            assert!(fixture.database.inspect_columnar_projections().is_empty());
+            assert!(!fixture.root.join("placements/recovery").exists());
+            if let Some(reference) = remote.receipt {
+                let page = receipts(&mut fixture.database, &mut runtime, None, 128).unwrap();
+                let receipt = page.receipts.last().unwrap();
+                assert_eq!(receipt.id.0, reference.receipt_id);
+                assert_eq!(
+                    receipt.outcome,
+                    ServerPhysicalDesignMutationReceiptOutcome::Rejected
+                );
+                assert!(!receipt_status(&mut fixture.database, &mut runtime)
+                    .unwrap()
+                    .recovery_required);
+            }
+            drop(runtime);
+            fixture.close();
+        }
     }
 
     #[test]
     fn operator_index_admission_storage_recovery_requires_reopen() {
-        let mut fixture = Fixture::create("p35-index-storage-recovery");
-        let mut runtime = runtime(&mut fixture, true);
-        fixture
-            .database
-            .inject_physical_design_storage_recovery_required(TABLE_ID)
-            .unwrap();
-        assert_storage_recovery_rejection(&mut fixture, &mut runtime, Target::Index);
-        drop(runtime);
-        discard_recovery_fixture(fixture);
+        for journal in [false, true] {
+            let mut fixture = Fixture::create("p35-index-storage-recovery");
+            let mut runtime = runtime(&mut fixture, journal);
+            fixture
+                .database
+                .inject_physical_design_storage_recovery_required(TABLE_ID)
+                .unwrap();
+            assert_storage_recovery_rejection(
+                &mut fixture,
+                &mut runtime,
+                Target::Index,
+                journal,
+            );
+            drop(runtime);
+            discard_recovery_fixture(fixture);
+        }
     }
 
     #[test]
     fn operator_heap_columnar_admission_storage_recovery_requires_reopen() {
-        let mut fixture = Fixture::create("p35-heap-columnar-storage-recovery");
-        let mut runtime = runtime(&mut fixture, true);
-        fixture
-            .database
-            .inject_physical_design_storage_recovery_required(TABLE_ID)
-            .unwrap();
-        assert_storage_recovery_rejection(
-            &mut fixture,
-            &mut runtime,
-            Target::Columnar(PhysicalColumnarDesignMode::Snapshot),
-        );
-        drop(runtime);
-        discard_recovery_fixture(fixture);
+        for journal in [false, true] {
+            let mut fixture = Fixture::create("p35-heap-columnar-storage-recovery");
+            let mut runtime = runtime(&mut fixture, journal);
+            fixture
+                .database
+                .inject_physical_design_storage_recovery_required(TABLE_ID)
+                .unwrap();
+            assert_storage_recovery_rejection(
+                &mut fixture,
+                &mut runtime,
+                Target::Columnar(PhysicalColumnarDesignMode::Snapshot),
+                journal,
+            );
+            drop(runtime);
+            discard_recovery_fixture(fixture);
+        }
     }
 
     #[test]
     fn operator_columnar_admission_storage_recovery_requires_reopen() {
-        let mut fixture = lsm_fixture();
-        let mut runtime = runtime(&mut fixture, true);
-        fixture
-            .database
-            .inject_physical_design_storage_recovery_required(TABLE_ID)
-            .unwrap();
-        assert_storage_recovery_rejection(
-            &mut fixture,
-            &mut runtime,
-            Target::Columnar(PhysicalColumnarDesignMode::Snapshot),
-        );
-        drop(runtime);
-        discard_recovery_fixture(fixture);
+        for journal in [false, true] {
+            let mut fixture = lsm_fixture();
+            let mut runtime = runtime(&mut fixture, journal);
+            fixture
+                .database
+                .inject_physical_design_storage_recovery_required(TABLE_ID)
+                .unwrap();
+            assert_storage_recovery_rejection(
+                &mut fixture,
+                &mut runtime,
+                Target::Columnar(PhysicalColumnarDesignMode::Snapshot),
+                journal,
+            );
+            drop(runtime);
+            discard_recovery_fixture(fixture);
+        }
     }
 
     #[test]
@@ -634,7 +654,7 @@ mod operator_admission_tests {
                 assert!(remote.admission.is_none());
                 assert_eq!(
                     remote.code,
-                    OperatorErrorCodeV6::PhysicalDesignMutationOutcomeUncertain
+                    OperatorErrorCodeV7::PhysicalDesignMutationOutcomeUncertain
                 );
                 drop(runtime);
                 fixture.close();
@@ -870,12 +890,12 @@ mod operator_admission_tests {
                 (
                     false,
                     epoch,
-                    OperatorErrorCodeV6::PhysicalDesignRuntimeChanged,
+                    OperatorErrorCodeV7::PhysicalDesignRuntimeChanged,
                 ),
                 (
                     true,
                     epoch + 1,
-                    OperatorErrorCodeV6::PhysicalDesignEvidenceEpochChanged,
+                    OperatorErrorCodeV7::PhysicalDesignEvidenceEpochChanged,
                 ),
             ] {
                 let error = apply_wire(
@@ -896,8 +916,8 @@ mod operator_admission_tests {
             let error = apply_wire(&mut fixture, &mut runtime, target, "approved", true, epoch)
                 .unwrap_err();
             let code = match target {
-                Target::Index => OperatorErrorCodeV6::PhysicalIndexNotRecommended,
-                Target::Columnar(_) => OperatorErrorCodeV6::PhysicalColumnarNotRecommended,
+                Target::Index => OperatorErrorCodeV7::PhysicalIndexNotRecommended,
+                Target::Columnar(_) => OperatorErrorCodeV7::PhysicalColumnarNotRecommended,
             };
             assert!(
                 matches!(error, OperatorClientError::Remote(remote) if remote.code == code && remote.admission.is_none())

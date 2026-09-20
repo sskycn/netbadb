@@ -9,6 +9,15 @@ removed. Native Protocol v2 is the sole network database protocol. Older entries
 below preserve implementation history only; they do not describe current APIs or
 open compatibility work. See [the removal report](postgresql-removal.md).
 
+## Operator protocol compatibility correction
+
+The current local operator contract is NBOP v7. Public V6 Rust DTOs are frozen
+from their pre-recovery-diagnostic shape, while the v7 admission rejection set
+adds only `recovery_required`. Current listeners and clients accept only v7;
+v6, v5, and all other versions are rejected. Manifest v11, NBMR v3, Native
+Protocol v2, Inspection JSON v7, Core/Storage recovery semantics, and all
+persistent formats are unchanged.
+
 ## Crash consistency and recovery audit
 
 The [audit report](crash-consistency-audit.md) covers Heap status publication,
