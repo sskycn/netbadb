@@ -1,0 +1,16 @@
+[package]
+name = "netbadb-storage-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+test-hooks = []
+
+[dependencies]
+netbadb-index = { path = "../netbadb-index" }
+netbadb-types = { path = "../netbadb-types" }
+
+[lints]
+workspace = true

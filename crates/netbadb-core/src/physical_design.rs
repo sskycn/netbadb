@@ -1886,6 +1886,7 @@ impl Database {
         };
         let output_write_bytes = heap
             .index_build_write_bound()
+            .map_err(StorageError::from)
             .map_err(DatabaseError::from)?
             .total_write_bytes_upper_bound;
         Ok(PhysicalIndexDesignMutationWorkInspection {

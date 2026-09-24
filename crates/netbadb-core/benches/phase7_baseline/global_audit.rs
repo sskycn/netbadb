@@ -205,7 +205,7 @@ fn page_work() -> BenchResult<()> {
                 let start = Instant::now();
                 match operation {
                     "full_reject" => {
-                        if !matches!(page.insert_record(black_box(b"x")), Err(StorageError::Page(PageError::PageFull { required, available: 0 })) if required == SLOT_SIZE + 1)
+                        if !matches!(page.insert_record(black_box(b"x")).map_err(StorageError::from), Err(StorageError::Page(PageError::PageFull { required, available: 0 })) if required == SLOT_SIZE + 1)
                         {
                             return Err(message_error(
                                 "full page did not reject with the exact fit error",

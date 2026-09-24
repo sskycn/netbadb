@@ -6,13 +6,25 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-test-hooks = []
+test-hooks = ["netbadb-storage-api/test-hooks", "netbadb-change-stream/test-hooks", "netbadb-lsm/test-hooks", "netbadb-heap/test-hooks"]
 
 [dependencies]
 crc32c.workspace = true
+netbadb-change-stream = { path = "../netbadb-change-stream" }
+netbadb-columnar = { path = "../netbadb-columnar" }
+netbadb-heap = { path = "../netbadb-heap" }
+netbadb-lsm = { path = "../netbadb-lsm" }
+netbadb-row-codec = { path = "../netbadb-row-codec" }
+netbadb-storage-api = { path = "../netbadb-storage-api" }
 netbadb-index = { path = "../netbadb-index" }
 netbadb-schema = { path = "../netbadb-schema" }
 netbadb-types = { path = "../netbadb-types" }
+
+[dev-dependencies]
+netbadb-heap = { path = "../netbadb-heap", features = ["test-hooks"] }
+netbadb-lsm = { path = "../netbadb-lsm", features = ["test-hooks"] }
+netbadb-change-stream = { path = "../netbadb-change-stream", features = ["test-hooks"] }
+netbadb-storage-api = { path = "../netbadb-storage-api", features = ["test-hooks"] }
 
 [lints]
 workspace = true

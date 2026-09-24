@@ -21,8 +21,8 @@ use netbadb_storage::{
     TableStorage,
 };
 use netbadb_types::{
-    AccessPathId, ColumnId, ColumnarGeneration, ColumnarProjectionId, Float32Value, Float64Value,
-    PartitionId, PhysicalType, RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId,
+    AccessPathId, ColumnId, ColumnarProjectionId, Float32Value, Float64Value, PhysicalType,
+    RelationBindingId, ScalarRef, ScalarValue, StorageId, TableId,
 };
 
 /// Runtime row capacity for the first owned batch-at-a-time execution path.
@@ -53,70 +53,10 @@ pub struct ExecutionColumnarProjection<'a> {
     pub projection: &'a ColumnarProjection,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ColumnarExecutionStatistics {
-    pub projection_id: Option<ColumnarProjectionId>,
-    pub generation: Option<ColumnarGeneration>,
-    pub table_id: Option<TableId>,
-    pub storage_id: Option<StorageId>,
-    pub scan: ColumnarScanStatistics,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionAccessKind {
-    SeqScan,
-    IndexPoint,
-    IndexRange,
-    Columnar,
-    PartitionedSeqScan,
-    PartitionedIndexPoint,
-    PartitionedIndexRange,
-}
-
-/// Raw counters measured by execution. They are deliberately not planner work
-/// units and never cause query execution to fail.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ExecutionWork {
-    pub rows_examined: u64,
-    pub rows_output: u64,
-    pub filter_rows_evaluated: u64,
-    pub filter_rows_passed: u64,
-    pub filter_rows_rejected: u64,
-    pub index_point_probes: u64,
-    pub index_range_probes: u64,
-    pub index_candidates_examined: u64,
-    pub columnar: Option<ColumnarExecutionStatistics>,
-    pub overflowed: bool,
-    pub incomplete: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutionAccessSample {
-    pub node: PlanNodeOrdinal,
-    pub binding_id: RelationBindingId,
-    pub table_id: TableId,
-    pub storage_id: StorageId,
-    pub partition_id: Option<PartitionId>,
-    pub kind: ExecutionAccessKind,
-    pub access_path: Option<AccessPathId>,
-    pub work: ExecutionWork,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutionFilterSample {
-    pub node: PlanNodeOrdinal,
-    pub work: ExecutionWork,
-}
-
-/// Opt-in execution telemetry. Normal execution constructs none of these
-/// vectors and retains its existing API and fast paths.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ExecutionStatistics {
-    pub accesses: Vec<ExecutionAccessSample>,
-    pub filters: Vec<ExecutionFilterSample>,
-    pub overflowed: bool,
-    pub incomplete: bool,
-}
+pub use netbadb_query_feedback::{
+    ColumnarExecutionStatistics, ExecutionAccessKind, ExecutionAccessSample, ExecutionFilterSample,
+    ExecutionStatistics, ExecutionWork,
+};
 
 fn saturating_add_counter(target: &mut u64, value: u64) -> bool {
     let (sum, overflowed) = target.overflowing_add(value);
@@ -126,17 +66,6 @@ fn saturating_add_counter(target: &mut u64, value: u64) -> bool {
         *target = sum;
     }
     overflowed
-}
-
-impl ExecutionWork {
-    /// Saturating counter update used by instrumentation sites that receive
-    /// more than one batch. Overflow degrades telemetry, never query results.
-    pub fn add_rows_examined(&mut self, value: u64) {
-        if saturating_add_counter(&mut self.rows_examined, value) {
-            self.overflowed = true;
-            self.incomplete = true;
-        }
-    }
 }
 
 fn measured_len(value: usize, work: &mut ExecutionWork) -> u64 {

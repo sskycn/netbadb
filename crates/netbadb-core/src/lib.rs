@@ -201,10 +201,12 @@ pub use execution_feedback::{
     PreparedExecutionFeedback, PreparedExecutionWithFeedback, PreparedFeedbackNotApplicableReason,
 };
 pub use maintenance::{
-    LsmMaintenanceReport, MaintenanceAction, MaintenanceActionReport, MaintenanceBlocker,
-    MaintenanceBound, MaintenanceBudget, MaintenanceCandidate, MaintenanceConsumption,
-    MaintenanceDecision, MaintenanceEstimate, MaintenanceInspection, MaintenanceOutcome,
-    MaintenanceReason, MaintenanceStepReport,
+    LsmMaintenanceReport, MaintenanceActionReport, MaintenanceOutcome, MaintenanceStepReport,
+};
+pub use netbadb_advisor::{
+    MaintenanceAction, MaintenanceBlocker, MaintenanceBound, MaintenanceBudget,
+    MaintenanceCandidate, MaintenanceConsumption, MaintenanceDecision, MaintenanceEstimate,
+    MaintenanceInspection, MaintenanceReason,
 };
 pub use netbadb_executor::{
     ColumnarExecutionStatistics, ExecutionAccessKind, ExecutionAccessSample, ExecutionFilterSample,

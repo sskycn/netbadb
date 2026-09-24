@@ -1,3 +1,8 @@
+//! Storage-local committed change logs, replay, retention and NBCL persistence.
+
+#[cfg(any(test, feature = "test-hooks"))]
+mod crash_test;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -12,10 +17,10 @@ use netbadb_types::{
     StorageDataVersion, StorageId, TableId, TxnId,
 };
 
-use crate::StorageError;
-use crate::row_codec::{decode_row, encode_row};
+use netbadb_row_codec::{decode_row, encode_row};
 
-pub(crate) type SharedChangeStream = Rc<RefCell<ChangeStreamManager>>;
+/// One synchronous stream runtime shared by an authoritative engine and its transactions.
+pub type SharedChangeStream = Rc<RefCell<ChangeStreamManager>>;
 
 pub const CHANGE_LOG_MAGIC: &[u8; 4] = b"NBCL";
 pub const CHANGE_LOG_FORMAT_VERSION: u16 = 2;
@@ -333,6 +338,7 @@ pub struct ChangeStreamGcStorageReport {
 #[derive(Debug)]
 pub enum ChangeStreamError {
     Io(std::io::Error),
+    Schema(netbadb_schema::SchemaError),
     InvalidMagic,
     UnsupportedVersion(u16),
     ChecksumMismatch {
@@ -373,6 +379,7 @@ impl fmt::Display for ChangeStreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "change-log I/O error: {error}"),
+            Self::Schema(error) => write!(f, "change-log schema error: {error}"),
             Self::InvalidMagic => f.write_str("change-log magic does not match"),
             Self::UnsupportedVersion(version) => {
                 write!(f, "unsupported change-log format version {version}")
@@ -424,8 +431,15 @@ impl std::error::Error for ChangeStreamError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Schema(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<netbadb_schema::SchemaError> for ChangeStreamError {
+    fn from(value: netbadb_schema::SchemaError) -> Self {
+        Self::Schema(value)
     }
 }
 
@@ -436,14 +450,17 @@ impl From<std::io::Error> for ChangeStreamError {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum AuthoritativeOutcome {
+/// Recovery evidence supplied by the authoritative storage engine.
+/// Unresolved prepares are never promoted to committed changes.
+pub enum AuthoritativeOutcome {
     Committed(Option<LsmCommitSeq>),
     Aborted,
     Unresolved,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PendingChangeSet {
+/// Transaction-local row changes coalesced before a durable Prepare.
+pub struct PendingChangeSet {
     mutations: Vec<StorageChange>,
     // Only live Insert/Update new versions are indexed. Stable vector order
     // remains the publication order; removed inserts retain payload-free holes
@@ -461,8 +478,14 @@ struct PendingChangeIndex {
     removed: HashSet<usize>,
 }
 
+impl Default for PendingChangeSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PendingChangeSet {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             mutations: Vec::new(),
             index: None,
@@ -475,18 +498,14 @@ impl PendingChangeSet {
         self.index.get_or_insert_with(Box::default)
     }
 
-    pub(crate) fn record_insert(
-        &mut self,
-        new_version: StorageVersionKey,
-        after: Vec<ScalarValue>,
-    ) {
+    pub fn record_insert(&mut self, new_version: StorageVersionKey, after: Vec<ScalarValue>) {
         let position = self.mutations.len();
         self.index().current_versions.insert(new_version, position);
         self.mutations
             .push(StorageChange::Insert { new_version, after });
     }
 
-    pub(crate) fn record_update(
+    pub fn record_update(
         &mut self,
         old_version: StorageVersionKey,
         new_version: StorageVersionKey,
@@ -524,7 +543,7 @@ impl PendingChangeSet {
         }
     }
 
-    pub(crate) fn record_delete(&mut self, old_version: StorageVersionKey) {
+    pub fn record_delete(&mut self, old_version: StorageVersionKey) {
         if let Some(position) = self
             .index
             .as_mut()
@@ -581,59 +600,60 @@ impl PendingChangeSet {
         }
     }
 
-    pub(crate) fn as_slice(&mut self) -> &[StorageChange] {
+    pub fn as_slice(&mut self) -> &[StorageChange] {
         self.compact();
         &self.mutations
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.mutations.clear();
         self.index = None;
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PreparedChange {
+/// Opaque reservation returned by a stream Prepare for the same transaction.
+pub struct PreparedChange {
     sequence: u64,
     before: StorageDataVersion,
     after: StorageDataVersion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ChangePrepareBatchReport {
-    pub(crate) changing_member_count: usize,
-    pub(crate) records_staged: usize,
-    pub(crate) record_bytes: u64,
-    pub(crate) syncs: u64,
-    pub(crate) first_sequence: u64,
-    pub(crate) last_sequence: u64,
-    pub(crate) before_frontier: StorageDataVersion,
-    pub(crate) after_reserved_frontier: StorageDataVersion,
-    pub(crate) prior_finalize_checkpoints_checkpointed: usize,
+pub struct ChangePrepareBatchReport {
+    pub changing_member_count: usize,
+    pub records_staged: usize,
+    pub record_bytes: u64,
+    pub syncs: u64,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub before_frontier: StorageDataVersion,
+    pub after_reserved_frontier: StorageDataVersion,
+    pub prior_finalize_checkpoints_checkpointed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ChangeFinalizeBatchReport {
-    pub(crate) finalized_member_count: usize,
-    pub(crate) markers_staged: usize,
-    pub(crate) marker_bytes: u64,
-    pub(crate) syncs: u64,
-    pub(crate) before_committed_frontier: StorageDataVersion,
-    pub(crate) after_committed_frontier: StorageDataVersion,
-    pub(crate) pending_finalize_checkpoints_after: usize,
+pub struct ChangeFinalizeBatchReport {
+    pub finalized_member_count: usize,
+    pub markers_staged: usize,
+    pub marker_bytes: u64,
+    pub syncs: u64,
+    pub before_committed_frontier: StorageDataVersion,
+    pub after_committed_frontier: StorageDataVersion,
+    pub pending_finalize_checkpoints_after: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct ChangeStreamSyncCounts {
-    pub(crate) total: u64,
-    pub(crate) member_prepare: u64,
-    pub(crate) group_prepare: u64,
-    pub(crate) member_finalize: u64,
-    pub(crate) group_finalize: u64,
-    pub(crate) pipelined_finalize_checkpoint: u64,
-    pub(crate) combined_finalize_prepare: u64,
-    pub(crate) explicit_finalize_checkpoint: u64,
-    pub(crate) recovery_finalize: u64,
+pub struct ChangeStreamSyncCounts {
+    pub total: u64,
+    pub member_prepare: u64,
+    pub group_prepare: u64,
+    pub member_finalize: u64,
+    pub group_finalize: u64,
+    pub pipelined_finalize_checkpoint: u64,
+    pub combined_finalize_prepare: u64,
+    pub explicit_finalize_checkpoint: u64,
+    pub recovery_finalize: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -714,7 +734,9 @@ enum State {
 }
 
 #[derive(Debug)]
-pub(crate) struct ChangeStreamManager {
+/// Caller-driven NBCL state and retention for one storage incarnation.
+/// This type has no database commit authority and owns no background worker.
+pub struct ChangeStreamManager {
     path: PathBuf,
     kind: ChangeStorageKind,
     storage_id: StorageId,
@@ -727,17 +749,18 @@ pub(crate) struct ChangeStreamManager {
     fail_next_group_prepare_sync: bool,
     #[cfg(any(test, feature = "test-hooks"))]
     fail_next_group_finalize_sync: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     fail_next_explicit_checkpoint_sync: bool,
 }
 
 impl ChangeStreamManager {
-    pub(crate) fn disabled(
+    /// Creates a disabled runtime before any NBCL incarnation has been enabled.
+    pub fn disabled(
         path: PathBuf,
         kind: ChangeStorageKind,
         storage_id: StorageId,
         table: &TableDef,
-    ) -> Result<Self, StorageError> {
+    ) -> Result<Self, ChangeStreamError> {
         Ok(Self {
             path,
             kind,
@@ -753,18 +776,21 @@ impl ChangeStreamManager {
             fail_next_group_prepare_sync: false,
             #[cfg(any(test, feature = "test-hooks"))]
             fail_next_group_finalize_sync: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             fail_next_explicit_checkpoint_sync: false,
         })
     }
 
-    pub(crate) fn open<F>(
+    /// Opens an existing runtime using the authoritative engine's outcome for
+    /// each prepared physical transaction. The callback must not infer commits
+    /// from NBCL bytes alone.
+    pub fn open<F>(
         path: PathBuf,
         kind: ChangeStorageKind,
         storage_id: StorageId,
         table: &TableDef,
         outcome: F,
-    ) -> Result<Self, StorageError>
+    ) -> Result<Self, ChangeStreamError>
     where
         F: Fn(TxnId) -> AuthoritativeOutcome,
     {
@@ -794,7 +820,7 @@ impl ChangeStreamManager {
                 fail_next_group_prepare_sync: false,
                 #[cfg(any(test, feature = "test-hooks"))]
                 fail_next_group_finalize_sync: false,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 fail_next_explicit_checkpoint_sync: false,
             });
         }
@@ -852,7 +878,7 @@ impl ChangeStreamManager {
                                     fail_next_group_prepare_sync: false,
                                     #[cfg(any(test, feature = "test-hooks"))]
                                     fail_next_group_finalize_sync: false,
-                                    #[cfg(test)]
+                                    #[cfg(any(test, feature = "test-hooks"))]
                                     fail_next_explicit_checkpoint_sync: false,
                                 });
                             }
@@ -886,36 +912,37 @@ impl ChangeStreamManager {
             fail_next_group_prepare_sync: false,
             #[cfg(any(test, feature = "test-hooks"))]
             fail_next_group_finalize_sync: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             fail_next_explicit_checkpoint_sync: false,
         })
     }
 
-    pub(crate) const fn sync_count(&self) -> u64 {
+    pub const fn sync_count(&self) -> u64 {
         self.sync_counts.total
     }
 
-    pub(crate) const fn sync_counts(&self) -> ChangeStreamSyncCounts {
+    pub const fn sync_counts(&self) -> ChangeStreamSyncCounts {
         self.sync_counts
     }
 
-    pub(crate) fn requires_changes(&self) -> bool {
+    pub fn requires_changes(&self) -> bool {
         !matches!(self.state, State::Disabled { .. })
     }
 
-    pub(crate) fn ensure_mutation_available(&self) -> Result<(), StorageError> {
+    pub fn ensure_mutation_available(&self) -> Result<(), ChangeStreamError> {
         match &self.state {
             State::Unavailable { reason, .. } => {
-                Err(ChangeStreamError::Unavailable(reason.clone()).into())
+                Err(ChangeStreamError::Unavailable(reason.clone()))
             }
             State::Disabled { .. } | State::Enabled { .. } => Ok(()),
         }
     }
 
-    pub(crate) fn enable(
+    /// Enables a fresh generation anchored at the caller's committed local frontier.
+    pub fn enable(
         &mut self,
         baseline: StorageDataVersion,
-    ) -> Result<ChangeStreamCursor, StorageError> {
+    ) -> Result<ChangeStreamCursor, ChangeStreamError> {
         let prior = match &self.state {
             State::Disabled { generation } => generation.0,
             State::Enabled {
@@ -950,7 +977,7 @@ impl ChangeStreamManager {
                     generation: Some(generation),
                     reason: error.to_string(),
                 };
-                return Err(error.into());
+                return Err(error);
             }
         };
         if let Err(error) = write_guard(&change_stream_guard_path(&self.path), &header) {
@@ -958,7 +985,7 @@ impl ChangeStreamManager {
                 generation: Some(generation),
                 reason: error.to_string(),
             };
-            return Err(error.into());
+            return Err(error);
         }
         let cursor = cursor_for(&header, baseline);
         self.state = State::Enabled {
@@ -976,7 +1003,7 @@ impl ChangeStreamManager {
         Ok(cursor)
     }
 
-    pub(crate) fn disable(&mut self) -> Result<(), StorageError> {
+    pub fn disable(&mut self) -> Result<(), ChangeStreamError> {
         let generation = match &self.state {
             State::Disabled { .. } => return Ok(()),
             State::Enabled { header, .. } => header.generation,
@@ -1003,12 +1030,15 @@ impl ChangeStreamManager {
         Ok(())
     }
 
-    pub(crate) fn prepare(
+    /// Durably prepares a transaction's coalesced changes. The returned token
+    /// is not a publication decision; call `publish` only after the engine's
+    /// corresponding commit is authoritative.
+    pub fn prepare(
         &mut self,
         txn_id: TxnId,
         database_txn_id: Option<DatabaseTxnId>,
         changes: &[StorageChange],
-    ) -> Result<Option<PreparedChange>, StorageError> {
+    ) -> Result<Option<PreparedChange>, ChangeStreamError> {
         let result = (|| {
             let prepared =
                 stage_prepare_enabled(&mut self.state, txn_id, database_txn_id, changes)?;
@@ -1029,28 +1059,30 @@ impl ChangeStreamManager {
         if let Err(error) = &result {
             self.poison_after_io_error(error);
         }
-        result.map_err(Into::into)
+        result
     }
 
     /// Appends one group member's existing PreparedChange without claiming
-    /// durability. This is intentionally crate-private and group-only.
-    pub(crate) fn stage_group_prepare(
+    /// durability. This is reserved for the engine integration and explicit group path.
+    pub fn stage_group_prepare(
         &mut self,
         txn_id: TxnId,
         database_txn_id: DatabaseTxnId,
         changes: &[StorageChange],
-    ) -> Result<Option<PreparedChange>, StorageError> {
+    ) -> Result<Option<PreparedChange>, ChangeStreamError> {
         let result = stage_prepare_enabled(&mut self.state, txn_id, Some(database_txn_id), changes);
         if let Err(error) = &result {
             self.poison_after_io_error(error);
         }
-        result.map_err(Into::into)
+        result
     }
 
-    pub(crate) fn durabilize_group_prepared_batch(
+    /// Synchronizes previously staged group Prepare records for one storage.
+    /// A successful return is the durability barrier for the supplied members.
+    pub fn durabilize_group_prepared_batch(
         &mut self,
         candidates: &[(TxnId, DatabaseTxnId, PreparedChange)],
-    ) -> Result<ChangePrepareBatchReport, StorageError> {
+    ) -> Result<ChangePrepareBatchReport, ChangeStreamError> {
         #[cfg(any(test, feature = "test-hooks"))]
         let fail_sync = std::mem::take(&mut self.fail_next_group_prepare_sync);
         let identities = candidates
@@ -1070,17 +1102,18 @@ impl ChangeStreamManager {
             Ok(report) => Ok(report),
             Err(error) => {
                 self.poison_after_io_error(&error);
-                Err(error.into())
+                Err(error)
             }
         }
     }
 
-    pub(crate) fn publish(
+    /// Finalizes one durably prepared change after authoritative engine commit.
+    pub fn publish(
         &mut self,
         txn_id: TxnId,
         prepared: PreparedChange,
         lsm_commit: Option<LsmCommitSeq>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(), ChangeStreamError> {
         let result = finalize_batch(
             &mut self.state,
             &mut self.sync_counts,
@@ -1093,13 +1126,13 @@ impl ChangeStreamManager {
         if let Err(error) = &result {
             self.poison_after_io_error(error);
         }
-        result.map(|_| ()).map_err(Into::into)
+        result.map(|_| ())
     }
 
-    pub(crate) fn finalize_group_batch(
+    pub fn finalize_group_batch(
         &mut self,
         candidates: &[(TxnId, PreparedChange, Option<LsmCommitSeq>)],
-    ) -> Result<ChangeFinalizeBatchReport, StorageError> {
+    ) -> Result<ChangeFinalizeBatchReport, ChangeStreamError> {
         #[cfg(any(test, feature = "test-hooks"))]
         let fail_sync = std::mem::take(&mut self.fail_next_group_finalize_sync);
         let result = finalize_batch(
@@ -1115,15 +1148,17 @@ impl ChangeStreamManager {
             Ok(report) => Ok(report),
             Err(error) => {
                 self.poison_after_io_error(&error);
-                Err(error.into())
+                Err(error)
             }
         }
     }
 
-    pub(crate) fn finalize_group_batch_pipelined(
+    /// Promotes an explicit group while leaving its Finalize checkpoint for a
+    /// later caller-driven barrier. The pending state remains distinguishable.
+    pub fn finalize_group_batch_pipelined(
         &mut self,
         candidates: &[(TxnId, PreparedChange, Option<LsmCommitSeq>)],
-    ) -> Result<ChangeFinalizeBatchReport, StorageError> {
+    ) -> Result<ChangeFinalizeBatchReport, ChangeStreamError> {
         let result = finalize_batch(
             &mut self.state,
             &mut self.sync_counts,
@@ -1136,12 +1171,12 @@ impl ChangeStreamManager {
         if let Err(error) = &result {
             self.poison_after_io_error(error);
         }
-        result.map_err(Into::into)
+        result
     }
 
     /// Explicitly synchronizes committed Finalize checkpoints left by the
     /// pipelined group path. A no-op performs no I/O.
-    pub(crate) fn checkpoint_pending_finalizes(&mut self) -> Result<u64, StorageError> {
+    pub fn checkpoint_pending_finalizes(&mut self) -> Result<u64, ChangeStreamError> {
         let pending = match &self.state {
             State::Enabled {
                 pending_finalize_checkpoints,
@@ -1157,43 +1192,43 @@ impl ChangeStreamManager {
         if pending == 0 {
             return Ok(0);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if std::mem::take(&mut self.fail_next_explicit_checkpoint_sync) {
             let error = ChangeStreamError::Io(std::io::Error::other(
                 "injected Finalize checkpoint sync failure",
             ));
             self.poison_after_io_error(&error);
-            return Err(error.into());
+            return Err(error);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         crate::crash_test::maybe_crash_named("change-before-explicit-finalize-checkpoint-sync");
         let result = sync_log(
             &mut self.state,
             &mut self.sync_counts,
             SyncReason::ExplicitFinalizeCheckpoint,
         );
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if result.is_ok() {
             crate::crash_test::maybe_crash_named("change-after-explicit-finalize-checkpoint-sync");
         }
         if let Err(error) = &result {
             self.poison_after_io_error(error);
         }
-        result.map(|_| 1).map_err(Into::into)
+        result.map(|_| 1)
     }
 
-    #[cfg(test)]
-    pub(crate) fn inject_finalize_checkpoint_sync_failure(&mut self) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn inject_finalize_checkpoint_sync_failure(&mut self) {
         self.fail_next_explicit_checkpoint_sync = true;
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn inject_group_prepare_sync_failure(&mut self) {
+    pub fn inject_group_prepare_sync_failure(&mut self) {
         self.fail_next_group_prepare_sync = true;
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn inject_group_finalize_sync_failure(&mut self) {
+    pub fn inject_group_finalize_sync_failure(&mut self) {
         self.fail_next_group_finalize_sync = true;
     }
 
@@ -1212,7 +1247,7 @@ impl ChangeStreamManager {
         };
     }
 
-    pub(crate) fn abandon(&mut self, txn_id: TxnId) -> Result<(), StorageError> {
+    pub fn abandon(&mut self, txn_id: TxnId) -> Result<(), ChangeStreamError> {
         if let State::Enabled { unresolved, .. } = &mut self.state {
             if let Some(record) = unresolved.get(&txn_id) {
                 let tail = unresolved
@@ -1222,8 +1257,7 @@ impl ChangeStreamManager {
                 if tail != Some(record.batch.physical_txn_id) {
                     return Err(ChangeStreamError::InvalidRecord(
                         "prepared reservation is not the chain tail",
-                    )
-                    .into());
+                    ));
                 }
             }
             unresolved.remove(&txn_id);
@@ -1231,24 +1265,25 @@ impl ChangeStreamManager {
         Ok(())
     }
 
-    pub(crate) fn cursor(&self) -> Result<ChangeStreamCursor, StorageError> {
+    /// Returns a position only; a cursor does not pin retention history.
+    pub fn cursor(&self) -> Result<ChangeStreamCursor, ChangeStreamError> {
         match &self.state {
             State::Enabled {
                 header, batches, ..
             } => Ok(cursor_for(header, effective_current(header, batches))),
-            State::Disabled { .. } => Err(ChangeStreamError::Disabled.into()),
+            State::Disabled { .. } => Err(ChangeStreamError::Disabled),
             State::Unavailable { reason, .. } => {
-                Err(ChangeStreamError::Unavailable(reason.clone()).into())
+                Err(ChangeStreamError::Unavailable(reason.clone()))
             }
         }
     }
 
-    pub(crate) fn read(
+    pub fn read(
         &self,
         cursor: ChangeStreamCursor,
         max_batches: usize,
         max_bytes: u64,
-    ) -> Result<ChangeReadResult, StorageError> {
+    ) -> Result<ChangeReadResult, ChangeStreamError> {
         let State::Enabled {
             header,
             batches,
@@ -1257,22 +1292,22 @@ impl ChangeStreamManager {
         } = &self.state
         else {
             return match &self.state {
-                State::Disabled { .. } => Err(ChangeStreamError::Disabled.into()),
+                State::Disabled { .. } => Err(ChangeStreamError::Disabled),
                 State::Unavailable { reason, .. } => {
-                    Err(ChangeStreamError::Unavailable(reason.clone()).into())
+                    Err(ChangeStreamError::Unavailable(reason.clone()))
                 }
                 State::Enabled { .. } => unreachable!(),
             };
         };
         if cursor.storage_id != header.storage_id {
-            return Err(ChangeStreamError::ContextMismatch.into());
+            return Err(ChangeStreamError::ContextMismatch);
         }
         if cursor.generation != header.generation {
-            return Err(ChangeStreamError::StreamIdentityMismatch.into());
+            return Err(ChangeStreamError::StreamIdentityMismatch);
         }
         let current = effective_current(header, batches);
         if cursor.frontier.0 < header.earliest.0 || cursor.frontier.0 > current.0 {
-            return Err(ChangeStreamError::HistoryUnavailable.into());
+            return Err(ChangeStreamError::HistoryUnavailable);
         }
         if cursor.frontier == current {
             return Ok(ChangeReadResult {
@@ -1293,8 +1328,7 @@ impl ChangeStreamManager {
                 return Err(ChangeStreamError::ChangeGap {
                     expected,
                     actual: batch.before,
-                }
-                .into());
+                });
             }
             let encoded_bytes = record_bytes.change_bytes;
             if selected.len() >= max_batches
@@ -1315,18 +1349,18 @@ impl ChangeStreamManager {
         })
     }
 
-    pub(crate) fn acquire_retention_pin(
+    pub fn acquire_retention_pin(
         &self,
         cursor: ChangeStreamCursor,
-    ) -> Result<ChangeStreamRetentionPin, StorageError> {
+    ) -> Result<ChangeStreamRetentionPin, ChangeStreamError> {
         let State::Enabled {
             header, batches, ..
         } = &self.state
         else {
             return match &self.state {
-                State::Disabled { .. } => Err(ChangeStreamError::Disabled.into()),
+                State::Disabled { .. } => Err(ChangeStreamError::Disabled),
                 State::Unavailable { reason, .. } => {
-                    Err(ChangeStreamError::Unavailable(reason.clone()).into())
+                    Err(ChangeStreamError::Unavailable(reason.clone()))
                 }
                 State::Enabled { .. } => unreachable!(),
             };
@@ -1356,17 +1390,16 @@ impl ChangeStreamManager {
         })
     }
 
-    pub(crate) fn advance_retention_pin(
+    pub fn advance_retention_pin(
         &self,
         pin: &mut ChangeStreamRetentionPin,
         frontier: StorageDataVersion,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(), ChangeStreamError> {
         if frontier.0 < pin.frontier.0 {
             return Err(ChangeStreamError::RetentionPinFrontierRegression {
                 current: pin.frontier,
                 requested: frontier,
-            }
-            .into());
+            });
         }
         let cursor = ChangeStreamCursor {
             storage_id: pin.storage_id,
@@ -1377,11 +1410,11 @@ impl ChangeStreamManager {
             header, batches, ..
         } = &self.state
         else {
-            return Err(ChangeStreamError::StreamIdentityMismatch.into());
+            return Err(ChangeStreamError::StreamIdentityMismatch);
         };
         validate_cursor_identity_and_frontier(header, batches, cursor)?;
         if !Rc::ptr_eq(&pin.registry, &self.retention_pins) || !pin.active {
-            return Err(ChangeStreamError::RetentionPinUnavailable.into());
+            return Err(ChangeStreamError::RetentionPinUnavailable);
         }
         let mut registry = self.retention_pins.borrow_mut();
         let entry = registry
@@ -1389,22 +1422,22 @@ impl ChangeStreamManager {
             .get_mut(&pin.id)
             .ok_or(ChangeStreamError::RetentionPinUnavailable)?;
         if entry.storage_id != pin.storage_id || entry.generation != pin.generation {
-            return Err(ChangeStreamError::RetentionPinUnavailable.into());
+            return Err(ChangeStreamError::RetentionPinUnavailable);
         }
         entry.frontier = frontier;
         pin.frontier = frontier;
         Ok(())
     }
 
-    pub(crate) fn gc_through(
+    pub fn gc_through(
         &mut self,
         frontier: StorageDataVersion,
-    ) -> Result<ChangeStreamGcStorageReport, StorageError> {
+    ) -> Result<ChangeStreamGcStorageReport, ChangeStreamError> {
         let path = self.path.clone();
         match &self.state {
-            State::Disabled { .. } => return Err(ChangeStreamError::Disabled.into()),
+            State::Disabled { .. } => return Err(ChangeStreamError::Disabled),
             State::Unavailable { reason, .. } => {
-                return Err(ChangeStreamError::Unavailable(reason.clone()).into());
+                return Err(ChangeStreamError::Unavailable(reason.clone()));
             }
             State::Enabled { .. } => {}
         }
@@ -1423,14 +1456,13 @@ impl ChangeStreamManager {
         else {
             return Err(ChangeStreamError::Unavailable(
                 "change stream state changed during synchronous GC".into(),
-            )
-            .into());
+            ));
         };
         if !unresolved.is_empty() {
-            return Err(ChangeStreamError::Busy.into());
+            return Err(ChangeStreamError::Busy);
         }
         if !pending_finalize_checkpoints.is_empty() {
-            return Err(ChangeStreamError::FinalizeCheckpointPending.into());
+            return Err(ChangeStreamError::FinalizeCheckpointPending);
         }
         if let Some(pinned) = self
             .retention_pins
@@ -1447,22 +1479,21 @@ impl ChangeStreamManager {
             return Err(ChangeStreamError::RetentionPinned {
                 requested: frontier,
                 pinned,
-            }
-            .into());
+            });
         }
         let current = effective_current(header, batches);
         if frontier.0 < header.earliest.0 || frontier.0 > current.0 {
-            return Err(ChangeStreamError::HistoryUnavailable.into());
+            return Err(ChangeStreamError::HistoryUnavailable);
         }
         let first_retained = batches
             .iter()
             .position(|batch| batch.after.0 > frontier.0)
             .unwrap_or(batches.len());
         if first_retained < batches.len() && batches[first_retained].before != frontier {
-            return Err(ChangeStreamError::HistoryUnavailable.into());
+            return Err(ChangeStreamError::HistoryUnavailable);
         }
         if first_retained == batches.len() && frontier != current {
-            return Err(ChangeStreamError::HistoryUnavailable.into());
+            return Err(ChangeStreamError::HistoryUnavailable);
         }
         let previous_earliest = header.earliest;
         let bytes_before = *file_bytes;
@@ -1534,7 +1565,7 @@ impl ChangeStreamManager {
         })
     }
 
-    pub(crate) fn source_inspection(&self) -> ChangeStreamSourceInspection {
+    pub fn source_inspection(&self) -> ChangeStreamSourceInspection {
         let (status, generation) = match &self.state {
             State::Disabled { generation } => (ChangeStreamStatus::Disabled, Some(*generation)),
             State::Enabled { header, .. } => (ChangeStreamStatus::Enabled, Some(header.generation)),
@@ -1549,9 +1580,9 @@ impl ChangeStreamManager {
         }
     }
 
-    pub(crate) fn inspection(&self) -> ChangeStreamInspection {
+    pub fn inspection(&self) -> ChangeStreamInspection {
         #[cfg(any(test, feature = "test-hooks"))]
-        crate::source_inspection_test_activity::record(|activity| {
+        netbadb_storage_api::source_inspection_test_activity::record(|activity| {
             activity.change_stream_history_inspections += 1
         });
         let (
@@ -1638,7 +1669,7 @@ impl ChangeStreamManager {
         }
     }
 
-    pub(crate) fn maintenance_inspection(&self) -> ChangeStreamMaintenanceInspection {
+    pub fn maintenance_inspection(&self) -> ChangeStreamMaintenanceInspection {
         let stream = self.inspection();
         let batches = match &self.state {
             State::Enabled {
@@ -1857,10 +1888,10 @@ fn durabilize_prepared_batch(
                 "injected group Prepare sync failure",
             )));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         crate::crash_test::maybe_crash_named("change-group-before-prepare-sync");
         let checkpoint = sync_log(state, sync_counts, sync_reason)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         crate::crash_test::maybe_crash_named("change-group-after-prepare-sync");
         let State::Enabled { unresolved, .. } = state else {
             unreachable!("enabled stream was synchronized");
@@ -1925,7 +1956,7 @@ fn sync_log(
         ));
     };
     file.sync_data()?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     crate::crash_test::maybe_crash_named("change-after-sync-before-checkpoint-bookkeeping");
     let pending = pending_finalize_checkpoints.len();
     if pending != 0 {
@@ -2117,7 +2148,7 @@ fn finalize_batch(
                 .ok_or(ChangeStreamError::RecordTooLarge(u64::MAX))?;
             record.staged_finalize = Some(candidate.lsm_commit);
             markers_staged = markers_staged.saturating_add(1);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             crate::crash_test::maybe_crash_indexed(
                 "change-group-after-finalize-append",
                 position + 1,
@@ -2134,10 +2165,10 @@ fn finalize_batch(
                 "injected group Finalize sync failure",
             )));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         crate::crash_test::maybe_crash_named("change-group-before-finalize-sync");
         sync_log(state, sync_counts, sync_reason)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         crate::crash_test::maybe_crash_named("change-group-after-finalize-sync");
     }
 
@@ -2179,7 +2210,7 @@ fn finalize_batch(
                 "pending Finalize sequence was prevalidated"
             );
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         crate::crash_test::maybe_crash_indexed(
             "change-group-after-finalize-promotion",
             position + 1,
@@ -3846,9 +3877,7 @@ mod tests {
         assert_eq!(manager.inspection().file_bytes, file_bytes_before_retry);
         assert!(matches!(
             manager.gc_through(first.after),
-            Err(StorageError::ChangeStream(
-                ChangeStreamError::FinalizeCheckpointPending
-            ))
+            Err(ChangeStreamError::FinalizeCheckpointPending)
         ));
 
         let third = manager
@@ -4175,7 +4204,7 @@ mod tests {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .arg("--exact")
-                .arg("change_stream::tests::grouped_finalize_crash_child")
+                .arg("tests::grouped_finalize_crash_child")
                 .arg("--nocapture");
             crate::crash_test::configure_named_child(
                 &mut command,
@@ -4229,7 +4258,7 @@ mod tests {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .arg("--exact")
-                .arg("change_stream::tests::grouped_finalize_crash_child")
+                .arg("tests::grouped_finalize_crash_child")
                 .arg("--nocapture");
             crate::crash_test::configure_named_child(
                 &mut command,
@@ -4280,7 +4309,7 @@ mod tests {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .arg("--exact")
-                .arg("change_stream::tests::grouped_finalize_crash_child")
+                .arg("tests::grouped_finalize_crash_child")
                 .arg("--nocapture");
             crate::crash_test::configure_named_child(
                 &mut command,
@@ -4399,7 +4428,7 @@ mod tests {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .arg("--exact")
-                .arg("change_stream::tests::phase3g_next_group_crash_child")
+                .arg("tests::phase3g_next_group_crash_child")
                 .arg("--nocapture");
             crate::crash_test::configure_named_child(
                 &mut command,
@@ -4641,7 +4670,7 @@ mod tests {
             write_committed_fixture(&path, CHANGE_LOG_FORMAT_VERSION, &[batch(), second.clone()]);
             let status =
                 std::process::Command::new(std::env::current_exe().expect("test executable"))
-                    .arg("change_stream::tests::gc_publication_crash_child")
+                    .arg("tests::gc_publication_crash_child")
                     .arg("--exact")
                     .arg("--nocapture")
                     .env("NETBADB_CHANGE_STREAM_GC_CRASH_CHILD", "1")

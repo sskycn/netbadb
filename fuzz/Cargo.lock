@@ -138,6 +138,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "netbadb-advisor"
+version = "0.1.0"
+dependencies = [
+ "netbadb-change-stream",
+ "netbadb-columnar",
+ "netbadb-lsm",
+ "netbadb-storage-api",
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-change-stream"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "netbadb-row-codec",
+ "netbadb-schema",
+ "netbadb-storage-api",
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-columnar"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "netbadb-change-stream",
+ "netbadb-index",
+ "netbadb-schema",
+ "netbadb-storage-api",
+ "netbadb-types",
+]
+
+[[package]]
 name = "netbadb-compiler"
 version = "0.1.0"
 dependencies = [
@@ -154,11 +188,13 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "getrandom 0.2.17",
+ "netbadb-advisor",
  "netbadb-compiler",
  "netbadb-executor",
  "netbadb-index",
  "netbadb-inspect",
  "netbadb-planner",
+ "netbadb-query-feedback",
  "netbadb-rel",
  "netbadb-schema",
  "netbadb-storage",
@@ -171,6 +207,7 @@ name = "netbadb-executor"
 version = "0.1.0"
 dependencies = [
  "netbadb-planner",
+ "netbadb-query-feedback",
  "netbadb-rel",
  "netbadb-storage",
  "netbadb-types",
@@ -184,9 +221,23 @@ dependencies = [
  "libfuzzer-sys",
  "netbadb-core",
  "netbadb-index",
+ "netbadb-lsm",
  "netbadb-protocol",
  "netbadb-schema",
  "netbadb-storage",
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-heap"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "netbadb-change-stream",
+ "netbadb-index",
+ "netbadb-row-codec",
+ "netbadb-schema",
+ "netbadb-storage-api",
  "netbadb-types",
 ]
 
@@ -215,6 +266,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "netbadb-lsm"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "netbadb-change-stream",
+ "netbadb-index",
+ "netbadb-row-codec",
+ "netbadb-schema",
+ "netbadb-storage-api",
+ "netbadb-types",
+]
+
+[[package]]
 name = "netbadb-parser"
 version = "0.1.0"
 dependencies = [
@@ -238,9 +302,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "netbadb-query-feedback"
+version = "0.1.0"
+dependencies = [
+ "netbadb-planner",
+ "netbadb-rel",
+ "netbadb-storage-api",
+ "netbadb-types",
+]
+
+[[package]]
 name = "netbadb-rel"
 version = "0.1.0"
 dependencies = [
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-row-codec"
+version = "0.1.0"
+dependencies = [
+ "netbadb-schema",
  "netbadb-types",
 ]
 
@@ -257,8 +339,22 @@ name = "netbadb-storage"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "netbadb-change-stream",
+ "netbadb-columnar",
+ "netbadb-heap",
  "netbadb-index",
+ "netbadb-lsm",
+ "netbadb-row-codec",
  "netbadb-schema",
+ "netbadb-storage-api",
+ "netbadb-types",
+]
+
+[[package]]
+name = "netbadb-storage-api"
+version = "0.1.0"
+dependencies = [
+ "netbadb-index",
  "netbadb-types",
 ]
 

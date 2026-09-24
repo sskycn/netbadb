@@ -1022,7 +1022,9 @@ fn candidate_b_same_fingerprint_clone_cost_and_publication_rejection() {
                 .find_map(|(id, view)| (id == source).then_some(view))
                 .unwrap(),
             |_, values| {
-                clone.insert(&values)?;
+                clone
+                    .insert(&values)
+                    .map_err(netbadb_storage::StorageError::from)?;
                 copied += 1;
                 Ok(ControlFlow::Continue(()))
             },

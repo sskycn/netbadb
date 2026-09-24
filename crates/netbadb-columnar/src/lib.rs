@@ -25,9 +25,9 @@ use netbadb_types::{
     StorageDataVersion, StorageId, TableId,
 };
 
-use crate::{
-    ChangeBatch, ChangeStreamCursor, StorageChange, StorageError,
-    StoragePhysicalDesignSourceInspection, StorageVersionKey,
+use ColumnarError as StorageError;
+pub use netbadb_change_stream::{
+    CHANGE_LOG_MAX_MUTATIONS, ChangeBatch, ChangeStreamCursor, StorageChange, StorageVersionKey,
 };
 
 const MANIFEST_MAGIC: &[u8; 4] = b"NBCM";
@@ -138,6 +138,14 @@ enum SnapshotKind {
     Lsm,
 }
 
+/// Conservative current source footprint supplied by an authoritative engine.
+/// This is an observation for one admission check, never a reusable permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnarSourceFootprint {
+    pub row_upper_bound: u64,
+    pub scalar_payload_bytes_upper_bound: u64,
+}
+
 /// Existing initial immutable-base writer mode. This is storage-owned so
 /// callers do not need to know NBCS/NBCM layout details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,29 +244,13 @@ fn initial_manifest_write_bound(
 /// flush, and reserves no projection identity.
 pub fn inspect_columnar_base_artifact_write_bound(
     table: &TableDef,
-    source: StoragePhysicalDesignSourceInspection,
+    source: ColumnarSourceFootprint,
     columns: &[ColumnId],
     mode: ColumnarBaseArtifactMode,
 ) -> Result<ColumnarBaseArtifactWriteBoundInspection, StorageError> {
-    let specs = resolve_columns(table, columns).map_err(StorageError::Columnar)?;
-    let (row_upper_bound, source_scalar_payload_bytes_upper_bound) = match source {
-        StoragePhysicalDesignSourceInspection::Heap(heap) => {
-            (heap.row_upper_bound, heap.main_file_bytes_upper_bound)
-        }
-        StoragePhysicalDesignSourceInspection::Lsm(lsm) => {
-            let payload = match mode {
-                ColumnarBaseArtifactMode::Snapshot => {
-                    lsm.prospective_snapshot_sstable_bytes_upper_bound()?
-                }
-                ColumnarBaseArtifactMode::Incremental => checked_bound_add(
-                    lsm.total_sstable_bytes,
-                    lsm.memtable_bytes,
-                    "Incremental LSM scalar payload bytes",
-                )?,
-            };
-            (lsm.row_upper_bound()?, payload)
-        }
-    };
+    let specs = resolve_columns(table, columns)?;
+    let row_upper_bound = source.row_upper_bound;
+    let source_scalar_payload_bytes_upper_bound = source.scalar_payload_bytes_upper_bound;
     let row_group_rows = u64::try_from(DEFAULT_ROW_GROUP_ROWS)
         .map_err(|_| bound_overflow("Columnar default row-group rows"))?;
     let row_group_upper_bound =
@@ -432,7 +424,7 @@ pub struct StorageSnapshotToken {
 }
 
 impl StorageSnapshotToken {
-    pub(crate) const fn heap(storage_id: StorageId, sequence: u64) -> Self {
+    pub const fn heap(storage_id: StorageId, sequence: u64) -> Self {
         Self {
             storage_id,
             kind: SnapshotKind::Heap,
@@ -441,7 +433,7 @@ impl StorageSnapshotToken {
         }
     }
 
-    pub(crate) const fn lsm(storage_id: StorageId, epoch: u64, sequence: u64) -> Self {
+    pub const fn lsm(storage_id: StorageId, epoch: u64, sequence: u64) -> Self {
         Self {
             storage_id,
             kind: SnapshotKind::Lsm,
@@ -492,37 +484,7 @@ pub struct ColumnarRowGroupStatistics {
     pub columns: Vec<(ColumnId, ColumnarColumnStatistics)>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ColumnarScanStatistics {
-    pub row_groups_total: u64,
-    pub row_groups_read: u64,
-    pub row_groups_pruned: u64,
-    pub rows_read: u64,
-    pub column_chunks_read: u64,
-    pub bytes_read: u64,
-    pub base_rows_suppressed: u64,
-    pub delta_segments: u64,
-    pub delta_mutations: u64,
-    pub delta_live_rows: u64,
-    pub delta_rows_emitted: u64,
-    pub delta_bytes_read: u64,
-    pub merged_rows: u64,
-    /// Physical payload blocks fetched for this scan. Header/footer reads made
-    /// while opening the immutable projection are intentionally excluded.
-    pub physical_block_reads: u64,
-    /// Physical payload bytes fetched for this scan.
-    pub physical_bytes_read: u64,
-    /// Column chunks decoded for this scan.
-    pub decoded_column_chunks: u64,
-    /// Hidden source-version blocks decoded for suppression.
-    pub decoded_version_blocks: u64,
-    pub base_data_bytes_read: u64,
-    pub base_version_key_bytes_read: u64,
-    pub delta_data_bytes_read: u64,
-    pub version_key_chunks_read: u64,
-    pub blocks_verified: u64,
-    pub row_groups_pruned_before_data_read: u64,
-}
+pub use netbadb_storage_api::ColumnarScanStatistics;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnarRepresentationStatistics {
@@ -3085,6 +3047,7 @@ fn vector_encoded_bytes(vector: &ColumnarVector) -> u64 {
 
 #[derive(Debug)]
 pub enum ColumnarError {
+    ResourceBoundOverflow { resource: &'static str },
     Io(std::io::Error),
     Schema(netbadb_schema::SchemaError),
     InvalidInput(&'static str),
@@ -3120,6 +3083,9 @@ impl ColumnarError {
 impl fmt::Display for ColumnarError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ResourceBoundOverflow { resource } => {
+                write!(formatter, "{resource} conservative bound overflowed u64")
+            }
             Self::Io(error) => write!(formatter, "columnar I/O error: {error}"),
             Self::Schema(error) => write!(formatter, "columnar schema error: {error}"),
             Self::InvalidInput(message) => write!(formatter, "invalid columnar input: {message}"),
@@ -6338,23 +6304,11 @@ mod tests {
     fn artifact_bound_source(
         rows: u64,
         scalar_payload_bytes: u64,
-    ) -> crate::StoragePhysicalDesignSourceInspection {
-        crate::StoragePhysicalDesignSourceInspection::Heap(
-            crate::HeapPhysicalDesignSourceInspection {
-                storage_id: StorageId(7),
-                visibility_boundary: crate::StorageVisibilityBoundary::new(
-                    StorageId(7),
-                    crate::StorageKind::Heap,
-                    1,
-                )
-                .expect("visibility boundary"),
-                managed_page_upper_bound: 1,
-                row_upper_bound: rows,
-                main_file_bytes_upper_bound: scalar_payload_bytes,
-                index_backfill_page_upper_bound: 1,
-                index_backfill_bytes_upper_bound: scalar_payload_bytes,
-            },
-        )
+    ) -> super::ColumnarSourceFootprint {
+        super::ColumnarSourceFootprint {
+            row_upper_bound: rows,
+            scalar_payload_bytes_upper_bound: scalar_payload_bytes,
+        }
     }
 
     fn actual_initial_artifact_write_bytes(root: &std::path::Path, id: u64) -> u64 {
@@ -8371,7 +8325,7 @@ mod tests {
             let directory = test_directory(point);
             seed_delta_crash_projection(&directory);
             let status = Command::new(std::env::current_exe().expect("test executable"))
-                .arg("columnar::tests::delta_publication_crash_child")
+                .arg("tests::delta_publication_crash_child")
                 .arg("--exact")
                 .arg("--nocapture")
                 .env("NETBADB_COLUMNAR_DELTA_CRASH_CHILD", "1")
@@ -8440,7 +8394,7 @@ mod tests {
                 .expect("seed delta");
             drop(advanced);
             let status = Command::new(std::env::current_exe().expect("test executable"))
-                .arg("columnar::tests::compaction_publication_crash_child")
+                .arg("tests::compaction_publication_crash_child")
                 .arg("--exact")
                 .arg("--nocapture")
                 .env("NETBADB_COLUMNAR_COMPACTION_CRASH_CHILD", "1")

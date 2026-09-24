@@ -14,6 +14,7 @@ crc32c = "0.6.8"
 libfuzzer-sys = "0.4"
 netbadb-core = { path = "../crates/netbadb-core" }
 netbadb-index = { path = "../crates/netbadb-index" }
+netbadb-lsm = { path = "../crates/netbadb-lsm" }
 netbadb-protocol = { path = "../crates/netbadb-protocol" }
 netbadb-schema = { path = "../crates/netbadb-schema" }
 netbadb-storage = { path = "../crates/netbadb-storage" }

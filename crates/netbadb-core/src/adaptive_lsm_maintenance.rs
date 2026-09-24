@@ -2,169 +2,24 @@ use std::error::Error;
 use std::fmt;
 use std::rc::Rc;
 
-use netbadb_storage::{
-    ChangeStreamInspection, LsmCompactionPlanInspection, LsmInspection, LsmMaintenanceAnchor,
-    LsmMaintenanceInspection, StorageKind, StorageSnapshotToken, StorageVersionKey,
-};
-use netbadb_types::{DatabaseCommitSeq, SchemaGeneration, StorageDataVersion, StorageId, TableId};
+use netbadb_storage::{LsmInspection, StorageKind, StorageVersionKey};
+use netbadb_types::{StorageId, TableId};
 
 use crate::maintenance::lsm_maintenance_candidates;
 use crate::{
-    Database, DatabaseError, MaintenanceAction, MaintenanceBlocker, MaintenanceBudget,
-    MaintenanceCandidate, MaintenanceConsumption, MaintenanceEstimate, StorageRegistryError,
+    Database, DatabaseError, MaintenanceAction, MaintenanceBudget, MaintenanceConsumption,
+    MaintenanceEstimate, StorageRegistryError,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdaptiveLsmMaintenanceAction {
-    Flush,
-    CompactOne,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AdaptiveLsmFlushPolicy {
-    pub minimum_memtable_bytes: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AdaptiveLsmCompactionPolicy {
-    pub minimum_input_bytes: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdaptiveLsmMaintenanceNoActionReason {
-    NoMemtableEntries,
-    MemtableBelowAutomaticThreshold,
-    MemtableNotEmpty,
-    NoCompactionPlan,
-    CompactionBelowAutomaticThreshold,
-    MaintenanceBlocked(MaintenanceBlocker),
-    BudgetBlocked(MaintenanceBlocker),
-    AutomaticBoundUnavailable,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdaptiveLsmMaintenanceObservation {
-    pub observed_global_commit_seq: Option<DatabaseCommitSeq>,
-    pub schema_generation: SchemaGeneration,
-    pub table_id: TableId,
-    pub storage_id: StorageId,
-    pub storage_kind: StorageKind,
-    pub storage_snapshot: StorageSnapshotToken,
-    pub logical_data_version: StorageDataVersion,
-    pub lsm: LsmInspection,
-    pub maintenance: LsmMaintenanceInspection,
-    pub change_stream: ChangeStreamInspection,
-    pub production_flush_candidate: Option<MaintenanceCandidate>,
-    pub production_compaction_candidate: Option<MaintenanceCandidate>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdaptiveLsmFlushProposal {
-    pub observed_global_commit_seq: Option<DatabaseCommitSeq>,
-    pub based_on_schema_generation: SchemaGeneration,
-    pub table_id: TableId,
-    pub storage_id: StorageId,
-    pub expected_storage_snapshot: StorageSnapshotToken,
-    pub expected_logical_data_version: StorageDataVersion,
-    pub expected_layout_anchor: LsmMaintenanceAnchor,
-    pub expected_memtable_entries: u64,
-    pub expected_memtable_bytes: u64,
-    pub expected_flush_threshold_bytes: u64,
-    pub estimated_cost: MaintenanceEstimate,
-    pub conservative_bound: MaintenanceEstimate,
-    pub policy: AdaptiveLsmFlushPolicy,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdaptiveLsmCompactionProposal {
-    pub observed_global_commit_seq: Option<DatabaseCommitSeq>,
-    pub based_on_schema_generation: SchemaGeneration,
-    pub table_id: TableId,
-    pub storage_id: StorageId,
-    pub expected_storage_snapshot: StorageSnapshotToken,
-    pub expected_logical_data_version: StorageDataVersion,
-    pub expected_layout_anchor: LsmMaintenanceAnchor,
-    pub expected_memtable_entries: u64,
-    pub selected_plan: LsmCompactionPlanInspection,
-    pub estimated_cost: MaintenanceEstimate,
-    pub conservative_bound: MaintenanceEstimate,
-    pub policy: AdaptiveLsmCompactionPolicy,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdaptiveLsmMaintenanceProposal {
-    Flush(AdaptiveLsmFlushProposal),
-    CompactOne(AdaptiveLsmCompactionProposal),
-}
-
-impl AdaptiveLsmMaintenanceProposal {
-    #[must_use]
-    pub const fn action(&self) -> AdaptiveLsmMaintenanceAction {
-        match self {
-            Self::Flush(_) => AdaptiveLsmMaintenanceAction::Flush,
-            Self::CompactOne(_) => AdaptiveLsmMaintenanceAction::CompactOne,
-        }
-    }
-
-    #[must_use]
-    pub const fn conservative_bound(&self) -> MaintenanceEstimate {
-        match self {
-            Self::Flush(proposal) => proposal.conservative_bound,
-            Self::CompactOne(proposal) => proposal.conservative_bound,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdaptiveLsmMaintenanceDecision {
-    Proposal(Box<AdaptiveLsmMaintenanceProposal>),
-    NoAction(AdaptiveLsmMaintenanceNoActionReason),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdaptiveLsmMaintenanceAbortReason {
-    PreconditionsChanged,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdaptiveLsmMaintenanceOutcome {
-    Completed,
-    Aborted(AdaptiveLsmMaintenanceAbortReason),
-    InconclusiveNoWork,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdaptiveLsmMaintenanceMeasurement {
-    pub lsm_before: LsmInspection,
-    pub lsm_after: LsmInspection,
-    pub maintenance_before: LsmMaintenanceInspection,
-    pub maintenance_after: LsmMaintenanceInspection,
-    pub storage_snapshot_before: StorageSnapshotToken,
-    pub storage_snapshot_after: StorageSnapshotToken,
-    pub logical_data_version_before: StorageDataVersion,
-    pub logical_data_version_after: StorageDataVersion,
-    pub change_stream_before: ChangeStreamInspection,
-    pub change_stream_after: ChangeStreamInspection,
-    pub global_commit_seq_before: Option<DatabaseCommitSeq>,
-    pub global_commit_seq_after: Option<DatabaseCommitSeq>,
-    pub schema_generation_before: SchemaGeneration,
-    pub schema_generation_after: SchemaGeneration,
-    pub logical_rows_unchanged: bool,
-    pub obsolete_bytes: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdaptiveLsmMaintenanceExecutionReport {
-    pub proposal: AdaptiveLsmMaintenanceProposal,
-    pub action: AdaptiveLsmMaintenanceAction,
-    pub budget_before: MaintenanceBudget,
-    pub conservative_bound: MaintenanceEstimate,
-    pub estimated_cost: MaintenanceEstimate,
-    pub consumed: MaintenanceConsumption,
-    pub budget_remaining: MaintenanceBudget,
-    pub measurement: Option<AdaptiveLsmMaintenanceMeasurement>,
-    pub outcome: AdaptiveLsmMaintenanceOutcome,
-}
+use netbadb_advisor::revalidate_lsm_proposal;
+pub use netbadb_advisor::{
+    AdaptiveLsmCompactionPolicy, AdaptiveLsmCompactionProposal, AdaptiveLsmFlushPolicy,
+    AdaptiveLsmFlushProposal, AdaptiveLsmMaintenanceAbortReason, AdaptiveLsmMaintenanceAction,
+    AdaptiveLsmMaintenanceDecision, AdaptiveLsmMaintenanceExecutionReport,
+    AdaptiveLsmMaintenanceMeasurement, AdaptiveLsmMaintenanceNoActionReason,
+    AdaptiveLsmMaintenanceObservation, AdaptiveLsmMaintenanceOutcome,
+    AdaptiveLsmMaintenanceProposal,
+};
 
 #[derive(Debug)]
 pub enum AdaptiveLsmMaintenanceError {
@@ -222,128 +77,6 @@ impl From<StorageRegistryError> for AdaptiveLsmMaintenanceError {
 impl From<netbadb_storage::StorageError> for AdaptiveLsmMaintenanceError {
     fn from(error: netbadb_storage::StorageError) -> Self {
         Self::Database(error.into())
-    }
-}
-
-impl AdaptiveLsmMaintenanceObservation {
-    #[must_use]
-    pub fn decide_flush(
-        &self,
-        policy: AdaptiveLsmFlushPolicy,
-        budget: MaintenanceBudget,
-    ) -> AdaptiveLsmMaintenanceDecision {
-        let Some(candidate) = self.production_flush_candidate.as_ref() else {
-            return AdaptiveLsmMaintenanceDecision::NoAction(
-                AdaptiveLsmMaintenanceNoActionReason::NoMemtableEntries,
-            );
-        };
-        if let Some(reason) = production_blocker(candidate) {
-            return AdaptiveLsmMaintenanceDecision::NoAction(reason);
-        }
-        let threshold = self
-            .maintenance
-            .memtable_flush_threshold_bytes
-            .max(policy.minimum_memtable_bytes);
-        if self.maintenance.memtable_bytes < threshold {
-            return AdaptiveLsmMaintenanceDecision::NoAction(
-                AdaptiveLsmMaintenanceNoActionReason::MemtableBelowAutomaticThreshold,
-            );
-        }
-        if self.lsm.write_amplification.overflowed {
-            return AdaptiveLsmMaintenanceDecision::NoAction(
-                AdaptiveLsmMaintenanceNoActionReason::AutomaticBoundUnavailable,
-            );
-        }
-        let Some(bound) = self.maintenance.flush_conservative_bound else {
-            return AdaptiveLsmMaintenanceDecision::NoAction(
-                AdaptiveLsmMaintenanceNoActionReason::AutomaticBoundUnavailable,
-            );
-        };
-        let bound = maintenance_bound(bound.work_units, bound.read_bytes, bound.write_bytes);
-        if let Some(blocker) = budget_blocker(bound, budget) {
-            return AdaptiveLsmMaintenanceDecision::NoAction(
-                AdaptiveLsmMaintenanceNoActionReason::BudgetBlocked(blocker),
-            );
-        }
-        AdaptiveLsmMaintenanceDecision::Proposal(Box::new(AdaptiveLsmMaintenanceProposal::Flush(
-            AdaptiveLsmFlushProposal {
-                observed_global_commit_seq: self.observed_global_commit_seq,
-                based_on_schema_generation: self.schema_generation,
-                table_id: self.table_id,
-                storage_id: self.storage_id,
-                expected_storage_snapshot: self.storage_snapshot,
-                expected_logical_data_version: self.logical_data_version,
-                expected_layout_anchor: self.maintenance.anchor,
-                expected_memtable_entries: self.maintenance.memtable_entry_count,
-                expected_memtable_bytes: self.maintenance.memtable_bytes,
-                expected_flush_threshold_bytes: self.maintenance.memtable_flush_threshold_bytes,
-                estimated_cost: candidate.estimate,
-                conservative_bound: bound,
-                policy,
-            },
-        )))
-    }
-
-    #[must_use]
-    pub fn decide_compaction(
-        &self,
-        policy: AdaptiveLsmCompactionPolicy,
-        budget: MaintenanceBudget,
-    ) -> AdaptiveLsmMaintenanceDecision {
-        let Some(plan) = self.maintenance.next_compaction.as_ref() else {
-            return AdaptiveLsmMaintenanceDecision::NoAction(
-                AdaptiveLsmMaintenanceNoActionReason::NoCompactionPlan,
-            );
-        };
-        if self.maintenance.memtable_entry_count != 0 {
-            return AdaptiveLsmMaintenanceDecision::NoAction(
-                AdaptiveLsmMaintenanceNoActionReason::MemtableNotEmpty,
-            );
-        }
-        let Some(candidate) = self.production_compaction_candidate.as_ref() else {
-            return AdaptiveLsmMaintenanceDecision::NoAction(
-                AdaptiveLsmMaintenanceNoActionReason::NoCompactionPlan,
-            );
-        };
-        if let Some(reason) = production_blocker(candidate) {
-            return AdaptiveLsmMaintenanceDecision::NoAction(reason);
-        }
-        if plan.input_bytes < policy.minimum_input_bytes {
-            return AdaptiveLsmMaintenanceDecision::NoAction(
-                AdaptiveLsmMaintenanceNoActionReason::CompactionBelowAutomaticThreshold,
-            );
-        }
-        if self.lsm.write_amplification.overflowed {
-            return AdaptiveLsmMaintenanceDecision::NoAction(
-                AdaptiveLsmMaintenanceNoActionReason::AutomaticBoundUnavailable,
-            );
-        }
-        let bound = maintenance_bound(
-            plan.conservative_bound.work_units,
-            plan.conservative_bound.read_bytes,
-            plan.conservative_bound.write_bytes,
-        );
-        if let Some(blocker) = budget_blocker(bound, budget) {
-            return AdaptiveLsmMaintenanceDecision::NoAction(
-                AdaptiveLsmMaintenanceNoActionReason::BudgetBlocked(blocker),
-            );
-        }
-        AdaptiveLsmMaintenanceDecision::Proposal(Box::new(
-            AdaptiveLsmMaintenanceProposal::CompactOne(AdaptiveLsmCompactionProposal {
-                observed_global_commit_seq: self.observed_global_commit_seq,
-                based_on_schema_generation: self.schema_generation,
-                table_id: self.table_id,
-                storage_id: self.storage_id,
-                expected_storage_snapshot: self.storage_snapshot,
-                expected_logical_data_version: self.logical_data_version,
-                expected_layout_anchor: self.maintenance.anchor,
-                expected_memtable_entries: self.maintenance.memtable_entry_count,
-                selected_plan: plan.clone(),
-                estimated_cost: candidate.estimate,
-                conservative_bound: bound,
-                policy,
-            }),
-        ))
     }
 }
 
@@ -436,30 +169,7 @@ impl Database {
         let Some(before) = current else {
             return Ok(aborted_report(proposal, budget, estimated_cost, bound));
         };
-        let revalidated = match proposal {
-            AdaptiveLsmMaintenanceProposal::Flush(expected) => {
-                match before.decide_flush(expected.policy, budget) {
-                    AdaptiveLsmMaintenanceDecision::Proposal(current) => match *current {
-                        AdaptiveLsmMaintenanceProposal::Flush(current) => {
-                            same_flush_authority(expected, &current)
-                        }
-                        AdaptiveLsmMaintenanceProposal::CompactOne(_) => false,
-                    },
-                    AdaptiveLsmMaintenanceDecision::NoAction(_) => false,
-                }
-            }
-            AdaptiveLsmMaintenanceProposal::CompactOne(expected) => {
-                match before.decide_compaction(expected.policy, budget) {
-                    AdaptiveLsmMaintenanceDecision::Proposal(current) => match *current {
-                        AdaptiveLsmMaintenanceProposal::CompactOne(current) => {
-                            same_compaction_authority(expected, &current)
-                        }
-                        AdaptiveLsmMaintenanceProposal::Flush(_) => false,
-                    },
-                    AdaptiveLsmMaintenanceDecision::NoAction(_) => false,
-                }
-            }
-        };
+        let revalidated = revalidate_lsm_proposal(proposal, &before, budget);
         if !revalidated {
             return Ok(aborted_report(proposal, budget, estimated_cost, bound));
         }
@@ -574,80 +284,6 @@ impl Database {
         let view = storage.read_view()?;
         Ok(storage.scan_versioned_columns_with_view(&columns, &view)?)
     }
-}
-
-fn maintenance_bound(work_units: u64, read_bytes: u64, write_bytes: u64) -> MaintenanceEstimate {
-    MaintenanceEstimate {
-        work_units,
-        read_bytes,
-        write_bytes,
-    }
-}
-
-fn production_blocker(
-    candidate: &MaintenanceCandidate,
-) -> Option<AdaptiveLsmMaintenanceNoActionReason> {
-    candidate.blocker.map(|blocker| match blocker {
-        MaintenanceBlocker::ActionBudgetExhausted
-        | MaintenanceBlocker::WorkBudgetExceeded
-        | MaintenanceBlocker::ReadBudgetExceeded
-        | MaintenanceBlocker::WriteBudgetExceeded => {
-            AdaptiveLsmMaintenanceNoActionReason::BudgetBlocked(blocker)
-        }
-        _ => AdaptiveLsmMaintenanceNoActionReason::MaintenanceBlocked(blocker),
-    })
-}
-
-fn budget_blocker(
-    estimate: MaintenanceEstimate,
-    budget: MaintenanceBudget,
-) -> Option<MaintenanceBlocker> {
-    if budget.max_actions == 0 {
-        Some(MaintenanceBlocker::ActionBudgetExhausted)
-    } else if estimate.work_units > budget.max_work_units {
-        Some(MaintenanceBlocker::WorkBudgetExceeded)
-    } else if estimate.read_bytes > budget.max_read_bytes {
-        Some(MaintenanceBlocker::ReadBudgetExceeded)
-    } else if estimate.write_bytes > budget.max_write_bytes {
-        Some(MaintenanceBlocker::WriteBudgetExceeded)
-    } else {
-        None
-    }
-}
-
-fn same_flush_authority(
-    expected: &AdaptiveLsmFlushProposal,
-    current: &AdaptiveLsmFlushProposal,
-) -> bool {
-    expected.based_on_schema_generation == current.based_on_schema_generation
-        && expected.table_id == current.table_id
-        && expected.storage_id == current.storage_id
-        && expected.expected_storage_snapshot == current.expected_storage_snapshot
-        && expected.expected_logical_data_version == current.expected_logical_data_version
-        && expected.expected_layout_anchor == current.expected_layout_anchor
-        && expected.expected_memtable_entries == current.expected_memtable_entries
-        && expected.expected_memtable_bytes == current.expected_memtable_bytes
-        && expected.expected_flush_threshold_bytes == current.expected_flush_threshold_bytes
-        && expected.estimated_cost == current.estimated_cost
-        && expected.conservative_bound == current.conservative_bound
-        && expected.policy == current.policy
-}
-
-fn same_compaction_authority(
-    expected: &AdaptiveLsmCompactionProposal,
-    current: &AdaptiveLsmCompactionProposal,
-) -> bool {
-    expected.based_on_schema_generation == current.based_on_schema_generation
-        && expected.table_id == current.table_id
-        && expected.storage_id == current.storage_id
-        && expected.expected_storage_snapshot == current.expected_storage_snapshot
-        && expected.expected_logical_data_version == current.expected_logical_data_version
-        && expected.expected_layout_anchor == current.expected_layout_anchor
-        && expected.expected_memtable_entries == current.expected_memtable_entries
-        && expected.selected_plan == current.selected_plan
-        && expected.estimated_cost == current.estimated_cost
-        && expected.conservative_bound == current.conservative_bound
-        && expected.policy == current.policy
 }
 
 fn measured_consumption(

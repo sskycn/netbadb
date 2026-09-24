@@ -101,9 +101,17 @@ compiler -> hir + parser + rel + schema + types
 tooling -> compiler + hir + parser + schema
 planner -> index + rel + types
 index -> types
-storage -> index + schema + types
-executor -> planner + rel + storage + types
-core -> compiler + inspect + planner + rel + executor + storage + schema + types
+storage-api -> index + types
+row-codec -> schema + types
+change-stream -> storage-api + row-codec + schema + types
+lsm -> change-stream + storage-api + row-codec + index + schema + types
+columnar -> change-stream + storage-api + index + schema + types
+heap -> change-stream + storage-api + row-codec + index + schema + types
+storage -> heap + lsm + columnar + change-stream + storage-api
+query-feedback -> planner + rel + storage-api + types
+advisor -> lsm + columnar + change-stream + storage-api + types
+executor -> query-feedback + planner + rel + storage + types
+core -> advisor + query-feedback + compiler + inspect + planner + rel + executor + storage + schema + types
 protocol -> types
 client -> protocol + schema + types
 server -> core + protocol + schema + types

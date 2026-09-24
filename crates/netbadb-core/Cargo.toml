@@ -9,6 +9,8 @@ rust-version.workspace = true
 test-hooks = ["netbadb-storage/test-hooks"]
 
 [dependencies]
+netbadb-advisor = { path = "../netbadb-advisor" }
+netbadb-query-feedback = { path = "../netbadb-query-feedback" }
 crc32c.workspace = true
 getrandom.workspace = true
 sha2.workspace = true

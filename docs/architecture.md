@@ -32,10 +32,25 @@ netbadb-tooling -> netbadb-compiler + netbadb-hir + netbadb-parser
                     + netbadb-schema
 netbadb-index -> netbadb-types
 netbadb-planner -> netbadb-index + netbadb-rel + netbadb-types
-netbadb-storage -> netbadb-index + netbadb-schema + netbadb-types
-netbadb-executor -> netbadb-planner + netbadb-rel + netbadb-storage
+netbadb-storage-api -> netbadb-index + netbadb-types
+netbadb-row-codec -> netbadb-schema + netbadb-types
+netbadb-change-stream -> netbadb-storage-api + netbadb-row-codec
+                         + netbadb-schema + netbadb-types
+netbadb-lsm -> netbadb-change-stream + netbadb-storage-api + netbadb-row-codec
+               + netbadb-index + netbadb-schema + netbadb-types
+netbadb-columnar -> netbadb-change-stream + netbadb-storage-api + netbadb-index
+                    + netbadb-schema + netbadb-types
+netbadb-heap -> netbadb-change-stream + netbadb-storage-api + netbadb-row-codec
+                + netbadb-index + netbadb-schema + netbadb-types
+netbadb-storage -> netbadb-heap + netbadb-lsm + netbadb-columnar
+                   + netbadb-change-stream + netbadb-storage-api + netbadb-row-codec
+                   + netbadb-index + netbadb-schema + netbadb-types
+netbadb-query-feedback -> netbadb-planner + netbadb-rel + netbadb-storage-api + netbadb-types
+netbadb-advisor -> netbadb-lsm + netbadb-columnar + netbadb-change-stream
+                   + netbadb-storage-api + netbadb-types
+netbadb-executor -> netbadb-query-feedback + netbadb-planner + netbadb-rel + netbadb-storage
                     + netbadb-types
-netbadb-core -> compiler + inspect + planner + rel + executor + storage
+netbadb-core -> advisor + query-feedback + compiler + inspect + planner + rel + executor + storage
                  + schema + types
 netbadb-protocol -> netbadb-types
 netbadb-client -> netbadb-protocol + netbadb-schema + netbadb-types

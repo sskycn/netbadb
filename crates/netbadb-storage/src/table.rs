@@ -1,5 +1,7 @@
+use crate::{AccessPathCapabilities, StorageAccessPath, StorageKind, StorageVisibilityBoundary};
+use netbadb_storage_api::validate_visibility_boundary;
 use std::ops::ControlFlow;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use netbadb_index::{BTreeHandle, IndexDefinition, IndexRange, IndexStatistics, TableStatistics};
 use netbadb_schema::TableDef;
@@ -9,203 +11,35 @@ use netbadb_types::{
 };
 
 use crate::{
-    HeapIdentityInspection, HeapRecoveryInspection, HeapStorage, IsolationLevel,
-    LsmIdentityInspection, LsmInspection, LsmReadView, LsmRecoveryInspection, LsmRowHandle,
+    HeapIdentityInspection, HeapPhysicalDesignSourceInspection, HeapRecoveryInspection,
+    HeapRewriteIndexes, HeapStorage, IsolationLevel, LsmIdentityInspection, LsmInspection,
+    LsmPhysicalDesignSourceInspection, LsmReadView, LsmRecoveryInspection, LsmRowHandle,
     LsmStorage, LsmTransaction, PreparedTxnResolution, PresenceCountSummary, ReadView,
     StorageError, StorageSnapshotToken, Transaction, TransactionError, TransactionState,
 };
 
-/// Logical index identity copied into a private replacement Heap.
-/// Physical BTree handles are intentionally replaced.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeapRewriteIndex {
-    pub id: IndexId,
-    pub name: Option<IndexName>,
-    pub column_id: ColumnId,
+enum VisitError<E> {
+    Heap(netbadb_heap::HeapStorageError),
+    Lsm(netbadb_lsm::LsmStorageError),
+    Visitor(E),
 }
 
-/// Active index inventory plus its durable allocation boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeapRewriteIndexes {
-    pub active: Vec<HeapRewriteIndex>,
-    pub next_index_id: IndexId,
-}
-
-/// One exact file owned by a single Heap storage resource.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeapResourceComponentKind {
-    Main,
-    Wal,
-    TransactionStatus,
-    AlternateWal,
-    ChangeLog,
-    ChangeStreamGuard,
-}
-
-/// Storage-authored physical bundle member. Callers may add their own
-/// higher-layer metadata, but must not infer Heap suffixes independently.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeapResourceComponent {
-    pub kind: HeapResourceComponentKind,
-    pub path: PathBuf,
-    pub required: bool,
-}
-
-/// Returns the complete, exact set of files owned by one Heap implementation.
-/// Index-catalog and BTree pages are contained in `Main`.
-#[must_use]
-pub fn heap_resource_components(path: impl AsRef<Path>) -> Vec<HeapResourceComponent> {
-    let main = path.as_ref();
-    let wal = crate::wal_path(main);
-    vec![
-        HeapResourceComponent {
-            kind: HeapResourceComponentKind::Main,
-            path: main.to_owned(),
-            required: true,
-        },
-        HeapResourceComponent {
-            kind: HeapResourceComponentKind::Wal,
-            path: wal.clone(),
-            required: true,
-        },
-        HeapResourceComponent {
-            kind: HeapResourceComponentKind::TransactionStatus,
-            path: crate::txn_status_path(main),
-            required: true,
-        },
-        HeapResourceComponent {
-            kind: HeapResourceComponentKind::AlternateWal,
-            path: crate::wal_alternate_path(wal),
-            required: false,
-        },
-        HeapResourceComponent {
-            kind: HeapResourceComponentKind::ChangeLog,
-            path: crate::heap_change_log_path(main),
-            required: false,
-        },
-        HeapResourceComponent {
-            kind: HeapResourceComponentKind::ChangeStreamGuard,
-            path: crate::change_stream_guard_path(crate::heap_change_log_path(main)),
-            required: false,
-        },
-    ]
-}
-
-/// Executable capabilities advertised by one table-scoped access path.
-///
-/// These properties describe operations available to planning and execution;
-/// they do not expose the access method's persistent representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AccessPathCapabilities {
-    pub point_lookup: bool,
-    pub range_lookup: bool,
-    /// Results are deterministic in access-key then storage row-identity order.
-    pub ordered: bool,
-}
-
-/// Storage-owned weights in neutral integer planning-work units.
-///
-/// One unit is conventionally comparable to one managed sequential-page unit
-/// from [`TableStatistics::managed_page_count`]; these values are neither
-/// elapsed time nor persistent page identities. `point_probe_base_cost` is the
-/// fixed CPU/access-method startup for one probe, excluding source reads and
-/// returned rows. `expected_point_io` is the engine's expected count of
-/// candidate-source reads for one point probe in the same neutral scale.
-/// `range_startup_cost` is the fixed access-method work before a range returns
-/// candidates. `sequential_unit_cost` converts each returned candidate row to
-/// the same scale. Engines must not encode outer-row thresholds or measured
-/// nanoseconds in these fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StorageAccessCostHints {
-    pub point_probe_base_cost: u32,
-    pub expected_point_io: u32,
-    pub range_startup_cost: u32,
-    pub sequential_unit_cost: u32,
-}
-
-/// Storage-owned optimizer snapshot for one registered access method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StorageAccessPath {
-    pub id: AccessPathId,
-    pub column_id: ColumnId,
-    pub capabilities: AccessPathCapabilities,
-    pub statistics: Option<IndexStatistics>,
-    pub cost_hints: Option<StorageAccessCostHints>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum StorageKind {
-    Heap,
-    Lsm,
-}
-
-/// Current main-file geometry, independent of optimizer ANALYZE snapshots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeapPhysicalDesignSourceInspection {
-    pub storage_id: StorageId,
-    /// Committed read horizon only; this is not a physical-layout token.
-    pub visibility_boundary: StorageVisibilityBoundary,
-    /// All managed pages, including access-method/catalog/free pages that the
-    /// production sequential scan validates and skips. No row-count claim.
-    pub managed_page_upper_bound: u64,
-    /// Maximum rows a valid production scan could emit from the current page
-    /// geometry. This is deliberately not a current live-row count.
-    pub row_upper_bound: u64,
-    /// Full aligned main-file extent, including its header. A format-level
-    /// source footprint, not device I/O, cache misses, or elapsed time.
-    pub main_file_bytes_upper_bound: u64,
-    /// One production Index backfill pass starts after empty-tree allocation
-    /// and bounded pre-scan catalog growth (including legacy re-encoding).
-    /// Excludes allocator/catalog traversal, tree inserts and output writes.
-    pub index_backfill_page_upper_bound: u64,
-    /// Main-file extent addressable by that backfill pass, including bounded
-    /// pre-scan growth. Later tree splits are outside its fixed limit.
-    pub index_backfill_bytes_upper_bound: u64,
-}
-
-/// Exact current runtime/manifest structure; versions and tombstones count as
-/// physical entries, never as current logical rows. No source rows are read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LsmPhysicalDesignSourceInspection {
-    pub anchor: crate::LsmMaintenanceAnchor,
-    pub visibility_boundary: StorageVisibilityBoundary,
-    pub memtable_entry_count: u64,
-    /// Resident encoded-payload accounting (40 bytes per version plus value
-    /// length), not allocator/RSS usage and not persistent read I/O.
-    pub memtable_bytes: u64,
-    pub sstable_count: u64,
-    pub sstable_entry_count: u64,
-    /// Current persistent SSTable file extents. One full source traversal
-    /// reads only blocks inside these files, at most once per block.
-    pub total_sstable_bytes: u64,
-    /// Existing production flush theorem. None means precisely an empty
-    /// MemTable (no flush output), not an unknown or zero resource bound.
-    pub flush_conservative_bound: Option<crate::LsmMaintenanceBoundInspection>,
-}
-
-impl LsmPhysicalDesignSourceInspection {
-    /// Physical versions and tombstones are included, so visible rows can only
-    /// be fewer than this current structural bound.
-    pub fn row_upper_bound(self) -> Result<u64, StorageError> {
-        self.sstable_entry_count
-            .checked_add(self.memtable_entry_count)
-            .ok_or(StorageError::ResourceBoundOverflow {
-                resource: "LSM source row",
-            })
+impl<E> From<netbadb_heap::HeapStorageError> for VisitError<E> {
+    fn from(error: netbadb_heap::HeapStorageError) -> Self {
+        Self::Heap(error)
     }
-
-    /// Bounds the persistent SSTable extent that Snapshot capture can scan
-    /// after its ordinary pre-scan flush. The existing flush theorem describes
-    /// the one newly added SSTable; that flush performs no compaction.
-    pub fn prospective_snapshot_sstable_bytes_upper_bound(self) -> Result<u64, StorageError> {
-        match self.flush_conservative_bound {
-            None => Ok(self.total_sstable_bytes),
-            Some(flush) => self
-                .total_sstable_bytes
-                .checked_add(flush.write_bytes)
-                .ok_or(StorageError::ResourceBoundOverflow {
-                    resource: "prospective Snapshot LSM SSTable bytes",
-                }),
+}
+impl<E> From<netbadb_lsm::LsmStorageError> for VisitError<E> {
+    fn from(error: netbadb_lsm::LsmStorageError) -> Self {
+        Self::Lsm(error)
+    }
+}
+impl<E: From<StorageError>> VisitError<E> {
+    fn into_caller_error(self) -> E {
+        match self {
+            Self::Heap(error) => E::from(StorageError::from(error)),
+            Self::Lsm(error) => E::from(StorageError::from(error)),
+            Self::Visitor(error) => error,
         }
     }
 }
@@ -216,96 +50,6 @@ impl LsmPhysicalDesignSourceInspection {
 pub enum StoragePhysicalDesignSourceInspection {
     Heap(HeapPhysicalDesignSourceInspection),
     Lsm(LsmPhysicalDesignSourceInspection),
-}
-
-/// Opaque committed visibility boundary for one physical storage.
-///
-/// The numeric value is meaningful only with both the storage identity and
-/// engine kind. Value zero is reserved; an empty engine's local horizon zero
-/// is encoded as boundary value one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct StorageVisibilityBoundary {
-    storage_id: StorageId,
-    storage_kind: StorageKind,
-    value: u64,
-}
-
-impl StorageVisibilityBoundary {
-    pub fn new(
-        storage_id: StorageId,
-        storage_kind: StorageKind,
-        value: u64,
-    ) -> Result<Self, StorageError> {
-        if storage_id.0 == 0 || value == 0 {
-            return Err(StorageError::InvalidVisibilityBoundary { storage_id, value });
-        }
-        Ok(Self {
-            storage_id,
-            storage_kind,
-            value,
-        })
-    }
-
-    #[must_use]
-    pub const fn storage_id(self) -> StorageId {
-        self.storage_id
-    }
-
-    #[must_use]
-    pub const fn storage_kind(self) -> StorageKind {
-        self.storage_kind
-    }
-
-    #[must_use]
-    pub const fn value(self) -> u64 {
-        self.value
-    }
-
-    pub(crate) fn from_local_horizon(
-        storage_id: StorageId,
-        storage_kind: StorageKind,
-        horizon: u64,
-    ) -> Result<Self, StorageError> {
-        let value = horizon
-            .checked_add(1)
-            .ok_or(StorageError::VisibilityBoundaryExhausted { storage_id })?;
-        Self::new(storage_id, storage_kind, value)
-    }
-
-    fn local_horizon(self) -> u64 {
-        self.value - 1
-    }
-}
-
-fn validate_visibility_boundary(
-    expected_storage_id: StorageId,
-    expected_kind: StorageKind,
-    current_horizon: u64,
-    boundary: StorageVisibilityBoundary,
-) -> Result<(), StorageError> {
-    if boundary.storage_id != expected_storage_id || boundary.storage_kind != expected_kind {
-        return Err(StorageError::VisibilityBoundaryContextMismatch {
-            expected_storage_id,
-            actual_storage_id: boundary.storage_id,
-            expected_kind,
-            actual_kind: boundary.storage_kind,
-        });
-    }
-    let current_value =
-        current_horizon
-            .checked_add(1)
-            .ok_or(StorageError::VisibilityBoundaryExhausted {
-                storage_id: expected_storage_id,
-            })?;
-    let requested_horizon = boundary.local_horizon();
-    if requested_horizon > current_horizon {
-        return Err(StorageError::FutureVisibilityBoundary {
-            storage_id: expected_storage_id,
-            requested: boundary.value,
-            current: current_value,
-        });
-    }
-    Ok(())
 }
 
 /// Opaque executor identity for a physical row version.
@@ -393,24 +137,13 @@ impl StorageRowHandle {
                 storage_id: self.storage_id,
                 row_id,
             }),
-            StorageRowHandleKind::Lsm(row) => match row.observed {
-                crate::lsm::LsmObservedVersion::Committed(version) if version.0 != 0 => {
-                    Ok(crate::StorageVersionKey::Lsm {
-                        storage_id: self.storage_id,
-                        row_id: row.row_id,
-                        version,
-                    })
-                }
-                crate::lsm::LsmObservedVersion::Committed(_) => Err(StorageError::InvalidFormat(
-                    "committed LSM row has zero commit sequence".into(),
-                )),
-                crate::lsm::LsmObservedVersion::Pending(_) => {
-                    Err(StorageError::UnsupportedOperation {
-                        operation: "version identity for an uncommitted LSM row",
-                        storage_kind: "LSM",
-                    })
-                }
-            },
+            StorageRowHandleKind::Lsm(row) => row
+                .committed_version_key(self.storage_id)
+                .map_err(StorageError::from)?
+                .ok_or(StorageError::UnsupportedOperation {
+                    operation: "version identity for an uncommitted LSM row",
+                    storage_kind: "LSM",
+                }),
         }
     }
 }
@@ -732,7 +465,7 @@ impl StorageTransaction {
                 (StorageKind::Lsm, transaction.current_commit_seq().0)
             }
         };
-        validate_visibility_boundary(self.storage_id, kind, current, boundary)
+        validate_visibility_boundary(self.storage_id, kind, current, boundary).map_err(Into::into)
     }
 
     pub fn current_visibility_boundary(&self) -> Result<StorageVisibilityBoundary, StorageError> {
@@ -743,6 +476,7 @@ impl StorageTransaction {
                     StorageKind::Heap,
                     transaction.current_commit_seq().0,
                 )
+                .map_err(Into::into)
             }
             StorageTransactionKind::Lsm(transaction) => {
                 StorageVisibilityBoundary::from_local_horizon(
@@ -750,21 +484,22 @@ impl StorageTransaction {
                     StorageKind::Lsm,
                     transaction.current_commit_seq().0,
                 )
+                .map_err(Into::into)
             }
         }
     }
 
     pub fn commit(&mut self) -> Result<(), StorageError> {
         match &mut self.inner {
-            StorageTransactionKind::Heap(txn) => txn.commit(),
-            StorageTransactionKind::Lsm(txn) => txn.commit(),
+            StorageTransactionKind::Heap(txn) => txn.commit().map_err(Into::into),
+            StorageTransactionKind::Lsm(txn) => txn.commit().map_err(Into::into),
         }
     }
 
     pub fn prepare(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
         match &mut self.inner {
-            StorageTransactionKind::Heap(txn) => txn.prepare(database_txn_id),
-            StorageTransactionKind::Lsm(txn) => txn.prepare(database_txn_id),
+            StorageTransactionKind::Heap(txn) => txn.prepare(database_txn_id).map_err(Into::into),
+            StorageTransactionKind::Lsm(txn) => txn.prepare(database_txn_id).map_err(Into::into),
         }
     }
 
@@ -776,8 +511,12 @@ impl StorageTransaction {
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
         match &mut self.inner {
-            StorageTransactionKind::Heap(txn) => txn.stage_group_prepare(database_txn_id),
-            StorageTransactionKind::Lsm(txn) => txn.stage_group_prepare(database_txn_id),
+            StorageTransactionKind::Heap(txn) => {
+                txn.stage_group_prepare(database_txn_id).map_err(Into::into)
+            }
+            StorageTransactionKind::Lsm(txn) => {
+                txn.stage_group_prepare(database_txn_id).map_err(Into::into)
+            }
         }
     }
 
@@ -789,12 +528,12 @@ impl StorageTransaction {
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
         match &mut self.inner {
-            StorageTransactionKind::Heap(txn) => {
-                txn.stage_group_prepare_with_batched_change_stream(database_txn_id)
-            }
-            StorageTransactionKind::Lsm(txn) => {
-                txn.stage_group_prepare_with_batched_change_stream(database_txn_id)
-            }
+            StorageTransactionKind::Heap(txn) => txn
+                .stage_group_prepare_with_batched_change_stream(database_txn_id)
+                .map_err(Into::into),
+            StorageTransactionKind::Lsm(txn) => txn
+                .stage_group_prepare_with_batched_change_stream(database_txn_id)
+                .map_err(Into::into),
         }
     }
 
@@ -828,15 +567,23 @@ impl StorageTransaction {
 
     pub fn park_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
         match &mut self.inner {
-            StorageTransactionKind::Heap(txn) => txn.park_prepared(database_txn_id),
-            StorageTransactionKind::Lsm(txn) => txn.park_prepared(database_txn_id),
+            StorageTransactionKind::Heap(txn) => {
+                txn.park_prepared(database_txn_id).map_err(Into::into)
+            }
+            StorageTransactionKind::Lsm(txn) => {
+                txn.park_prepared(database_txn_id).map_err(Into::into)
+            }
         }
     }
 
     pub fn commit_prepared(&mut self, database_txn_id: DatabaseTxnId) -> Result<(), StorageError> {
         match &mut self.inner {
-            StorageTransactionKind::Heap(txn) => txn.commit_prepared(database_txn_id),
-            StorageTransactionKind::Lsm(txn) => txn.commit_prepared(database_txn_id),
+            StorageTransactionKind::Heap(txn) => {
+                txn.commit_prepared(database_txn_id).map_err(Into::into)
+            }
+            StorageTransactionKind::Lsm(txn) => {
+                txn.commit_prepared(database_txn_id).map_err(Into::into)
+            }
         }
     }
 
@@ -1205,15 +952,19 @@ impl StorageTransaction {
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
         match &mut self.inner {
-            StorageTransactionKind::Heap(txn) => txn.rollback_prepared(database_txn_id),
-            StorageTransactionKind::Lsm(txn) => txn.rollback_prepared(database_txn_id),
+            StorageTransactionKind::Heap(txn) => {
+                txn.rollback_prepared(database_txn_id).map_err(Into::into)
+            }
+            StorageTransactionKind::Lsm(txn) => {
+                txn.rollback_prepared(database_txn_id).map_err(Into::into)
+            }
         }
     }
 
     pub fn rollback(&mut self) -> Result<(), StorageError> {
         match &mut self.inner {
-            StorageTransactionKind::Heap(txn) => txn.rollback(),
-            StorageTransactionKind::Lsm(txn) => txn.rollback(),
+            StorageTransactionKind::Heap(txn) => txn.rollback().map_err(Into::into),
+            StorageTransactionKind::Lsm(txn) => txn.rollback().map_err(Into::into),
         }
     }
 
@@ -1271,10 +1022,12 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => storage
                 .inspect_physical_design_source()
-                .map(StoragePhysicalDesignSourceInspection::Heap),
+                .map(StoragePhysicalDesignSourceInspection::Heap)
+                .map_err(Into::into),
             Self::Lsm(storage) => storage
                 .inspect_physical_design_source()
-                .map(StoragePhysicalDesignSourceInspection::Lsm),
+                .map(StoragePhysicalDesignSourceInspection::Lsm)
+                .map_err(Into::into),
         }
     }
 
@@ -1291,13 +1044,17 @@ impl TableStorage {
     ) -> Result<Option<crate::LsmMaintenanceInspection>, StorageError> {
         match self {
             Self::Heap(_) => Ok(None),
-            Self::Lsm(storage) => storage.maintenance_inspection().map(Some),
+            Self::Lsm(storage) => storage
+                .maintenance_inspection()
+                .map(Some)
+                .map_err(Into::into),
         }
     }
     pub fn create_heap(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
         HeapStorage::create(path, table)
             .map(Box::new)
             .map(Self::Heap)
+            .map_err(Into::into)
     }
 
     pub fn create_heap_with_storage_id(
@@ -1308,10 +1065,14 @@ impl TableStorage {
         HeapStorage::create_with_storage_id(path, table, storage_id)
             .map(Box::new)
             .map(Self::Heap)
+            .map_err(Into::into)
     }
 
     pub fn open_heap(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
-        HeapStorage::open(path, table).map(Box::new).map(Self::Heap)
+        HeapStorage::open(path, table)
+            .map(Box::new)
+            .map(Self::Heap)
+            .map_err(Into::into)
     }
 
     pub fn open_heap_with_prepared_resolutions(
@@ -1322,19 +1083,20 @@ impl TableStorage {
         HeapStorage::open_with_prepared_resolutions(path, table, resolutions)
             .map(Box::new)
             .map(Self::Heap)
+            .map_err(Into::into)
     }
 
     pub fn inspect_heap_recovery(
         path: impl AsRef<Path>,
         table: &TableDef,
     ) -> Result<HeapRecoveryInspection, StorageError> {
-        HeapStorage::inspect_recovery(path, table)
+        HeapStorage::inspect_recovery(path, table).map_err(Into::into)
     }
 
     pub fn inspect_heap_identity(
         path: impl AsRef<Path>,
     ) -> Result<HeapIdentityInspection, StorageError> {
-        HeapStorage::inspect_identity(path)
+        HeapStorage::inspect_identity(path).map_err(Into::into)
     }
 
     pub fn create_lsm(
@@ -1342,7 +1104,9 @@ impl TableStorage {
         table: TableDef,
         clustering_column: ColumnId,
     ) -> Result<Self, StorageError> {
-        LsmStorage::create(root, table, clustering_column).map(Self::Lsm)
+        LsmStorage::create(root, table, clustering_column)
+            .map(Self::Lsm)
+            .map_err(Into::into)
     }
 
     pub fn create_lsm_with_storage_id(
@@ -1353,10 +1117,13 @@ impl TableStorage {
     ) -> Result<Self, StorageError> {
         LsmStorage::create_with_storage_id(root, table, clustering_column, storage_id)
             .map(Self::Lsm)
+            .map_err(Into::into)
     }
 
     pub fn open_lsm(root: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
-        LsmStorage::open(root, table).map(Self::Lsm)
+        LsmStorage::open(root, table)
+            .map(Self::Lsm)
+            .map_err(Into::into)
     }
 
     pub fn open_lsm_with_prepared_resolutions(
@@ -1364,20 +1131,22 @@ impl TableStorage {
         table: TableDef,
         resolutions: &[PreparedTxnResolution],
     ) -> Result<Self, StorageError> {
-        LsmStorage::open_with_prepared_resolutions(root, table, resolutions).map(Self::Lsm)
+        LsmStorage::open_with_prepared_resolutions(root, table, resolutions)
+            .map(Self::Lsm)
+            .map_err(Into::into)
     }
 
     pub fn inspect_lsm_recovery(
         root: impl AsRef<Path>,
         table: &TableDef,
     ) -> Result<LsmRecoveryInspection, StorageError> {
-        LsmStorage::inspect_recovery(root, table)
+        LsmStorage::inspect_recovery(root, table).map_err(Into::into)
     }
 
     pub fn inspect_lsm_identity(
         root: impl AsRef<Path>,
     ) -> Result<LsmIdentityInspection, StorageError> {
-        LsmStorage::inspect_identity(root)
+        LsmStorage::inspect_identity(root).map_err(Into::into)
     }
 
     #[must_use]
@@ -1404,7 +1173,9 @@ impl TableStorage {
         target: TableDef,
     ) -> Result<(), StorageError> {
         match self {
-            Self::Heap(storage) => storage.retarget_private_schema(expected, target),
+            Self::Heap(storage) => storage
+                .retarget_private_schema(expected, target)
+                .map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "private Heap schema retarget",
                 storage_kind: "LSM",
@@ -1439,6 +1210,7 @@ impl TableStorage {
                 storage.current_commit_seq().0,
             ),
         }
+        .map_err(Into::into)
     }
 
     /// Opens a committed read view at a previously captured local boundary.
@@ -1448,8 +1220,8 @@ impl TableStorage {
     ) -> Result<StorageReadView, StorageError> {
         let current = self.current_visibility_boundary()?;
         validate_visibility_boundary(
-            current.storage_id,
-            current.storage_kind,
+            current.storage_id(),
+            current.storage_kind(),
             current.local_horizon(),
             boundary,
         )?;
@@ -1478,22 +1250,22 @@ impl TableStorage {
 
     pub fn enable_change_stream(&mut self) -> Result<crate::ChangeStreamCursor, StorageError> {
         match self {
-            Self::Heap(storage) => storage.enable_change_stream(),
-            Self::Lsm(storage) => storage.enable_change_stream(),
+            Self::Heap(storage) => storage.enable_change_stream().map_err(Into::into),
+            Self::Lsm(storage) => storage.enable_change_stream().map_err(Into::into),
         }
     }
 
     pub fn disable_change_stream(&mut self) -> Result<(), StorageError> {
         match self {
-            Self::Heap(storage) => storage.disable_change_stream(),
-            Self::Lsm(storage) => storage.disable_change_stream(),
+            Self::Heap(storage) => storage.disable_change_stream().map_err(Into::into),
+            Self::Lsm(storage) => storage.disable_change_stream().map_err(Into::into),
         }
     }
 
     pub fn change_stream_cursor(&self) -> Result<crate::ChangeStreamCursor, StorageError> {
         match self {
-            Self::Heap(storage) => storage.change_stream_cursor(),
-            Self::Lsm(storage) => storage.change_stream_cursor(),
+            Self::Heap(storage) => storage.change_stream_cursor().map_err(Into::into),
+            Self::Lsm(storage) => storage.change_stream_cursor().map_err(Into::into),
         }
     }
 
@@ -1510,8 +1282,12 @@ impl TableStorage {
         max_bytes: u64,
     ) -> Result<crate::ChangeReadResult, StorageError> {
         match self {
-            Self::Heap(storage) => storage.read_changes(cursor, max_batches, max_bytes),
-            Self::Lsm(storage) => storage.read_changes(cursor, max_batches, max_bytes),
+            Self::Heap(storage) => storage
+                .read_changes(cursor, max_batches, max_bytes)
+                .map_err(Into::into),
+            Self::Lsm(storage) => storage
+                .read_changes(cursor, max_batches, max_bytes)
+                .map_err(Into::into),
         }
     }
 
@@ -1520,8 +1296,12 @@ impl TableStorage {
         cursor: crate::ChangeStreamCursor,
     ) -> Result<crate::ChangeStreamRetentionPin, StorageError> {
         match self {
-            Self::Heap(storage) => storage.acquire_change_stream_retention_pin(cursor),
-            Self::Lsm(storage) => storage.acquire_change_stream_retention_pin(cursor),
+            Self::Heap(storage) => storage
+                .acquire_change_stream_retention_pin(cursor)
+                .map_err(Into::into),
+            Self::Lsm(storage) => storage
+                .acquire_change_stream_retention_pin(cursor)
+                .map_err(Into::into),
         }
     }
 
@@ -1531,8 +1311,12 @@ impl TableStorage {
         frontier: netbadb_types::StorageDataVersion,
     ) -> Result<(), StorageError> {
         match self {
-            Self::Heap(storage) => storage.advance_change_stream_retention_pin(pin, frontier),
-            Self::Lsm(storage) => storage.advance_change_stream_retention_pin(pin, frontier),
+            Self::Heap(storage) => storage
+                .advance_change_stream_retention_pin(pin, frontier)
+                .map_err(Into::into),
+            Self::Lsm(storage) => storage
+                .advance_change_stream_retention_pin(pin, frontier)
+                .map_err(Into::into),
         }
     }
 
@@ -1541,8 +1325,8 @@ impl TableStorage {
         frontier: netbadb_types::StorageDataVersion,
     ) -> Result<crate::ChangeStreamGcStorageReport, StorageError> {
         match self {
-            Self::Heap(storage) => storage.gc_change_stream(frontier),
-            Self::Lsm(storage) => storage.gc_change_stream(frontier),
+            Self::Heap(storage) => storage.gc_change_stream(frontier).map_err(Into::into),
+            Self::Lsm(storage) => storage.gc_change_stream(frontier).map_err(Into::into),
         }
     }
 
@@ -1636,12 +1420,12 @@ impl TableStorage {
         transaction: &StorageTransaction,
     ) -> Result<(), StorageError> {
         match self {
-            Self::Heap(storage) => {
-                storage.validate_transaction(transaction.heap_transaction(storage.table().id)?)
-            }
-            Self::Lsm(storage) => {
-                storage.validate_transaction(transaction.lsm_transaction(storage.table().id)?)
-            }
+            Self::Heap(storage) => storage
+                .validate_transaction(transaction.heap_transaction(storage.table().id)?)
+                .map_err(Into::into),
+            Self::Lsm(storage) => storage
+                .validate_transaction(transaction.lsm_transaction(storage.table().id)?)
+                .map_err(Into::into),
         }
     }
 
@@ -1652,12 +1436,14 @@ impl TableStorage {
                 storage
                     .insert(values)
                     .map(|row_id| StorageRowHandle::heap(table_id, storage.storage_id(), row_id))
+                    .map_err(Into::into)
             }
             Self::Lsm(storage) => {
                 let table_id = storage.table().id;
                 storage
                     .insert(values)
                     .map(|row| StorageRowHandle::lsm(table_id, storage.storage_id(), row))
+                    .map_err(Into::into)
             }
         }
     }
@@ -1695,11 +1481,15 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
-                storage.delete(row.heap_row_id(table_id, storage.storage_id())?)
+                storage
+                    .delete(row.heap_row_id(table_id, storage.storage_id())?)
+                    .map_err(Into::into)
             }
             Self::Lsm(storage) => {
                 let table_id = storage.table().id;
-                storage.delete(row.lsm_handle(table_id, storage.storage_id())?)
+                storage
+                    .delete(row.lsm_handle(table_id, storage.storage_id())?)
+                    .map_err(Into::into)
             }
         }
     }
@@ -1771,15 +1561,19 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
-                storage.delete_in(
-                    transaction.heap_transaction_mut(table_id)?,
-                    row.heap_row_id(table_id, storage.storage_id())?,
-                )
+                storage
+                    .delete_in(
+                        transaction.heap_transaction_mut(table_id)?,
+                        row.heap_row_id(table_id, storage.storage_id())?,
+                    )
+                    .map_err(Into::into)
             }
             Self::Lsm(storage) => {
                 let table_id = storage.table().id;
                 let row = row.lsm_handle(table_id, storage.storage_id())?;
-                storage.delete_in(transaction.lsm_transaction_mut(table_id)?, row)
+                storage
+                    .delete_in(transaction.lsm_transaction_mut(table_id)?, row)
+                    .map_err(Into::into)
             }
         }
     }
@@ -1860,25 +1654,31 @@ impl TableStorage {
                 let table_id = storage.table().id;
                 let storage_id = storage.storage_id();
                 let view = view.heap_view(table_id).map_err(E::from)?;
-                storage.visit_row_scalar_refs_with_presence_view_control(
-                    columns,
-                    &[],
-                    view,
-                    |row_id, values, _presence| {
-                        visitor(
-                            StorageRowHandle::heap(table_id, storage_id, row_id),
-                            values.iter().copied().map(ScalarRef::to_owned).collect(),
-                        )
-                    },
-                )
+                storage
+                    .visit_row_scalar_refs_with_presence_view_control(
+                        columns,
+                        &[],
+                        view,
+                        |row_id, values, _presence| {
+                            visitor(
+                                StorageRowHandle::heap(table_id, storage_id, row_id),
+                                values.iter().copied().map(ScalarRef::to_owned).collect(),
+                            )
+                            .map_err(VisitError::Visitor)
+                        },
+                    )
+                    .map_err(VisitError::into_caller_error)
             }
             Self::Lsm(storage) => {
                 let table_id = storage.table().id;
                 let storage_id = storage.storage_id();
                 let view = view.lsm_view(table_id).map_err(E::from)?;
-                storage.visit_columns_with_view_control(columns, view, |row, values| {
-                    visitor(StorageRowHandle::lsm(table_id, storage_id, row), values)
-                })
+                storage
+                    .visit_columns_with_view_control(columns, view, |row, values| {
+                        visitor(StorageRowHandle::lsm(table_id, storage_id, row), values)
+                            .map_err(VisitError::Visitor)
+                    })
+                    .map_err(VisitError::into_caller_error)
             }
         }
     }
@@ -1985,12 +1785,12 @@ impl TableStorage {
         view: &StorageReadView,
     ) -> Result<PresenceCountSummary, StorageError> {
         match self {
-            Self::Heap(storage) => {
-                storage.scan_presence_counts_with_view(columns, view.heap_view(storage.table().id)?)
-            }
-            Self::Lsm(storage) => {
-                storage.scan_presence_counts_with_view(columns, view.lsm_view(storage.table().id)?)
-            }
+            Self::Heap(storage) => storage
+                .scan_presence_counts_with_view(columns, view.heap_view(storage.table().id)?)
+                .map_err(Into::into),
+            Self::Lsm(storage) => storage
+                .scan_presence_counts_with_view(columns, view.lsm_view(storage.table().id)?)
+                .map_err(Into::into),
         }
     }
 
@@ -2008,12 +1808,14 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let view = view.heap_view(storage.table().id).map_err(E::from)?;
-                storage.visit_scalar_refs_with_presence_view(
-                    value_columns,
-                    presence_columns,
-                    view,
-                    visitor,
-                )
+                storage
+                    .visit_scalar_refs_with_presence_view(
+                        value_columns,
+                        presence_columns,
+                        view,
+                        |values, presence| visitor(values, presence).map_err(VisitError::Visitor),
+                    )
+                    .map_err(VisitError::into_caller_error)
             }
             Self::Lsm(storage) => {
                 let table_id = storage.table().id;
@@ -2025,7 +1827,7 @@ impl TableStorage {
                     .collect::<Vec<_>>();
                 let rows = storage
                     .scan_columns_with_view(&requested, view)
-                    .map_err(E::from)?;
+                    .map_err(|error| E::from(StorageError::from(error)))?;
                 for (_, values) in rows {
                     let split = value_columns.len();
                     let scalar_refs = values[..split]
@@ -2059,18 +1861,21 @@ impl TableStorage {
                 let table_id = storage.table().id;
                 let storage_id = storage.storage_id();
                 let view = view.heap_view(table_id).map_err(E::from)?;
-                storage.visit_row_scalar_refs_with_presence_view(
-                    value_columns,
-                    presence_columns,
-                    view,
-                    |row_id, values, presence| {
-                        visitor(
-                            StorageRowHandle::heap(table_id, storage_id, row_id),
-                            values,
-                            presence,
-                        )
-                    },
-                )
+                storage
+                    .visit_row_scalar_refs_with_presence_view(
+                        value_columns,
+                        presence_columns,
+                        view,
+                        |row_id, values, presence| {
+                            visitor(
+                                StorageRowHandle::heap(table_id, storage_id, row_id),
+                                values,
+                                presence,
+                            )
+                            .map_err(VisitError::Visitor)
+                        },
+                    )
+                    .map_err(VisitError::into_caller_error)
             }
             Self::Lsm(storage) => {
                 let table_id = storage.table().id;
@@ -2083,7 +1888,7 @@ impl TableStorage {
                     .collect::<Vec<_>>();
                 let rows = storage
                     .scan_columns_with_view(&requested, view)
-                    .map_err(E::from)?;
+                    .map_err(|error| E::from(StorageError::from(error)))?;
                 for (row, values) in rows {
                     let split = value_columns.len();
                     let scalar_refs = values[..split]
@@ -2166,7 +1971,7 @@ impl TableStorage {
 
     pub fn create_index(&mut self, column_id: ColumnId) -> Result<IndexDefinition, StorageError> {
         match self {
-            Self::Heap(storage) => storage.create_index(column_id),
+            Self::Heap(storage) => storage.create_index(column_id).map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "create B+Tree access method",
                 storage_kind: "LSM",
@@ -2180,7 +1985,9 @@ impl TableStorage {
         column_id: ColumnId,
     ) -> Result<IndexDefinition, StorageError> {
         match self {
-            Self::Heap(storage) => storage.create_named_index(name, column_id),
+            Self::Heap(storage) => storage
+                .create_named_index(name, column_id)
+                .map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "create B+Tree access method",
                 storage_kind: "LSM",
@@ -2195,7 +2002,9 @@ impl TableStorage {
         floor: IndexId,
     ) -> Result<IndexDefinition, StorageError> {
         match self {
-            Self::Heap(storage) => storage.create_index_from_floor(name, column_id, floor),
+            Self::Heap(storage) => storage
+                .create_index_from_floor(name, column_id, floor)
+                .map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "create B+Tree access method from durable floor",
                 storage_kind: "LSM",
@@ -2212,11 +2021,13 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
-                storage.create_named_index_in(
-                    transaction.heap_transaction_mut(table_id)?,
-                    name,
-                    column_id,
-                )
+                storage
+                    .create_named_index_in(
+                        transaction.heap_transaction_mut(table_id)?,
+                        name,
+                        column_id,
+                    )
+                    .map_err(Into::into)
             }
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "create B+Tree access method",
@@ -2233,7 +2044,9 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
-                storage.create_index_in(transaction.heap_transaction_mut(table_id)?, column_id)
+                storage
+                    .create_index_in(transaction.heap_transaction_mut(table_id)?, column_id)
+                    .map_err(Into::into)
             }
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "create B+Tree access method",
@@ -2253,13 +2066,15 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
-                storage.create_named_index_with_reserved_id_in(
-                    transaction.heap_transaction_mut(table_id)?,
-                    name,
-                    column_id,
-                    id,
-                    next_index_id,
-                )
+                storage
+                    .create_named_index_with_reserved_id_in(
+                        transaction.heap_transaction_mut(table_id)?,
+                        name,
+                        column_id,
+                        id,
+                        next_index_id,
+                    )
+                    .map_err(Into::into)
             }
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "create reserved B+Tree access method",
@@ -2278,6 +2093,7 @@ impl TableStorage {
                 let table_id = storage.table().id;
                 storage
                     .advance_index_id_floor_in(transaction.heap_transaction_mut(table_id)?, target)
+                    .map_err(Into::into)
             }
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "advance B+Tree IndexId floor",
@@ -2289,7 +2105,7 @@ impl TableStorage {
     /// Captures only logical active indexes and the authoritative high-water.
     pub fn heap_rewrite_indexes(&mut self) -> Result<HeapRewriteIndexes, StorageError> {
         match self {
-            Self::Heap(storage) => storage.rewrite_indexes(),
+            Self::Heap(storage) => storage.rewrite_indexes().map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "snapshot Heap indexes for schema rewrite",
                 storage_kind: "LSM",
@@ -2306,7 +2122,9 @@ impl TableStorage {
         expected: &HeapRewriteIndexes,
     ) -> Result<(), StorageError> {
         match self {
-            Self::Heap(storage) => storage.validate_rewrite_index_inventory(target, expected),
+            Self::Heap(storage) => storage
+                .validate_rewrite_index_inventory(target, expected)
+                .map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "validate private Heap index inventory",
                 storage_kind: "LSM",
@@ -2323,10 +2141,12 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
-                storage.install_rewrite_indexes_in(
-                    transaction.heap_transaction_mut(table_id)?,
-                    snapshot,
-                )
+                storage
+                    .install_rewrite_indexes_in(
+                        transaction.heap_transaction_mut(table_id)?,
+                        snapshot,
+                    )
+                    .map_err(Into::into)
             }
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "install Heap indexes for schema rewrite",
@@ -2344,7 +2164,7 @@ impl TableStorage {
 
     pub fn drop_index(&mut self, id: IndexId) -> Result<(), StorageError> {
         match self {
-            Self::Heap(storage) => storage.drop_index(id),
+            Self::Heap(storage) => storage.drop_index(id).map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "drop B+Tree access method",
                 storage_kind: "LSM",
@@ -2360,7 +2180,9 @@ impl TableStorage {
         match self {
             Self::Heap(storage) => {
                 let table_id = storage.table().id;
-                storage.drop_index_in(transaction.heap_transaction_mut(table_id)?, id)
+                storage
+                    .drop_index_in(transaction.heap_transaction_mut(table_id)?, id)
+                    .map_err(Into::into)
             }
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "drop B+Tree access method",
@@ -2380,14 +2202,14 @@ impl TableStorage {
         #[cfg(any(test, feature = "test-hooks"))]
         crate::source_inspection_test_activity::record(|activity| activity.analyze_calls += 1);
         match self {
-            Self::Heap(storage) => storage.analyze(),
-            Self::Lsm(storage) => storage.analyze(),
+            Self::Heap(storage) => storage.analyze().map_err(Into::into),
+            Self::Lsm(storage) => storage.analyze().map_err(Into::into),
         }
     }
 
     pub fn vacuum(&mut self) -> Result<u64, StorageError> {
         match self {
-            Self::Heap(storage) => storage.vacuum(),
+            Self::Heap(storage) => storage.vacuum().map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "Heap vacuum",
                 storage_kind: "LSM",
@@ -2399,8 +2221,8 @@ impl TableStorage {
     /// startup recovery, while permitting the caller's active transaction.
     pub fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
         match self {
-            Self::Heap(storage) => storage.ensure_recovery_ready(),
-            Self::Lsm(storage) => storage.ensure_recovery_ready(),
+            Self::Heap(storage) => storage.ensure_recovery_ready().map_err(Into::into),
+            Self::Lsm(storage) => storage.ensure_recovery_ready().map_err(Into::into),
         }
     }
 
@@ -2418,30 +2240,34 @@ impl TableStorage {
         #[cfg(any(test, feature = "test-hooks"))]
         crate::source_inspection_test_activity::record(|activity| activity.flush_calls += 1);
         match self {
-            Self::Heap(storage) => storage.flush(),
-            Self::Lsm(storage) => storage.flush(),
+            Self::Heap(storage) => storage.flush().map_err(Into::into),
+            Self::Lsm(storage) => storage.flush().map_err(Into::into),
         }
     }
 
     /// Synchronizes only pending pipelined NBCL Finalize checkpoints.
     pub fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
         match self {
-            Self::Heap(storage) => storage.flush_change_stream_checkpoints(),
-            Self::Lsm(storage) => storage.flush_change_stream_checkpoints(),
+            Self::Heap(storage) => storage
+                .flush_change_stream_checkpoints()
+                .map_err(Into::into),
+            Self::Lsm(storage) => storage
+                .flush_change_stream_checkpoints()
+                .map_err(Into::into),
         }
     }
 
     pub fn checkpoint(&mut self) -> Result<(), StorageError> {
         match self {
-            Self::Heap(storage) => storage.checkpoint(),
-            Self::Lsm(storage) => storage.checkpoint(),
+            Self::Heap(storage) => storage.checkpoint().map_err(Into::into),
+            Self::Lsm(storage) => storage.checkpoint().map_err(Into::into),
         }
     }
 
     pub fn close(self) -> Result<(), StorageError> {
         match self {
-            Self::Heap(storage) => storage.close(),
-            Self::Lsm(storage) => storage.close(),
+            Self::Heap(storage) => storage.close().map_err(Into::into),
+            Self::Lsm(storage) => storage.close().map_err(Into::into),
         }
     }
 
@@ -2451,7 +2277,7 @@ impl TableStorage {
         &mut self,
     ) -> Result<crate::IndexTailReclaimReport, StorageError> {
         match self {
-            Self::Heap(storage) => storage.reclaim_retired_index_tail(),
+            Self::Heap(storage) => storage.reclaim_retired_index_tail().map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "retired index tail reclamation",
                 storage_kind: "LSM",
@@ -2462,7 +2288,7 @@ impl TableStorage {
     /// Quiescent candidate inspection, not allocation permission.
     pub fn inspect_reusable_pages(&mut self) -> Result<crate::PageReuseInspection, StorageError> {
         match self {
-            Self::Heap(storage) => storage.inspect_reusable_pages(),
+            Self::Heap(storage) => storage.inspect_reusable_pages().map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "reusable page inspection",
                 storage_kind: "LSM",
@@ -2475,7 +2301,7 @@ impl TableStorage {
         &mut self,
     ) -> Result<crate::HistoricalOrphanAdoptionReport, StorageError> {
         match self {
-            Self::Heap(storage) => storage.adopt_historical_btree_orphans(),
+            Self::Heap(storage) => storage.adopt_historical_btree_orphans().map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "historical BTree orphan adoption",
                 storage_kind: "LSM",
@@ -2486,7 +2312,7 @@ impl TableStorage {
     /// Validates the full Heap file and reports pending retirement ownership.
     pub fn inspect_index_reclaim(&mut self) -> Result<crate::IndexReclaimReport, StorageError> {
         match self {
-            Self::Heap(storage) => storage.inspect_index_reclaim(),
+            Self::Heap(storage) => storage.inspect_index_reclaim().map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "index reclaim inspection",
                 storage_kind: "LSM",
@@ -2497,7 +2323,7 @@ impl TableStorage {
     /// Explicit Heap index metadata maintenance; LSM indexes are unsupported.
     pub fn compact_index_catalog(&mut self) -> Result<crate::IndexMaintenanceReport, StorageError> {
         match self {
-            Self::Heap(storage) => storage.compact_index_catalog(),
+            Self::Heap(storage) => storage.compact_index_catalog().map_err(Into::into),
             Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
                 operation: "index catalog compaction",
                 storage_kind: "LSM",
@@ -2511,7 +2337,7 @@ impl TableStorage {
                 operation: "LSM compaction",
                 storage_kind: "Heap",
             }),
-            Self::Lsm(storage) => storage.compact(),
+            Self::Lsm(storage) => storage.compact().map_err(Into::into),
         }
     }
 
@@ -2521,7 +2347,7 @@ impl TableStorage {
                 operation: "LSM bounded compaction",
                 storage_kind: "Heap",
             }),
-            Self::Lsm(storage) => storage.compact_one(),
+            Self::Lsm(storage) => storage.compact_one().map_err(Into::into),
         }
     }
 
@@ -2531,7 +2357,7 @@ impl TableStorage {
                 operation: "LSM full compaction",
                 storage_kind: "Heap",
             }),
-            Self::Lsm(storage) => storage.compact_full(),
+            Self::Lsm(storage) => storage.compact_full().map_err(Into::into),
         }
     }
 }
@@ -2849,7 +2675,7 @@ mod tests {
             assert_eq!(baseline.value(), 1);
             assert!(matches!(
                 StorageVisibilityBoundary::new(storage_id, kind, 0),
-                Err(StorageError::InvalidVisibilityBoundary { .. })
+                Err(netbadb_storage_api::VisibilityBoundaryError::InvalidVisibilityBoundary { .. })
             ));
             let row = storage
                 .insert(&[ScalarValue::Int64(1), ScalarValue::Text("new".into())])

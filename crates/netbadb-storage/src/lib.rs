@@ -1,26 +1,66 @@
 //! Synchronous page, buffer, and heap storage for the embedded vertical slice.
 
-mod allocation_transition;
-mod btree;
-mod buffer;
-mod change_stream;
-mod columnar;
-#[cfg(test)]
-mod crash_test;
-mod heap;
-mod lsm;
-mod mvcc;
-mod page;
-mod recovery;
-mod row_codec;
 mod table;
-mod transaction;
-mod txn_status;
-mod wal;
 
-pub use btree::BTree;
-pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
-pub use change_stream::{
+pub use netbadb_columnar::{
+    ColumnarBaseArtifactMode, ColumnarBaseArtifactWriteBoundInspection, ColumnarBatch,
+    ColumnarBatchColumn, ColumnarColumnSpec, ColumnarColumnStatistics, ColumnarConstraint,
+    ColumnarDeltaSegmentMetadata, ColumnarError, ColumnarIncrementalMetadata, ColumnarProjection,
+    ColumnarProjectionMetadata, ColumnarRepresentationStatistics, ColumnarRowGroupStatistics,
+    ColumnarScanStatistics, ColumnarVector, PreparedColumnarAdvance, PreparedColumnarProjection,
+    StorageSnapshotToken, cleanup_unpublished_projection_build,
+    columnar_projection_manifest_exists,
+};
+pub use netbadb_heap::{
+    BTree, BufferPool, DEFAULT_BUFFER_POOL_SIZE, HeapIdentityInspection,
+    HeapIndexBuildWriteBoundInspection, HeapPhysicalDesignSourceInspection, HeapRecoveryInspection,
+    HeapResourceComponent, HeapResourceComponentKind, HeapRewriteIndex, HeapRewriteIndexes,
+    HeapStorage, HistoricalOrphanAdoptionReport, IndexMaintenanceReport, IndexPageAllocation,
+    IndexReclaimReport, IndexTailReclaimReport, PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE, PAGE_MAGIC,
+    PAGE_SIZE, Page, PageHeader, PageManager, PageReuseClass, PageReuseInspection, PageType,
+    PresenceCountSummary, ReadPageGuard, ReadView, RecoveryError, ReusablePageInspection,
+    SLOT_SIZE, Slot, SlotRef, SlotState, Transaction, TxnStatus, TxnStatusError,
+    WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager, WalRecord,
+    WalRecordKind, heap_resource_components, txn_status_path, wal_alternate_path, wal_path,
+};
+
+/// Computes the initial Columnar artifact bound from a fresh authoritative
+/// source inspection, preserving the historical facade API.
+pub fn inspect_columnar_base_artifact_write_bound(
+    table: &netbadb_schema::TableDef,
+    source: StoragePhysicalDesignSourceInspection,
+    columns: &[netbadb_types::ColumnId],
+    mode: ColumnarBaseArtifactMode,
+) -> Result<ColumnarBaseArtifactWriteBoundInspection, StorageError> {
+    let footprint = match source {
+        StoragePhysicalDesignSourceInspection::Heap(heap) => {
+            netbadb_columnar::ColumnarSourceFootprint {
+                row_upper_bound: heap.row_upper_bound,
+                scalar_payload_bytes_upper_bound: heap.main_file_bytes_upper_bound,
+            }
+        }
+        StoragePhysicalDesignSourceInspection::Lsm(lsm) => {
+            let scalar_payload_bytes_upper_bound = match mode {
+                ColumnarBaseArtifactMode::Snapshot => lsm
+                    .prospective_snapshot_sstable_bytes_upper_bound()
+                    .map_err(StorageError::from)?,
+                ColumnarBaseArtifactMode::Incremental => lsm
+                    .total_sstable_bytes
+                    .checked_add(lsm.memtable_bytes)
+                    .ok_or(StorageError::ResourceBoundOverflow {
+                        resource: "Incremental LSM scalar payload bytes",
+                    })?,
+            };
+            netbadb_columnar::ColumnarSourceFootprint {
+                row_upper_bound: lsm.row_upper_bound().map_err(StorageError::from)?,
+                scalar_payload_bytes_upper_bound,
+            }
+        }
+    };
+    netbadb_columnar::inspect_columnar_base_artifact_write_bound(table, footprint, columns, mode)
+        .map_err(Into::into)
+}
+pub use netbadb_change_stream::{
     CHANGE_LOG_FORMAT_VERSION, CHANGE_LOG_MAGIC, CHANGE_LOG_MAX_MUTATIONS,
     CHANGE_LOG_MAX_RECORD_BYTES, CHANGE_LOG_MAX_ROW_BYTES, ChangeBatch, ChangeBatchInspection,
     ChangeBatchMaintenanceInspection, ChangeReadResult, ChangeStorageKind, ChangeStreamCursor,
@@ -30,706 +70,46 @@ pub use change_stream::{
     StorageChange, StorageVersionKey, change_stream_guard_path, heap_change_log_path,
     lsm_change_log_path, validate_change_log_file,
 };
-pub use columnar::{
-    ColumnarBaseArtifactMode, ColumnarBaseArtifactWriteBoundInspection, ColumnarBatch,
-    ColumnarBatchColumn, ColumnarColumnSpec, ColumnarColumnStatistics, ColumnarConstraint,
-    ColumnarDeltaSegmentMetadata, ColumnarError, ColumnarIncrementalMetadata, ColumnarProjection,
-    ColumnarProjectionMetadata, ColumnarRepresentationStatistics, ColumnarRowGroupStatistics,
-    ColumnarScanStatistics, ColumnarVector, PreparedColumnarAdvance, PreparedColumnarProjection,
-    StorageSnapshotToken, cleanup_unpublished_projection_build,
-    columnar_projection_manifest_exists, inspect_columnar_base_artifact_write_bound,
-};
-pub use heap::{
-    HeapIdentityInspection, HeapIndexBuildWriteBoundInspection, HeapRecoveryInspection,
-    HeapStorage, HistoricalOrphanAdoptionReport, IndexMaintenanceReport, IndexPageAllocation,
-    IndexReclaimReport, IndexTailReclaimReport, PageReuseClass, PageReuseInspection,
-    PresenceCountSummary, ReusablePageInspection,
-};
-pub(crate) use lsm::LsmRowHandle;
-pub use lsm::{
+pub use netbadb_index::{IndexDefinition, IndexStatistics, TableStatistics};
+pub(crate) use netbadb_lsm::LsmRowHandle;
+pub use netbadb_lsm::{
     DEFAULT_LSM_MEMTABLE_FLUSH_BYTES, LSM_MANIFEST_FORMAT_VERSION, LSM_MAX_LEVELS,
     LSM_MAX_PENDING_MUTATIONS, LSM_MAX_PENDING_TRANSACTION_BYTES, LSM_SSTABLE_FORMAT_VERSION,
     LSM_WAL_FORMAT_VERSION, LsmCompactionPlanInspection, LsmError, LsmIdentityInspection,
     LsmInspection, LsmLevelInspection, LsmMaintenanceAnchor, LsmMaintenanceBoundInspection,
     LsmMaintenanceCostInspection, LsmMaintenanceInspection, LsmMaintenanceSafetyBlocker,
-    LsmReadAmplification, LsmReadView, LsmRecoveryInspection, LsmStorage, LsmTransaction,
-    LsmWriteAmplification, fuzz_lsm_manifest_bytes, fuzz_lsm_sstable_block_bytes,
-    fuzz_lsm_wal_bytes,
+    LsmPhysicalDesignSourceInspection, LsmReadAmplification, LsmReadView, LsmRecoveryInspection,
+    LsmStorage, LsmTransaction, LsmWriteAmplification, fuzz_lsm_manifest_bytes,
+    fuzz_lsm_sstable_block_bytes, fuzz_lsm_wal_bytes,
 };
-pub use mvcc::{IsolationLevel, ReadView, Snapshot};
-pub use netbadb_index::{IndexDefinition, IndexStatistics, TableStatistics};
-pub use page::{
-    PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, Page, PageHeader, PageManager,
-    PageType, SLOT_SIZE, Slot, SlotRef, SlotState,
-};
-pub use recovery::{
-    PreparedDecision, PreparedTransaction, PreparedTransactionState, PreparedTxnResolution,
-    RecoveryError,
+pub use netbadb_row_codec::CodecError;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use netbadb_storage_api::source_inspection_test_activity;
+pub use netbadb_storage_api::{
+    AccessPathCapabilities, CheckpointError, IsolationLevel, PreparedDecision,
+    PreparedRuntimeInspection, PreparedTransaction, PreparedTransactionState,
+    PreparedTxnResolution, Snapshot, StorageAccessCostHints, StorageAccessPath, StorageKind,
+    StorageVisibilityBoundary, TransactionError, TransactionState,
 };
 pub use table::{
-    AccessPathCapabilities, CommittedReadAnchor, HeapPhysicalDesignSourceInspection,
-    HeapResourceComponent, HeapResourceComponentKind, HeapRewriteIndex, HeapRewriteIndexes,
-    LsmPhysicalDesignSourceInspection, StorageAccessCostHints, StorageAccessPath,
-    StorageChangeFinalizeBatchReport, StorageChangePrepareBatchReport, StorageCommitBatchReport,
-    StorageKind, StoragePhysicalDesignSourceInspection, StoragePrepareBatchReport, StorageReadView,
-    StorageRowHandle, StorageTransaction, StorageVisibilityBoundary, StorageVisibilityPin,
-    TableStorage, heap_resource_components,
-};
-pub use transaction::{Transaction, TransactionState};
-pub use txn_status::{TxnStatus, TxnStatusError, txn_status_path};
-pub use wal::{
-    WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager, WalRecord,
-    WalRecordKind, wal_alternate_path, wal_path,
+    CommittedReadAnchor, StorageChangeFinalizeBatchReport, StorageChangePrepareBatchReport,
+    StorageCommitBatchReport, StoragePhysicalDesignSourceInspection, StoragePrepareBatchReport,
+    StorageReadView, StorageRowHandle, StorageTransaction, StorageVisibilityPin, TableStorage,
 };
 
-/// Thread-local production-path instrumentation for deterministic inspection
-/// purity/bound proofs. Absent from ordinary builds.
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub mod source_inspection_test_activity {
-    use std::cell::Cell;
-
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    pub struct Activity {
-        pub scan_columns_calls: u64,
-        pub scan_versioned_columns_calls: u64,
-        pub change_stream_history_inspections: u64,
-        pub analyze_calls: u64,
-        pub flush_calls: u64,
-        pub buffer_page_reads: u64,
-        pub heap_backfill_pages: u64,
-        pub heap_backfill_max_byte_end: u64,
-        pub heap_scan_pages: u64,
-        pub heap_scan_max_byte_end: u64,
-        pub lsm_scan_block_bytes: u64,
-    }
-
-    thread_local! { static ACTIVITY: Cell<Activity> = Cell::new(Activity::default()); }
-
-    pub fn take() -> Activity {
-        ACTIVITY.with(|value| value.replace(Activity::default()))
-    }
-
-    pub(crate) fn record(update: impl FnOnce(&mut Activity)) {
-        ACTIVITY.with(|value| {
-            let mut current = value.get();
-            update(&mut current);
-            value.set(current);
-        });
-    }
-}
-
-/// Thread-local production-path instrumentation for deterministic Index writer
-/// bound tests. It is absent unless tests or the explicit test-hooks feature
-/// are enabled and never participates in sizing or mutation decisions.
-#[cfg(any(test, feature = "test-hooks"))]
-#[doc(hidden)]
-pub mod index_write_bound_test_activity {
-    use std::cell::Cell;
-
-    use crate::{TxnStatus, WalRecordKind};
-
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    pub struct Activity {
-        pub published_page_images: u64,
-        pub wal_page_image_records: u64,
-        pub wal_page_update_records: u64,
-        pub wal_page_transition_records: u64,
-        pub generation_reservation_records: u64,
-        pub begin_records: u64,
-        pub prepare_records: u64,
-        pub commit_records: u64,
-        pub abort_records: u64,
-        pub rollback_complete_records: u64,
-        pub wal_appended_bytes: u64,
-        pub committed_txn_status_records: u64,
-        pub txn_status_appended_bytes: u64,
-        pub staged_change_stream_rows: u64,
-    }
-
-    thread_local! { static ACTIVITY: Cell<Activity> = Cell::new(Activity::default()); }
-
-    pub fn take() -> Activity {
-        ACTIVITY.with(|value| value.replace(Activity::default()))
-    }
-
-    fn record(update: impl FnOnce(&mut Activity)) {
-        ACTIVITY.with(|value| {
-            let mut current = value.get();
-            update(&mut current);
-            value.set(current);
-        });
-    }
-
-    pub(crate) fn record_wal_append(kind: &WalRecordKind, bytes: usize) {
-        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-        record(|activity| {
-            activity.wal_appended_bytes = activity.wal_appended_bytes.saturating_add(bytes);
-            match kind {
-                WalRecordKind::Begin => activity.begin_records += 1,
-                WalRecordKind::PageGenerationReservation => {
-                    activity.generation_reservation_records += 1;
-                }
-                WalRecordKind::PageUpdate { .. } => {
-                    activity.wal_page_image_records += 1;
-                    activity.wal_page_update_records += 1;
-                }
-                WalRecordKind::PageAllocationTransition { .. } => {
-                    activity.wal_page_image_records += 1;
-                    activity.wal_page_transition_records += 1;
-                }
-                WalRecordKind::Commit => activity.commit_records += 1,
-                WalRecordKind::Abort => activity.abort_records += 1,
-                WalRecordKind::RollbackComplete => activity.rollback_complete_records += 1,
-                WalRecordKind::Prepare { .. } => activity.prepare_records += 1,
-            }
-        });
-    }
-
-    pub(crate) fn record_txn_status_append(status: TxnStatus, bytes: usize) {
-        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-        record(|activity| {
-            activity.txn_status_appended_bytes =
-                activity.txn_status_appended_bytes.saturating_add(bytes);
-            if matches!(status, TxnStatus::Committed(_)) {
-                activity.committed_txn_status_records += 1;
-            }
-        });
-    }
-
-    pub(crate) fn record_published_page_images(count: usize) {
-        let count = u64::try_from(count).unwrap_or(u64::MAX);
-        record(|activity| {
-            activity.published_page_images = activity.published_page_images.saturating_add(count);
-        });
-    }
-
-    pub(crate) fn record_staged_change_stream_rows(count: usize) {
-        let count = u64::try_from(count).unwrap_or(u64::MAX);
-        record(|activity| {
-            activity.staged_change_stream_rows =
-                activity.staged_change_stream_rows.saturating_add(count);
-        });
-    }
-}
+pub use netbadb_heap::index_write_bound_test_activity;
 
 use std::error::Error;
 use std::fmt;
 
 use netbadb_index::IndexError;
 use netbadb_schema::{SchemaError, SchemaFingerprint};
-use netbadb_types::{AccessPathId, PageId, PhysicalType, SlotId, TableId};
+use netbadb_types::{AccessPathId, PageId, PhysicalType, TableId};
 
-/// Errors raised while validating or mutating a raw database page.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PageError {
-    InvalidMagic,
-    UnsupportedVersion(u16),
-    ChecksumMismatch {
-        stored: u32,
-        computed: u32,
-    },
-    UnknownPageType(u8),
-    InvalidReservedByte(u8),
-    InvalidSlotCount(u16),
-    InvalidFreeSpace {
-        free_start: u16,
-        free_end: u16,
-    },
-    SlotDirectoryOutOfBounds {
-        slot_count: u16,
-        free_start: u16,
-    },
-    InvalidSlot {
-        slot: SlotId,
-    },
-    InvalidSlotGeneration {
-        slot: SlotId,
-        generation: u32,
-    },
-    SlotDeleted {
-        slot: SlotId,
-    },
-    InvalidDeletedSlotEncoding {
-        slot: SlotId,
-        offset: u16,
-        length: u16,
-    },
-    RecordOutOfBounds {
-        slot: SlotId,
-        offset: u16,
-        length: u16,
-    },
-    RecordOverlapsFreeSpace {
-        slot: SlotId,
-        offset: u16,
-        free_end: u16,
-    },
-    OverlappingRecords {
-        first: SlotId,
-        second: SlotId,
-    },
-    WrongPageType {
-        expected: PageType,
-        actual: PageType,
-    },
-    InvalidSinglePayload {
-        page_type: PageType,
-        slot_count: u16,
-    },
-    InvalidSinglePayloadGeneration {
-        page_type: PageType,
-        generation: u32,
-    },
-    PageFull {
-        required: usize,
-        available: usize,
-    },
-    RecordTooLarge {
-        size: usize,
-        capacity: usize,
-    },
-    UpdateWouldOverflowPage {
-        slot: SlotId,
-        size: usize,
-        capacity: usize,
-    },
-}
-
-impl fmt::Display for PageError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidMagic => formatter.write_str("page magic does not match"),
-            Self::UnsupportedVersion(version) => {
-                write!(formatter, "unsupported page format version {version}")
-            }
-            Self::ChecksumMismatch { stored, computed } => write!(
-                formatter,
-                "page checksum mismatch: stored {stored:#010x}, computed {computed:#010x}"
-            ),
-            Self::UnknownPageType(tag) => write!(formatter, "unknown page type tag {tag}"),
-            Self::InvalidReservedByte(value) => {
-                write!(formatter, "page reserved byte must be zero, found {value}")
-            }
-            Self::InvalidSlotCount(count) => write!(formatter, "invalid page slot count {count}"),
-            Self::InvalidFreeSpace {
-                free_start,
-                free_end,
-            } => write!(
-                formatter,
-                "invalid page free-space bounds {free_start}..{free_end}"
-            ),
-            Self::SlotDirectoryOutOfBounds {
-                slot_count,
-                free_start,
-            } => write!(
-                formatter,
-                "slot directory with {slot_count} slots ends at {free_start}"
-            ),
-            Self::InvalidSlot { slot } => write!(formatter, "invalid page slot {}", slot.0),
-            Self::InvalidSlotGeneration { slot, generation } => write!(
-                formatter,
-                "page slot {} has invalid generation {generation}",
-                slot.0
-            ),
-            Self::SlotDeleted { slot } => write!(formatter, "page slot {} is deleted", slot.0),
-            Self::InvalidDeletedSlotEncoding {
-                slot,
-                offset,
-                length,
-            } => write!(
-                formatter,
-                "slot {} has invalid deleted encoding ({offset}, {length})",
-                slot.0
-            ),
-            Self::RecordOutOfBounds {
-                slot,
-                offset,
-                length,
-            } => write!(
-                formatter,
-                "record in slot {} is out of bounds at {offset} with length {length}",
-                slot.0
-            ),
-            Self::RecordOverlapsFreeSpace {
-                slot,
-                offset,
-                free_end,
-            } => write!(
-                formatter,
-                "record in slot {} at {offset} overlaps free space beginning at {free_end}",
-                slot.0
-            ),
-            Self::OverlappingRecords { first, second } => write!(
-                formatter,
-                "records in slots {} and {} overlap",
-                first.0, second.0
-            ),
-            Self::WrongPageType { expected, actual } => {
-                write!(formatter, "expected {expected:?} page, found {actual:?}")
-            }
-            Self::InvalidSinglePayload {
-                page_type,
-                slot_count,
-            } => write!(
-                formatter,
-                "{page_type:?} page must contain exactly one live payload slot, found {slot_count}"
-            ),
-            Self::InvalidSinglePayloadGeneration {
-                page_type,
-                generation,
-            } => write!(
-                formatter,
-                "{page_type:?} single payload must have generation 1, found {generation}"
-            ),
-            Self::PageFull {
-                required,
-                available,
-            } => write!(
-                formatter,
-                "page needs {required} bytes but only {available} are free"
-            ),
-            Self::RecordTooLarge { size, capacity } => write!(
-                formatter,
-                "record of {size} bytes exceeds page record capacity {capacity}"
-            ),
-            Self::UpdateWouldOverflowPage {
-                slot,
-                size,
-                capacity,
-            } => write!(
-                formatter,
-                "replacement record of {size} bytes for slot {} exceeds its page capacity {capacity}",
-                slot.0
-            ),
-        }
-    }
-}
-
-impl Error for PageError {}
-
-/// Errors raised by the in-memory buffer pool.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BufferError {
-    PageDirty {
-        page_id: PageId,
-    },
-    InvalidCapacity,
-    Exhausted {
-        capacity: usize,
-    },
-    PagePinned {
-        page_id: PageId,
-    },
-    PageNotCached {
-        page_id: PageId,
-    },
-    PinCountOverflow {
-        page_id: PageId,
-    },
-    WalUnavailable {
-        page_id: PageId,
-        page_lsn: netbadb_types::Lsn,
-    },
-}
-
-impl fmt::Display for BufferError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PageDirty { page_id } => write!(
-                formatter,
-                "page {} is dirty during suffix invalidation",
-                page_id.0
-            ),
-            Self::InvalidCapacity => formatter.write_str("buffer pool capacity must be non-zero"),
-            Self::Exhausted { capacity } => write!(
-                formatter,
-                "buffer pool with capacity {capacity} has no evictable frame"
-            ),
-            Self::PagePinned { page_id } => {
-                write!(formatter, "page {} is pinned by an active guard", page_id.0)
-            }
-            Self::PageNotCached { page_id } => {
-                write!(formatter, "page {} is not cached", page_id.0)
-            }
-            Self::PinCountOverflow { page_id } => {
-                write!(formatter, "pin count for page {} overflows", page_id.0)
-            }
-            Self::WalUnavailable { page_id, page_lsn } => write!(
-                formatter,
-                "page {} at LSN {} cannot be flushed without its WAL",
-                page_id.0, page_lsn.0
-            ),
-        }
-    }
-}
-
-impl Error for BufferError {}
-
-/// Errors raised while decoding the explicit row scalar format.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CodecError {
-    MissingScalarTag,
-    UnknownScalarTag(u8),
-    InvalidBoolean(u8),
-    ScalarTruncated,
-    LengthOverflow,
-    TextNotUtf8,
-    ExtraValues,
-}
-
-impl fmt::Display for CodecError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingScalarTag => formatter.write_str("row is missing a scalar tag"),
-            Self::UnknownScalarTag(tag) => write!(formatter, "unknown scalar tag {tag}"),
-            Self::InvalidBoolean(value) => write!(formatter, "invalid boolean value {value}"),
-            Self::ScalarTruncated => formatter.write_str("scalar value is truncated"),
-            Self::LengthOverflow => formatter.write_str("scalar length overflows the row"),
-            Self::TextNotUtf8 => formatter.write_str("text value is not valid UTF-8"),
-            Self::ExtraValues => formatter.write_str("row contains extra values"),
-        }
-    }
-}
-
-impl Error for CodecError {}
-
-/// Errors raised while decoding the heap file root metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MetadataError {
-    InvalidMagic,
-    UnsupportedVersion(u16),
-    InvalidReservedBytes,
-    InvalidStorageId(netbadb_types::StorageId),
-    InvalidColumnCount { stored: u16, expected: usize },
-}
-
-impl fmt::Display for MetadataError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidMagic => formatter.write_str("heap metadata magic does not match"),
-            Self::UnsupportedVersion(version) => {
-                write!(formatter, "unsupported heap metadata version {version}")
-            }
-            Self::InvalidReservedBytes => {
-                formatter.write_str("heap metadata reserved bytes are non-zero")
-            }
-            Self::InvalidStorageId(storage_id) => write!(
-                formatter,
-                "heap metadata stores invalid physical storage ID {}",
-                storage_id.0
-            ),
-            Self::InvalidColumnCount { stored, expected } => write!(
-                formatter,
-                "heap metadata stores {stored} columns but its schema fingerprint identifies {expected}"
-            ),
-        }
-    }
-}
-
-impl Error for MetadataError {}
-
-/// Errors raised by the transaction state machine and single-writer guard.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransactionError {
-    NotActive {
-        txn_id: netbadb_types::TxnId,
-        state: TransactionState,
-    },
-    IdExhausted,
-    OutstandingTransactionCountOverflow,
-    WalBusy,
-    StatusBusy,
-    CommandIdExhausted,
-    InvalidDatabaseTxnId,
-    DatabaseTxnMismatch {
-        txn_id: netbadb_types::TxnId,
-        expected: Option<netbadb_types::DatabaseTxnId>,
-        actual: netbadb_types::DatabaseTxnId,
-    },
-    NotPrepared {
-        txn_id: netbadb_types::TxnId,
-        state: TransactionState,
-    },
-    PreparedWriteConflict {
-        txn_id: netbadb_types::TxnId,
-        conflicting_txn_id: netbadb_types::TxnId,
-    },
-    PreparedResolutionOrder {
-        txn_id: netbadb_types::TxnId,
-        expected: netbadb_types::TxnId,
-    },
-    EmptyPreparedCommitBatch,
-    PreparedCommitBatchStorageMismatch,
-    EmptyPreparedPrepareBatch,
-    PreparedPrepareBatchStorageMismatch,
-    WriterBusy {
-        txn_id: netbadb_types::TxnId,
-    },
-    InvalidRollbackChain {
-        txn_id: netbadb_types::TxnId,
-        lsn: netbadb_types::Lsn,
-    },
-    UnfinishedWriter {
-        txn_id: netbadb_types::TxnId,
-    },
-    OutstandingTransactions {
-        count: u64,
-    },
-    RecoveryRequired,
-    ForeignTransaction {
-        txn_id: netbadb_types::TxnId,
-    },
-    #[cfg(test)]
-    RollbackInterrupted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedRuntimeInspection {
-    pub parked_prepared_count: usize,
-    pub parked_prepare_pending_count: usize,
-    pub active_group_chain: Vec<netbadb_types::TxnId>,
-    pub prepared_write_conflict_count: u64,
-    /// Durable prepare barriers issued by this live storage runtime.
-    pub prepare_sync_count: u64,
-    /// Prepare barriers shared by explicitly staged group members.
-    pub group_prepare_barrier_sync_count: u64,
-    /// Commit barriers issued by ordinary or individually resolved commits.
-    pub single_commit_sync_count: u64,
-    /// Post-decision barriers shared by explicit group members.
-    pub group_commit_barrier_sync_count: u64,
-    /// All NBCL prepare and finalize sync calls successfully completed by this
-    /// live runtime. Failed or uncertain attempts are not counted.
-    pub change_stream_sync_count: u64,
-    /// Successful per-member NBCL Prepare syncs in this live runtime.
-    pub change_stream_member_prepare_sync_count: u64,
-    /// Successful grouped NBCL Prepare barriers in this live runtime.
-    pub change_stream_group_prepare_barrier_sync_count: u64,
-    /// Successful per-member NBCL Finalize syncs in this live runtime.
-    pub change_stream_member_finalize_sync_count: u64,
-    /// Successful grouped NBCL Finalize barriers in this live runtime.
-    pub change_stream_group_finalize_barrier_sync_count: u64,
-    /// Successful syncs that checkpointed previously promoted pipelined
-    /// Finalizes. This overlaps the reason-specific counters below.
-    pub change_stream_pipelined_finalize_checkpoint_sync_count: u64,
-    pub change_stream_combined_finalize_prepare_sync_count: u64,
-    pub change_stream_explicit_finalize_checkpoint_sync_count: u64,
-    pub change_stream_recovery_finalize_sync_count: u64,
-}
-
-impl fmt::Display for TransactionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotActive { txn_id, state } => write!(
-                formatter,
-                "transaction {} is {state:?}, not active",
-                txn_id.0
-            ),
-            Self::IdExhausted => formatter.write_str("transaction ID space is exhausted"),
-            Self::OutstandingTransactionCountOverflow => {
-                formatter.write_str("outstanding transaction count overflowed")
-            }
-            Self::WalBusy => formatter.write_str("transaction WAL is already borrowed"),
-            Self::StatusBusy => formatter.write_str("transaction-status store is already borrowed"),
-            Self::CommandIdExhausted => formatter.write_str("transaction command ID exhausted"),
-            Self::InvalidDatabaseTxnId => {
-                formatter.write_str("database transaction ID zero is invalid")
-            }
-            Self::DatabaseTxnMismatch {
-                txn_id,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "physical transaction {} is prepared for database transaction {expected:?}, not {}",
-                txn_id.0, actual.0
-            ),
-            Self::NotPrepared { txn_id, state } => write!(
-                formatter,
-                "physical transaction {} is {state:?}, not prepared",
-                txn_id.0
-            ),
-            Self::PreparedWriteConflict {
-                txn_id,
-                conflicting_txn_id,
-            } => write!(
-                formatter,
-                "transaction {} conflicts with parked prepared transaction {}",
-                txn_id.0, conflicting_txn_id.0
-            ),
-            Self::PreparedResolutionOrder { txn_id, expected } => write!(
-                formatter,
-                "parked prepared transaction {} cannot resolve before transaction {}",
-                txn_id.0, expected.0
-            ),
-            Self::EmptyPreparedCommitBatch => formatter.write_str("prepared commit batch is empty"),
-            Self::PreparedCommitBatchStorageMismatch => formatter
-                .write_str("prepared commit batch mixes physical storage identities or kinds"),
-            Self::EmptyPreparedPrepareBatch => formatter.write_str("staged prepare batch is empty"),
-            Self::PreparedPrepareBatchStorageMismatch => formatter
-                .write_str("staged prepare batch mixes physical storage identities or kinds"),
-            Self::WriterBusy { txn_id } => {
-                write!(formatter, "transaction {} is the active writer", txn_id.0)
-            }
-            Self::InvalidRollbackChain { txn_id, lsn } => write!(
-                formatter,
-                "transaction {} has an invalid rollback chain at WAL record {}",
-                txn_id.0, lsn.0
-            ),
-            Self::UnfinishedWriter { txn_id } => write!(
-                formatter,
-                "transaction {} still owns the database writer",
-                txn_id.0
-            ),
-            Self::OutstandingTransactions { count } => write!(
-                formatter,
-                "{count} transaction handle(s) are still outstanding"
-            ),
-            Self::RecoveryRequired => formatter
-                .write_str("an unfinished writer requires database recovery before writing again"),
-            Self::ForeignTransaction { txn_id } => write!(
-                formatter,
-                "transaction {} belongs to a different database",
-                txn_id.0
-            ),
-            #[cfg(test)]
-            Self::RollbackInterrupted => {
-                formatter.write_str("rollback interrupted by a test failure injection")
-            }
-        }
-    }
-}
-
-impl Error for TransactionError {}
-
-/// Errors raised when a quiescent checkpoint cannot be admitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CheckpointError {
-    OutstandingTransactions { count: u64 },
-    WriterActive { txn_id: netbadb_types::TxnId },
-    RecoveryRequired,
-}
-
-impl fmt::Display for CheckpointError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OutstandingTransactions { count } => write!(
-                formatter,
-                "checkpoint requires quiescence but {count} transaction handle(s) are outstanding"
-            ),
-            Self::WriterActive { txn_id } => write!(
-                formatter,
-                "checkpoint cannot run while transaction {} owns the writer",
-                txn_id.0
-            ),
-            Self::RecoveryRequired => formatter
-                .write_str("checkpoint cannot clear a database that requires startup recovery"),
-        }
-    }
-}
-
-impl Error for CheckpointError {}
-
+pub use netbadb_heap::{BufferError, MetadataError, PageError};
 #[derive(Debug)]
 pub enum StorageError {
     Io(std::io::Error),
@@ -1003,13 +383,21 @@ impl From<std::io::Error> for StorageError {
 
 impl From<ColumnarError> for StorageError {
     fn from(error: ColumnarError) -> Self {
-        Self::Columnar(error)
+        match error {
+            ColumnarError::ResourceBoundOverflow { resource } => {
+                Self::ResourceBoundOverflow { resource }
+            }
+            other => Self::Columnar(other),
+        }
     }
 }
 
 impl From<ChangeStreamError> for StorageError {
     fn from(error: ChangeStreamError) -> Self {
-        Self::ChangeStream(error)
+        match error {
+            ChangeStreamError::Schema(error) => Self::Schema(error),
+            other => Self::ChangeStream(other),
+        }
     }
 }
 
@@ -1067,6 +455,161 @@ impl From<LsmError> for StorageError {
     }
 }
 
+impl From<netbadb_lsm::LsmStorageError> for StorageError {
+    fn from(error: netbadb_lsm::LsmStorageError) -> Self {
+        use netbadb_lsm::LsmStorageError as E;
+        match error {
+            E::Io(error) => Self::Io(error),
+            E::Schema(error) => Self::Schema(error),
+            E::InvalidFormat(message) => Self::InvalidFormat(message),
+            E::Codec(error) => Self::Codec(error),
+            E::Lsm(error) => Self::Lsm(error),
+            E::ChangeStream(error) => error.into(),
+            E::Transaction(error) => Self::Transaction(error),
+            E::Checkpoint(error) => Self::Checkpoint(error),
+            E::Recovery(error) => Self::Recovery(error.into()),
+            E::TableIdMismatch { expected, actual } => Self::TableIdMismatch { expected, actual },
+            E::SchemaMismatch { expected, actual } => Self::SchemaMismatch { expected, actual },
+            E::InvalidRowLength { expected, actual } => Self::InvalidRowLength { expected, actual },
+            E::TypeMismatch {
+                column,
+                expected,
+                actual,
+            } => Self::TypeMismatch {
+                column,
+                expected,
+                actual,
+            },
+            E::NullNotAllowed { column } => Self::NullNotAllowed { column },
+            E::UnknownColumn { column_id } => Self::UnknownColumn { column_id },
+            E::CountOverflow => Self::CountOverflow,
+            E::ResourceBoundOverflow { resource } => Self::ResourceBoundOverflow { resource },
+            E::ResourceLimit { resource, limit } => Self::ResourceLimit { resource, limit },
+            E::FutureVisibilityBoundary {
+                storage_id,
+                requested,
+                current,
+            } => Self::FutureVisibilityBoundary {
+                storage_id,
+                requested,
+                current,
+            },
+            E::VisibilityBoundaryExhausted { storage_id } => {
+                Self::VisibilityBoundaryExhausted { storage_id }
+            }
+            E::InvalidVisibilityBoundary { storage_id, value } => {
+                Self::InvalidVisibilityBoundary { storage_id, value }
+            }
+            E::VisibilityBoundaryContextMismatch {
+                expected_storage_id,
+                actual_storage_id,
+                expected_kind,
+                actual_kind,
+            } => Self::VisibilityBoundaryContextMismatch {
+                expected_storage_id,
+                actual_storage_id,
+                expected_kind,
+                actual_kind,
+            },
+        }
+    }
+}
+
+impl From<netbadb_heap::HeapStorageError> for StorageError {
+    fn from(error: netbadb_heap::HeapStorageError) -> Self {
+        use netbadb_heap::HeapStorageError as E;
+        match error {
+            E::Io(error) => Self::Io(error),
+            E::Schema(error) => Self::Schema(error),
+            E::InvalidFormat(message) => Self::InvalidFormat(message),
+            E::Page(error) => Self::Page(error),
+            E::Buffer(error) => Self::Buffer(error),
+            E::Codec(error) => Self::Codec(error),
+            E::Metadata(error) => Self::Metadata(error),
+            E::Index(error) => Self::Index(error),
+            E::Recovery(error) => Self::Recovery(error),
+            E::Wal(error) => Self::Wal(error),
+            E::Transaction(error) => Self::Transaction(error),
+            E::TxnStatus(error) => Self::TxnStatus(error),
+            E::Checkpoint(error) => Self::Checkpoint(error),
+            E::ChangeStream(error) => error.into(),
+            E::TableIdMismatch { expected, actual } => Self::TableIdMismatch { expected, actual },
+            E::SchemaMismatch { expected, actual } => Self::SchemaMismatch { expected, actual },
+            E::InvalidRowLength { expected, actual } => Self::InvalidRowLength { expected, actual },
+            E::TypeMismatch {
+                column,
+                expected,
+                actual,
+            } => Self::TypeMismatch {
+                column,
+                expected,
+                actual,
+            },
+            E::NullNotAllowed { column } => Self::NullNotAllowed { column },
+            E::UnknownColumn { column_id } => Self::UnknownColumn { column_id },
+            E::CountOverflow => Self::CountOverflow,
+            E::ResourceBoundOverflow { resource } => Self::ResourceBoundOverflow { resource },
+            E::RowNotFound { row_id } => Self::RowNotFound { row_id },
+            E::RowDeleted { row_id } => Self::RowDeleted { row_id },
+            E::StaleRowId {
+                row_id,
+                actual_generation,
+            } => Self::StaleRowId {
+                row_id,
+                actual_generation,
+            },
+            E::RowTooLarge { size, capacity } => Self::RowTooLarge { size, capacity },
+            E::PageOffsetOverflow { page_id } => Self::PageOffsetOverflow { page_id },
+            E::InvalidMvccHeader(message) => Self::InvalidMvccHeader(message),
+            E::UnsupportedTupleVersion(version) => Self::UnsupportedTupleVersion(version),
+            E::StorageContextMismatch { expected, actual } => {
+                Self::StorageContextMismatch { expected, actual }
+            }
+            E::InvalidVisibilityBoundary { storage_id, value } => {
+                Self::InvalidVisibilityBoundary { storage_id, value }
+            }
+            E::VisibilityBoundaryExhausted { storage_id } => {
+                Self::VisibilityBoundaryExhausted { storage_id }
+            }
+            E::VisibilityBoundaryContextMismatch {
+                expected_storage_id,
+                actual_storage_id,
+                expected_kind,
+                actual_kind,
+            } => Self::VisibilityBoundaryContextMismatch {
+                expected_storage_id,
+                actual_storage_id,
+                expected_kind,
+                actual_kind,
+            },
+            E::FutureVisibilityBoundary {
+                storage_id,
+                requested,
+                current,
+            } => Self::FutureVisibilityBoundary {
+                storage_id,
+                requested,
+                current,
+            },
+            E::UnknownAccessPath {
+                table_id,
+                access_path,
+            } => Self::UnknownAccessPath {
+                table_id,
+                access_path,
+            },
+            E::ResourceLimit { resource, limit } => Self::ResourceLimit { resource, limit },
+            E::UnsupportedOperation {
+                operation,
+                storage_kind,
+            } => Self::UnsupportedOperation {
+                operation,
+                storage_kind,
+            },
+        }
+    }
+}
+
 impl From<TransactionError> for StorageError {
     fn from(error: TransactionError) -> Self {
         Self::Transaction(error)
@@ -1085,6 +628,36 @@ impl From<CheckpointError> for StorageError {
     }
 }
 
-fn invalid_format(message: impl Into<String>) -> StorageError {
-    StorageError::InvalidFormat(message.into())
+impl From<netbadb_storage_api::VisibilityBoundaryError> for StorageError {
+    fn from(error: netbadb_storage_api::VisibilityBoundaryError) -> Self {
+        use netbadb_storage_api::VisibilityBoundaryError as E;
+        match error {
+            E::InvalidVisibilityBoundary { storage_id, value } => {
+                Self::InvalidVisibilityBoundary { storage_id, value }
+            }
+            E::VisibilityBoundaryExhausted { storage_id } => {
+                Self::VisibilityBoundaryExhausted { storage_id }
+            }
+            E::VisibilityBoundaryContextMismatch {
+                expected_storage_id,
+                actual_storage_id,
+                expected_kind,
+                actual_kind,
+            } => Self::VisibilityBoundaryContextMismatch {
+                expected_storage_id,
+                actual_storage_id,
+                expected_kind,
+                actual_kind,
+            },
+            E::FutureVisibilityBoundary {
+                storage_id,
+                requested,
+                current,
+            } => Self::FutureVisibilityBoundary {
+                storage_id,
+                requested,
+                current,
+            },
+        }
+    }
 }

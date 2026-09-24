@@ -1,3 +1,4 @@
+pub use netbadb_storage_api::{IsolationLevel, Snapshot};
 use netbadb_types::{CommandId, CommitSeq, RowId, TxnId};
 
 use crate::txn_status::{SharedTxnStatus, TxnStatus};
@@ -10,19 +11,6 @@ const HAS_XMAX: u16 = 1;
 const HAS_CMAX: u16 = 2;
 const HAS_NEXT_VERSION: u16 = 4;
 const KNOWN_FLAGS: u16 = HAS_XMAX | HAS_CMAX | HAS_NEXT_VERSION;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IsolationLevel {
-    ReadCommitted,
-    RepeatableRead,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Snapshot {
-    pub visible_csn: CommitSeq,
-    pub own_txn: Option<TxnId>,
-    pub command_id: CommandId,
-}
 
 #[derive(Debug)]
 pub struct ReadView {

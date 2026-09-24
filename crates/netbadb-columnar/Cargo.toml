@@ -1,0 +1,17 @@
+[package]
+name = "netbadb-columnar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+netbadb-storage-api = { path = "../netbadb-storage-api" }
+crc32c.workspace = true
+netbadb-change-stream = { path = "../netbadb-change-stream" }
+netbadb-index = { path = "../netbadb-index" }
+netbadb-schema = { path = "../netbadb-schema" }
+netbadb-types = { path = "../netbadb-types" }
+
+[lints]
+workspace = true

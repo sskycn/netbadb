@@ -6,6 +6,6 @@ const MAX_INPUT_SIZE: usize = 256 * 1024;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() <= MAX_INPUT_SIZE {
-        netbadb_storage::fuzz_lsm_wal_bytes(data);
+        netbadb_lsm::fuzz_lsm_wal_bytes(data);
     }
 });

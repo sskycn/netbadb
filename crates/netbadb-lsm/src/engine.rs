@@ -278,20 +278,43 @@ struct PendingRow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum LsmObservedVersion {
+enum LsmObservedVersion {
     Committed(LsmCommitSeq),
     Pending(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct LsmRowHandle {
-    pub(crate) row_id: LsmRowId,
-    pub(crate) observed: LsmObservedVersion,
-    pub(crate) clustering_key: ScalarKeyHandle,
+pub struct LsmRowHandle {
+    row_id: LsmRowId,
+    observed: LsmObservedVersion,
+    clustering_key: ScalarKeyHandle,
+}
+
+impl LsmRowHandle {
+    /// Returns the committed version identity, or `None` for an uncommitted
+    /// transaction-local handle. The caller must supply its owning storage ID.
+    pub fn committed_version_key(
+        self,
+        storage_id: StorageId,
+    ) -> Result<Option<StorageVersionKey>, StorageError> {
+        match self.observed {
+            LsmObservedVersion::Committed(version) if version.0 != 0 => {
+                Ok(Some(StorageVersionKey::Lsm {
+                    storage_id,
+                    row_id: self.row_id,
+                    version,
+                }))
+            }
+            LsmObservedVersion::Committed(_) => Err(crate::invalid_format(
+                "committed LSM row has zero commit sequence",
+            )),
+            LsmObservedVersion::Pending(_) => Ok(None),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ScalarKeyHandle {
+enum ScalarKeyHandle {
     Int64(i64),
     UInt64(u64),
 }
@@ -690,21 +713,21 @@ pub struct LsmTransaction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PreparedCommitBatchReport {
-    pub(crate) member_count: usize,
-    pub(crate) commit_records_staged: usize,
-    pub(crate) wal_syncs: u64,
-    pub(crate) first_local_boundary: u64,
-    pub(crate) last_local_boundary: u64,
+pub struct PreparedCommitBatchReport {
+    pub member_count: usize,
+    pub commit_records_staged: usize,
+    pub wal_syncs: u64,
+    pub first_local_boundary: u64,
+    pub last_local_boundary: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PreparedPrepareBatchReport {
-    pub(crate) member_count: usize,
-    pub(crate) prepare_records_staged: usize,
-    pub(crate) wal_syncs: u64,
-    pub(crate) first_local_boundary: u64,
-    pub(crate) last_local_boundary: u64,
+pub struct PreparedPrepareBatchReport {
+    pub member_count: usize,
+    pub prepare_records_staged: usize,
+    pub wal_syncs: u64,
+    pub first_local_boundary: u64,
+    pub last_local_boundary: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -893,7 +916,7 @@ impl LsmStorage {
     /// its WAL generation stays stable across close/reopen. Any later flush
     /// changes that generation, preventing compaction from making an old token
     /// equal again after it discards tombstones.
-    pub(crate) fn projection_snapshot_parts(&self) -> Result<(u64, u64), StorageError> {
+    pub fn projection_snapshot_parts(&self) -> Result<(u64, u64), StorageError> {
         let shared = self.shared.borrow();
         let mut maximum = shared
             .memtable
@@ -1306,7 +1329,7 @@ impl LsmStorage {
         }
     }
 
-    pub(crate) fn inspect_physical_design_source(
+    pub fn inspect_physical_design_source(
         &self,
     ) -> Result<crate::LsmPhysicalDesignSourceInspection, StorageError> {
         self.ensure_recovery_ready()?;
@@ -1376,7 +1399,7 @@ impl LsmStorage {
         })
     }
 
-    pub(crate) fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
+    pub fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
         let shared = self.shared.borrow();
         if shared.runtime.recovery_required.get() || shared.wal.poisoned {
             Err(TransactionError::RecoveryRequired.into())
@@ -1386,7 +1409,7 @@ impl LsmStorage {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn inject_recovery_required(&self) {
+    pub fn inject_recovery_required(&self) {
         self.shared.borrow().runtime.recovery_required.set(true);
     }
 
@@ -1396,11 +1419,11 @@ impl LsmStorage {
     }
 
     #[must_use]
-    pub(crate) fn current_commit_seq(&self) -> LsmCommitSeq {
+    pub fn current_commit_seq(&self) -> LsmCommitSeq {
         self.shared.borrow().maximum_commit_seq()
     }
 
-    pub(crate) fn read_view_at(&self, horizon: LsmCommitSeq) -> Result<LsmReadView, StorageError> {
+    pub fn read_view_at(&self, horizon: LsmCommitSeq) -> Result<LsmReadView, StorageError> {
         let shared = self.shared.borrow();
         let current = shared.maximum_commit_seq();
         if horizon > current {
@@ -1413,9 +1436,7 @@ impl LsmStorage {
         new_read_view(&shared, None, BTreeMap::new(), horizon)
     }
 
-    pub(crate) fn enable_change_stream(
-        &mut self,
-    ) -> Result<crate::ChangeStreamCursor, StorageError> {
+    pub fn enable_change_stream(&mut self) -> Result<crate::ChangeStreamCursor, StorageError> {
         let mut shared = self.shared.borrow_mut();
         if shared.runtime.outstanding_transactions.get() != 0
             || shared.runtime.writer.get().is_some()
@@ -1428,10 +1449,10 @@ impl LsmStorage {
         // The incarnation identity binds this F0 to the current authoritative
         // state; later logical row commits alone advance the frontier.
         let baseline = netbadb_types::StorageDataVersion(0);
-        shared.change_stream.enable(baseline)
+        shared.change_stream.enable(baseline).map_err(Into::into)
     }
 
-    pub(crate) fn disable_change_stream(&mut self) -> Result<(), StorageError> {
+    pub fn disable_change_stream(&mut self) -> Result<(), StorageError> {
         let mut shared = self.shared.borrow_mut();
         if shared.runtime.outstanding_transactions.get() != 0
             || shared.runtime.writer.get().is_some()
@@ -1441,14 +1462,18 @@ impl LsmStorage {
             }
             .into());
         }
-        shared.change_stream.disable()
+        shared.change_stream.disable().map_err(Into::into)
     }
 
-    pub(crate) fn change_stream_cursor(&self) -> Result<crate::ChangeStreamCursor, StorageError> {
-        self.shared.borrow().change_stream.cursor()
+    pub fn change_stream_cursor(&self) -> Result<crate::ChangeStreamCursor, StorageError> {
+        self.shared
+            .borrow()
+            .change_stream
+            .cursor()
+            .map_err(Into::into)
     }
 
-    pub(crate) fn read_changes(
+    pub fn read_changes(
         &self,
         cursor: crate::ChangeStreamCursor,
         max_batches: usize,
@@ -1458,9 +1483,10 @@ impl LsmStorage {
             .borrow()
             .change_stream
             .read(cursor, max_batches, max_bytes)
+            .map_err(Into::into)
     }
 
-    pub(crate) fn acquire_change_stream_retention_pin(
+    pub fn acquire_change_stream_retention_pin(
         &self,
         cursor: crate::ChangeStreamCursor,
     ) -> Result<crate::ChangeStreamRetentionPin, StorageError> {
@@ -1468,9 +1494,10 @@ impl LsmStorage {
             .borrow()
             .change_stream
             .acquire_retention_pin(cursor)
+            .map_err(Into::into)
     }
 
-    pub(crate) fn advance_change_stream_retention_pin(
+    pub fn advance_change_stream_retention_pin(
         &self,
         pin: &mut crate::ChangeStreamRetentionPin,
         frontier: netbadb_types::StorageDataVersion,
@@ -1479,9 +1506,10 @@ impl LsmStorage {
             .borrow()
             .change_stream
             .advance_retention_pin(pin, frontier)
+            .map_err(Into::into)
     }
 
-    pub(crate) fn gc_change_stream(
+    pub fn gc_change_stream(
         &mut self,
         frontier: netbadb_types::StorageDataVersion,
     ) -> Result<crate::ChangeStreamGcStorageReport, StorageError> {
@@ -1494,20 +1522,21 @@ impl LsmStorage {
             }
             .into());
         }
-        shared.change_stream.gc_through(frontier)
+        shared
+            .change_stream
+            .gc_through(frontier)
+            .map_err(Into::into)
     }
 
-    pub(crate) fn change_stream_source_inspection(&self) -> crate::ChangeStreamSourceInspection {
+    pub fn change_stream_source_inspection(&self) -> crate::ChangeStreamSourceInspection {
         self.shared.borrow().change_stream.source_inspection()
     }
 
-    pub(crate) fn change_stream_inspection(&self) -> crate::ChangeStreamInspection {
+    pub fn change_stream_inspection(&self) -> crate::ChangeStreamInspection {
         self.shared.borrow().change_stream.inspection()
     }
 
-    pub(crate) fn change_stream_maintenance_inspection(
-        &self,
-    ) -> crate::ChangeStreamMaintenanceInspection {
+    pub fn change_stream_maintenance_inspection(&self) -> crate::ChangeStreamMaintenanceInspection {
         self.shared.borrow().change_stream.maintenance_inspection()
     }
 
@@ -1558,7 +1587,7 @@ impl LsmStorage {
         Ok(())
     }
 
-    pub(crate) fn insert(&mut self, values: &[ScalarValue]) -> Result<LsmRowHandle, StorageError> {
+    pub fn insert(&mut self, values: &[ScalarValue]) -> Result<LsmRowHandle, StorageError> {
         let mut transaction = self.begin_transaction()?;
         let row = self.insert_in(&mut transaction, values)?;
         transaction.commit()?;
@@ -1566,7 +1595,7 @@ impl LsmStorage {
         self.refresh_handle(row.row_id, &view)
     }
 
-    pub(crate) fn update(
+    pub fn update(
         &mut self,
         row: LsmRowHandle,
         values: &[ScalarValue],
@@ -1578,13 +1607,13 @@ impl LsmStorage {
         self.refresh_handle(updated.row_id, &view)
     }
 
-    pub(crate) fn delete(&mut self, row: LsmRowHandle) -> Result<(), StorageError> {
+    pub fn delete(&mut self, row: LsmRowHandle) -> Result<(), StorageError> {
         let mut transaction = self.begin_transaction()?;
         self.delete_in(&mut transaction, row)?;
         transaction.commit()
     }
 
-    pub(crate) fn insert_in(
+    pub fn insert_in(
         &mut self,
         transaction: &mut LsmTransaction,
         values: &[ScalarValue],
@@ -1619,7 +1648,7 @@ impl LsmStorage {
         })
     }
 
-    pub(crate) fn update_in(
+    pub fn update_in(
         &mut self,
         transaction: &mut LsmTransaction,
         handle: LsmRowHandle,
@@ -1673,7 +1702,7 @@ impl LsmStorage {
         })
     }
 
-    pub(crate) fn delete_in(
+    pub fn delete_in(
         &mut self,
         transaction: &mut LsmTransaction,
         handle: LsmRowHandle,
@@ -1724,7 +1753,7 @@ impl LsmStorage {
         Ok(())
     }
 
-    pub(crate) fn scan_columns_with_view(
+    pub fn scan_columns_with_view(
         &mut self,
         columns: &[ColumnId],
         view: &LsmReadView,
@@ -1732,7 +1761,7 @@ impl LsmStorage {
         self.scan_range_columns_with_view(None, columns, view)
     }
 
-    pub(crate) fn visit_columns_with_view_control<E, F>(
+    pub fn visit_columns_with_view_control<E, F>(
         &mut self,
         columns: &[ColumnId],
         view: &LsmReadView,
@@ -1758,7 +1787,7 @@ impl LsmStorage {
         })
     }
 
-    pub(crate) fn point_lookup_columns_with_view(
+    pub fn point_lookup_columns_with_view(
         &mut self,
         key: &ScalarValue,
         columns: &[ColumnId],
@@ -1768,7 +1797,7 @@ impl LsmStorage {
         self.scan_range_columns_with_view(Some(KeyRange::Point(key)), columns, view)
     }
 
-    pub(crate) fn range_lookup_columns_with_view(
+    pub fn range_lookup_columns_with_view(
         &mut self,
         range: &IndexRange,
         columns: &[ColumnId],
@@ -2005,11 +2034,12 @@ impl LsmStorage {
         Ok(())
     }
 
-    pub(crate) fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
+    pub fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
         self.shared
             .borrow_mut()
             .change_stream
             .checkpoint_pending_finalizes()
+            .map_err(Into::into)
     }
 }
 
@@ -2118,7 +2148,7 @@ impl LsmTransaction {
         new_read_view(&shared, Some(self.id), self.pending.clone(), horizon)
     }
 
-    pub(crate) fn begin_statement_at(
+    pub fn begin_statement_at(
         &mut self,
         horizon: LsmCommitSeq,
     ) -> Result<LsmReadView, StorageError> {
@@ -2136,7 +2166,7 @@ impl LsmTransaction {
     }
 
     #[must_use]
-    pub(crate) fn current_commit_seq(&self) -> LsmCommitSeq {
+    pub fn current_commit_seq(&self) -> LsmCommitSeq {
         self.shared.borrow().maximum_commit_seq()
     }
 
@@ -2299,14 +2329,14 @@ impl LsmTransaction {
         Ok(())
     }
 
-    pub(crate) fn stage_group_prepare(
+    pub fn stage_group_prepare(
         &mut self,
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
         self.stage_group_prepare_inner(database_txn_id, false)
     }
 
-    pub(crate) fn stage_group_prepare_with_batched_change_stream(
+    pub fn stage_group_prepare_with_batched_change_stream(
         &mut self,
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
@@ -2534,7 +2564,7 @@ impl LsmTransaction {
         Ok(())
     }
 
-    pub(crate) fn commit_prepared_batch(
+    pub fn commit_prepared_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<PreparedCommitBatchReport, StorageError> {
         let report = Self::commit_prepared_batch_authoritative(participants)?;
@@ -2559,7 +2589,7 @@ impl LsmTransaction {
         Ok(report)
     }
 
-    pub(crate) fn commit_prepared_batch_authoritative(
+    pub fn commit_prepared_batch_authoritative(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<PreparedCommitBatchReport, StorageError> {
         let Some((first, _)) = participants.first() else {
@@ -2681,13 +2711,13 @@ impl LsmTransaction {
         })
     }
 
-    pub(crate) fn finalize_group_changes_batch(
+    pub fn finalize_group_changes_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
         Self::finalize_group_changes_batch_with_mode(participants, false)
     }
 
-    pub(crate) fn finalize_group_changes_batch_pipelined(
+    pub fn finalize_group_changes_batch_pipelined(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
         Self::finalize_group_changes_batch_with_mode(participants, true)
@@ -2744,7 +2774,7 @@ impl LsmTransaction {
         Ok(report)
     }
 
-    pub(crate) fn durabilize_group_prepare_batch(
+    pub fn durabilize_group_prepare_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<PreparedPrepareBatchReport, StorageError> {
         let Some((first, _)) = participants.first() else {
@@ -2826,7 +2856,7 @@ impl LsmTransaction {
         })
     }
 
-    pub(crate) fn durabilize_group_change_prepare_batch(
+    pub fn durabilize_group_change_prepare_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<Option<ChangePrepareBatchReport>, StorageError> {
         let Some((first, _)) = participants.first() else {
@@ -3211,7 +3241,7 @@ impl LsmTransaction {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn inject_change_stream_group_prepare_sync_failure(&mut self) {
+    pub fn inject_change_stream_group_prepare_sync_failure(&mut self) {
         self.shared
             .borrow_mut()
             .change_stream
@@ -3219,7 +3249,7 @@ impl LsmTransaction {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn inject_change_stream_group_finalize_sync_failure(&mut self) {
+    pub fn inject_change_stream_group_finalize_sync_failure(&mut self) {
         self.shared
             .borrow_mut()
             .change_stream
@@ -8941,7 +8971,7 @@ mod tests {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "lsm::tests::crash_audit_lsm_recovery_child",
+                    "engine::tests::crash_audit_lsm_recovery_child",
                     "--nocapture",
                 ])
                 .env("NETBADB_LSM_RECOVERY_CHILD", "1")
@@ -9438,7 +9468,7 @@ mod tests {
                 std::env::current_exe().expect("current storage test executable"),
             )
             .arg("--exact")
-            .arg("lsm::tests::lsm_commit_crash_child")
+            .arg("engine::tests::lsm_commit_crash_child")
             .arg("--nocapture")
             .env("NETBADB_LSM_COMMIT_CRASH_CHILD", "1")
             .env("NETBADB_LSM_CRASH_CHILD", "1")
@@ -9482,7 +9512,7 @@ mod tests {
             LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
-                .arg("lsm::tests::lsm_group_commit_crash_child")
+                .arg("engine::tests::lsm_group_commit_crash_child")
                 .arg("--nocapture")
                 .env("NETBADB_LSM_GROUP_CRASH_CHILD", "1")
                 .env("NETBADB_LSM_CRASH_CHILD", "1")
@@ -9537,7 +9567,7 @@ mod tests {
             LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
-                .arg("lsm::tests::lsm_group_commit_crash_child")
+                .arg("engine::tests::lsm_group_commit_crash_child")
                 .arg("--nocapture")
                 .env("NETBADB_LSM_GROUP_PREPARE_CRASH_CHILD", "1")
                 .env("NETBADB_LSM_CRASH_CHILD", "1")
@@ -9608,7 +9638,7 @@ mod tests {
         );
         command
             .arg("--exact")
-            .arg("lsm::tests::lsm_maintenance_crash_child")
+            .arg("engine::tests::lsm_maintenance_crash_child")
             .arg("--nocapture")
             .env("NETBADB_LSM_CRASH_CHILD", "1")
             .env("NETBADB_LSM_CRASH_ROOT", root)

@@ -41,45 +41,26 @@ struct TransactionRuntime {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PreparedCommitBatchReport {
-    pub(crate) member_count: usize,
-    pub(crate) commit_records_staged: usize,
-    pub(crate) wal_syncs: u64,
-    pub(crate) first_local_boundary: u64,
-    pub(crate) last_local_boundary: u64,
+pub struct PreparedCommitBatchReport {
+    pub member_count: usize,
+    pub commit_records_staged: usize,
+    pub wal_syncs: u64,
+    pub first_local_boundary: u64,
+    pub last_local_boundary: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PreparedPrepareBatchReport {
-    pub(crate) member_count: usize,
-    pub(crate) prepare_records_staged: usize,
-    pub(crate) wal_syncs: u64,
-    pub(crate) first_local_boundary: u64,
-    pub(crate) last_local_boundary: u64,
+pub struct PreparedPrepareBatchReport {
+    pub member_count: usize,
+    pub prepare_records_staged: usize,
+    pub wal_syncs: u64,
+    pub first_local_boundary: u64,
+    pub last_local_boundary: u64,
 }
 
 type SharedRuntime = Rc<TransactionRuntime>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransactionState {
-    Active,
-    /// A compound logical operation logged only part of its physical work.
-    /// The transaction may be rolled back but cannot continue or commit.
-    RollbackRequired,
-    PreparePending,
-    Prepared,
-    /// A group Prepare is staged and the writer is released, but its storage
-    /// durability barrier has not yet succeeded.
-    ParkedPreparePending,
-    ParkedPrepared,
-    CommitPending,
-    /// Authoritative commit is durable, while a grouped Change Stream
-    /// Finalize barrier has not yet promoted the prepared batch.
-    ChangeFinalizePending,
-    RollbackPending,
-    Committed,
-    RolledBack,
-}
+pub use netbadb_storage_api::TransactionState;
 
 #[derive(Debug)]
 pub(crate) struct IndexTransactionState {
@@ -256,14 +237,14 @@ impl Transaction {
     /// Unlike [`Self::prepare`], success does not establish authoritative WAL
     /// durability. The transaction is frozen, ordered with the other parked
     /// members, and no longer owns the single writer.
-    pub(crate) fn stage_group_prepare(
+    pub fn stage_group_prepare(
         &mut self,
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
         self.stage_group_prepare_inner(database_txn_id, false)
     }
 
-    pub(crate) fn stage_group_prepare_with_batched_change_stream(
+    pub fn stage_group_prepare_with_batched_change_stream(
         &mut self,
         database_txn_id: DatabaseTxnId,
     ) -> Result<(), StorageError> {
@@ -384,7 +365,7 @@ impl Transaction {
         self.publish_changes(None)
     }
 
-    pub(crate) fn commit_prepared_batch(
+    pub fn commit_prepared_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<PreparedCommitBatchReport, StorageError> {
         let report = Self::commit_prepared_batch_authoritative(participants)?;
@@ -403,7 +384,7 @@ impl Transaction {
         Ok(report)
     }
 
-    pub(crate) fn commit_prepared_batch_authoritative(
+    pub fn commit_prepared_batch_authoritative(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<PreparedCommitBatchReport, StorageError> {
         let Some((first, _)) = participants.first() else {
@@ -520,13 +501,13 @@ impl Transaction {
         })
     }
 
-    pub(crate) fn finalize_group_changes_batch(
+    pub fn finalize_group_changes_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
         Self::finalize_group_changes_batch_with_mode(participants, false)
     }
 
-    pub(crate) fn finalize_group_changes_batch_pipelined(
+    pub fn finalize_group_changes_batch_pipelined(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<Option<ChangeFinalizeBatchReport>, StorageError> {
         Self::finalize_group_changes_batch_with_mode(participants, true)
@@ -581,7 +562,7 @@ impl Transaction {
         Ok(report)
     }
 
-    pub(crate) fn durabilize_group_prepare_batch(
+    pub fn durabilize_group_prepare_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<PreparedPrepareBatchReport, StorageError> {
         let Some((first, _)) = participants.first() else {
@@ -667,7 +648,7 @@ impl Transaction {
         })
     }
 
-    pub(crate) fn durabilize_group_change_prepare_batch(
+    pub fn durabilize_group_change_prepare_batch(
         participants: &mut [(&mut Self, DatabaseTxnId)],
     ) -> Result<Option<ChangePrepareBatchReport>, StorageError> {
         let mut stream = None::<SharedChangeStream>;
@@ -1084,10 +1065,7 @@ impl Transaction {
         )
     }
 
-    pub(crate) fn begin_statement_at(
-        &mut self,
-        visible_csn: CommitSeq,
-    ) -> Result<ReadView, StorageError> {
+    pub fn begin_statement_at(&mut self, visible_csn: CommitSeq) -> Result<ReadView, StorageError> {
         self.ensure_active()?;
         let current = self.current_commit_seq();
         if visible_csn > current {
@@ -1116,7 +1094,7 @@ impl Transaction {
     }
 
     #[must_use]
-    pub(crate) fn current_commit_seq(&self) -> CommitSeq {
+    pub fn current_commit_seq(&self) -> CommitSeq {
         self.statuses.borrow().maximum_commit_seq()
     }
 
@@ -1503,15 +1481,15 @@ impl Transaction {
             .inject_partial_append_failure(after_bytes);
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn inject_change_stream_group_prepare_sync_failure(&mut self) {
+    #[cfg(feature = "test-hooks")]
+    pub fn inject_change_stream_group_prepare_sync_failure(&mut self) {
         if let Some(stream) = &self.change_stream {
             stream.borrow_mut().inject_group_prepare_sync_failure();
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn inject_change_stream_group_finalize_sync_failure(&mut self) {
+    #[cfg(feature = "test-hooks")]
+    pub fn inject_change_stream_group_finalize_sync_failure(&mut self) {
         if let Some(stream) = &self.change_stream {
             stream.borrow_mut().inject_group_finalize_sync_failure();
         }
@@ -1737,7 +1715,7 @@ impl TransactionManager {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(feature = "test-hooks")]
     pub(crate) fn inject_recovery_required(&self) {
         self.runtime.writer.set(WriterState::RecoveryRequired);
     }

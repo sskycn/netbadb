@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::rc::Rc;
 
 use netbadb_storage::{
@@ -12,253 +11,13 @@ use crate::{
     ColumnarProjectionHealth, Database, DatabaseError, StorageRegistryError,
 };
 
-/// Structural resource limits for one caller-driven maintenance step.
-///
-/// These limits are deliberately not time deadlines. A step executes at most
-/// one action even when `max_actions` is larger than one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MaintenanceBudget {
-    pub max_work_units: u64,
-    pub max_read_bytes: u64,
-    pub max_write_bytes: u64,
-    pub max_actions: u32,
-}
+pub(crate) use netbadb_advisor::MaintenanceCursor;
 
-impl MaintenanceBudget {
-    #[must_use]
-    pub const fn new(
-        max_work_units: u64,
-        max_read_bytes: u64,
-        max_write_bytes: u64,
-        max_actions: u32,
-    ) -> Self {
-        Self {
-            max_work_units,
-            max_read_bytes,
-            max_write_bytes,
-            max_actions,
-        }
-    }
-
-    /// Returns the component-wise minimum of two independent maintenance
-    /// envelopes.
-    #[must_use]
-    pub const fn capped_by(self, other: Self) -> Self {
-        Self {
-            max_work_units: if self.max_work_units < other.max_work_units {
-                self.max_work_units
-            } else {
-                other.max_work_units
-            },
-            max_read_bytes: if self.max_read_bytes < other.max_read_bytes {
-                self.max_read_bytes
-            } else {
-                other.max_read_bytes
-            },
-            max_write_bytes: if self.max_write_bytes < other.max_write_bytes {
-                self.max_write_bytes
-            } else {
-                other.max_write_bytes
-            },
-            max_actions: if self.max_actions < other.max_actions {
-                self.max_actions
-            } else {
-                other.max_actions
-            },
-        }
-    }
-
-    pub(crate) const fn checked_remaining(self, consumed: MaintenanceConsumption) -> Option<Self> {
-        if !self.contains(consumed) {
-            return None;
-        }
-        Some(Self {
-            max_work_units: self.max_work_units - consumed.work_units,
-            max_read_bytes: self.max_read_bytes - consumed.read_bytes,
-            max_write_bytes: self.max_write_bytes - consumed.write_bytes,
-            max_actions: self.max_actions - consumed.actions,
-        })
-    }
-
-    pub(crate) fn remaining(self, consumed: MaintenanceConsumption) -> Self {
-        Self {
-            max_work_units: self.max_work_units.saturating_sub(consumed.work_units),
-            max_read_bytes: self.max_read_bytes.saturating_sub(consumed.read_bytes),
-            max_write_bytes: self.max_write_bytes.saturating_sub(consumed.write_bytes),
-            max_actions: self.max_actions.saturating_sub(consumed.actions),
-        }
-    }
-
-    pub(crate) const fn admits(self, estimate: MaintenanceEstimate) -> bool {
-        self.max_actions != 0
-            && estimate.work_units <= self.max_work_units
-            && estimate.read_bytes <= self.max_read_bytes
-            && estimate.write_bytes <= self.max_write_bytes
-    }
-
-    pub(crate) const fn contains(self, consumed: MaintenanceConsumption) -> bool {
-        consumed.actions <= self.max_actions
-            && consumed.work_units <= self.max_work_units
-            && consumed.read_bytes <= self.max_read_bytes
-            && consumed.write_bytes <= self.max_write_bytes
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MaintenanceConsumption {
-    pub work_units: u64,
-    pub read_bytes: u64,
-    pub write_bytes: u64,
-    pub actions: u32,
-}
-
-impl MaintenanceConsumption {
-    /// Adds independently measured maintenance consumption without hiding an
-    /// overflow as a trustworthy total.
-    #[must_use]
-    pub const fn checked_add(self, other: Self) -> Option<Self> {
-        let Some(work_units) = self.work_units.checked_add(other.work_units) else {
-            return None;
-        };
-        let Some(read_bytes) = self.read_bytes.checked_add(other.read_bytes) else {
-            return None;
-        };
-        let Some(write_bytes) = self.write_bytes.checked_add(other.write_bytes) else {
-            return None;
-        };
-        let Some(actions) = self.actions.checked_add(other.actions) else {
-            return None;
-        };
-        Some(Self {
-            work_units,
-            read_bytes,
-            write_bytes,
-            actions,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MaintenanceEstimate {
-    pub work_units: u64,
-    pub read_bytes: u64,
-    pub write_bytes: u64,
-}
-
-impl MaintenanceEstimate {
-    const fn from_lsm(cost: LsmMaintenanceCostInspection) -> Self {
-        Self {
-            work_units: cost.work_units,
-            read_bytes: cost.read_bytes,
-            write_bytes: cost.write_bytes,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaintenanceBound {
-    /// Batch count and encoded NBCL input bytes are hard bounded. Output bytes
-    /// are an admission estimate because the existing NBCD writer is atomic.
-    HardBoundedInput,
-    /// The existing operation is atomic and starts only when its complete
-    /// structural estimate fits the budget.
-    EstimateGatedAtomic,
-    /// The complete structural input and exact production rewrite output are
-    /// known and admitted before an irreversible mutation begins.
-    HardBoundedRewrite,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaintenanceReason {
-    LsmMemtableFlush,
-    ProjectionLag,
-    ChangeHistoryReclaim,
-    LsmCompactionPressure,
-    ColumnarDeltaCost,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaintenanceAction {
-    AdvanceColumnar {
-        projection_id: ColumnarProjectionId,
-        max_batches: u64,
-        max_change_bytes: u64,
-    },
-    CompactColumnar {
-        projection_id: ColumnarProjectionId,
-    },
-    GcChangeStream {
-        table_id: TableId,
-        storage_id: StorageId,
-    },
-    FlushLsm {
-        table_id: TableId,
-        storage_id: StorageId,
-    },
-    CompactLsm {
-        table_id: TableId,
-        storage_id: StorageId,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaintenanceBlocker {
-    ActionBudgetExhausted,
-    WorkBudgetExceeded,
-    ReadBudgetExceeded,
-    WriteBudgetExceeded,
-    Busy,
-    SnapshotProjection,
-    ProjectionFresh,
-    ProjectionLagging,
-    RebuildRequired,
-    Unavailable,
-    NoDelta,
-    NoRetentionConsumer,
-    NoReclaimableHistory,
-    RetentionUnsafe,
-    HistoryUnavailable,
-    RecoveryRequired,
-    MemtableNotEmpty,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MaintenanceCandidate {
-    pub action: MaintenanceAction,
-    pub reason: MaintenanceReason,
-    pub bound: MaintenanceBound,
-    pub estimate: MaintenanceEstimate,
-    pub eligible: bool,
-    pub blocker: Option<MaintenanceBlocker>,
-}
-
-impl MaintenanceCandidate {
-    fn pending_work(&self) -> bool {
-        matches!(
-            self.blocker,
-            None | Some(MaintenanceBlocker::ActionBudgetExhausted)
-                | Some(MaintenanceBlocker::WorkBudgetExceeded)
-                | Some(MaintenanceBlocker::ReadBudgetExceeded)
-                | Some(MaintenanceBlocker::WriteBudgetExceeded)
-                | Some(MaintenanceBlocker::Busy)
-                | Some(MaintenanceBlocker::ProjectionLagging)
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MaintenanceDecision {
-    pub action: MaintenanceAction,
-    pub reason: MaintenanceReason,
-    pub bound: MaintenanceBound,
-    pub estimated: MaintenanceEstimate,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MaintenanceInspection {
-    pub decision: Option<MaintenanceDecision>,
-    pub candidates: Vec<MaintenanceCandidate>,
-}
+use netbadb_advisor::{
+    MaintenanceAction, MaintenanceBlocker, MaintenanceBound, MaintenanceBudget,
+    MaintenanceCandidate, MaintenanceConsumption, MaintenanceDecision, MaintenanceEstimate,
+    MaintenanceInspection, MaintenanceReason, action_cursor, candidate,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LsmMaintenanceReport {
@@ -292,12 +51,6 @@ pub struct MaintenanceStepReport {
     pub consumed: MaintenanceConsumption,
     pub budget_remaining: MaintenanceBudget,
     pub more_work_remaining: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MaintenanceCursor {
-    class: u8,
-    target: u64,
 }
 
 #[derive(Debug)]
@@ -685,7 +438,7 @@ pub(crate) fn lsm_maintenance_candidates(
             },
             MaintenanceReason::LsmMemtableFlush,
             MaintenanceBound::EstimateGatedAtomic,
-            MaintenanceEstimate::from_lsm(cost),
+            lsm_estimate(cost),
             safety_blocker,
             core_busy,
             budget,
@@ -702,7 +455,7 @@ pub(crate) fn lsm_maintenance_candidates(
             },
             MaintenanceReason::LsmCompactionPressure,
             MaintenanceBound::EstimateGatedAtomic,
-            MaintenanceEstimate::from_lsm(cost),
+            lsm_estimate(cost),
             blocker,
             core_busy,
             budget,
@@ -890,139 +643,19 @@ fn change_stream_gc_candidate(
     )
 }
 
-fn candidate(
-    action: MaintenanceAction,
-    reason: MaintenanceReason,
-    bound: MaintenanceBound,
-    estimate: MaintenanceEstimate,
-    structural_blocker: Option<MaintenanceBlocker>,
-    busy: bool,
-    budget: MaintenanceBudget,
-) -> MaintenanceCandidate {
-    let blocker = structural_blocker.or_else(|| {
-        if busy {
-            Some(MaintenanceBlocker::Busy)
-        } else {
-            budget_blocker(estimate, budget)
-        }
-    });
-    MaintenanceCandidate {
-        action,
-        reason,
-        bound,
-        estimate,
-        eligible: blocker.is_none(),
-        blocker,
-    }
-}
-
-fn budget_blocker(
-    estimate: MaintenanceEstimate,
-    budget: MaintenanceBudget,
-) -> Option<MaintenanceBlocker> {
-    if budget.max_actions == 0 {
-        Some(MaintenanceBlocker::ActionBudgetExhausted)
-    } else if estimate.work_units > budget.max_work_units {
-        Some(MaintenanceBlocker::WorkBudgetExceeded)
-    } else if estimate.read_bytes > budget.max_read_bytes {
-        Some(MaintenanceBlocker::ReadBudgetExceeded)
-    } else if estimate.write_bytes > budget.max_write_bytes {
-        Some(MaintenanceBlocker::WriteBudgetExceeded)
-    } else {
-        None
-    }
-}
-
 fn plan_maintenance(
-    mut state: MaintenanceState,
+    state: MaintenanceState,
     cursor: Option<MaintenanceCursor>,
 ) -> MaintenanceInspection {
-    state.candidates.sort_by(compare_candidates);
-    let decision = state
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.eligible)
-        .min_by(|left, right| compare_with_cursor(left, right, cursor))
-        .map(|candidate| MaintenanceDecision {
-            action: candidate.action,
-            reason: candidate.reason,
-            bound: candidate.bound,
-            estimated: candidate.estimate,
-        });
-    MaintenanceInspection {
-        decision,
-        candidates: state.candidates,
-    }
+    netbadb_advisor::plan_maintenance(state.candidates, cursor)
 }
 
-fn compare_candidates(left: &MaintenanceCandidate, right: &MaintenanceCandidate) -> Ordering {
-    action_priority(left.action)
-        .cmp(&action_priority(right.action))
-        .then_with(|| action_sort_key(left.action).cmp(&action_sort_key(right.action)))
-}
-
-fn compare_with_cursor(
-    left: &MaintenanceCandidate,
-    right: &MaintenanceCandidate,
-    cursor: Option<MaintenanceCursor>,
-) -> Ordering {
-    let priority = action_priority(left.action).cmp(&action_priority(right.action));
-    if priority != Ordering::Equal {
-        return priority;
+fn lsm_estimate(cost: LsmMaintenanceCostInspection) -> MaintenanceEstimate {
+    MaintenanceEstimate {
+        work_units: cost.work_units,
+        read_bytes: cost.read_bytes,
+        write_bytes: cost.write_bytes,
     }
-    let left_cursor = action_cursor(left.action);
-    let right_cursor = action_cursor(right.action);
-    if left_cursor.class != right_cursor.class {
-        return left_cursor.class.cmp(&right_cursor.class);
-    }
-    let Some(cursor) = cursor.filter(|cursor| cursor.class == left_cursor.class) else {
-        return left_cursor.target.cmp(&right_cursor.target);
-    };
-    let left_after = left_cursor.target > cursor.target;
-    let right_after = right_cursor.target > cursor.target;
-    right_after
-        .cmp(&left_after)
-        .then_with(|| left_cursor.target.cmp(&right_cursor.target))
-}
-
-const fn action_priority(action: MaintenanceAction) -> u8 {
-    match action {
-        MaintenanceAction::FlushLsm { .. } => 0,
-        MaintenanceAction::AdvanceColumnar { .. } => 1,
-        MaintenanceAction::GcChangeStream { .. } => 2,
-        MaintenanceAction::CompactLsm { .. } => 3,
-        MaintenanceAction::CompactColumnar { .. } => 4,
-    }
-}
-
-const fn action_cursor(action: MaintenanceAction) -> MaintenanceCursor {
-    match action {
-        MaintenanceAction::FlushLsm { storage_id, .. } => MaintenanceCursor {
-            class: 0,
-            target: storage_id.0,
-        },
-        MaintenanceAction::AdvanceColumnar { projection_id, .. } => MaintenanceCursor {
-            class: 1,
-            target: projection_id.0,
-        },
-        MaintenanceAction::GcChangeStream { storage_id, .. } => MaintenanceCursor {
-            class: 2,
-            target: storage_id.0,
-        },
-        MaintenanceAction::CompactLsm { storage_id, .. } => MaintenanceCursor {
-            class: 3,
-            target: storage_id.0,
-        },
-        MaintenanceAction::CompactColumnar { projection_id } => MaintenanceCursor {
-            class: 4,
-            target: projection_id.0,
-        },
-    }
-}
-
-const fn action_sort_key(action: MaintenanceAction) -> (u8, u64) {
-    let cursor = action_cursor(action);
-    (cursor.class, cursor.target)
 }
 
 const fn zero_estimate() -> MaintenanceEstimate {

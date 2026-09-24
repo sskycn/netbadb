@@ -278,7 +278,15 @@ netbadb/
 │   ├── netbadb-tooling/     stable schema-driven SQL diagnostics
 │   ├── netbadb-planner/     logical plan → physical plan
 │   ├── netbadb-index/       typed B+Tree ordering, nodes, codecs, and splits
-│   ├── netbadb-storage/     transactions, WAL, pages, buffer pool, heap, B+Tree
+│   ├── netbadb-storage-api/ engine-independent storage contracts
+│   ├── netbadb-row-codec/   positional typed row payload codec
+│   ├── netbadb-change-stream/ storage-local NBCL logs, replay and retention
+│   ├── netbadb-lsm/         authoritative LSM WAL, SSTables and transactions
+│   ├── netbadb-columnar/    derived NBC artifacts and lazy scans
+│   ├── netbadb-heap/        authoritative Heap, pages, WAL, recovery and B+Tree
+│   ├── netbadb-storage/     Heap/LSM dispatch and compatibility facade
+│   ├── netbadb-query-feedback/ typed execution feedback and workload windows
+│   ├── netbadb-advisor/     maintenance proposals, admission and logical-tick gate
 │   ├── netbadb-executor/    synchronous physical-plan execution
 │   ├── netbadb-core/        native embedded database API
 │   ├── netbadb-protocol/    versioned language-neutral binary wire contract
@@ -312,9 +320,17 @@ compiler -> hir + parser + rel + schema + types
 tooling -> compiler + hir + parser + schema
 planner -> index + rel + types
 index -> types
-storage -> index + schema + types
-executor -> planner + rel + storage + types
-core -> compiler + inspect + planner + rel + executor + storage + schema + types
+storage-api -> index + types
+row-codec -> schema + types
+change-stream -> storage-api + row-codec + schema + types
+lsm -> change-stream + storage-api + row-codec + index + schema + types
+columnar -> change-stream + storage-api + index + schema + types
+heap -> change-stream + storage-api + row-codec + index + schema + types
+storage -> heap + lsm + columnar + change-stream + storage-api + row-codec + index + schema + types
+query-feedback -> planner + rel + storage-api + types
+advisor -> lsm + columnar + change-stream + storage-api + types
+executor -> query-feedback + planner + rel + storage + types
+core -> advisor + query-feedback + compiler + inspect + planner + rel + executor + storage + schema + types
 protocol -> types
 client -> protocol + schema + types
 server -> core + protocol + schema + types

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+netbadb-query-feedback = { path = "../netbadb-query-feedback" }
 netbadb-planner = { path = "../netbadb-planner" }
 netbadb-rel = { path = "../netbadb-rel" }
 netbadb-storage = { path = "../netbadb-storage" }

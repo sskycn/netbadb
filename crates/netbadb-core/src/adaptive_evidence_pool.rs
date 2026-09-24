@@ -43,21 +43,7 @@ pub struct AdaptiveTargetLineage {
     pub projection_id: ColumnarProjectionId,
 }
 
-/// Runtime aggregation lifetime. It is independent of schema, physical, and
-/// planner-calibration generations.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AdaptiveEvidenceWindowEpoch(pub u64);
-
-/// Allocation-free progress coordinate for cooperative adaptive scheduling.
-///
-/// This token only indicates that the caller-owned aggregation state may have
-/// changed. It is not evidence quality, freshness, or mutation authority.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AdaptiveEvidenceProgressToken {
-    pub window_epoch: AdaptiveEvidenceWindowEpoch,
-    pub schema_generation: Option<SchemaGeneration>,
-    pub recorded_reports: u64,
-}
+pub use netbadb_advisor::{AdaptiveEvidenceProgressToken, AdaptiveEvidenceWindowEpoch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdaptiveEvidencePoolHealth {

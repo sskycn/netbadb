@@ -460,17 +460,7 @@ pub enum AutomaticLaneSelectionReason {
     NoReadyCandidates,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutomaticEvidenceRenewalReason {
-    ColumnarPhysicalStateChanged,
-    ColumnarEligibilityChanged,
-    AuthoritativeLsmLayoutChanged,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AutomaticEvidenceRenewalRecommendation {
-    pub reason: AutomaticEvidenceRenewalReason,
-}
+pub use netbadb_advisor::{AutomaticEvidenceRenewalReason, AutomaticEvidenceRenewalRecommendation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AutomaticCandidateKey {

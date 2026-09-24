@@ -1,3 +1,6 @@
+pub use netbadb_storage_api::{
+    PreparedDecision, PreparedTransaction, PreparedTransactionState, PreparedTxnResolution,
+};
 use std::collections::{BinaryHeap, HashMap};
 use std::error::Error;
 use std::fmt;
@@ -16,35 +19,6 @@ pub(crate) struct RecoveryReport {
     pub pages_redone: usize,
     pub pages_undone: usize,
     pub truncated_wal_tail: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreparedTransactionState {
-    Prepared,
-    Committed,
-    RolledBack,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PreparedTransaction {
-    pub database_txn_id: DatabaseTxnId,
-    pub physical_txn_id: TxnId,
-    /// Monotonic WAL position used to reconstruct prepare/rollback stack order.
-    pub prepare_order: u64,
-    pub state: PreparedTransactionState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreparedDecision {
-    Commit,
-    Abort,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PreparedTxnResolution {
-    pub database_txn_id: DatabaseTxnId,
-    pub physical_txn_id: TxnId,
-    pub decision: PreparedDecision,
 }
 
 pub(crate) fn inspect_prepared_transactions(records: &[WalRecord]) -> Vec<PreparedTransaction> {
@@ -144,6 +118,51 @@ pub enum RecoveryError {
     },
     #[cfg(test)]
     InterruptedForTest,
+}
+
+impl From<netbadb_storage_api::PreparedRecoveryError> for RecoveryError {
+    fn from(error: netbadb_storage_api::PreparedRecoveryError) -> Self {
+        use netbadb_storage_api::PreparedRecoveryError as E;
+        match error {
+            E::PreparedTransactionRequiresResolution {
+                database_txn_id,
+                physical_txn_id,
+            } => Self::PreparedTransactionRequiresResolution {
+                database_txn_id,
+                physical_txn_id,
+            },
+            E::DuplicatePreparedResolution { physical_txn_id } => {
+                Self::DuplicatePreparedResolution { physical_txn_id }
+            }
+            E::PreparedResolutionMismatch {
+                physical_txn_id,
+                expected,
+                actual,
+            } => Self::PreparedResolutionMismatch {
+                physical_txn_id,
+                expected,
+                actual,
+            },
+            E::UnknownPreparedResolution {
+                database_txn_id,
+                physical_txn_id,
+            } => Self::UnknownPreparedResolution {
+                database_txn_id,
+                physical_txn_id,
+            },
+            E::PreparedResolutionConflictsWithTerminalState {
+                database_txn_id,
+                physical_txn_id,
+                state,
+                decision,
+            } => Self::PreparedResolutionConflictsWithTerminalState {
+                database_txn_id,
+                physical_txn_id,
+                state,
+                decision,
+            },
+        }
+    }
 }
 
 impl fmt::Display for RecoveryError {

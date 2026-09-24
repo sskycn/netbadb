@@ -140,16 +140,7 @@ struct CatalogSnapshot {
     current_format: bool,
 }
 
-/// Exact counts collected by one current live Heap scan.
-///
-/// `non_null_counts` follows the caller-provided column request order and
-/// retains duplicate requests. Both the live-row count and column counts use
-/// checked `u128` arithmetic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PresenceCountSummary {
-    pub live_rows: u128,
-    pub non_null_counts: Vec<u128>,
-}
+pub use netbadb_storage_api::PresenceCountSummary;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeapRecoveryInspection {
@@ -761,7 +752,7 @@ impl HeapStorage {
         Ok(())
     }
 
-    pub(crate) fn rewrite_indexes(&mut self) -> Result<HeapRewriteIndexes, StorageError> {
+    pub fn rewrite_indexes(&mut self) -> Result<HeapRewriteIndexes, StorageError> {
         let catalog = self.read_index_catalog(self.index_catalog_root)?;
         Ok(HeapRewriteIndexes {
             active: self
@@ -780,7 +771,7 @@ impl HeapStorage {
     /// Validates the exact transaction-visible active inventory and the
     /// persisted key specification of every surviving tree against a
     /// prospective private-Heap schema.
-    pub(crate) fn validate_rewrite_index_inventory(
+    pub fn validate_rewrite_index_inventory(
         &mut self,
         target: &TableDef,
         expected: &HeapRewriteIndexes,
@@ -808,7 +799,7 @@ impl HeapStorage {
         Ok(())
     }
 
-    pub(crate) fn rewrite_indexes_with_definitions(
+    pub fn rewrite_indexes_with_definitions(
         &mut self,
     ) -> Result<Vec<IndexDefinition>, StorageError> {
         Ok(self
@@ -863,7 +854,7 @@ impl HeapStorage {
         self.create_index_with_name(Some(name), column_id)
     }
 
-    pub(crate) fn create_index_from_floor(
+    pub fn create_index_from_floor(
         &mut self,
         name: Option<IndexName>,
         column_id: ColumnId,
@@ -917,7 +908,7 @@ impl HeapStorage {
         }
     }
 
-    pub(crate) fn create_named_index_in(
+    pub fn create_named_index_in(
         &mut self,
         transaction: &mut Transaction,
         name: IndexName,
@@ -927,7 +918,7 @@ impl HeapStorage {
             .map(|plan| plan.definition)
     }
 
-    pub(crate) fn create_index_in(
+    pub fn create_index_in(
         &mut self,
         transaction: &mut Transaction,
         column_id: ColumnId,
@@ -936,7 +927,7 @@ impl HeapStorage {
             .map(|plan| plan.definition)
     }
 
-    pub(crate) fn create_named_index_with_reserved_id_in(
+    pub fn create_named_index_with_reserved_id_in(
         &mut self,
         transaction: &mut Transaction,
         name: IndexName,
@@ -948,7 +939,7 @@ impl HeapStorage {
             .map(|plan| plan.definition)
     }
 
-    pub(crate) fn advance_index_id_floor_in(
+    pub fn advance_index_id_floor_in(
         &mut self,
         transaction: &mut Transaction,
         target: IndexId,
@@ -977,7 +968,7 @@ impl HeapStorage {
         self.write_catalog_node_in(transaction, self.index_catalog_root, before, node)
     }
 
-    pub(crate) fn install_rewrite_indexes_in(
+    pub fn install_rewrite_indexes_in(
         &mut self,
         transaction: &mut Transaction,
         snapshot: &HeapRewriteIndexes,
@@ -1239,7 +1230,7 @@ impl HeapStorage {
         Ok((column_position, spec))
     }
 
-    pub(crate) fn publish_committed_index(&mut self, definition: IndexDefinition) {
+    pub fn publish_committed_index(&mut self, definition: IndexDefinition) {
         let column_position = self
             .table
             .columns
@@ -2007,7 +1998,7 @@ impl HeapStorage {
         }
     }
 
-    pub(crate) fn drop_index_in(
+    pub fn drop_index_in(
         &mut self,
         transaction: &mut Transaction,
         id: IndexId,
@@ -2067,7 +2058,7 @@ impl HeapStorage {
         }
     }
 
-    pub(crate) fn publish_committed_index_drop(&mut self, id: IndexId) {
+    pub fn publish_committed_index_drop(&mut self, id: IndexId) {
         self.reusable_btree_pages = None;
         let position = self
             .indexes
@@ -2161,12 +2152,12 @@ impl HeapStorage {
         self.transactions.begin_with_isolation(isolation_level)
     }
 
-    pub(crate) fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
+    pub fn ensure_recovery_ready(&self) -> Result<(), StorageError> {
         self.transactions.ensure_recovery_ready()
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn inject_recovery_required(&self) {
+    #[cfg(feature = "test-hooks")]
+    pub fn inject_recovery_required(&self) {
         self.transactions.inject_recovery_required();
     }
 
@@ -2178,11 +2169,11 @@ impl HeapStorage {
     }
 
     #[must_use]
-    pub(crate) fn current_commit_seq(&self) -> netbadb_types::CommitSeq {
+    pub fn current_commit_seq(&self) -> netbadb_types::CommitSeq {
         self.statuses.borrow().maximum_commit_seq()
     }
 
-    pub(crate) fn read_view_at(
+    pub fn read_view_at(
         &self,
         visible_csn: netbadb_types::CommitSeq,
     ) -> Result<ReadView, StorageError> {
@@ -2208,27 +2199,31 @@ impl HeapStorage {
         )
     }
 
-    pub(crate) fn enable_change_stream(
-        &mut self,
-    ) -> Result<crate::ChangeStreamCursor, StorageError> {
+    pub fn enable_change_stream(&mut self) -> Result<crate::ChangeStreamCursor, StorageError> {
         self.transactions.ensure_checkpoint_safe()?;
         // A new incarnation defines its current authoritative state as F0.
         // Heap CommitSeq also covers metadata transactions and therefore is
         // deliberately not reused as the logical row-change frontier.
         let baseline = netbadb_types::StorageDataVersion(0);
-        self.change_stream.borrow_mut().enable(baseline)
+        self.change_stream
+            .borrow_mut()
+            .enable(baseline)
+            .map_err(Into::into)
     }
 
-    pub(crate) fn disable_change_stream(&mut self) -> Result<(), StorageError> {
+    pub fn disable_change_stream(&mut self) -> Result<(), StorageError> {
         self.transactions.ensure_checkpoint_safe()?;
-        self.change_stream.borrow_mut().disable()
+        self.change_stream
+            .borrow_mut()
+            .disable()
+            .map_err(Into::into)
     }
 
-    pub(crate) fn change_stream_cursor(&self) -> Result<crate::ChangeStreamCursor, StorageError> {
-        self.change_stream.borrow().cursor()
+    pub fn change_stream_cursor(&self) -> Result<crate::ChangeStreamCursor, StorageError> {
+        self.change_stream.borrow().cursor().map_err(Into::into)
     }
 
-    pub(crate) fn read_changes(
+    pub fn read_changes(
         &self,
         cursor: crate::ChangeStreamCursor,
         max_batches: usize,
@@ -2237,16 +2232,20 @@ impl HeapStorage {
         self.change_stream
             .borrow()
             .read(cursor, max_batches, max_bytes)
+            .map_err(Into::into)
     }
 
-    pub(crate) fn acquire_change_stream_retention_pin(
+    pub fn acquire_change_stream_retention_pin(
         &self,
         cursor: crate::ChangeStreamCursor,
     ) -> Result<crate::ChangeStreamRetentionPin, StorageError> {
-        self.change_stream.borrow().acquire_retention_pin(cursor)
+        self.change_stream
+            .borrow()
+            .acquire_retention_pin(cursor)
+            .map_err(Into::into)
     }
 
-    pub(crate) fn advance_change_stream_retention_pin(
+    pub fn advance_change_stream_retention_pin(
         &self,
         pin: &mut crate::ChangeStreamRetentionPin,
         frontier: netbadb_types::StorageDataVersion,
@@ -2254,27 +2253,29 @@ impl HeapStorage {
         self.change_stream
             .borrow()
             .advance_retention_pin(pin, frontier)
+            .map_err(Into::into)
     }
 
-    pub(crate) fn gc_change_stream(
+    pub fn gc_change_stream(
         &mut self,
         frontier: netbadb_types::StorageDataVersion,
     ) -> Result<crate::ChangeStreamGcStorageReport, StorageError> {
         self.transactions.ensure_checkpoint_safe()?;
-        self.change_stream.borrow_mut().gc_through(frontier)
+        self.change_stream
+            .borrow_mut()
+            .gc_through(frontier)
+            .map_err(Into::into)
     }
 
-    pub(crate) fn change_stream_source_inspection(&self) -> crate::ChangeStreamSourceInspection {
+    pub fn change_stream_source_inspection(&self) -> crate::ChangeStreamSourceInspection {
         self.change_stream.borrow().source_inspection()
     }
 
-    pub(crate) fn change_stream_inspection(&self) -> crate::ChangeStreamInspection {
+    pub fn change_stream_inspection(&self) -> crate::ChangeStreamInspection {
         self.change_stream.borrow().inspection()
     }
 
-    pub(crate) fn change_stream_maintenance_inspection(
-        &self,
-    ) -> crate::ChangeStreamMaintenanceInspection {
+    pub fn change_stream_maintenance_inspection(&self) -> crate::ChangeStreamMaintenanceInspection {
         self.change_stream.borrow().maintenance_inspection()
     }
 
@@ -2826,7 +2827,7 @@ impl HeapStorage {
         self.scan_columns_with_view(columns, &view)
     }
 
-    pub(crate) fn inspect_physical_design_source(
+    pub fn inspect_physical_design_source(
         &self,
     ) -> Result<crate::HeapPhysicalDesignSourceInspection, StorageError> {
         self.ensure_recovery_ready()?;
@@ -3389,10 +3390,11 @@ impl HeapStorage {
         self.flush()
     }
 
-    pub(crate) fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
+    pub fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
         self.change_stream
             .borrow_mut()
             .checkpoint_pending_finalizes()
+            .map_err(Into::into)
     }
 
     #[must_use]
