@@ -5,6 +5,37 @@ on:
   pull_request:
 
 jobs:
+  capability-acceptance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Record checkout and toolchain
+        run: |
+          echo "current=$(git rev-parse HEAD)"
+          echo "baseline=$(git rev-parse b36f784584132ce21fe24ed840da681613487881)"
+          rustc --version
+          cargo --version
+      - name: Fetch current and baseline dependencies
+        run: |
+          cargo fetch --locked
+          baseline_dir=$(mktemp -d)
+          trap 'rm -rf "$baseline_dir"' EXIT
+          git archive b36f784584132ce21fe24ed840da681613487881 | tar -xf - -C "$baseline_dir"
+          cargo fetch --locked --manifest-path "$baseline_dir/Cargo.toml"
+      - name: Check capability dependency boundaries and checker fixtures
+        run: |
+          python3 scripts/test-capability-deps.py
+          python3 scripts/check-capability-deps.py
+      - name: Check independent consumers
+        run: |
+          scripts/check-independent-consumers.sh
+          python3 scripts/check-minimal-consumers.py
+      - name: Check baseline storage compatibility
+        run: scripts/check-baseline-change-compatibility.sh
+
   rust:
     runs-on: ubuntu-latest
     steps:

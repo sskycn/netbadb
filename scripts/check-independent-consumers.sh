@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+echo "combined consumer: current=$(git -C "$repository" rev-parse HEAD) toolchain=$(rustc --version)"
 consumer=$(mktemp -d)
 trap 'rm -rf "$consumer"' EXIT HUP INT TERM
 mkdir -p "$consumer/src"

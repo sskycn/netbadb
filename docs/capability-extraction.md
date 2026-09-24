@@ -152,3 +152,130 @@ Database transaction coordination, full catalog lifecycles, DDL rewrite,
 schema mutation journal, generic RPC and code generation, remote CDC,
 replication, asynchronous core execution, and multiple active writers per
 `StorageId` are outside this extraction. They remain in their current owners.
+
+## Acceptance hardening (24 September 2026)
+
+This pass validates the extraction at `7b30a6df103a574aa3aa44aab0826e8aee96cd65`
+against baseline `b36f784584132ce21fe24ed840da681613487881`. It adds
+acceptance scripts and CI wiring, without changing production storage,
+protocol, SQL, transaction, or catalog code. The extracted implementation
+scope remains the seven capabilities above. Advisor owns maintenance ranking,
+budget decisions, LSM proposal/revalidation, and logical-tick gating. Other
+adaptive and Physical Design logic remains in Core.
+
+### What the original scripts covered
+
+Before hardening, `check-independent-consumers.sh` ran one external Cargo
+project whose manifest declared every extracted engine and decision crate.
+`check-capability-deps.py` traversed workspace declarations from
+`cargo metadata --no-deps`, including optional path edges, but did not
+traverse the resolved graph or fail when a required capability package was
+missing. `check-baseline-change-compatibility.sh` tested baseline Heap/NBCL
+write to current read/append/reopen, a baseline/current NBCL byte comparison,
+baseline LSM write to current read/append/reopen, and a baseline/current LSM
+manifest comparison. It did not establish reverse readability or Columnar
+baseline artifact compatibility. None of the three scripts ran in CI.
+
+### Dependency and consumer evidence
+
+`capability-acceptance` runs on push and pull request. It checks out complete
+history, records the current/baseline commits and Rust/Cargo versions, fetches
+locked current and baseline dependencies, then runs the boundary checker,
+checker fixtures, combined consumer, seven separate minimal consumers, and
+compatibility matrix. A nonzero check exit fails the job. The external
+projects still resolve dependencies offline, so the job does not depend on
+cache contents inherited from a developer computer.
+
+The boundary checker tests both declared optional path edges and the full
+resolved package graph. It compares package identities (source and version),
+and follows normal and build edges transitively, including workspace-external
+adapters. Dev edges are checked at the capability root only; dependency tests
+are not built by a consumer. For an inactive optional external registry
+dependency, Cargo has no resolved transitive graph; its declaration remains
+visible for inspection, while indirect edges can only be checked when
+resolved. Failure messages include each edge, kind, alias, package identity,
+and full route.
+Isolated checker fixtures verify direct, renamed, transitive external,
+inactive optional, build, missing-package, legal, and same-name-different-
+identity cases. They do not edit production manifests.
+
+Each of the seven new consumers has its own workspace-external manifest and
+declares only the target capability and crates actually used by its case. They
+exercise row values/NULL/type and malformed input; Change Stream prepare,
+publication after a test-owned durable decision ledger, authoritative-outcome
+callback on reopen and bounded replay; LSM and Heap commit/rollback/reopen;
+Columnar publish/reopen/scan; nonempty feedback
+correlation and rejected identity mismatch; and Advisor ranking, budget
+rejection, stale proposal revalidation and tick gating. Advisor's synthetic
+eligible observation tests its pure proposal comparison; it does not modify an
+engine or grant mutation authority. Each manifest's resolved normal/build
+graph is checked for Core, Server, Executor, the storage facade, and
+`test-hooks`. The original combined consumer remains in place.
+
+### Persistent and API compatibility evidence
+
+The compatibility matrix compiles independent external baseline and current
+Cargo programs. These are normal close/reopen tests, **not** crash-recovery
+tests. The existing Heap, LSM, Change Stream and Columnar process-crash/fault
+injection tests remain the recovery evidence and are run separately.
+
+| Format | Baseline write → current read | Current write → baseline read | Current append to baseline data → baseline read | Current clean reopen | Deterministic bytes |
+| --- | --- | --- | --- | --- | --- |
+| Heap with NBCL | yes, including Change Stream replay | yes | yes, two replayed batches | yes | NBCL log bytes |
+| LSM | yes | yes | yes, two rows | yes | initial manifest bytes |
+| Columnar base artifact | yes | yes | not claimed: managed generation/advance requires Core catalog authority; this matrix opens immutable published base artifacts | yes | manifest and base segment bytes |
+
+These comparisons cover the named artifacts and scenarios, not every page,
+WAL, SSTable, delta, or catalog format. A current encoder/decoder round trip
+alone does not establish baseline compatibility. No forward-writing guarantee
+is claimed beyond the explicit Heap/NBCL and LSM append cases.
+
+External compile cases cover old-path `HeapStorage` and `LsmStorage`
+create/open-style calls, `TableStorage` Heap/LSM operations, error adapters,
+visibility-boundary construction, and type identity of old reexports:
+
+| API | Source compatibility |
+| --- | --- |
+| `netbadb_storage::TableStorage` and its `StorageError` results | Retained; baseline and current external programs compile and run. |
+| Old `netbadb_storage::{HeapStorage,LsmStorage}` paths | Retained as the same concrete types reexported from the new engine crates. Common externally callable operations compile against both versions. |
+| Direct Heap/LSM operation errors | Deliberately changed from facade `StorageError` to `HeapStorageError` / `LsmStorageError`; facade `From` adapters retain structured errors. Callers with explicit direct-operation result types must update them. |
+| `StorageVisibilityBoundary::new` errors | Deliberately changed from `StorageError` to `VisibilityBoundaryError`; callers with explicit error types or `?` conversion must adapt. |
+| `RecoveryError::Storage` nested error | Deliberately carries `Box<HeapStorageError>` in the direct Heap path, rather than `Box<StorageError>`; pattern matching callers must adapt. |
+| Direct LSM mutation methods | Newly public to support facade delegation across crates. The baseline's `LsmStorage::insert` was crate-private, so it is not a preexisting stable external call. |
+
+The current-only external compilation checks typed result/error identities, not
+just the presence of `pub use`. New lower-level methods remain implementation
+entry points: a public Rust signature does not make transaction ownership,
+generation, or recovery bypass a supported external contract. Prepared Change
+and Columnar publication tokens retain private fields; recovery and generation
+checks remain in their owning engines. LSM row-handle fields are private, and
+mutation methods validate handles against the owning engine. Its
+`committed_version_key(storage_id)` helper takes a caller-supplied storage ID
+and checks committed versus pending version state; that DTO helper is not a
+storage-identity authority. This pass found no source-and-test-proven runtime
+corruption defect to repair.
+
+### Protocol and verification status
+
+No protocol source or wire format changed in this pass. Protocol compatibility
+is therefore bounded to the existing workspace protocol tests; there is no
+new cross-version wire fixture in this acceptance matrix.
+
+Local validation on this acceptance tree passed:
+
+- `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and
+  `cargo test --workspace`. The first sandboxed full test run hit the
+  previously documented loopback bind restriction in two CLI tests; the
+  complete rerun with local loopback permission passed.
+- `cargo +1.85.0 check --workspace --all-targets`, all three CI SDK feature
+  combinations, and MSRV remote SDK check.
+- Current and baseline `cargo fetch --locked`; checker and nine isolated
+  fixture tests; combined and seven minimal external consumers; baseline
+  compatibility matrix; script syntax checks; and `git diff --check`.
+- Separate process-crash tests for Change Stream grouped finalize, LSM durable
+  commit, Columnar delta publication, and Heap no-force winner redo.
+
+Remote CI is a separate result. The new job had not been triggered when this
+record was written; inspect the pushed commit's Actions run for its actual
+status. Local success is not a remote CI result.

@@ -1,68 +1,101 @@
 #!/usr/bin/env python3
-"""Check capability boundaries from Cargo package metadata, including optional edges."""
+"""Check declared optional edges and the complete resolved Cargo dependency graph.
+
+Normal and build edges are traversed at every level. Dev edges are included only
+at the checked package root: a consumer does not build its dependencies' tests.
+"""
+import argparse
+from collections import deque
 import json
+from pathlib import Path
 import subprocess
 import sys
 
-metadata = json.loads(subprocess.check_output([
-    "cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"
-]))
-packages = {package["name"]: package for package in metadata["packages"]}
-engines = {"netbadb-heap", "netbadb-lsm", "netbadb-columnar", "netbadb-change-stream"}
-facade = "netbadb-storage"
-core = "netbadb-core"
-forbidden = {
-    "netbadb-storage-api": engines | {facade, core, "netbadb-executor"},
-    "netbadb-row-codec": engines | {facade, core, "netbadb-executor"},
-    "netbadb-change-stream": {facade, core, "netbadb-heap", "netbadb-lsm", "netbadb-columnar"},
-    "netbadb-lsm": {facade, core, "netbadb-heap", "netbadb-columnar"},
-    "netbadb-columnar": {facade, core, "netbadb-heap", "netbadb-lsm"},
-    "netbadb-heap": {facade, core, "netbadb-lsm", "netbadb-columnar"},
-    "netbadb-query-feedback": {facade, core, "netbadb-executor"},
-    "netbadb-advisor": {facade, core, "netbadb-executor"},
-    "netbadb-planner": {core, "netbadb-executor", "netbadb-advisor"},
+ENGINES = {"netbadb-heap", "netbadb-lsm", "netbadb-columnar", "netbadb-change-stream"}
+UPPER = {"netbadb-storage", "netbadb-core", "netbadb-executor", "netbadb-server"}
+FORBIDDEN = {
+    "netbadb-storage-api": ENGINES | UPPER,
+    "netbadb-row-codec": ENGINES | UPPER,
+    "netbadb-change-stream": (ENGINES - {"netbadb-change-stream"}) | UPPER,
+    "netbadb-lsm": (ENGINES - {"netbadb-lsm", "netbadb-change-stream"}) | UPPER,
+    "netbadb-columnar": (ENGINES - {"netbadb-columnar", "netbadb-change-stream"}) | UPPER,
+    "netbadb-heap": (ENGINES - {"netbadb-heap", "netbadb-change-stream"}) | UPPER,
+    "netbadb-query-feedback": UPPER,
+    "netbadb-advisor": UPPER,
+    "netbadb-planner": {"netbadb-core", "netbadb-executor", "netbadb-advisor", "netbadb-server"},
 }
 
 
-def edges(package_name, include_dev):
-    """Cargo reports actual package names even for renamed dependencies."""
-    for dep in packages[package_name]["dependencies"]:
-        if dep["kind"] == "dev" and not include_dev:
+def inspect(metadata):
+    packages = {p["id"]: p for p in metadata["packages"]}
+    workspace = {packages[i]["name"]: i for i in metadata["workspace_members"]}
+    errors = [f"required workspace package missing: {n}" for n in sorted(FORBIDDEN.keys() - workspace.keys())]
+    paths = {str(Path(p["manifest_path"]).parent): p["id"] for p in metadata["packages"]}
+    resolved = {n["id"]: n for n in metadata["resolve"]["nodes"]}
+
+    def label(i):
+        p = packages[i]
+        return f'{p["name"]}@{p["version"]} ({i})'
+
+    def declared(i):
+        # Inactive optional declarations are absent from the resolved graph.
+        for d in packages[i]["dependencies"]:
+            target = paths.get(str(Path(d["path"]))) if d.get("path") else None
+            if target:
+                yield target, d["kind"] or "normal", bool(d["optional"]), d.get("rename") or d["name"]
+
+    def actual(i):
+        # Package IDs, including source and version, prevent name collisions.
+        for d in resolved.get(i, {}).get("deps", []):
+            for k in d["dep_kinds"]:
+                yield d["pkg"], k["kind"] or "normal", False, d["name"]
+
+    def find(start, bad, graph, include_dev):
+        queue = deque([(start, [])])
+        seen = {start}
+        while queue:
+            current, route = queue.popleft()
+            for target, kind, optional, alias in graph(current):
+                if kind == "dev" and (not include_dev or current != start):
+                    continue
+                if target not in packages:
+                    continue
+                step = f'{label(current)} -[{kind}{", optional" if optional else ""}, as {alias}]-> {label(target)}'
+                next_route = route + [step]
+                if target in bad:
+                    yield "\n    ".join(next_route)
+                elif target not in seen:
+                    seen.add(target)
+                    queue.append((target, next_route))
+
+    for name, forbidden in FORBIDDEN.items():
+        if name not in workspace:
             continue
-        if dep["name"] in packages:
-            yield dep["name"], dep["kind"] or "normal", dep["optional"]
+        bad = {workspace[n] for n in forbidden if n in workspace}
+        for graph_name, graph in (("declaration", declared), ("resolved", actual)):
+            for scope, include_dev in (("normal/build", False), ("root dev plus normal/build", True)):
+                for route in find(workspace[name], bad, graph, include_dev):
+                    errors.append(f"{name}: {graph_name} {scope} forbidden path:\n    {route}")
+    return errors
 
 
-def find_forbidden(start, bad, include_dev):
-    stack = [(start, [])]
-    seen = set()
-    while stack:
-        current, path = stack.pop()
-        if current in seen:
-            continue
-        seen.add(current)
-        for target, kind, optional in edges(current, include_dev and current == start):
-            step = f"{current} -[{kind}{', optional' if optional else ''}]-> {target}"
-            if target in bad:
-                return path + [step]
-            stack.append((target, path + [step]))
-    return None
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--metadata", type=Path, help="Cargo metadata JSON fixture")
+    args = parser.parse_args()
+    if not args.metadata:
+        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        toolchain = subprocess.check_output(["cargo", "--version"], text=True).strip()
+        print(f"capability dependencies: current={revision} toolchain={toolchain}", flush=True)
+    metadata = (json.loads(args.metadata.read_text()) if args.metadata else
+                json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1", "--offline"])))
+    errors = inspect(metadata)
+    if errors:
+        print("Capability dependency boundaries failed:\n" + "\n".join(errors), file=sys.stderr)
+        return 1
+    print("Capability dependency boundaries passed (declared and resolved graphs)")
+    return 0
 
 
-errors = []
-for name, bad in forbidden.items():
-    if name not in packages:
-        continue
-    # Production graph includes all normal and build edges, even optional ones.
-    path = find_forbidden(name, bad, include_dev=False)
-    if path:
-        errors.append("production: " + " / ".join(path))
-    # Capability tests also stay independent. No dev-dependency exception is
-    # currently needed; if one becomes justified, list it explicitly here.
-    path = find_forbidden(name, bad, include_dev=True)
-    if path:
-        errors.append("test: " + " / ".join(path))
-if errors:
-    print("Forbidden capability dependencies:", *errors, sep="\n", file=sys.stderr)
-    sys.exit(1)
-print("Capability dependency boundaries passed")
+if __name__ == "__main__":
+    sys.exit(main())
