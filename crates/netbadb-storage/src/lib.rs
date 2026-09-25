@@ -13,15 +13,16 @@ pub use netbadb_columnar::{
 };
 pub use netbadb_heap::{
     BTree, BufferPool, DEFAULT_BUFFER_POOL_SIZE, HeapIdentityInspection,
-    HeapIndexBuildWriteBoundInspection, HeapPhysicalDesignSourceInspection, HeapRecoveryInspection,
-    HeapResourceComponent, HeapResourceComponentKind, HeapRewriteIndex, HeapRewriteIndexes,
-    HeapStorage, HistoricalOrphanAdoptionReport, IndexMaintenanceReport, IndexPageAllocation,
-    IndexReclaimReport, IndexTailReclaimReport, PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE, PAGE_MAGIC,
-    PAGE_SIZE, Page, PageHeader, PageManager, PageReuseClass, PageReuseInspection, PageType,
-    PresenceCountSummary, ReadPageGuard, ReadView, RecoveryError, ReusablePageInspection,
-    SLOT_SIZE, Slot, SlotRef, SlotState, Transaction, TxnStatus, TxnStatusError,
-    WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager, WalRecord,
-    WalRecordKind, heap_resource_components, txn_status_path, wal_alternate_path, wal_path,
+    HeapIndexBuildWriteBoundInspection, HeapOwnership, HeapPhysicalDesignSourceInspection,
+    HeapRecoveryInspection, HeapResourceComponent, HeapResourceComponentKind, HeapRewriteIndex,
+    HeapRewriteIndexes, HeapStorage, HistoricalOrphanAdoptionReport, IndexMaintenanceReport,
+    IndexPageAllocation, IndexReclaimReport, IndexTailReclaimReport, PAGE_FORMAT_VERSION,
+    PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, Page, PageHeader, PageManager, PageReuseClass,
+    PageReuseInspection, PageType, PresenceCountSummary, ReadPageGuard, ReadView, RecoveryError,
+    ReusablePageInspection, SLOT_SIZE, Slot, SlotRef, SlotState, Transaction, TxnStatus,
+    TxnStatusError, WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager,
+    WalRecord, WalRecordKind, heap_resource_components, txn_status_path, wal_alternate_path,
+    wal_path,
 };
 
 /// Computes the initial Columnar artifact bound from a fresh authoritative

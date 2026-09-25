@@ -11,11 +11,11 @@ use netbadb_types::{
 };
 
 use crate::{
-    HeapIdentityInspection, HeapPhysicalDesignSourceInspection, HeapRecoveryInspection,
-    HeapRewriteIndexes, HeapStorage, IsolationLevel, LsmIdentityInspection, LsmInspection,
-    LsmPhysicalDesignSourceInspection, LsmReadView, LsmRecoveryInspection, LsmRowHandle,
-    LsmStorage, LsmTransaction, PreparedTxnResolution, PresenceCountSummary, ReadView,
-    StorageError, StorageSnapshotToken, Transaction, TransactionError, TransactionState,
+    HeapIdentityInspection, HeapOwnership, HeapPhysicalDesignSourceInspection,
+    HeapRecoveryInspection, HeapRewriteIndexes, HeapStorage, IsolationLevel, LsmIdentityInspection,
+    LsmInspection, LsmPhysicalDesignSourceInspection, LsmReadView, LsmRecoveryInspection,
+    LsmRowHandle, LsmStorage, LsmTransaction, PreparedTxnResolution, PresenceCountSummary,
+    ReadView, StorageError, StorageSnapshotToken, Transaction, TransactionError, TransactionState,
 };
 
 enum VisitError<E> {
@@ -1084,6 +1084,33 @@ impl TableStorage {
             .map(Box::new)
             .map(Self::Heap)
             .map_err(Into::into)
+    }
+
+    /// Consumes a locked Heap token after path and identity verification in Heap.
+    /// `None` preserves the ordinary unresolved-prepared open contract.
+    pub fn open_heap_with_ownership(
+        ownership: HeapOwnership,
+        table: TableDef,
+        resolutions: Option<&[PreparedTxnResolution]>,
+    ) -> Result<Self, StorageError> {
+        HeapStorage::open_with_ownership(ownership, table, resolutions)
+            .map(Box::new)
+            .map(Self::Heap)
+            .map_err(Into::into)
+    }
+
+    /// Stops a clean Heap writer and returns its same-inode ownership token.
+    pub fn stop_heap_for_promotion(
+        self,
+        path: impl AsRef<Path>,
+    ) -> Result<HeapOwnership, StorageError> {
+        match self {
+            Self::Heap(storage) => storage.stop_for_promotion(path).map_err(Into::into),
+            Self::Lsm(_) => Err(StorageError::UnsupportedOperation {
+                operation: "Heap promotion handoff",
+                storage_kind: "LSM",
+            }),
+        }
     }
 
     pub fn inspect_heap_recovery(

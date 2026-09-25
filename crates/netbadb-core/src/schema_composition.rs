@@ -27,8 +27,8 @@ use crate::schema_catalog_file as file;
 use crate::schema_mutation::{
     AlterTableOperation, AlterTableSpec, CreateTableSpec, SchemaDependency, SchemaMutationError,
     SchemaWriter, SharedMutationJournal, build_alter_target, cleanup_prepared,
-    cleanup_staged_loser, crash, digest, ensure_parent, open_winner_heap, promote, retarget_owner,
-    validate_resource_path, write_owner,
+    cleanup_staged_loser, crash, digest, ensure_parent, open_winner_heap, promote_with_ownership,
+    retarget_owner, validate_resource_path, write_owner,
 };
 use crate::schema_mutation_journal::{
     CompositionColumnReservation, CompositionIndexReservation, CompositionResolution,
@@ -7111,10 +7111,23 @@ impl Database {
         };
         let completion =
             (|| -> Result<CompositionCompletion, DatabaseError> {
-                for storage in materialized.staged.values() {
-                    storage.flush()?;
+                let mut ownerships = BTreeMap::new();
+                for storage_id in materialized.staged.keys().copied().collect::<Vec<_>>() {
+                    let storage = materialized
+                        .staged
+                        .remove(&storage_id)
+                        .ok_or(SchemaMutationError::Corrupt("staged Heap disappeared"))?;
+                    let stage = file::resolve(
+                        &materialized.logical.catalog,
+                        &stage_locator(
+                            &materialized.logical.catalog,
+                            materialized.target.incarnation,
+                            materialized.intent.transaction,
+                            storage_id,
+                        )?,
+                    );
+                    ownerships.insert(storage_id, storage.stop_heap_for_promotion(&stage)?);
                 }
-                materialized.staged.clear();
                 for plan in &materialized.intent.tables {
                     transaction.release_staged_context(plan.new_storage());
                 }
@@ -7123,10 +7136,11 @@ impl Database {
                 for (position, plan) in materialized.intent.tables.iter().enumerate() {
                     let reservation =
                         composition_physical_reservation(&materialized.intent, plan, None);
-                    promote(
+                    let ownership = promote_with_ownership(
                         &materialized.logical.catalog,
                         &reservation,
                         &materialized.reference,
+                        ownerships.remove(&plan.new_storage()),
                     )?;
                     crash(&format!("composition-after-promotion-{}", position + 1));
                     let final_path = file::resolve(
@@ -7137,7 +7151,8 @@ impl Database {
                             plan.new_storage(),
                         )?,
                     );
-                    let storage = open_winner_heap(&final_path, &reservation, &decisions)?;
+                    let storage =
+                        open_winner_heap(&final_path, &reservation, &decisions, ownership)?;
                     storage.flush()?;
                     let source = self.registry.get(plan.old_storage()).ok_or(
                         SchemaMutationError::Corrupt("composition source disappeared"),
@@ -7241,10 +7256,28 @@ impl Database {
             }
         };
         let completion = (|| -> Result<_, DatabaseError> {
-            for storage in materialized.staged.values() {
-                storage.flush()?;
+            let mut ownerships = BTreeMap::new();
+            for storage_id in materialized.staged.keys().copied().collect::<Vec<_>>() {
+                let storage = materialized
+                    .staged
+                    .remove(&storage_id)
+                    .ok_or(SchemaMutationError::Corrupt("staged Heap disappeared"))?;
+                let incarnation = materialized
+                    .target
+                    .as_ref()
+                    .ok_or(SchemaMutationError::Corrupt("staged Heap has no target"))?
+                    .incarnation;
+                let stage = file::resolve(
+                    &materialized.logical.catalog,
+                    &stage_locator(
+                        &materialized.logical.catalog,
+                        incarnation,
+                        materialized.intent.transaction,
+                        storage_id,
+                    )?,
+                );
+                ownerships.insert(storage_id, storage.stop_heap_for_promotion(&stage)?);
             }
-            materialized.staged.clear();
             for plan in &materialized.intent.tables {
                 match plan {
                     SchemaIndexTablePlan::CreateHeap { target, .. } => {
@@ -7273,13 +7306,19 @@ impl Database {
                                 ))?;
                         let reservation =
                             create_physical_reservation(&materialized.intent, target, None);
-                        promote(&materialized.logical.catalog, &reservation, reference)?;
+                        let ownership = promote_with_ownership(
+                            &materialized.logical.catalog,
+                            &reservation,
+                            reference,
+                            ownerships.remove(&reservation.storage),
+                        )?;
                         crash(&format!("composition-after-promotion-{}", position + 1));
                         let final_path = file::resolve(
                             &materialized.logical.catalog,
                             &target.storages[0].locator,
                         );
-                        let storage = open_winner_heap(&final_path, &reservation, &decisions)?;
+                        let storage =
+                            open_winner_heap(&final_path, &reservation, &decisions, ownership)?;
                         storage.flush()?;
                         created.push((plan.table(), storage));
                     }
@@ -7296,13 +7335,19 @@ impl Database {
                             replacement,
                             None,
                         );
-                        promote(&materialized.logical.catalog, &reservation, reference)?;
+                        let ownership = promote_with_ownership(
+                            &materialized.logical.catalog,
+                            &reservation,
+                            reference,
+                            ownerships.remove(&reservation.storage),
+                        )?;
                         crash(&format!("composition-after-promotion-{}", position + 1));
                         let final_path = file::resolve(
                             &materialized.logical.catalog,
                             &replacement.target.storages[0].locator,
                         );
-                        let storage = open_winner_heap(&final_path, &reservation, &decisions)?;
+                        let storage =
+                            open_winner_heap(&final_path, &reservation, &decisions, ownership)?;
                         storage.flush()?;
                         let source = self.registry.get(replacement.old_storage()).ok_or(
                             SchemaMutationError::Corrupt("composition source disappeared"),

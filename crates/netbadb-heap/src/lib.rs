@@ -22,10 +22,10 @@ pub use buffer::{BufferPool, DEFAULT_BUFFER_POOL_SIZE, ReadPageGuard};
 pub(crate) use error::invalid_format;
 pub use error::{BufferError, HeapStorageError, MetadataError, PageError};
 pub use heap::{
-    HeapIdentityInspection, HeapIndexBuildWriteBoundInspection, HeapRecoveryInspection,
-    HeapStorage, HistoricalOrphanAdoptionReport, IndexMaintenanceReport, IndexPageAllocation,
-    IndexReclaimReport, IndexTailReclaimReport, PageReuseClass, PageReuseInspection,
-    ReusablePageInspection,
+    HeapIdentityInspection, HeapIndexBuildWriteBoundInspection, HeapOwnership,
+    HeapRecoveryInspection, HeapStorage, HistoricalOrphanAdoptionReport, IndexMaintenanceReport,
+    IndexPageAllocation, IndexReclaimReport, IndexTailReclaimReport, PageReuseClass,
+    PageReuseInspection, ReusablePageInspection,
 };
 pub use inspection::{
     HeapPhysicalDesignSourceInspection, HeapResourceComponent, HeapResourceComponentKind,

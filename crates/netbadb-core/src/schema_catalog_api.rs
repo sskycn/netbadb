@@ -1,5 +1,5 @@
 //! Bootstrap/expectation adapters around the single persisted schema authority.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use netbadb_schema::{Schema, TableDef};
@@ -661,7 +661,7 @@ fn open_authority(
     partition: Option<&Path>,
 ) -> Result<Database, DatabaseError> {
     let path = file::absolute(path)?;
-    let journal = crate::schema_mutation::recover(&path)?;
+    let (journal, mut ownerships) = crate::schema_mutation::recover(&path)?;
     let snapshot = file::load(&path)?;
     let incarnation = snapshot.incarnation;
     preflight_paths(&path, &snapshot, false)?;
@@ -686,7 +686,17 @@ fn open_authority(
     }
     validate_partition_evidence(&path, &snapshot)?;
     validate_physical(&path, &snapshot, overrides)?;
-    let mut database = recover_physical(&path, &snapshot, overrides)?;
+    #[cfg(test)]
+    if let Some(storage) = snapshot
+        .storages
+        .iter()
+        .find(|storage| matches!(storage.kind, CatalogStorageKind::Heap))
+    {
+        let heap = file::resolve(&path, &storage.locator);
+        crate::schema_mutation::handoff_pause("validated", Some(&heap));
+    }
+    let mut database =
+        recover_physical_with_ownership(&path, &snapshot, overrides, &mut ownerships)?;
     database.committed = snapshot.committed;
     database.catalog_path = Some(path);
     database.configure_managed_projection_catalog(incarnation)?;
@@ -906,7 +916,48 @@ pub(crate) fn recover_physical(
     snapshot: &SchemaCatalogSnapshot,
     overrides: &[TableStorageOpenSpec],
 ) -> Result<Database, DatabaseError> {
+    recover_physical_with_ownership(path, snapshot, overrides, &mut BTreeMap::new())
+}
+
+pub(crate) fn recover_physical_with_ownership(
+    path: &Path,
+    snapshot: &SchemaCatalogSnapshot,
+    overrides: &[TableStorageOpenSpec],
+    ownerships: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+) -> Result<Database, DatabaseError> {
     let specs = materialize(path, snapshot, overrides)?;
+    // `materialize` may use a read-only identity to resolve a legacy path
+    // override. Recheck every Heap descriptor after claiming all Heap inodes,
+    // before coordinator recovery can modify any participant.
+    let claimed = crate::claim_heap_paths_with_existing(
+        specs.iter().filter_map(|spec| match spec {
+            TableStorageOpenSpec::Heap { path, .. } => Some(path.clone()),
+            TableStorageOpenSpec::Lsm { .. } => None,
+        }),
+        ownerships,
+    )?;
+    for (descriptor, spec) in snapshot.storages.iter().zip(&specs) {
+        if let TableStorageOpenSpec::Heap { path, table } = spec {
+            let identity = claimed
+                .get(path)
+                .ok_or(SchemaCatalogError::InventoryMismatch(
+                    "claimed Heap path missing",
+                ))?
+                .inspect_identity()
+                .map_err(StorageError::from)?;
+            if identity.storage_id != descriptor.id
+                || identity.table_id != descriptor.table_id
+                || identity.schema_fingerprint != table.fingerprint()?
+                || !matches!(descriptor.kind, CatalogStorageKind::Heap)
+            {
+                return Err(SchemaCatalogError::InventoryMismatch(
+                    "Heap identity changed before recovery ownership",
+                )
+                .into());
+            }
+        }
+    }
+    ownerships.extend(claimed);
     let journal =
         crate::schema_mutation_journal::SchemaMutationJournal::open(path, snapshot.incarnation)?;
     let coordinator_locator = snapshot.coordinator.as_ref().or_else(|| {
@@ -1018,6 +1069,7 @@ pub(crate) fn recover_physical(
                 specs.iter().map(|s| s.path().to_owned()).collect(),
                 PartitionCatalogConfig::new(file::resolve(path, partition), coordinator.log_path()),
                 snapshot.committed.clone(),
+                ownerships,
             );
         }
     }
@@ -1066,8 +1118,9 @@ pub(crate) fn recover_physical(
                 tables,
                 config,
                 snapshot.committed.clone(),
+                ownerships,
             ),
-            None => Database::physical_open_tables(tables, snapshot.committed.clone()),
+            None => Database::physical_open_tables(tables, snapshot.committed.clone(), ownerships),
         };
     }
     match coordinator {
@@ -1076,8 +1129,9 @@ pub(crate) fn recover_physical(
             config,
             snapshot.committed.clone(),
             Some(snapshot.placements.clone()),
+            ownerships,
         ),
-        None => Database::physical_open_storages(specs, snapshot.committed.clone()),
+        None => Database::physical_open_storages(specs, snapshot.committed.clone(), ownerships),
     }
 }
 

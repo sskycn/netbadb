@@ -1,6 +1,6 @@
 //! Frontend-independent transactional Heap creation. No SQL parsing occurs here.
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::OpenOptions;
@@ -2255,24 +2255,43 @@ impl Database {
             .ok_or(SchemaMutationError::Corrupt("schema participant absent"))?;
         // Close path-bearing storage handles before promotion. The transaction's
         // physical context is already terminal and is removed separately below.
-        if let Some(storage) = mutation.staged.take() {
-            storage.close()?;
-        }
+        let ownership = if let Some(storage) = mutation.staged.take() {
+            let stage = file::resolve(
+                &mutation.catalog,
+                &stage_locator(
+                    &mutation.catalog,
+                    mutation.target.incarnation,
+                    mutation.reservation.transaction,
+                    mutation.reservation.storage,
+                )?,
+            );
+            Some(storage.stop_heap_for_promotion(&stage)?)
+        } else {
+            None
+        };
         let catalog = mutation.catalog.clone();
         let reservation = mutation.reservation.clone();
         let target = mutation.target.clone();
         let reference = mutation.reference.clone();
         transaction.release_staged_context(reservation.storage);
-        promote(&catalog, &reservation, &reference)?;
+        #[cfg(test)]
+        handoff_pause(
+            "stopped",
+            ownership.as_ref().map(netbadb_storage::HeapOwnership::path),
+        );
+        let ownership = promote_with_ownership(&catalog, &reservation, &reference, ownership)?;
         crash("promotion-complete");
         let final_path = file::resolve(
             &catalog,
             &final_locator(&catalog, target.incarnation, reservation.storage)?,
         );
+        #[cfg(test)]
+        handoff_pause("promoted", Some(&final_path));
         let storage = open_winner_heap(
             &final_path,
             &reservation,
             &transaction.coordinator_decisions()?,
+            ownership,
         )?;
         storage.flush()?;
         if self.registry.get(reservation.storage).is_some()
@@ -2329,16 +2348,27 @@ impl Database {
             .as_ref()
             .ok_or(SchemaMutationError::Corrupt("rewrite participant absent"))?
             .clone();
-        if let Some(storage) = mutation.staged.take() {
-            storage.close()?;
-        }
+        let ownership = if let Some(storage) = mutation.staged.take() {
+            let stage = file::resolve(
+                &mutation.catalog,
+                &stage_locator(
+                    &mutation.catalog,
+                    mutation.target.incarnation,
+                    mutation.reservation.transaction,
+                    mutation.reservation.storage,
+                )?,
+            );
+            Some(storage.stop_heap_for_promotion(&stage)?)
+        } else {
+            None
+        };
         let catalog = mutation.catalog.clone();
         let reservation = mutation.reservation.clone();
         let target = mutation.target.clone();
         let reference = mutation.reference.clone();
         let journal = Rc::clone(&mutation.journal);
         transaction.release_staged_context(reservation.storage);
-        promote(&catalog, &reservation, &reference)?;
+        let ownership = promote_with_ownership(&catalog, &reservation, &reference, ownership)?;
         crash("rewrite-promotion-complete");
         let final_path = file::resolve(
             &catalog,
@@ -2348,6 +2378,7 @@ impl Database {
             &final_path,
             &reservation,
             &transaction.coordinator_decisions()?,
+            ownership,
         )?;
         storage.flush()?;
         validate_rewrite_source(&catalog, &rewrite)?;
@@ -3785,6 +3816,15 @@ fn components(heap: &Path) -> Vec<(PathBuf, bool)> {
         (netbadb_storage::wal_alternate_path(wal), false),
     ]
 }
+
+fn promotion_components(heap: &Path) -> Vec<(PathBuf, bool)> {
+    let mut components = components(heap);
+    // Keep the source data pathname occupied until every path-bound companion
+    // moved. The carried inode lock then protects its final pathname.
+    let data = components.remove(1);
+    components.push(data);
+    components
+}
 fn exists_file(path: &Path) -> Result<bool, SchemaMutationError> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
@@ -3876,11 +3916,12 @@ fn validate_intent(
     }
     Ok(())
 }
-pub(crate) fn promote(
+pub(crate) fn promote_with_ownership(
     catalog: &Path,
     reservation: &Reservation,
     reference: &SchemaParticipantReference,
-) -> Result<(), DatabaseError> {
+    ownership: Option<netbadb_storage::HeapOwnership>,
+) -> Result<netbadb_storage::HeapOwnership, DatabaseError> {
     validate_intent(catalog, reservation, reference)?;
     let intent = reservation
         .intent
@@ -3901,7 +3942,6 @@ pub(crate) fn promote(
     );
     validate_resource_path(catalog, &stage)?;
     validate_resource_path(catalog, &final_path)?;
-    ensure_parent(&final_path)?;
     let expected_owner = owner_bytes(
         reference.incarnation,
         reservation.transaction,
@@ -3909,6 +3949,52 @@ pub(crate) fn promote(
         reservation.storage,
         intent.fragment.placements.tables[0].schema_fingerprint,
     )?;
+    let heap = if exists_file(&stage)? {
+        &stage
+    } else {
+        &final_path
+    };
+    // Determine all conflicts before the first rename. In particular, a live
+    // target is never replaced after only part of the source bundle moved.
+    let components = promotion_components(&stage)
+        .into_iter()
+        .zip(promotion_components(&final_path))
+        .collect::<Vec<_>>();
+    for ((source, required), (destination, _)) in &components {
+        let source_exists = exists_file(source)?;
+        let destination_exists = exists_file(destination)?;
+        if source_exists && destination_exists {
+            return Err(SchemaCatalogError::PathConflict(destination.clone()).into());
+        }
+        if *required && !source_exists && !destination_exists {
+            return Err(
+                SchemaMutationError::Corrupt("winner physical component is missing").into(),
+            );
+        }
+    }
+    let ownership = match ownership {
+        Some(ownership) => ownership,
+        None => netbadb_storage::HeapOwnership::acquire(heap)
+            .map_err(netbadb_storage::StorageError::from)?,
+    };
+    ownership
+        .verify_path(heap)
+        .map_err(netbadb_storage::StorageError::from)?;
+    // Private staged Heaps cannot enable a change stream through Core. Do
+    // this check under the data-inode lock: startup recovery may have observed
+    // the path before it acquired ownership.
+    for path in [&stage, &final_path] {
+        for component in netbadb_storage::heap_resource_components(path) {
+            if matches!(
+                component.kind,
+                netbadb_storage::HeapResourceComponentKind::ChangeLog
+                    | netbadb_storage::HeapResourceComponentKind::ChangeStreamGuard
+            ) && exists_file(&component.path)?
+            {
+                return Err(SchemaCatalogError::PathConflict(component.path).into());
+            }
+        }
+    }
     let source_owner = file::suffix(&stage, ".owner");
     let final_owner = file::suffix(&final_path, ".owner");
     let owner = if exists_file(&source_owner)? {
@@ -3919,17 +4005,11 @@ pub(crate) fn promote(
     if file::read(owner)? != expected_owner {
         return Err(SchemaMutationError::Corrupt("staged owner identity mismatch").into());
     }
-    let heap = if exists_file(&stage)? {
-        &stage
-    } else {
-        &final_path
-    };
     validate_heap_identity(heap, reservation)?;
-    for (position, ((source, required), (destination, _))) in components(&stage)
-        .into_iter()
-        .zip(components(&final_path))
-        .enumerate()
-    {
+    ensure_parent(&final_path)?;
+    #[cfg(test)]
+    handoff_pause("promotion-preflight", Some(&final_path));
+    for (position, ((source, required), (destination, _))) in components.into_iter().enumerate() {
         let source_exists = exists_file(&source)?;
         let destination_exists = exists_file(&destination)?;
         match (source_exists, destination_exists) {
@@ -3940,7 +4020,7 @@ pub(crate) fn promote(
                 );
             }
             (true, false) => {
-                std::fs::rename(&source, &destination)
+                rename_no_replace(&source, &destination)
                     .map_err(|e| file::io("promote staged Heap component", &destination, e))?;
                 file::sync_parent(&destination)?;
                 file::sync_parent(&source)?;
@@ -3949,9 +4029,80 @@ pub(crate) fn promote(
         }
         if position == 1 {
             crash("promotion-partial");
+            #[cfg(test)]
+            handoff_pause("promotion-partial", Some(&stage));
         }
     }
+    let ownership = ownership
+        .rebind(&final_path)
+        .map_err(netbadb_storage::StorageError::from)?;
     validate_heap_identity(&final_path, reservation)?;
+    Ok(ownership)
+}
+
+/// A late arrival at the final name must never be overwritten by promotion.
+/// The kernel performs the existence check and rename as one operation.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(unsafe_code)]
+fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: Both C strings remain alive for the synchronous syscall, and
+    // the kernel reads their terminated path bytes without retaining pointers.
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    // SAFETY: Same path lifetime as above; renameat2 retains no pointers.
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_no_replace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace Heap promotion is unavailable on this platform",
+    ))
+}
+
+pub(crate) fn promote(
+    catalog: &Path,
+    reservation: &Reservation,
+    reference: &SchemaParticipantReference,
+    ownerships: &mut RecoveryOwners,
+) -> Result<(), DatabaseError> {
+    let path = file::resolve(
+        catalog,
+        &final_locator(catalog, reference.incarnation, reservation.storage)?,
+    );
+    let ownership =
+        promote_with_ownership(catalog, reservation, reference, ownerships.remove(&path))?;
+    ownerships.insert(path, ownership);
     Ok(())
 }
 fn validate_heap_identity(path: &Path, reservation: &Reservation) -> Result<(), DatabaseError> {
@@ -3974,14 +4125,20 @@ pub(crate) fn open_winner_heap(
     path: &Path,
     reservation: &Reservation,
     decisions: &[crate::CoordinatorDecision],
+    ownership: netbadb_storage::HeapOwnership,
 ) -> Result<TableStorage, DatabaseError> {
+    ownership
+        .verify_path(path)
+        .map_err(netbadb_storage::StorageError::from)?;
     validate_heap_identity(path, reservation)?;
     let intent = reservation
         .intent
         .as_ref()
         .ok_or(SchemaMutationError::Corrupt("missing winner intent"))?;
     let table = &intent.fragment.committed.schema.tables()[0];
-    let recovery = TableStorage::inspect_heap_recovery(path, table)?;
+    let recovery = ownership
+        .inspect_recovery(table)
+        .map_err(netbadb_storage::StorageError::from)?;
     let decision = decisions
         .iter()
         .find(|d| d.database_txn_id == reservation.transaction)
@@ -4001,10 +4158,10 @@ pub(crate) fn open_winner_heap(
         .iter()
         .map(|p| crate::resolution_for_prepared(p, reservation.storage, decisions))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(TableStorage::open_heap_with_prepared_resolutions(
-        path,
+    Ok(TableStorage::open_heap_with_ownership(
+        ownership,
         table.clone(),
-        &resolutions,
+        Some(&resolutions),
     )?)
 }
 fn remove_file(path: &Path) -> Result<(), SchemaMutationError> {
@@ -4117,7 +4274,24 @@ fn finish_exact_heap_commit_participants(
     decisions: &[crate::CoordinatorDecision],
     decision: &crate::CoordinatorDecision,
     authorities: &[CommitParticipantAuthority<'_>],
+    ownerships: &mut RecoveryOwners,
 ) -> Result<(), DatabaseError> {
+    let paths = decision
+        .participants
+        .iter()
+        .map(|participant| {
+            let authority = authorities
+                .iter()
+                .find(|authority| authority.storage == participant.storage_id)
+                .ok_or(DatabaseError::MissingCommitParticipant {
+                    database_txn_id: decision.database_txn_id,
+                    storage_id: participant.storage_id,
+                    physical_txn_id: participant.physical_txn_id,
+                })?;
+            Ok(file::resolve(catalog, authority.locator))
+        })
+        .collect::<Result<Vec<_>, DatabaseError>>()?;
+    let mut claimed = crate::claim_heap_paths_with_existing(paths, ownerships)?;
     for participant in &decision.participants {
         let authority = authorities
             .iter()
@@ -4129,7 +4303,11 @@ fn finish_exact_heap_commit_participants(
             })?;
         let path = file::resolve(catalog, authority.locator);
         validate_resource_path(catalog, &path)?;
-        let inspection = TableStorage::inspect_heap_recovery(&path, authority.table)?;
+        let inspection = claimed
+            .get(&path)
+            .ok_or(DatabaseError::EmptyCatalog)?
+            .inspect_recovery(authority.table)
+            .map_err(netbadb_storage::StorageError::from)?;
         if inspection.storage_id != participant.storage_id {
             return Err(SchemaMutationError::Corrupt(
                 "schema winner participant StorageId mismatch",
@@ -4161,13 +4339,15 @@ fn finish_exact_heap_commit_participants(
                 crate::resolution_for_prepared(prepared, participant.storage_id, decisions)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        TableStorage::open_heap_with_prepared_resolutions(
-            &path,
+        let owner = claimed.remove(&path).ok_or(DatabaseError::EmptyCatalog)?;
+        let storage = TableStorage::open_heap_with_ownership(
+            owner,
             authority.table.clone(),
-            &resolutions,
-        )?
-        .close()?;
+            Some(&resolutions),
+        )?;
+        claimed.insert(path.clone(), storage.stop_heap_for_promotion(&path)?);
     }
+    ownerships.extend(claimed);
     Ok(())
 }
 
@@ -4178,12 +4358,24 @@ fn finish_exact_heap_commit_participants(
 fn open_finished_heap_snapshot(
     catalog: &Path,
     snapshot: &SchemaCatalogSnapshot,
+    ownerships: &mut RecoveryOwners,
 ) -> Result<Database, DatabaseError> {
+    if snapshot
+        .storages
+        .iter()
+        .any(|descriptor| !matches!(descriptor.kind, CatalogStorageKind::Heap))
+    {
+        return Err(SchemaMutationError::UnsupportedPlacement.into());
+    }
+    let mut claimed = crate::claim_heap_paths_with_existing(
+        snapshot
+            .storages
+            .iter()
+            .map(|descriptor| file::resolve(catalog, &descriptor.locator)),
+        ownerships,
+    )?;
     let mut storages = Vec::with_capacity(snapshot.storages.len());
     for descriptor in &snapshot.storages {
-        if !matches!(descriptor.kind, CatalogStorageKind::Heap) {
-            return Err(SchemaMutationError::UnsupportedPlacement.into());
-        }
         let table = snapshot
             .committed
             .schema
@@ -4196,7 +4388,11 @@ fn open_finished_heap_snapshot(
             ))?;
         let path = file::resolve(catalog, &descriptor.locator);
         validate_resource_path(catalog, &path)?;
-        let storage = TableStorage::open_heap(path, table)?;
+        let storage = TableStorage::open_heap_with_ownership(
+            claimed.remove(&path).ok_or(DatabaseError::EmptyCatalog)?,
+            table,
+            Some(&[]),
+        )?;
         if storage.storage_id() != descriptor.id {
             return Err(SchemaMutationError::Corrupt(
                 "winner storage descriptor identity mismatch",
@@ -4209,12 +4405,35 @@ fn open_finished_heap_snapshot(
 }
 
 /// Resolve schema obligations before strict active NBSC/state pair validation.
-pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, DatabaseError> {
+type RecoveryOwners = BTreeMap<PathBuf, netbadb_storage::HeapOwnership>;
+
+fn open_recovery_database(
+    catalog: &Path,
+    snapshot: &SchemaCatalogSnapshot,
+    ownerships: &mut RecoveryOwners,
+) -> Result<Database, DatabaseError> {
+    crate::schema_catalog_api::recover_physical_with_ownership(catalog, snapshot, &[], ownerships)
+}
+
+fn stop_recovery_database(
+    database: Database,
+    catalog: &Path,
+    snapshot: &SchemaCatalogSnapshot,
+    ownerships: &mut RecoveryOwners,
+) -> Result<(), DatabaseError> {
+    ownerships.extend(database.close_retaining_heap_ownership(catalog, snapshot)?);
+    Ok(())
+}
+
+pub(crate) fn recover(
+    catalog: &Path,
+) -> Result<(Option<SchemaMutationJournal>, RecoveryOwners), DatabaseError> {
+    let mut ownerships = RecoveryOwners::new();
     let marker = file::marker(catalog)?
         .filter(|m| m.initialized)
         .ok_or(SchemaCatalogError::LegacyCatalogRequired)?;
     let Some(mut journal) = SchemaMutationJournal::open(catalog, marker.incarnation)? else {
-        return Ok(None);
+        return Ok((None, ownerships));
     };
     let coordinator_path = file::resolve(catalog, &journal.coordinator);
     if journal.reservations.is_empty()
@@ -4222,7 +4441,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         && journal.rewrite_reservations.is_empty()
         && journal.compositions.is_empty()
     {
-        return Ok(Some(journal));
+        return Ok((Some(journal), ownerships));
     }
     let mut coordinator = CoordinatorLog::open(&coordinator_path)?;
     let mut decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
@@ -4366,7 +4585,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         let target = SchemaCatalogSnapshot::decode(&bytes)?;
         verify_rewrite_published(&target, &rewrite, true)?;
         let reservation = rewrite_physical_reservation(&rewrite);
-        promote(catalog, &reservation, reference)?;
+        promote(catalog, &reservation, reference, &mut ownerships)?;
         let authorities = [
             CommitParticipantAuthority {
                 storage: rewrite.old_storage(),
@@ -4379,10 +4598,17 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                 locator: &rewrite.target.storages[0].locator,
             },
         ];
-        finish_exact_heap_commit_participants(catalog, &decisions, &decision, &authorities)?;
+        finish_exact_heap_commit_participants(
+            catalog,
+            &decisions,
+            &decision,
+            &authorities,
+            &mut ownerships,
+        )?;
         journal.retire_rewrite(rewrite.reservation.transaction)?;
         crash("rewrite-retirement-durable");
-        open_finished_heap_snapshot(catalog, &target)?.close()?;
+        let database = open_finished_heap_snapshot(catalog, &target, &mut ownerships)?;
+        stop_recovery_database(database, catalog, &target, &mut ownerships)?;
         validate_rewrite_source(catalog, &rewrite)?;
         file::publish_runtime(catalog, &target)?;
         coordinator.complete_decision(rewrite.reservation.transaction)?;
@@ -4486,7 +4712,7 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         let target = SchemaCatalogSnapshot::decode(&bytes)?;
         verify_schema_index_published(&target, &intent, true)?;
         let reservation = schema_index_reservation(&intent, replacement, None);
-        promote(catalog, &reservation, reference)?;
+        promote(catalog, &reservation, reference, &mut ownerships)?;
         let authorities = [
             CommitParticipantAuthority {
                 storage: source.source_storage,
@@ -4499,10 +4725,16 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                 locator: &source.target_final_locator,
             },
         ];
-        finish_exact_heap_commit_participants(catalog, &decisions, &decision, &authorities)?;
-        let mut target_database = open_finished_heap_snapshot(catalog, &target)?;
+        finish_exact_heap_commit_participants(
+            catalog,
+            &decisions,
+            &decision,
+            &authorities,
+            &mut ownerships,
+        )?;
+        let mut target_database = open_finished_heap_snapshot(catalog, &target, &mut ownerships)?;
         verify_schema_index_inventory(&mut target_database, &intent)?;
-        target_database.close()?;
+        stop_recovery_database(target_database, catalog, &target, &mut ownerships)?;
         validate_composition_source(catalog, replacement)?;
         journal.retire_composition_table(source.transaction, source.table)?;
         crash("source-backfill-retirement-durable");
@@ -4600,27 +4832,27 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
         let decision = decisions
             .iter()
             .find(|decision| decision.database_txn_id == txn);
-        if let Some(intent) = composition.table_intent.as_ref() {
+        if composition.table_intent.is_some() {
             recover_table_object_composition(
                 catalog,
                 marker.incarnation,
                 &mut journal,
                 &mut coordinator,
                 &composition,
-                intent,
                 decision,
+                &mut ownerships,
             )?;
             continue;
         }
-        if let Some(intent) = composition.index_intent.as_ref() {
+        if composition.index_intent.is_some() {
             recover_schema_index_composition(
                 catalog,
                 marker.incarnation,
                 &mut journal,
                 &mut coordinator,
                 &composition,
-                intent,
                 decision,
+                &mut ownerships,
             )?;
             continue;
         }
@@ -4699,10 +4931,11 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                     catalog,
                     &composition_reservation(intent, plan, None),
                     reference,
+                    &mut ownerships,
                 )?;
             }
-            let database = crate::schema_catalog_api::recover_physical(catalog, &target, &[])?;
-            database.close()?;
+            let database = open_recovery_database(catalog, &target, &mut ownerships)?;
+            stop_recovery_database(database, catalog, &target, &mut ownerships)?;
             for plan in &intent.tables {
                 validate_composition_source(catalog, plan)?;
                 journal.retire_composition_table(txn, plan.table())?;
@@ -4876,11 +5109,11 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
                     SchemaMutationError::Corrupt("prepared NBSC reference mismatch").into(),
                 );
             }
-            promote(catalog, &reservation, reference)?;
+            promote(catalog, &reservation, reference, &mut ownerships)?;
             // Complete ALL old and new participants with the existing physical
             // resolver before exposing target schema. Missing/corrupt winners fail.
-            let database = crate::schema_catalog_api::recover_physical(catalog, &target, &[])?;
-            database.close()?;
+            let database = open_recovery_database(catalog, &target, &mut ownerships)?;
+            stop_recovery_database(database, catalog, &target, &mut ownerships)?;
             file::publish_runtime(catalog, &target)?;
             coordinator.complete_decision(reservation.transaction)?;
             journal.resolve(reservation.transaction, true)?;
@@ -4975,11 +5208,11 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
             }
             let target = SchemaCatalogSnapshot::decode(&bytes)?;
             verify_rewrite_published(&target, &rewrite, true)?;
-            promote(catalog, &reservation, reference)?;
+            promote(catalog, &reservation, reference, &mut ownerships)?;
             journal.retire_rewrite(txn)?;
             crash("rewrite-retirement-durable");
-            let database = crate::schema_catalog_api::recover_physical(catalog, &target, &[])?;
-            database.close()?;
+            let database = open_recovery_database(catalog, &target, &mut ownerships)?;
+            stop_recovery_database(database, catalog, &target, &mut ownerships)?;
             validate_rewrite_source(catalog, &rewrite)?;
             file::publish_runtime(catalog, &target)?;
             coordinator.complete_decision(txn)?;
@@ -5048,9 +5281,8 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
             validate_drop_resource(catalog, &intent)?;
             if !decision.participants.is_empty() {
                 let recovery = drop_recovery_snapshot(&target, &intent)?;
-                let database =
-                    crate::schema_catalog_api::recover_physical(catalog, &recovery, &[])?;
-                database.close()?;
+                let database = open_recovery_database(catalog, &recovery, &mut ownerships)?;
+                stop_recovery_database(database, catalog, &recovery, &mut ownerships)?;
             }
             journal.retire_drop(intent.transaction)?;
             crash("drop-retirement-durable");
@@ -5123,7 +5355,12 @@ pub(crate) fn recover(catalog: &Path) -> Result<Option<SchemaMutationJournal>, D
             .into());
         }
     }
-    Ok(Some(journal))
+    #[cfg(test)]
+    handoff_pause(
+        "recovery-retained",
+        ownerships.values().next().map(|owner| owner.path()),
+    );
+    Ok((Some(journal), ownerships))
 }
 
 fn rewrite_physical_reservation(intent: &RewriteIntent) -> Reservation {
@@ -5320,9 +5557,15 @@ fn recover_table_object_composition(
     journal: &mut SchemaMutationJournal,
     coordinator: &mut CoordinatorLog,
     composition: &CompositionRecord,
-    intent: &TableObjectChangeSetIntent,
     decision: Option<&crate::CoordinatorDecision>,
+    ownerships: &mut RecoveryOwners,
 ) -> Result<(), DatabaseError> {
+    let intent = composition
+        .table_intent
+        .as_ref()
+        .ok_or(SchemaMutationError::Corrupt(
+            "table-object composition intent absent",
+        ))?;
     if let Some(decision) = decision {
         validate_table_object_decision(intent, decision)?;
         if matches!(
@@ -5372,12 +5615,12 @@ fn recover_table_object_composition(
                     .into());
                 }
             }
-            let database = crate::schema_catalog_api::recover_physical(catalog, &active, &[])?;
+            let database = open_recovery_database(catalog, &active, ownerships)?;
             // A resolved table-object winner may have arbitrarily newer DML or
             // index-only commits on the surviving Heap. Opening the current
             // catalog proves its physical identity; exact final inventory was
             // already checked before this winner became terminal.
-            database.close()?;
+            stop_recovery_database(database, catalog, &active, ownerships)?;
             cleanup_table_object_prepared(catalog, incarnation, intent, Some(true))?;
             return Ok(());
         }
@@ -5424,6 +5667,7 @@ fn recover_table_object_composition(
                     catalog,
                     &table_object_reservation(intent, fragment, None),
                     reference,
+                    ownerships,
                 )?;
             }
         }
@@ -5435,9 +5679,9 @@ fn recover_table_object_composition(
                 journal.retire_table_object(intent.transaction, plan.table())?;
             }
         }
-        let mut database = crate::schema_catalog_api::recover_physical(catalog, &target, &[])?;
+        let mut database = open_recovery_database(catalog, &target, ownerships)?;
         verify_table_object_inventory(&mut database, intent, true)?;
-        database.close()?;
+        stop_recovery_database(database, catalog, &target, ownerships)?;
         file::publish_runtime(catalog, &target)?;
         coordinator.complete_decision(intent.transaction)?;
         journal.resolve_composition(intent.transaction, CompositionResolution::Winner)?;
@@ -5458,9 +5702,9 @@ fn recover_table_object_composition(
     }
     if composition.resolution.is_none() {
         let active = file::load(catalog)?;
-        let mut database = crate::schema_catalog_api::recover_physical(catalog, &active, &[])?;
+        let mut database = open_recovery_database(catalog, &active, ownerships)?;
         verify_table_object_inventory(&mut database, intent, false)?;
-        database.close()?;
+        stop_recovery_database(database, catalog, &active, ownerships)?;
         for plan in &intent.tables {
             let fragment = match plan {
                 SchemaIndexTablePlan::CreateHeap { target, .. } => Some(target.as_ref()),
@@ -5667,9 +5911,15 @@ fn recover_schema_index_composition(
     journal: &mut SchemaMutationJournal,
     coordinator: &mut CoordinatorLog,
     composition: &CompositionRecord,
-    intent: &SchemaIndexChangeSetIntent,
     decision: Option<&crate::CoordinatorDecision>,
+    ownerships: &mut RecoveryOwners,
 ) -> Result<(), DatabaseError> {
+    let intent = composition
+        .index_intent
+        .as_ref()
+        .ok_or(SchemaMutationError::Corrupt(
+            "schema-index composition intent absent",
+        ))?;
     if let Some(decision) = decision {
         validate_schema_index_decision(
             intent,
@@ -5700,9 +5950,9 @@ fn recover_schema_index_composition(
             if intent.target_generation.is_some() {
                 verify_schema_index_published(&active, intent, false)?;
             }
-            let mut database = crate::schema_catalog_api::recover_physical(catalog, &active, &[])?;
+            let mut database = open_recovery_database(catalog, &active, ownerships)?;
             verify_current_schema_index_inventory(&mut database, intent, journal)?;
-            database.close()?;
+            stop_recovery_database(database, catalog, &active, ownerships)?;
             cleanup_schema_index_prepared(catalog, incarnation, intent, Some(true))?;
             return Ok(());
         }
@@ -5742,15 +5992,16 @@ fn recover_schema_index_composition(
                     catalog,
                     &schema_index_reservation(intent, replacement, None),
                     reference,
+                    ownerships,
                 )?;
             }
             target
         } else {
             file::load(catalog)?
         };
-        let mut database = crate::schema_catalog_api::recover_physical(catalog, &target, &[])?;
+        let mut database = open_recovery_database(catalog, &target, ownerships)?;
         verify_schema_index_inventory(&mut database, intent)?;
-        database.close()?;
+        stop_recovery_database(database, catalog, &target, ownerships)?;
         for replacement in intent
             .tables
             .iter()
@@ -5780,9 +6031,9 @@ fn recover_schema_index_composition(
     }
     if composition.resolution.is_none() {
         let active = file::load(catalog)?;
-        let mut database = crate::schema_catalog_api::recover_physical(catalog, &active, &[])?;
+        let mut database = open_recovery_database(catalog, &active, ownerships)?;
         verify_schema_index_base_inventory(&mut database, intent)?;
-        database.close()?;
+        stop_recovery_database(database, catalog, &active, ownerships)?;
         for replacement in intent
             .tables
             .iter()
@@ -6353,6 +6604,22 @@ fn verify_published(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn handoff_pause(point: &str, path: Option<&Path>) {
+    use std::io::{Read, Write};
+
+    if std::env::var("NETBADB_HEAP_HANDOFF_PAUSE").as_deref() != Ok(point) {
+        return;
+    }
+    let path = path.expect("handoff test path");
+    println!("NETBADB_HANDOFF_READY:{point}:{}", path.display());
+    std::io::stdout().flush().expect("flush handoff marker");
+    let mut release = [0_u8];
+    std::io::stdin()
+        .read_exact(&mut release)
+        .expect("handoff test release");
 }
 
 #[cfg(test)]

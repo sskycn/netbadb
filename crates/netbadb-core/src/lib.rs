@@ -1957,12 +1957,26 @@ impl Database {
     fn physical_open_storages(
         specs: Vec<TableStorageOpenSpec>,
         committed: CommittedCatalogState,
+        ownerships: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
     ) -> Result<Self, DatabaseError> {
         validate_open_specs(&specs)?;
+        let mut claimed = claim_heap_paths_with_existing(
+            specs.iter().filter_map(|spec| match spec {
+                TableStorageOpenSpec::Heap { path, .. } => Some(path.clone()),
+                TableStorageOpenSpec::Lsm { .. } => None,
+            }),
+            ownerships,
+        )?;
         let mut storages = Vec::with_capacity(specs.len());
         for spec in specs {
             storages.push(match spec {
-                TableStorageOpenSpec::Heap { path, table } => TableStorage::open_heap(path, table)?,
+                TableStorageOpenSpec::Heap { path, table } => {
+                    TableStorage::open_heap_with_ownership(
+                        claimed.remove(&path).ok_or(DatabaseError::EmptyCatalog)?,
+                        table,
+                        None,
+                    )?
+                }
                 TableStorageOpenSpec::Lsm { directory, table } => {
                     TableStorage::open_lsm(directory, table)?
                 }
@@ -1979,6 +1993,7 @@ impl Database {
         config: DatabaseCoordinatorConfig,
         committed: CommittedCatalogState,
         placements: Option<PartitionCatalog>,
+        existing: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
     ) -> Result<Self, DatabaseError> {
         validate_open_specs(&specs)?;
         if specs.iter().any(|spec| spec.path() == config.log_path()) {
@@ -1986,6 +2001,13 @@ impl Database {
                 config.log_path().to_owned(),
             ));
         }
+        let mut ownerships = claim_heap_paths_with_existing(
+            specs.iter().filter_map(|spec| match spec {
+                TableStorageOpenSpec::Heap { path, .. } => Some(path.clone()),
+                TableStorageOpenSpec::Lsm { .. } => None,
+            }),
+            existing,
+        )?;
         let mut coordinator = CoordinatorLog::open(config.log_path())?;
         let mut decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
         decisions.sort_by_key(|decision| {
@@ -1997,7 +2019,11 @@ impl Database {
         for spec in &specs {
             let recovery = match spec {
                 TableStorageOpenSpec::Heap { path, table } => {
-                    let recovery = TableStorage::inspect_heap_recovery(path, table)?;
+                    let recovery = ownerships
+                        .get(path)
+                        .ok_or(DatabaseError::EmptyCatalog)?
+                        .inspect_recovery(table)
+                        .map_err(netbadb_storage::StorageError::from)?;
                     GenericRecoveryInspection {
                         storage_id: recovery.storage_id,
                         prepared_transactions: recovery.prepared_transactions,
@@ -2014,6 +2040,11 @@ impl Database {
             inspected.push(GenericInspectedStorage { recovery });
         }
         validate_generic_coordinator_recovery(&decisions, &inspected, &config.retired_storage_ids)?;
+        #[cfg(test)]
+        crate::schema_mutation::handoff_pause(
+            "inspected",
+            ownerships.values().next().map(|owner| owner.path()),
+        );
 
         let mut maximum_database_txn_id = coordinator.database_txn_id_high_water().0;
         let checkpoint_high_water = coordinator
@@ -2035,7 +2066,10 @@ impl Database {
             }
             storages.push(match spec {
                 TableStorageOpenSpec::Heap { path, table } => {
-                    TableStorage::open_heap_with_prepared_resolutions(path, table, &resolutions)?
+                    let ownership = ownerships
+                        .remove(&path)
+                        .ok_or(DatabaseError::EmptyCatalog)?;
+                    TableStorage::open_heap_with_ownership(ownership, table, Some(&resolutions))?
                 }
                 TableStorageOpenSpec::Lsm { directory, table } => {
                     TableStorage::open_lsm_with_prepared_resolutions(
@@ -2154,11 +2188,20 @@ impl Database {
     fn physical_open_tables(
         tables: Vec<(PathBuf, TableDef)>,
         committed: CommittedCatalogState,
+        ownerships: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
     ) -> Result<Self, DatabaseError> {
         validate_catalog_paths(&tables)?;
+        let mut claimed = claim_heap_paths_with_existing(
+            tables.iter().map(|(path, _)| path.clone()),
+            ownerships,
+        )?;
         let mut storages = Vec::with_capacity(tables.len());
         for (path, table) in tables {
-            storages.push(TableStorage::open_heap(path, table)?);
+            storages.push(TableStorage::open_heap_with_ownership(
+                claimed.remove(&path).ok_or(DatabaseError::EmptyCatalog)?,
+                table,
+                None,
+            )?);
         }
         Self::compose_recovered(committed, storages, None, None)
     }
@@ -2169,9 +2212,12 @@ impl Database {
         tables: Vec<(PathBuf, TableDef)>,
         config: DatabaseCoordinatorConfig,
         committed: CommittedCatalogState,
+        existing: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
     ) -> Result<Self, DatabaseError> {
         validate_catalog_paths(&tables)?;
         validate_coordinator_path(&tables, &config)?;
+        let mut ownerships =
+            claim_heap_paths_with_existing(tables.iter().map(|(path, _)| path.clone()), existing)?;
         let mut coordinator = CoordinatorLog::open(config.log_path())?;
         let mut decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
         decisions.sort_by_key(|decision| {
@@ -2184,10 +2230,19 @@ impl Database {
             inspected.push(InspectedStorage {
                 path: path.clone(),
                 table: table.clone(),
-                recovery: TableStorage::inspect_heap_recovery(path, table)?,
+                recovery: ownerships
+                    .get(path)
+                    .ok_or(DatabaseError::EmptyCatalog)?
+                    .inspect_recovery(table)
+                    .map_err(netbadb_storage::StorageError::from)?,
             });
         }
         validate_coordinator_recovery(&decisions, &inspected, &config.retired_storage_ids)?;
+        #[cfg(test)]
+        crate::schema_mutation::handoff_pause(
+            "inspected",
+            ownerships.values().next().map(|owner| owner.path()),
+        );
 
         let mut maximum_database_txn_id = coordinator.database_txn_id_high_water().0;
         let checkpoint_high_water = coordinator
@@ -2207,10 +2262,13 @@ impl Database {
                     resolutions.push(resolution);
                 }
             }
-            storages.push(TableStorage::open_heap_with_prepared_resolutions(
-                storage.path,
+            let ownership = ownerships
+                .remove(&storage.path)
+                .ok_or(DatabaseError::EmptyCatalog)?;
+            storages.push(TableStorage::open_heap_with_ownership(
+                ownership,
                 storage.table,
-                &resolutions,
+                Some(&resolutions),
             )?);
         }
         for decision in &decisions {
@@ -2358,8 +2416,11 @@ impl Database {
         storage_paths: Vec<PathBuf>,
         config: PartitionCatalogConfig,
         committed: CommittedCatalogState,
+        existing: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
     ) -> Result<Self, DatabaseError> {
         validate_physical_paths(&storage_paths, &config)?;
+        let mut ownerships =
+            claim_heap_paths_with_existing(storage_paths.iter().cloned(), existing)?;
         let catalog = PartitionCatalog::open(config.catalog_path())?;
         validate_catalog_schemas(&catalog, &tables)?;
         let mut coordinator = CoordinatorLog::open(config.coordinator_log_path())?;
@@ -2372,7 +2433,11 @@ impl Database {
 
         let mut inspected = Vec::with_capacity(storage_paths.len());
         for path in storage_paths {
-            let identity = TableStorage::inspect_heap_identity(&path)?;
+            let identity = ownerships
+                .get(&path)
+                .ok_or(DatabaseError::EmptyCatalog)?
+                .inspect_identity()
+                .map_err(netbadb_storage::StorageError::from)?;
             let table = tables
                 .iter()
                 .find(|table| table.id == identity.table_id)
@@ -2392,7 +2457,11 @@ impl Database {
             if !expected {
                 return Err(PartitionError::PartitionStorageMismatch(identity.storage_id).into());
             }
-            let recovery = TableStorage::inspect_heap_recovery(&path, table)?;
+            let recovery = ownerships
+                .get(&path)
+                .ok_or(DatabaseError::EmptyCatalog)?
+                .inspect_recovery(table)
+                .map_err(netbadb_storage::StorageError::from)?;
             inspected.push(InspectedStorage {
                 path,
                 table: table.clone(),
@@ -2401,6 +2470,11 @@ impl Database {
         }
         validate_catalog_storage_set(&catalog, &inspected)?;
         validate_coordinator_recovery(&decisions, &inspected, &[])?;
+        #[cfg(test)]
+        crate::schema_mutation::handoff_pause(
+            "inspected",
+            ownerships.values().next().map(|owner| owner.path()),
+        );
 
         let mut maximum_database_txn_id = coordinator.database_txn_id_high_water().0;
         let checkpoint_high_water = coordinator
@@ -2420,10 +2494,13 @@ impl Database {
                     resolutions.push(resolution);
                 }
             }
-            storages.push(TableStorage::open_heap_with_prepared_resolutions(
-                storage.path,
+            let ownership = ownerships
+                .remove(&storage.path)
+                .ok_or(DatabaseError::EmptyCatalog)?;
+            storages.push(TableStorage::open_heap_with_ownership(
+                ownership,
                 storage.table,
-                &resolutions,
+                Some(&resolutions),
             )?);
         }
         for decision in &decisions {
@@ -4844,6 +4921,33 @@ impl Database {
         Ok(())
     }
 
+    /// Recovery may reopen the same Heap inventory before returning to the
+    /// caller. Keep every Heap inode owned between those passes.
+    pub(crate) fn close_retaining_heap_ownership(
+        self,
+        catalog: &Path,
+        snapshot: &crate::schema_catalog::SchemaCatalogSnapshot,
+    ) -> Result<BTreeMap<PathBuf, netbadb_storage::HeapOwnership>, DatabaseError> {
+        self.flush()?;
+        let mut owners = BTreeMap::new();
+        for entry in self.registry.into_entries() {
+            let descriptor = snapshot
+                .storages
+                .iter()
+                .find(|storage| storage.id == entry.id)
+                .ok_or(DatabaseError::EmptyCatalog)?;
+            match descriptor.kind {
+                crate::schema_catalog::CatalogStorageKind::Heap => {
+                    let path = crate::schema_catalog_file::resolve(catalog, &descriptor.locator);
+                    let owner = entry.storage.stop_heap_for_promotion(&path)?;
+                    owners.insert(path, owner);
+                }
+                crate::schema_catalog::CatalogStorageKind::Lsm { .. } => entry.storage.close()?,
+            }
+        }
+        Ok(owners)
+    }
+
     pub fn query(&mut self, source: &str) -> Result<QueryResult, DatabaseError> {
         let (compiled, physical) = self.compile_and_plan(source)?;
         let PhysicalStatement::Query(plan) = physical else {
@@ -7233,6 +7337,31 @@ struct GenericInspectedStorage {
     recovery: GenericRecoveryInspection,
 }
 
+/// Acquire every Heap mutation domain before any participant recovery. The
+/// physical StorageIds are learned only after opening headers, so canonical
+/// path order provides deterministic acquisition without trusting a stale ID.
+pub(crate) fn claim_heap_paths_with_existing(
+    paths: impl IntoIterator<Item = PathBuf>,
+    existing: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+) -> Result<BTreeMap<PathBuf, netbadb_storage::HeapOwnership>, DatabaseError> {
+    let paths = paths.into_iter().collect::<BTreeSet<_>>();
+    let mut owners = BTreeMap::new();
+    for path in paths {
+        let owner = match existing.remove(&path) {
+            Some(owner) => {
+                owner
+                    .verify_path(&path)
+                    .map_err(netbadb_storage::StorageError::from)?;
+                owner
+            }
+            None => netbadb_storage::HeapOwnership::acquire(&path)
+                .map_err(netbadb_storage::StorageError::from)?,
+        };
+        owners.insert(path, owner);
+    }
+    Ok(owners)
+}
+
 fn create_explicit_storages(
     specs: Vec<TableStorageCreateSpec>,
 ) -> Result<(Schema, Vec<TableStorage>), DatabaseError> {
@@ -8867,6 +8996,7 @@ mod tests {
                     subset,
                     DatabaseCoordinatorConfig::new(&coordinator_path),
                     committed,
+                    &mut std::collections::BTreeMap::new(),
                 )
                 .err()
                 .expect("missing recovery participant must fail")

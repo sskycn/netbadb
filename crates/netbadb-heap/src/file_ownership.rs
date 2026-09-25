@@ -58,14 +58,37 @@ pub(crate) fn lock_file(file: &File, path: &Path) -> io::Result<()> {
         }
         return Err(error);
     }
+    verify_file_path(file, path)
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_file_path(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
     let named = path.symlink_metadata()?;
-    if named.dev() != metadata.dev() || named.ino() != metadata.ino() || named.nlink() != 1 {
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || !named.is_file()
+        || named.file_type().is_symlink()
+        || named.dev() != metadata.dev()
+        || named.ino() != metadata.ino()
+        || named.nlink() != 1
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Heap data path changed while acquiring ownership",
+            "Heap data path does not name the owned inode",
         ));
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn verify_file_path(_file: &File, _path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Heap ownership requires Unix flock",
+    ))
 }
 
 #[cfg(not(unix))]

@@ -3882,6 +3882,612 @@ fn create_crash_child() {
     }
     panic!("configured crash hook was not reached");
 }
+
+#[cfg(unix)]
+fn promoted_project_table() -> TableDef {
+    TableDef::new(
+        TableId(3),
+        "projects",
+        vec![
+            ColumnDef::new(
+                ColumnId(1),
+                "id",
+                TypeSpec::Semantic {
+                    name: "ProjectId".into(),
+                    physical: PhysicalType::Int64,
+                },
+            ),
+            ColumnDef::new(
+                ColumnId(2),
+                "name",
+                TypeSpec::Semantic {
+                    name: "ProjectName".into(),
+                    physical: PhysicalType::Text,
+                },
+            ),
+            ColumnDef::new(
+                ColumnId(3),
+                "active",
+                TypeSpec::Physical(PhysicalType::Bool),
+            ),
+            ColumnDef::new(
+                ColumnId(4),
+                "score",
+                TypeSpec::Physical(PhysicalType::Int64),
+            )
+            .nullable(true),
+            ColumnDef::new(ColumnId(5), "label", TypeSpec::Physical(PhysicalType::Text))
+                .nullable(true),
+        ],
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn handoff_rival_child() {
+    let Ok(path) = std::env::var("NETBADB_HEAP_HANDOFF_RIVAL") else {
+        return;
+    };
+    let table = match std::env::var("NETBADB_HEAP_HANDOFF_RIVAL_KIND").as_deref() {
+        Ok("users") => old_table(1, "users"),
+        Ok("teams") => old_table(2, "teams"),
+        _ => promoted_project_table(),
+    };
+    let error = TableStorage::open_heap(path, table)
+        .expect_err("handoff owns the staged or promoted inode");
+    assert!(matches!(
+        error,
+        netbadb_storage::StorageError::Io(source)
+            if source.kind() == std::io::ErrorKind::WouldBlock
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn handoff_recovery_child() {
+    let Ok(root) = std::env::var("NETBADB_HEAP_HANDOFF_RECOVERY_ROOT") else {
+        return;
+    };
+    Database::open_catalog(Path::new(&root).join("catalog"))
+        .unwrap()
+        .close()
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn coordinator_inspection_keeps_all_heap_locks_until_recovery_open() {
+    use std::io::{BufRead, Read, Write};
+    use std::process::Stdio;
+
+    let root = root("handoff-inspection");
+    seed(&root, true).close().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::handoff_recovery_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_HEAP_HANDOFF_RECOVERY_ROOT", &root)
+        .env("NETBADB_HEAP_HANDOFF_PAUSE", "inspected")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let marker = "NETBADB_HANDOFF_READY:inspected:";
+    let path = (&mut stdout)
+        .lines()
+        .map(Result::unwrap)
+        .find_map(|line| line.strip_prefix(marker).map(PathBuf::from))
+        .expect("child reached inspection barrier");
+    let kind = if path.file_name().unwrap() == "users.heap" {
+        "users"
+    } else {
+        "teams"
+    };
+    let before = std::fs::read(&path).unwrap();
+    let directory_before = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    let rival = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "schema_mutation_tests::handoff_rival_child"])
+        .env("NETBADB_HEAP_HANDOFF_RIVAL", &path)
+        .env("NETBADB_HEAP_HANDOFF_RIVAL_KIND", kind)
+        .output()
+        .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        directory_before
+    );
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(
+        rival.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rival.stderr)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_read_only_recovery_observation_is_rechecked_under_ownership() {
+    use std::io::Write;
+
+    let root = root("handoff-stale-inspection");
+    seed(&root, true).close().unwrap();
+    let path = root.join("users.heap");
+    let inspection = TableStorage::inspect_heap_recovery(&path, &old_table(1, "users")).unwrap();
+    assert_eq!(inspection.storage_id, StorageId(1));
+    let wal = netbadb_storage::wal_path(&path);
+    let previous_len = std::fs::metadata(&wal).unwrap().len();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&wal)
+        .unwrap()
+        .write_all(b"W")
+        .unwrap();
+    assert_eq!(std::fs::metadata(&wal).unwrap().len(), previous_len + 1);
+    Database::open_catalog(root.join("catalog"))
+        .unwrap()
+        .close()
+        .unwrap();
+    assert_eq!(std::fs::metadata(&wal).unwrap().len(), previous_len);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn changed_heap_inode_after_catalog_validation_fails_before_wal_recovery() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+
+    let root = root("handoff-validated-replacement");
+    seed(&root, true).close().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::handoff_recovery_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_HEAP_HANDOFF_RECOVERY_ROOT", &root)
+        .env("NETBADB_HEAP_HANDOFF_PAUSE", "validated")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let marker = "NETBADB_HANDOFF_READY:validated:";
+    let path = (&mut stdout)
+        .lines()
+        .map(Result::unwrap)
+        .find_map(|line| line.strip_prefix(marker).map(PathBuf::from))
+        .expect("catalog identity validated before ownership");
+    let wal = netbadb_storage::wal_path(&path);
+    let status = netbadb_storage::txn_status_path(&path);
+    let wal_before = std::fs::read(&wal).unwrap();
+    let status_before = std::fs::read(&status).unwrap();
+    let replacement = root.join("replacement.heap");
+    TableStorage::create_heap_with_storage_id(&replacement, old_table(1, "users"), StorageId(999))
+        .unwrap()
+        .close()
+        .unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(101));
+    assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+    assert_eq!(std::fs::read(&status).unwrap(), status_before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn later_heap_lock_failure_does_not_recover_earlier_participant() {
+    use std::io::Write;
+
+    let root = root("handoff-all-locks-first");
+    seed(&root, true).close().unwrap();
+    let teams_wal = netbadb_storage::wal_path(root.join("teams.heap"));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&teams_wal)
+        .unwrap()
+        .write_all(b"W")
+        .unwrap();
+    let before = std::fs::read(&teams_wal).unwrap();
+    let holder = TableStorage::open_heap(root.join("users.heap"), old_table(1, "users")).unwrap();
+    assert!(Database::open_catalog(root.join("catalog")).is_err());
+    assert_eq!(std::fs::read(&teams_wal).unwrap(), before);
+    holder.close().unwrap();
+    Database::open_catalog(root.join("catalog"))
+        .unwrap()
+        .close()
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&teams_wal).unwrap().len(),
+        before.len() as u64 - 1
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_handoff_blocks_second_process_before_and_after_promotion() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+
+    for point in ["stopped", "promoted"] {
+        let root = root(&format!("handoff-{point}"));
+        seed(&root, true).close().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "schema_mutation_tests::create_crash_child",
+                "--nocapture",
+            ])
+            .env("NETBADB_CREATE_CHILD_ROOT", &root)
+            .env("NETBADB_CREATE_CRASH_POINT", "before-api-return")
+            .env("NETBADB_HEAP_HANDOFF_PAUSE", point)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let marker = format!("NETBADB_HANDOFF_READY:{point}:");
+        let mut path = None;
+        for line in stdout.lines() {
+            let line = line.unwrap();
+            if let Some(value) = line.strip_prefix(&marker) {
+                path = Some(PathBuf::from(value));
+                break;
+            }
+        }
+        let path = path.expect("child reached exact handoff barrier");
+        let before_data = std::fs::read(&path).unwrap();
+        let before_wal = std::fs::read(netbadb_storage::wal_path(&path)).unwrap();
+        let before_status = std::fs::read(netbadb_storage::txn_status_path(&path)).unwrap();
+        let before_entries = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let rival = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "schema_mutation_tests::handoff_rival_child"])
+            .env("NETBADB_HEAP_HANDOFF_RIVAL", &path)
+            .output()
+            .unwrap();
+        let after_data = std::fs::read(&path).unwrap();
+        let after_wal = std::fs::read(netbadb_storage::wal_path(&path)).unwrap();
+        let after_status = std::fs::read(netbadb_storage::txn_status_path(&path)).unwrap();
+        let after_entries = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(90));
+        assert!(
+            rival.status.success(),
+            "{}",
+            String::from_utf8_lossy(&rival.stderr)
+        );
+        assert_eq!(after_data, before_data);
+        assert_eq!(after_wal, before_wal);
+        assert_eq!(after_status, before_status);
+        assert_eq!(after_entries, before_entries);
+        outcome(&root, true);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_handoff_keeps_promoted_heap_owned_until_final_open() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+
+    let root = root("handoff-recovery-retained");
+    seed(&root, true).close().unwrap();
+    spawn(&root, "staged-heap-committed");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::handoff_recovery_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_HEAP_HANDOFF_RECOVERY_ROOT", &root)
+        .env("NETBADB_HEAP_HANDOFF_PAUSE", "recovery-retained")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let marker = "NETBADB_HANDOFF_READY:recovery-retained:";
+    let path = (&mut stdout)
+        .lines()
+        .map(Result::unwrap)
+        .find_map(|line| line.strip_prefix(marker).map(PathBuf::from))
+        .expect("recovery kept promoted owner after internal reopen");
+    let before = std::fs::read(&path).unwrap();
+    let rival = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "schema_mutation_tests::handoff_rival_child"])
+        .env("NETBADB_HEAP_HANDOFF_RIVAL", &path)
+        .output()
+        .unwrap();
+    assert!(
+        rival.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rival.stderr)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    outcome(&root, true);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn partial_promotion_keeps_source_name_owned_while_companions_move() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+
+    let root = root("handoff-partial-promotion");
+    seed(&root, true).close().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::create_crash_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_CREATE_CHILD_ROOT", &root)
+        .env("NETBADB_CREATE_CRASH_POINT", "before-api-return")
+        .env("NETBADB_HEAP_HANDOFF_PAUSE", "promotion-partial")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let marker = "NETBADB_HANDOFF_READY:promotion-partial:";
+    let stage = (&mut stdout)
+        .lines()
+        .map(Result::unwrap)
+        .find_map(|line| line.strip_prefix(marker).map(PathBuf::from))
+        .expect("paused with source data name still present");
+    let before = std::fs::read(&stage).unwrap();
+    let entries_before = std::fs::read_dir(stage.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    let rival = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "schema_mutation_tests::handoff_rival_child"])
+        .env("NETBADB_HEAP_HANDOFF_RIVAL", &stage)
+        .output()
+        .unwrap();
+    assert!(
+        rival.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rival.stderr)
+    );
+    assert_eq!(std::fs::read(&stage).unwrap(), before);
+    assert_eq!(
+        std::fs::read_dir(stage.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        entries_before
+    );
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(90),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    outcome(&root, true);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_handoff_rejects_occupied_target_before_moving_any_component() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+
+    let root = root("handoff-target-occupied");
+    seed(&root, true).close().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::create_crash_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_CREATE_CHILD_ROOT", &root)
+        .env("NETBADB_HEAP_HANDOFF_PAUSE", "stopped")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let marker = "NETBADB_HANDOFF_READY:stopped:";
+    let stage = stdout
+        .lines()
+        .map(Result::unwrap)
+        .find_map(|line| line.strip_prefix(marker).map(PathBuf::from))
+        .expect("child reached stopped barrier");
+    let final_path = stage
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("storage")
+        .join(stage.file_name().unwrap());
+    std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+    let holder = TableStorage::create_heap_with_storage_id(
+        &final_path,
+        promoted_project_table(),
+        StorageId(999),
+    )
+    .unwrap();
+    let before = [
+        stage.clone(),
+        netbadb_storage::wal_path(&stage),
+        netbadb_storage::txn_status_path(&stage),
+        stage.with_extension("heap.owner"),
+    ]
+    .map(|path| (path.clone(), std::fs::read(path).unwrap()));
+    let catalog_before = std::fs::read(root.join("catalog")).unwrap();
+    let target_before = std::fs::read(&final_path).unwrap();
+    let stage_entries_before = std::fs::read_dir(stage.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(101));
+    for (path, bytes) in before {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(std::fs::read(root.join("catalog")).unwrap(), catalog_before);
+    assert_eq!(std::fs::read(&final_path).unwrap(), target_before);
+    assert_eq!(
+        std::fs::read_dir(stage.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        stage_entries_before
+    );
+    holder.close().unwrap();
+    for path in [
+        final_path.clone(),
+        netbadb_storage::wal_path(&final_path),
+        netbadb_storage::txn_status_path(&final_path),
+    ] {
+        std::fs::remove_file(path).unwrap();
+    }
+    outcome(&root, true);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn target_created_after_promotion_preflight_is_never_overwritten() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+
+    let root = root("handoff-late-target");
+    seed(&root, true).close().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::create_crash_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_CREATE_CHILD_ROOT", &root)
+        .env("NETBADB_HEAP_HANDOFF_PAUSE", "promotion-preflight")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let marker = "NETBADB_HANDOFF_READY:promotion-preflight:";
+    let final_path = (&mut stdout)
+        .lines()
+        .map(Result::unwrap)
+        .find_map(|line| line.strip_prefix(marker).map(PathBuf::from))
+        .expect("promotion passed its no-conflict preflight");
+    let holder = TableStorage::create_heap_with_storage_id(
+        &final_path,
+        promoted_project_table(),
+        StorageId(999),
+    )
+    .unwrap();
+    let target_before = std::fs::read(&final_path).unwrap();
+    let wal_path = netbadb_storage::wal_path(&final_path);
+    let status_path = netbadb_storage::txn_status_path(&final_path);
+    let wal_before = std::fs::read(&wal_path).unwrap();
+    let status_before = std::fs::read(&status_path).unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(101));
+    assert_eq!(std::fs::read(&final_path).unwrap(), target_before);
+    assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
+    assert_eq!(std::fs::read(&status_path).unwrap(), status_before);
+    holder.close().unwrap();
+    for path in [final_path, wal_path, status_path] {
+        std::fs::remove_file(path).unwrap();
+    }
+    outcome(&root, true);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn unexplained_staged_change_stream_sidecar_blocks_promotion() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+
+    let root = root("handoff-stream-sidecar");
+    seed(&root, true).close().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::create_crash_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_CREATE_CHILD_ROOT", &root)
+        .env("NETBADB_HEAP_HANDOFF_PAUSE", "stopped")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let marker = "NETBADB_HANDOFF_READY:stopped:";
+    let stage = (&mut stdout)
+        .lines()
+        .map(Result::unwrap)
+        .find_map(|line| line.strip_prefix(marker).map(PathBuf::from))
+        .expect("staged Heap is quiescent and owned");
+    let sidecar = netbadb_storage::heap_change_log_path(&stage);
+    std::fs::write(&sidecar, b"foreign stream").unwrap();
+    let data_before = std::fs::read(&stage).unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(101));
+    assert_eq!(std::fs::read(&stage).unwrap(), data_before);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"foreign stream");
+    std::fs::remove_file(sidecar).unwrap();
+    outcome(&root, true);
+    std::fs::remove_dir_all(root).unwrap();
+}
 fn spawn(root: &Path, point: &str) {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command

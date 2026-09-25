@@ -882,6 +882,27 @@ impl PageManager {
         Self::open_internal(path.as_ref(), true, true)
     }
 
+    /// Duplicates the locked open file description for a quiescent Heap handoff.
+    /// No wrapper calls LOCK_UN: the lock ends when its final descriptor closes.
+    pub(crate) fn duplicate_owned(&self, path: &Path) -> Result<Self, StorageError> {
+        self.verify_owned_path(path)?;
+        Ok(Self {
+            file: self.file.try_clone()?,
+            page_count: self.page_count,
+            #[cfg(test)]
+            fail_next_write: false,
+            #[cfg(test)]
+            fail_next_sync: false,
+            #[cfg(test)]
+            fail_next_allocation_after: None,
+        })
+    }
+
+    pub(crate) fn verify_owned_path(&self, path: &Path) -> Result<(), StorageError> {
+        crate::file_ownership::verify_file_path(&self.file, path)?;
+        Ok(())
+    }
+
     /// Inspection is also used while Core owns a live Heap. It opens read-only
     /// and never starts recovery or claims mutation authority.
     pub(crate) fn inspect_read_only(path: impl AsRef<Path>) -> Result<Self, StorageError> {

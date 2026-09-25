@@ -13,6 +13,7 @@ netbadb-advisor = { path = "../netbadb-advisor" }
 netbadb-query-feedback = { path = "../netbadb-query-feedback" }
 crc32c.workspace = true
 getrandom.workspace = true
+libc.workspace = true
 sha2.workspace = true
 netbadb-compiler = { path = "../netbadb-compiler" }
 netbadb-executor = { path = "../netbadb-executor" }

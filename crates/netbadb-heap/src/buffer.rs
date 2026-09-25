@@ -326,6 +326,13 @@ pub struct BufferPool {
 pub const DEFAULT_BUFFER_POOL_SIZE: usize = 8;
 
 impl BufferPool {
+    pub(crate) fn duplicate_owned_page_manager(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<PageManager, StorageError> {
+        self.state.borrow().disk.duplicate_owned(path)
+    }
+
     pub(crate) fn validate_capacity(capacity: usize) -> Result<(), StorageError> {
         if capacity == 0 {
             return Err(BufferError::InvalidCapacity.into());

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use netbadb_index::{
@@ -156,6 +156,84 @@ pub struct HeapIdentityInspection {
     pub table_id: TableId,
     pub schema_fingerprint: SchemaFingerprint,
     pub storage_id: StorageId,
+}
+
+/// A single, non-cloneable Heap data-inode lock carried across Core inspection,
+/// staged promotion, and recovery. Only an owned Heap or an exclusive open can
+/// construct it; the locked descriptor is consumed by the next Heap instance.
+#[derive(Debug)]
+pub struct HeapOwnership {
+    pages: PageManager,
+    path: PathBuf,
+}
+
+impl HeapOwnership {
+    /// Claims an existing Heap data inode before any recovery-capable open.
+    pub fn acquire(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let path = authority_path(path.as_ref())?;
+        let pages = PageManager::open_owned(&path)?;
+        Ok(Self { pages, path })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Confirms that `path` still names the locked, single-link regular file.
+    pub fn verify_path(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
+        let path = authority_path(path.as_ref())?;
+        self.pages.verify_owned_path(&path)
+    }
+
+    /// Moves the token's path binding after a same-inode rename. Rejects
+    /// path-bound change-stream sidecars whose migration is not represented
+    /// by this token.
+    pub fn rebind(mut self, path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let path = authority_path(path.as_ref())?;
+        self.pages.verify_owned_path(&path)?;
+        if path != self.path {
+            // Change-stream files are path-bound and this token carries only
+            // the data inode. Their migration needs a separate exact protocol.
+            for heap in [&self.path, &path] {
+                let log = crate::heap_change_log_path(heap);
+                let guard = crate::change_stream_guard_path(&log);
+                for sidecar in [&log, &guard] {
+                    match sidecar.symlink_metadata() {
+                        Ok(_) => {
+                            return Err(StorageError::UnsupportedOperation {
+                                operation: "Heap ownership path rebind",
+                                storage_kind: "change stream sidecar present",
+                            });
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+        self.path = path;
+        Ok(self)
+    }
+
+    /// Reads recovery evidence while retaining the writer-exclusion lock.
+    pub fn inspect_recovery(
+        &self,
+        table: &TableDef,
+    ) -> Result<HeapRecoveryInspection, StorageError> {
+        self.verify_path(&self.path)?;
+        let inspection = HeapStorage::inspect_recovery(&self.path, table)?;
+        self.verify_path(&self.path)?;
+        Ok(inspection)
+    }
+
+    /// Reads physical identity while retaining the writer-exclusion lock.
+    pub fn inspect_identity(&self) -> Result<HeapIdentityInspection, StorageError> {
+        self.verify_path(&self.path)?;
+        let identity = HeapStorage::inspect_identity(&self.path)?;
+        self.verify_path(&self.path)?;
+        Ok(identity)
+    }
 }
 
 /// Metadata-only conservative write bound for one successful Global Heap
@@ -523,7 +601,7 @@ impl HeapStorage {
     }
 
     pub fn open(path: impl AsRef<Path>, table: TableDef) -> Result<Self, StorageError> {
-        Self::open_internal(path, table, DEFAULT_BUFFER_POOL_SIZE, None)
+        Self::open_internal(path, table, DEFAULT_BUFFER_POOL_SIZE, None, None)
     }
 
     pub fn open_with_buffer_pool_size(
@@ -531,7 +609,7 @@ impl HeapStorage {
         table: TableDef,
         buffer_pool_size: usize,
     ) -> Result<Self, StorageError> {
-        Self::open_internal(path, table, buffer_pool_size, None)
+        Self::open_internal(path, table, buffer_pool_size, None, None)
     }
 
     pub fn open_with_prepared_resolutions(
@@ -539,7 +617,31 @@ impl HeapStorage {
         table: TableDef,
         resolutions: &[PreparedTxnResolution],
     ) -> Result<Self, StorageError> {
-        Self::open_internal(path, table, DEFAULT_BUFFER_POOL_SIZE, Some(resolutions))
+        Self::open_internal(
+            path,
+            table,
+            DEFAULT_BUFFER_POOL_SIZE,
+            Some(resolutions),
+            None,
+        )
+    }
+
+    /// Consumes the sole handoff token to reopen the same inode. `None` keeps
+    /// ordinary in-doubt prepared-transaction behavior; `Some` carries exact
+    /// coordinator resolutions. No second file lock is attempted.
+    pub fn open_with_ownership(
+        ownership: HeapOwnership,
+        table: TableDef,
+        resolutions: Option<&[PreparedTxnResolution]>,
+    ) -> Result<Self, StorageError> {
+        let path = ownership.path.clone();
+        Self::open_internal(
+            path,
+            table,
+            DEFAULT_BUFFER_POOL_SIZE,
+            resolutions,
+            Some(ownership),
+        )
     }
 
     pub fn inspect_recovery(
@@ -574,12 +676,18 @@ impl HeapStorage {
         table: TableDef,
         buffer_pool_size: usize,
         prepared_resolutions: Option<&[PreparedTxnResolution]>,
+        ownership: Option<HeapOwnership>,
     ) -> Result<Self, StorageError> {
         let fingerprint = validate_table(&table)?;
         BufferPool::validate_capacity(buffer_pool_size)?;
         let authority = authority_path(path.as_ref())?;
         let path = authority.as_path();
-        let mut pages = PageManager::open_owned(path)?;
+        let mut pages = if let Some(ownership) = ownership {
+            ownership.verify_path(path)?;
+            ownership.pages
+        } else {
+            PageManager::open_owned(path)?
+        };
         if pages.page_count() < 3 {
             return Err(crate::invalid_format("heap file has no data page"));
         }
@@ -3414,6 +3522,20 @@ impl HeapStorage {
         Ok(())
     }
 
+    /// Quiesce the old engine without unlocking its data inode. The duplicate
+    /// descriptor shares the existing flock; no second writer is constructed.
+    pub fn stop_for_promotion(
+        mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<HeapOwnership, StorageError> {
+        self.transactions.ensure_clean_close()?;
+        self.flush()?;
+        let path = authority_path(path.as_ref())?;
+        let pages = self.buffer.duplicate_owned_page_manager(&path)?;
+        self.closed = true;
+        Ok(HeapOwnership { pages, path })
+    }
+
     pub fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
         self.change_stream
             .borrow_mut()
@@ -4347,6 +4469,133 @@ mod tests {
         assert_eq!(transaction.state(), TransactionState::Committed);
         drop(transaction);
         cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_handoff_rejects_independent_open_and_reuses_held_descriptor() {
+        let path = test_path("ownership-handoff");
+        cleanup(&path);
+        let storage = HeapStorage::create(&path, table()).unwrap();
+        let owner = storage.stop_for_promotion(&path).unwrap();
+        assert!(matches!(
+            HeapStorage::open(&path, table()),
+            Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("heap::tests::ownership_child_probe")
+            .env("NETBADB_HEAP_OWNERSHIP_PROBE", &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reopened = HeapStorage::open_with_ownership(owner, table(), None).unwrap();
+        assert!(matches!(
+            HeapStorage::open(&path, table()),
+            Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        reopened.close().unwrap();
+        HeapStorage::open(&path, table()).unwrap().close().unwrap();
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_handoff_requires_quiescent_transactions() {
+        let path = test_path("ownership-handoff-live-transaction");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).unwrap();
+        let mut transaction = storage.begin_transaction().unwrap();
+        assert!(storage.stop_for_promotion(&path).is_err());
+        assert!(matches!(
+            HeapStorage::open(&path, table()),
+            Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        transaction.rollback().unwrap();
+        drop(transaction);
+        HeapStorage::open(&path, table()).unwrap().close().unwrap();
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_rebind_uses_new_sidecar_paths_and_frees_source_name() {
+        let source = test_path("ownership-rebind-source");
+        let target = test_path("ownership-rebind-target");
+        cleanup(&source);
+        cleanup(&target);
+        let storage = HeapStorage::create(&source, table()).unwrap();
+        let owner = storage.stop_for_promotion(&source).unwrap();
+        std::fs::rename(wal_path(&source), wal_path(&target)).unwrap();
+        std::fs::rename(txn_status_path(&source), txn_status_path(&target)).unwrap();
+        std::fs::rename(&source, &target).unwrap();
+        let owner = owner.rebind(&target).unwrap();
+        let mut reopened = HeapStorage::open_with_ownership(owner, table(), None).unwrap();
+        let mut source_reused = HeapStorage::create(&source, table()).unwrap();
+        reopened
+            .insert(&[ScalarValue::Int64(1), ScalarValue::Text("target".into())])
+            .unwrap();
+        source_reused
+            .insert(&[ScalarValue::Int64(2), ScalarValue::Text("source".into())])
+            .unwrap();
+        source_reused.close().unwrap();
+        reopened.close().unwrap();
+        let mut target_storage = HeapStorage::open(&target, table()).unwrap();
+        let mut source_storage = HeapStorage::open(&source, table()).unwrap();
+        assert_eq!(
+            target_storage.scan().unwrap()[0].1[1],
+            ScalarValue::Text("target".into())
+        );
+        assert_eq!(
+            source_storage.scan().unwrap()[0].1[1],
+            ScalarValue::Text("source".into())
+        );
+        target_storage.close().unwrap();
+        source_storage.close().unwrap();
+        cleanup(&source);
+        cleanup(&target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_rebind_rejects_same_bytes_at_a_different_inode() {
+        let source = test_path("ownership-rebind-identity-source");
+        let target = test_path("ownership-rebind-identity-target");
+        cleanup(&source);
+        cleanup(&target);
+        let storage = HeapStorage::create(&source, table()).unwrap();
+        let owner = storage.stop_for_promotion(&source).unwrap();
+        std::fs::copy(&source, &target).unwrap();
+        assert!(owner.rebind(&target).is_err());
+        HeapStorage::open(&source, table())
+            .unwrap()
+            .close()
+            .unwrap();
+        cleanup(&source);
+        cleanup(&target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_rebind_rejects_unmigrated_change_stream_sidecar() {
+        let source = test_path("ownership-rebind-stream-source");
+        let target = test_path("ownership-rebind-stream-target");
+        cleanup(&source);
+        cleanup(&target);
+        let storage = HeapStorage::create(&source, table()).unwrap();
+        let owner = storage.stop_for_promotion(&source).unwrap();
+        let sidecar = crate::heap_change_log_path(&source);
+        std::fs::write(&sidecar, b"unmigrated").unwrap();
+        std::fs::rename(&source, &target).unwrap();
+        assert!(owner.rebind(&target).is_err());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"unmigrated");
+        std::fs::remove_file(sidecar).unwrap();
+        cleanup(&source);
+        cleanup(&target);
     }
 
     #[cfg(unix)]
