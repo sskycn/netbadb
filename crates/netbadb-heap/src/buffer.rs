@@ -345,6 +345,15 @@ impl BufferPool {
         Self::new_inner(page_manager, capacity, Some(wal))
     }
 
+    /// Called only after a clean close has synchronized all Heap files and
+    /// verified that no transaction can still mutate this shared state.
+    pub(crate) fn release_ownership_after_clean_close(&self) -> Result<(), StorageError> {
+        self.state
+            .borrow()
+            .disk
+            .release_ownership_after_clean_close()
+    }
+
     fn new_inner(
         page_manager: PageManager,
         capacity: usize,

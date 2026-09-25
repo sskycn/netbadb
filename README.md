@@ -545,12 +545,15 @@ shapes remain closed.
 
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable
-contract is [`docs/inspection-json-v1.md`](docs/inspection-json-v1.md). Stop
-`netbadbd` and every embedded process using the same files before running the
-local CLI: NetbaDB does not yet provide cross-process file locking. Opening an
-offline database performs normal startup recovery and can redo or undo WAL
-state; this is not a forensic no-write reader. The inspected SQL itself is
-never executed.
+contract is [`docs/inspection-json-v1.md`](docs/inspection-json-v1.md). Direct
+Heap storage opens now lock the durable data-file inode across processes on
+Unix, but database-wide ownership and LSM ownership are not yet implemented.
+The [storage ownership audit](docs/optimization-audit.md) records the remaining
+boundary.
+Stop `netbadbd` and every embedded process using the same catalog before
+running the local CLI. Opening an offline database performs normal startup
+recovery and can redo or undo WAL state; this is not a forensic no-write
+reader. The inspected SQL itself is never executed.
 
 Schema-driven editor diagnostics are documented in [`docs/lsp.md`](docs/lsp.md).
 Run `netbadb-lsp --schema schema.json` as an LSP stdio process. It neither opens

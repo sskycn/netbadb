@@ -1804,6 +1804,7 @@ mod tests {
             .expect("transaction remains writable");
         transaction.commit().expect("commit after not found");
         storage.close().expect("close tree");
+        drop(transaction);
 
         let mut reopened =
             HeapStorage::open_with_buffer_pool_size(&path, table(), 1).expect("reopen tree");

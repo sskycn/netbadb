@@ -829,12 +829,27 @@ pub struct PageManager {
 
 impl PageManager {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let path = path.as_ref().to_owned();
+        Self::create_internal(path.as_ref(), false)
+    }
+
+    pub(crate) fn create_owned(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::create_internal(path.as_ref(), true)
+    }
+
+    fn create_internal(path: &Path, exclusive: bool) -> Result<Self, StorageError> {
+        let path = crate::file_ownership::authority_path(path)?;
         let mut file = OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
             .open(&path)?;
+        if exclusive {
+            if let Err(error) = crate::file_ownership::lock_file(&file, &path) {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                return Err(error.into());
+            }
+        }
         // NBPG is the legacy experimental container header. It is intentionally
         // kept unchanged; versioned page headers live in data pages.
         let initialization = (|| -> std::io::Result<()> {
@@ -860,7 +875,32 @@ impl PageManager {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        Self::open_internal(path.as_ref(), true, false)
+    }
+
+    pub(crate) fn open_owned(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_internal(path.as_ref(), true, true)
+    }
+
+    /// Inspection is also used while Core owns a live Heap. It opens read-only
+    /// and never starts recovery or claims mutation authority.
+    pub(crate) fn inspect_read_only(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_internal(path.as_ref(), false, false)
+    }
+
+    fn open_internal(path: &Path, writable: bool, exclusive: bool) -> Result<Self, StorageError> {
+        let path = crate::file_ownership::authority_path(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(writable);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = options.open(&path)?;
+        if exclusive {
+            crate::file_ownership::lock_file(&file, &path)?;
+        }
         let length = file.metadata()?.len();
         let page_size = PAGE_SIZE as u64;
         if length < page_size || length % page_size != 0 {
@@ -881,6 +921,11 @@ impl PageManager {
             #[cfg(test)]
             fail_next_allocation_after: None,
         })
+    }
+
+    pub(crate) fn release_ownership_after_clean_close(&self) -> Result<(), StorageError> {
+        crate::file_ownership::unlock_file(&self.file)?;
+        Ok(())
     }
 
     #[must_use]

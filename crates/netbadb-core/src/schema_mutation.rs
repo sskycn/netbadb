@@ -2253,12 +2253,11 @@ impl Database {
             .schema_mutation
             .as_mut()
             .ok_or(SchemaMutationError::Corrupt("schema participant absent"))?;
-        if let Some(storage) = &mutation.staged {
-            storage.flush()?;
-        }
         // Close path-bearing storage handles before promotion. The transaction's
         // physical context is already terminal and is removed separately below.
-        mutation.staged.take();
+        if let Some(storage) = mutation.staged.take() {
+            storage.close()?;
+        }
         let catalog = mutation.catalog.clone();
         let reservation = mutation.reservation.clone();
         let target = mutation.target.clone();
@@ -2330,10 +2329,9 @@ impl Database {
             .as_ref()
             .ok_or(SchemaMutationError::Corrupt("rewrite participant absent"))?
             .clone();
-        if let Some(storage) = &mutation.staged {
-            storage.flush()?;
+        if let Some(storage) = mutation.staged.take() {
+            storage.close()?;
         }
-        mutation.staged.take();
         let catalog = mutation.catalog.clone();
         let reservation = mutation.reservation.clone();
         let target = mutation.target.clone();

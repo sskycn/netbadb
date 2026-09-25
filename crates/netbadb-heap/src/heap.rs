@@ -17,6 +17,7 @@ use netbadb_types::{
 };
 
 use crate::change_stream::{AuthoritativeOutcome, ChangeStreamManager, SharedChangeStream};
+use crate::file_ownership::authority_path;
 use crate::mvcc::{TupleHeader, decode_tuple, encode_tuple, is_dead_before, is_visible};
 use crate::recovery::{RecoveryManager, inspect_prepared_transactions};
 use crate::transaction::TransactionManager;
@@ -25,7 +26,7 @@ use crate::{
     BufferPool, CodecError, DEFAULT_BUFFER_POOL_SIZE, HeapRewriteIndex, HeapRewriteIndexes,
     IsolationLevel, MetadataError, PAGE_HEADER_SIZE, PAGE_SIZE, Page, PageError, PageManager,
     PageType, ReadView, SLOT_SIZE, SlotRef, SlotState, Snapshot, StorageError, Transaction,
-    TransactionError, WalManager, WalRecordKind, wal_path,
+    TransactionError, WalManager, WalRecordKind, wal_alternate_path, wal_path,
 };
 use crate::{PreparedTransaction, PreparedTxnResolution};
 
@@ -77,6 +78,7 @@ pub struct HeapStorage {
     index_statistics: Vec<Option<IndexStatistics>>,
     index_catalog_root: PageId,
     change_stream: SharedChangeStream,
+    closed: bool,
     #[cfg(test)]
     skip_drop_flush: bool,
     #[cfg(test)]
@@ -404,16 +406,25 @@ impl HeapStorage {
         }
         let fingerprint = validate_table(&table)?;
         BufferPool::validate_capacity(buffer_pool_size)?;
-        let path = path.as_ref();
+        let authority = authority_path(path.as_ref())?;
+        let path = authority.as_path();
         let wal_path = wal_path(path);
         let status_path = txn_status_path(path);
-        let wal_manager = WalManager::create(&wal_path)?;
-        let pages = match PageManager::create(path) {
-            Ok(pages) => pages,
+        // Keep the existing WAL conflict error precedence without creating or
+        // modifying a WAL before the new Heap inode is exclusively owned.
+        if wal_alternate_path(&wal_path).try_exists()? {
+            return Err(crate::WalError::GenerationConflict.into());
+        }
+        if wal_path.try_exists()? {
+            return Err(crate::WalError::Io(std::io::ErrorKind::AlreadyExists.into()).into());
+        }
+        let pages = PageManager::create_owned(path)?;
+        let wal_manager = match WalManager::create(&wal_path) {
+            Ok(wal) => wal,
             Err(error) => {
-                drop(wal_manager);
-                let _ = std::fs::remove_file(wal_path);
-                return Err(error);
+                drop(pages);
+                let _ = std::fs::remove_file(path);
+                return Err(error.into());
             }
         };
         let status_store = match TxnStatusStore::create(&status_path) {
@@ -487,6 +498,7 @@ impl HeapStorage {
             index_statistics: Vec::new(),
             index_catalog_root: FIRST_MANAGED_PAGE,
             change_stream,
+            closed: false,
             #[cfg(test)]
             skip_drop_flush: false,
             #[cfg(test)]
@@ -535,11 +547,15 @@ impl HeapStorage {
         table: &TableDef,
     ) -> Result<HeapRecoveryInspection, StorageError> {
         let fingerprint = validate_table(table)?;
-        let path = path.as_ref();
-        let mut pages = PageManager::open(path)?;
+        let authority = authority_path(path.as_ref())?;
+        let path = authority.as_path();
+        // Core also inspects a live Heap during schema replacement. Inspection
+        // performs no recovery or writes; the eventual open claims ownership
+        // before it can change any durable state.
+        let mut pages = PageManager::inspect_read_only(path)?;
         let (_, storage_id) =
             validate_heap_metadata(pages.read_page(HEADER_PAGE)?.bytes(), table, fingerprint)?;
-        let (_, records, _) = WalManager::open_for_recovery(wal_path(path))?;
+        let records = WalManager::inspect_for_recovery(wal_path(path))?;
         Ok(HeapRecoveryInspection {
             storage_id,
             prepared_transactions: inspect_prepared_transactions(&records),
@@ -549,7 +565,7 @@ impl HeapStorage {
     pub fn inspect_identity(
         path: impl AsRef<Path>,
     ) -> Result<HeapIdentityInspection, StorageError> {
-        let mut pages = PageManager::open(path)?;
+        let mut pages = PageManager::inspect_read_only(path)?;
         inspect_heap_identity(pages.read_page(HEADER_PAGE)?.bytes())
     }
 
@@ -561,8 +577,9 @@ impl HeapStorage {
     ) -> Result<Self, StorageError> {
         let fingerprint = validate_table(&table)?;
         BufferPool::validate_capacity(buffer_pool_size)?;
-        let path = path.as_ref();
-        let mut pages = PageManager::open(path)?;
+        let authority = authority_path(path.as_ref())?;
+        let path = authority.as_path();
+        let mut pages = PageManager::open_owned(path)?;
         if pages.page_count() < 3 {
             return Err(crate::invalid_format("heap file has no data page"));
         }
@@ -664,6 +681,7 @@ impl HeapStorage {
             index_statistics: Vec::new(),
             index_catalog_root: catalog_root,
             change_stream,
+            closed: false,
             #[cfg(test)]
             skip_drop_flush: false,
             #[cfg(test)]
@@ -3385,9 +3403,15 @@ impl HeapStorage {
         Ok(())
     }
 
-    pub fn close(self) -> Result<(), StorageError> {
+    pub fn close(mut self) -> Result<(), StorageError> {
         self.transactions.ensure_clean_close()?;
-        self.flush()
+        self.flush()?;
+        // Completed transaction handles may still own BufferPool clones. They
+        // cannot issue storage I/O; close has checked there is no live writer
+        // or outstanding transaction and has synchronized the files.
+        self.closed = true;
+        self.buffer.release_ownership_after_clean_close()?;
+        Ok(())
     }
 
     pub fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
@@ -3539,6 +3563,9 @@ impl Drop for HeapStorage {
     fn drop(&mut self) {
         // Explicit `flush`/`close` report errors. Drop only preserves the old
         // embedded behavior with best-effort cleanup and is not durability.
+        if self.closed {
+            return;
+        }
         #[cfg(test)]
         if self.skip_drop_flush {
             return;
@@ -4178,6 +4205,230 @@ mod tests {
         let _ = std::fs::remove_file(wal);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ownership_child_probe() {
+        let Ok(path) = std::env::var("NETBADB_HEAP_OWNERSHIP_PROBE") else {
+            return;
+        };
+        let error = HeapStorage::open(path, table()).expect_err("parent owns Heap");
+        assert!(
+            matches!(error, StorageError::Io(source) if source.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_exit_child() {
+        let Ok(path) = std::env::var("NETBADB_HEAP_OWNERSHIP_EXIT") else {
+            return;
+        };
+        let mut storage = HeapStorage::open(path, table()).unwrap();
+        let mut transaction = storage.begin_transaction().unwrap();
+        storage
+            .insert_in(
+                &mut transaction,
+                &[ScalarValue::Int64(1), ScalarValue::Text("loser".into())],
+            )
+            .unwrap();
+        storage.flush().unwrap();
+        std::process::exit(42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_rejects_second_instance_without_mutation_and_releases_on_drop() {
+        let path = test_path("ownership-reject");
+        cleanup(&path);
+        let storage = HeapStorage::create(&path, table()).unwrap();
+        let before_page = std::fs::read(&path).unwrap();
+        let before_wal = std::fs::read(wal_path(&path)).unwrap();
+        let before_status = std::fs::read(txn_status_path(&path)).unwrap();
+        let before_entries = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                name.to_string_lossy()
+                    .starts_with(path.file_name().unwrap().to_string_lossy().as_ref())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let error = HeapStorage::open(&path, table()).expect_err("same-process second writer");
+        assert!(
+            matches!(error, StorageError::Io(source) if source.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("heap::tests::ownership_child_probe")
+            .env("NETBADB_HEAP_OWNERSHIP_PROBE", &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert_eq!(std::fs::read(&path).unwrap(), before_page);
+        assert_eq!(std::fs::read(wal_path(&path)).unwrap(), before_wal);
+        assert_eq!(
+            std::fs::read(txn_status_path(&path)).unwrap(),
+            before_status
+        );
+        let after_entries = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                name.to_string_lossy()
+                    .starts_with(path.file_name().unwrap().to_string_lossy().as_ref())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(after_entries, before_entries);
+        drop(storage);
+        HeapStorage::open(&path, table()).unwrap().close().unwrap();
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_inspection_preserves_incomplete_wal_tail() {
+        use std::io::Write;
+        let path = test_path("ownership-inspection");
+        cleanup(&path);
+        HeapStorage::create(&path, table())
+            .unwrap()
+            .close()
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(wal_path(&path))
+            .unwrap()
+            .write_all(b"W")
+            .unwrap();
+        let before = std::fs::read(wal_path(&path)).unwrap();
+        let inspection = HeapStorage::inspect_recovery(&path, &table()).unwrap();
+        assert_eq!(inspection.storage_id, StorageId(1));
+        assert_eq!(std::fs::read(wal_path(&path)).unwrap(), before);
+        HeapStorage::open(&path, table()).unwrap().close().unwrap();
+        assert_eq!(
+            std::fs::metadata(wal_path(&path)).unwrap().len(),
+            before.len() as u64 - 1
+        );
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_survives_heap_drop_while_transaction_is_live() {
+        let path = test_path("ownership-transaction");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).unwrap();
+        let mut transaction = storage.begin_transaction().unwrap();
+        drop(storage);
+        assert!(
+            matches!(HeapStorage::open(&path, table()), Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        HeapStorage::inspect_recovery(&path, &table()).unwrap();
+        transaction.rollback().unwrap();
+        drop(transaction);
+        HeapStorage::open(&path, table()).unwrap().close().unwrap();
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_clean_close_releases_with_completed_transaction_handle() {
+        let path = test_path("ownership-completed-handle");
+        cleanup(&path);
+        let mut storage = HeapStorage::create(&path, table()).unwrap();
+        let mut transaction = storage.begin_transaction().unwrap();
+        transaction.commit().unwrap();
+        storage.close().unwrap();
+        HeapStorage::open(&path, table()).unwrap().close().unwrap();
+        assert_eq!(transaction.state(), TransactionState::Committed);
+        drop(transaction);
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_releases_after_process_exit_and_panic() {
+        let path = test_path("ownership-abort");
+        cleanup(&path);
+        HeapStorage::create(&path, table())
+            .unwrap()
+            .close()
+            .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("heap::tests::ownership_exit_child")
+            .env("NETBADB_HEAP_OWNERSHIP_EXIT", &path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(42));
+        let caught = std::panic::catch_unwind(|| {
+            let mut storage = HeapStorage::open(&path, table()).unwrap();
+            assert!(storage.scan().unwrap().is_empty());
+            panic!("simulate unwind");
+        });
+        assert!(caught.is_err());
+        HeapStorage::open(&path, table()).unwrap().close().unwrap();
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_releases_after_failed_recovery_open() {
+        let path = test_path("ownership-failed-open");
+        cleanup(&path);
+        HeapStorage::create(&path, table())
+            .unwrap()
+            .close()
+            .unwrap();
+        let wal = wal_path(&path);
+        let original = std::fs::read(&wal).unwrap();
+        std::fs::write(&wal, b"bad").unwrap();
+        assert!(HeapStorage::open(&path, table()).is_err());
+        std::fs::write(&wal, original).unwrap();
+        HeapStorage::open(&path, table()).unwrap().close().unwrap();
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_rejects_file_symlink_and_hard_link_aliases() {
+        let path = test_path("ownership-alias");
+        cleanup(&path);
+        HeapStorage::create(&path, table())
+            .unwrap()
+            .close()
+            .unwrap();
+        let symlink = path.with_extension("symlink");
+        let hardlink = path.with_extension("hardlink");
+        let _ = std::fs::remove_file(&symlink);
+        let _ = std::fs::remove_file(&hardlink);
+        std::os::unix::fs::symlink(&path, &symlink).unwrap();
+        assert!(
+            matches!(HeapStorage::open(&symlink, table()), Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::InvalidInput)
+        );
+        std::fs::hard_link(&path, &hardlink).unwrap();
+        assert!(
+            matches!(HeapStorage::open(&hardlink, table()), Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::InvalidInput)
+        );
+        std::fs::remove_file(&symlink).unwrap();
+        std::fs::remove_file(&hardlink).unwrap();
+        let directory_alias = path.with_extension("directory-alias");
+        let _ = std::fs::remove_file(&directory_alias);
+        std::os::unix::fs::symlink(path.parent().unwrap(), &directory_alias).unwrap();
+        let alias_path = directory_alias.join(path.file_name().unwrap());
+        let storage = HeapStorage::open(&path, table()).unwrap();
+        assert!(
+            matches!(HeapStorage::open(&alias_path, table()), Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        storage.close().unwrap();
+        std::fs::remove_file(&directory_alias).unwrap();
+        cleanup(&path);
+    }
+
     #[test]
     fn physical_design_source_tracks_current_geometry_and_bounds_production_scan() {
         use crate::source_inspection_test_activity as activity;
@@ -4709,6 +4960,7 @@ mod tests {
         drop(statement);
         writer.commit().expect("durable commit");
         winner.simulate_crash();
+        drop(writer);
         let mut recovered = HeapStorage::open(&winner_path, table()).expect("recover winner");
         assert_eq!(recovered.scan().unwrap(), vec![(new, mvcc_text("B"))]);
         recovered.close().expect("close winner recovery");
@@ -8246,6 +8498,7 @@ mod tests {
             .expect("winner update");
         winner.commit().expect("commit winner");
         storage.simulate_crash();
+        drop(winner);
 
         let mut storage = HeapStorage::open(&path, table()).expect("redo winner");
         assert_eq!(
@@ -8272,6 +8525,7 @@ mod tests {
             .expect("winner delete");
         delete_winner.commit().expect("commit delete winner");
         storage.simulate_crash();
+        drop(delete_winner);
 
         let mut storage = HeapStorage::open(&path, table()).expect("redo delete winner");
         assert!(matches!(
@@ -8876,6 +9130,8 @@ mod tests {
         assert_eq!(loser.state(), TransactionState::RolledBack);
         assert_eq!(storage.scan().expect("scan rows").len(), 1);
         storage.close().expect("close heap");
+        drop(loser);
+        drop(winner);
 
         let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
         let rows = reopened.scan().expect("scan reopened rows");
@@ -9074,6 +9330,8 @@ mod tests {
             .expect("insert winner");
         winner.commit().expect("commit winner");
         storage.simulate_crash();
+        drop(loser);
+        drop(winner);
 
         let mut reopened = HeapStorage::open(&path, table()).expect("recover database");
         let rows = reopened.scan().expect("scan recovered winner");
@@ -9600,6 +9858,7 @@ mod tests {
         storage.checkpoint().expect("checkpoint rollback");
         assert!(storage.wal_records().expect("scan WAL").is_empty());
         storage.close().expect("close heap");
+        drop(transaction);
 
         let mut reopened = HeapStorage::open(&path, table()).expect("reopen heap");
         assert!(reopened.scan().expect("scan heap").is_empty());

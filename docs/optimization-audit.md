@@ -1,0 +1,21 @@
+# Optimization audit: storage ownership, round A
+
+Baseline: `387a5a2b37733b42eae01ebd61dd949db313d593`; the working tree was clean before this round. This round addresses only the Heap slice of stage A. No performance claim is made because the change is a reliability boundary, not an optimized hot path.
+
+| ID | Current state | Call chain, trigger, and impact | Tests and this round |
+| --- | --- | --- | --- |
+| F01 | Confirmed; Heap direct open guarded, LSM and database-wide ownership remain open | `HeapStorage::open_internal` used to reach `WalManager::open_for_recovery` (tail truncation, sync, generation cleanup) and `RecoveryManager::recover` before any exclusive ownership. `LsmStorage::open_with_prepared_resolutions` also cleans orphans and replays WAL without a guard. Core's `physical_open_storages_with_coordinator` inspects participants before opening them, with no transferred guard. Two instances of one authority could mistake an active transaction for crash residue. | New Heap same-process, subprocess, active-transaction, close/reopen, failed-open, process-exit, panic, alias, read-only inspection, and no-mutation tests. LSM and Core transfer are deferred. |
+| F02 | Not established | Executor and Core resource paths were not traced in this round. | No change. |
+| F03 | Not established | Synchronous worker deadline/cancellation paths were not traced in this round. | No change. |
+| F04 | Not established | TLS and frame admission paths were not traced in this round. | No change. |
+| F05 | Not established | Coordinator allocation frequency was not measured in this round. | No change. |
+| F06 | Not established | Query response encoding path was not measured in this round. | No change. |
+| F07 | Not established | BufferPool's `find_frame` is linear, but its workload cost was not measured in this round. | No change. |
+| F08 | Not established | Prepare and authorization errors were not traced in this round. | No change. |
+| F09 | Not established | CI already runs workspace tests, MSRV, independent consumers, storage compatibility, and Go interoperation; fuzz scheduling was not audited in this round. | No change. |
+
+Heap ownership is a nonblocking advisory `flock` on the durable Heap data-file inode, held by the shared buffer state through its `PageManager`. The inode follows a staged-file rename, unlike a WAL generation, and does not conflict with Core's structured `<heap>.owner` identity file. The guard survives a dropped `HeapStorage` while a transaction still owns the buffer. A successful clean `close` synchronizes the files, verifies that no transaction is active, and unlocks the inode even if a completed transaction object remains in scope. The path's parent is canonicalized and subsequent I/O uses that path; file symlinks and hard links are rejected. The guard is acquired before WAL or recovery writes. A rejected open performs no file mutation. `inspect_recovery` uses read-only page and WAL handles without claiming mutation authority; Core inspects an already-open source Heap during replacement. It does not truncate incomplete WAL tails or remove WAL generations. A later recovery-style open independently acquires the inode lock before any mutation.
+
+The remaining stage A boundary is **LSM and database-wide ownership**, including Core inspection-to-open guard transfer and catalog/coordinator/sidecar coverage. Core's staged Heap closes before promotion and reopens after promotion, leaving an ownership gap; the new instance must acquire the lock before recovery but the transition is not an atomic guard handoff. The public low-level `PageManager` and `WalManager` interfaces remain raw file tools and do not themselves enforce Heap-wide ownership; the guarantee here applies to `HeapStorage` entry points. The next phase after stage A is **stage B: network entry deadlines and payload admission**. No disk or wire format or sidecar layout was changed. Heap creation now creates and locks its data inode before creating the WAL, so its normal recovery and WAL mutation occur after ownership.
+
+`libc` was already a workspace dependency. Heap now uses it for Unix `flock` because the standard library file-lock API is newer than the declared Rust 1.85 MSRV. Non-Unix Heap creation/opening fails with `Unsupported` until a platform-specific ownership implementation exists.

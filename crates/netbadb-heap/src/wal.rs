@@ -421,19 +421,26 @@ impl WalManager {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let (manager, _, _) = Self::open_selected(path.as_ref(), TailPolicy::Reject)?;
+        let (manager, _, _) = Self::open_selected(path.as_ref(), TailPolicy::Reject, true)?;
         Ok(manager)
     }
 
     pub(crate) fn open_for_recovery(
         path: impl AsRef<Path>,
     ) -> Result<(Self, Vec<WalRecord>, bool), WalError> {
-        Self::open_selected(path.as_ref(), TailPolicy::AllowIncompleteFinalRecord)
+        Self::open_selected(path.as_ref(), TailPolicy::AllowIncompleteFinalRecord, true)
+    }
+
+    pub(crate) fn inspect_for_recovery(path: impl AsRef<Path>) -> Result<Vec<WalRecord>, WalError> {
+        let (_, records, _) =
+            Self::open_selected(path.as_ref(), TailPolicy::AllowIncompleteFinalRecord, false)?;
+        Ok(records)
     }
 
     fn open_selected(
         root_path: &Path,
         tail_policy: TailPolicy,
+        allow_mutation: bool,
     ) -> Result<(Self, Vec<WalRecord>, bool), WalError> {
         let root_path = root_path.to_owned();
         let alternate_path = wal_alternate_path(&root_path);
@@ -448,7 +455,10 @@ impl WalManager {
                 failures.push((path.to_owned(), None, WalError::TruncatedHeader));
                 continue;
             }
-            let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(allow_mutation)
+                .open(path)?;
             let header = match read_header(&mut file) {
                 Ok(header) => header,
                 Err(error) => {
@@ -491,21 +501,23 @@ impl WalManager {
             .collect::<Vec<_>>();
         superseded_paths.extend(ignored_failure_paths);
         drop(candidates);
-        if scan.incomplete_tail {
+        if scan.incomplete_tail && allow_mutation {
             file.set_len(scan.valid_end)?;
         }
         // Reopening readable bytes cannot prove the previous file/directory
         // barriers completed. Keep the old generation until both succeed,
         // including when the new generation contains only a checkpoint header.
-        #[cfg(test)]
-        fail_open_authority_sync(false)?;
-        file.sync_all()?;
-        #[cfg(test)]
-        fail_open_authority_sync(true)?;
-        sync_parent_directory(&path)?;
-        for superseded in superseded_paths {
-            std::fs::remove_file(&superseded)?;
-            sync_parent_directory(&superseded)?;
+        if allow_mutation {
+            #[cfg(test)]
+            fail_open_authority_sync(false)?;
+            file.sync_all()?;
+            #[cfg(test)]
+            fail_open_authority_sync(true)?;
+            sync_parent_directory(&path)?;
+            for superseded in superseded_paths {
+                std::fs::remove_file(&superseded)?;
+                sync_parent_directory(&superseded)?;
+            }
         }
         let records = scan.records;
         let manager = Self::from_scan(file, root_path, path, header, &records, scan.valid_end)?;

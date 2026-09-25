@@ -5,6 +5,7 @@ mod buffer;
 #[cfg(test)]
 mod crash_test;
 mod error;
+mod file_ownership;
 mod heap;
 mod inspection;
 mod mvcc;
