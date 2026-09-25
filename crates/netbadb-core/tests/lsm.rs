@@ -41,6 +41,70 @@ fn cleanup(heap: &std::path::Path, lsm: &std::path::Path, coordinator: &std::pat
     let _ = std::fs::remove_file(coordinator);
 }
 
+#[cfg(unix)]
+#[test]
+fn completed_mixed_create_journal_reopens_with_lsm_participant() {
+    use std::os::unix::fs::MetadataExt;
+    let root = std::env::temp_dir().join(format!(
+        "netbadb-mixed-create-reopen-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut database = Database::create_catalog(
+        root.join("catalog"),
+        vec![TableStorageCreateSpec::lsm(
+            root.join("items.lsm"),
+            table(1, "items"),
+            ColumnId(1),
+        )],
+        Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+    )
+    .unwrap();
+    database
+        .execute("CREATE TABLE projects (id BIGINT NOT NULL)")
+        .unwrap();
+    database.close().unwrap();
+    let carriers = ["catalog.core-owner", "coordinator.core-owner"].map(|name| {
+        let metadata = std::fs::metadata(root.join(name)).unwrap();
+        (metadata.dev(), metadata.ino())
+    });
+    let before = ["catalog", "catalog.mutations", "coordinator"]
+        .map(|name| std::fs::read(root.join(name)).unwrap());
+    let holder =
+        netbadb_storage::TableStorage::open_lsm(root.join("items.lsm"), table(1, "items")).unwrap();
+    assert!(Database::open_catalog(root.join("catalog")).is_err());
+    for (name, expected) in ["catalog", "catalog.mutations", "coordinator"]
+        .into_iter()
+        .zip(before)
+    {
+        assert_eq!(std::fs::read(root.join(name)).unwrap(), expected);
+    }
+    holder.close().unwrap();
+    let mut reopened = Database::open_catalog(root.join("catalog")).unwrap();
+    reopened
+        .execute("INSERT INTO projects (id) VALUES (7)")
+        .unwrap();
+    assert_eq!(
+        reopened
+            .query("SELECT id FROM projects")
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    reopened.close().unwrap();
+    for (name, expected) in ["catalog.core-owner", "coordinator.core-owner"]
+        .into_iter()
+        .zip(carriers)
+    {
+        let metadata = std::fs::metadata(root.join(name)).unwrap();
+        assert_eq!((metadata.dev(), metadata.ino()), expected);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn root(plan: &StatementPlanInspection) -> &PlanNodeInspection {
     match plan {
         StatementPlanInspection::Query { root } => root,

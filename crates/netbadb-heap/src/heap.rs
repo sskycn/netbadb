@@ -227,6 +227,20 @@ impl HeapOwnership {
         Ok(inspection)
     }
 
+    /// Reads recovery evidence while a staged promotion has moved the WAL
+    /// pathname but still holds the data inode at its original pathname.
+    /// The caller must supply the exact WAL destination from that promotion.
+    pub fn inspect_recovery_with_wal(
+        &self,
+        table: &TableDef,
+        wal: &Path,
+    ) -> Result<HeapRecoveryInspection, StorageError> {
+        self.verify_path(&self.path)?;
+        let inspection = HeapStorage::inspect_recovery_at(&self.path, table, wal)?;
+        self.verify_path(&self.path)?;
+        Ok(inspection)
+    }
+
     /// Reads physical identity while retaining the writer-exclusion lock.
     pub fn inspect_identity(&self) -> Result<HeapIdentityInspection, StorageError> {
         self.verify_path(&self.path)?;
@@ -648,16 +662,23 @@ impl HeapStorage {
         path: impl AsRef<Path>,
         table: &TableDef,
     ) -> Result<HeapRecoveryInspection, StorageError> {
-        let fingerprint = validate_table(table)?;
         let authority = authority_path(path.as_ref())?;
-        let path = authority.as_path();
+        Self::inspect_recovery_at(&authority, table, &wal_path(&authority))
+    }
+
+    fn inspect_recovery_at(
+        path: &Path,
+        table: &TableDef,
+        wal: &Path,
+    ) -> Result<HeapRecoveryInspection, StorageError> {
+        let fingerprint = validate_table(table)?;
         // Core also inspects a live Heap during schema replacement. Inspection
         // performs no recovery or writes; the eventual open claims ownership
         // before it can change any durable state.
         let mut pages = PageManager::inspect_read_only(path)?;
         let (_, storage_id) =
             validate_heap_metadata(pages.read_page(HEADER_PAGE)?.bytes(), table, fingerprint)?;
-        let records = WalManager::inspect_for_recovery(wal_path(path))?;
+        let records = WalManager::inspect_for_recovery(wal)?;
         Ok(HeapRecoveryInspection {
             storage_id,
             prepared_transactions: inspect_prepared_transactions(&records),

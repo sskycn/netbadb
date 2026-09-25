@@ -743,9 +743,9 @@ fn open_authority(
                 .map_err(|e| file::io("claim coordinator ownership", &coordinator_path, e))?,
         ));
     }
-    // Terminal create history is allocator evidence, not replay work. All
-    // other mixed mutation histories may name staged Heap participants beyond
-    // the published inventory and therefore fail before any recovery write.
+    // Terminal create history is allocator evidence, not replay work. A
+    // single pending CreateHeap composition has a separate exact admission;
+    // other mixed histories still fail before any recovery write.
     let mixed = candidate
         .storages
         .iter()
@@ -772,38 +772,101 @@ fn open_authority(
             .ok_or(SchemaCatalogError::InventoryMismatch(
                 "settled mixed journal disappeared",
             ))?;
-        let coordinator_path = file::resolve(&path, &journal.coordinator);
-        terminal_create_history = crate::CoordinatorLog::inspect_completed(
-            &coordinator_path,
-            journal
-                .reservations
-                .values()
-                .filter_map(|record| (record.resolved == Some(true)).then_some(record.transaction)),
-        )?;
+        terminal_create_history =
+            crate::schema_mutation::settled_mixed_create_history(&path, &candidate, journal)?;
     }
-    let (journal, mut ownerships) = if mixed && terminal_create_history {
-        (candidate_journal, BTreeMap::new())
-    } else if mixed
-        && candidate_journal.as_ref().is_some_and(|journal| {
-            !journal.reservations.is_empty()
-                || !journal.drops.is_empty()
-                || !journal.rewrite_reservations.is_empty()
-                || !journal.rewrites.is_empty()
-                || !journal.rewrite_losers.is_empty()
-                || !journal.compositions.is_empty()
-                || !journal.stage_intents.is_empty()
-                || !journal.finalization_intents.is_empty()
-                || !journal.migration_finalization_intents.is_empty()
-                || !journal.source_backfill_intents.is_empty()
-        })
+    // A settled-history proof reads Heap owner companions. Retain those data
+    // inode locks through the later ordinary mixed participant installation.
+    let mut settled_heap_owners = if mixed
+        && candidate_journal
+            .as_ref()
+            .is_some_and(|journal| terminal_create_history || !journal.compositions.is_empty())
     {
-        return Err(SchemaCatalogError::InventoryMismatch(
-            "mixed schema mutation replay requires complete participant admission",
-        )
-        .into());
+        crate::claim_heap_paths_with_existing(
+            candidate
+                .storages
+                .iter()
+                .filter(|storage| matches!(storage.kind, CatalogStorageKind::Heap))
+                .map(|storage| file::resolve(&path, &storage.locator)),
+            &mut BTreeMap::new(),
+        )?
     } else {
-        crate::schema_mutation::recover(&path)?
+        BTreeMap::new()
     };
+    let terminal_table_create_history = if mixed && !terminal_create_history {
+        match candidate_journal.as_ref() {
+            Some(journal) => {
+                crate::schema_mutation::settled_mixed_create_history(&path, &candidate, journal)?
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    let mixed_create_owners = if mixed && !terminal_create_history && !terminal_table_create_history
+    {
+        match candidate_journal.as_ref() {
+            Some(journal) => {
+                match crate::schema_mutation::claim_mixed_create_recovery(
+                    &path,
+                    &candidate,
+                    journal,
+                    std::mem::take(&mut settled_heap_owners),
+                )? {
+                    Some(owners) => Some(owners),
+                    None => crate::schema_mutation::claim_mixed_reservation_recovery(
+                        &path, &candidate, journal,
+                    )?,
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    #[cfg(test)]
+    if let Some(owners) = mixed_create_owners.as_ref() {
+        crate::schema_mutation::handoff_pause(
+            "mixed-journal-inspected",
+            owners
+                .heap
+                .values()
+                .next()
+                .map(netbadb_storage::HeapOwnership::path),
+        );
+    }
+    let (journal, mut ownerships) =
+        if mixed && (terminal_create_history || terminal_table_create_history) {
+            (
+                candidate_journal,
+                crate::schema_mutation::RecoveryOwners {
+                    heap: std::mem::take(&mut settled_heap_owners),
+                    lsm: BTreeMap::new(),
+                },
+            )
+        } else if let Some(owners) = mixed_create_owners {
+            crate::schema_mutation::recover_with_owners(&path, owners)?
+        } else if mixed
+            && candidate_journal.as_ref().is_some_and(|journal| {
+                !journal.reservations.is_empty()
+                    || !journal.drops.is_empty()
+                    || !journal.rewrite_reservations.is_empty()
+                    || !journal.rewrites.is_empty()
+                    || !journal.rewrite_losers.is_empty()
+                    || !journal.compositions.is_empty()
+                    || !journal.stage_intents.is_empty()
+                    || !journal.finalization_intents.is_empty()
+                    || !journal.migration_finalization_intents.is_empty()
+                    || !journal.source_backfill_intents.is_empty()
+            })
+        {
+            return Err(SchemaCatalogError::InventoryMismatch(
+                "mixed schema mutation replay requires complete participant admission",
+            )
+            .into());
+        } else {
+            crate::schema_mutation::recover(&path)?
+        };
     let snapshot = file::load(&path)?;
     let incarnation = snapshot.incarnation;
     preflight_paths(&path, &snapshot, false)?;
@@ -837,8 +900,13 @@ fn open_authority(
         let heap = file::resolve(&path, &storage.locator);
         crate::schema_mutation::handoff_pause("validated", Some(&heap));
     }
-    let mut database =
-        recover_physical_with_ownership(&path, &snapshot, overrides, &mut ownerships)?;
+    let mut database = recover_physical_with_owners(
+        &path,
+        &snapshot,
+        overrides,
+        &mut ownerships.heap,
+        &mut ownerships.lsm,
+    )?;
     database.committed = snapshot.committed;
     database.catalog_path = Some(path);
     retain_metadata_owners(&mut database, metadata_owners);
@@ -1068,6 +1136,16 @@ pub(crate) fn recover_physical_with_ownership(
     overrides: &[TableStorageOpenSpec],
     ownerships: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
 ) -> Result<Database, DatabaseError> {
+    recover_physical_with_owners(path, snapshot, overrides, ownerships, &mut BTreeMap::new())
+}
+
+pub(crate) fn recover_physical_with_owners(
+    path: &Path,
+    snapshot: &SchemaCatalogSnapshot,
+    overrides: &[TableStorageOpenSpec],
+    ownerships: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+    lsm_ownerships: &mut BTreeMap<PathBuf, netbadb_storage::LsmOwnership>,
+) -> Result<Database, DatabaseError> {
     let specs = materialize(path, snapshot, overrides)?;
     // `materialize` may use a read-only identity to resolve a legacy path
     // override. Recheck every Heap descriptor after claiming all Heap inodes,
@@ -1278,6 +1356,7 @@ pub(crate) fn recover_physical_with_ownership(
             snapshot.committed.clone(),
             Some(snapshot.placements.clone()),
             ownerships,
+            lsm_ownerships,
         ),
         None => Database::physical_open_storages(
             specs,
@@ -1288,6 +1367,7 @@ pub(crate) fn recover_physical_with_ownership(
                 .collect::<Vec<_>>(),
             snapshot.committed.clone(),
             ownerships,
+            lsm_ownerships,
         ),
     }
 }

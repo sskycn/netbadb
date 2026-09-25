@@ -3973,6 +3973,809 @@ fn mixed_direct_probe_child() {
 
 #[cfg(unix)]
 #[test]
+fn mixed_create_history_with_unexplained_private_file_keeps_evidence() {
+    let root = root("mixed-create-private-evidence");
+    let mut database = Database::create_catalog(
+        root.join("catalog"),
+        vec![TableStorageCreateSpec::lsm(
+            root.join("teams.lsm"),
+            old_table(1, "teams"),
+            ColumnId(1),
+        )],
+        Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+    )
+    .unwrap();
+    database
+        .execute("CREATE TABLE projects (id BIGINT NOT NULL)")
+        .unwrap();
+    database.close().unwrap();
+    let catalog = root.join("catalog");
+    let marker = crate::schema_catalog_file::marker(&catalog)
+        .unwrap()
+        .unwrap();
+    let journal =
+        crate::schema_mutation_journal::SchemaMutationJournal::open(&catalog, marker.incarnation)
+            .unwrap()
+            .unwrap();
+    let transaction = *journal.compositions.keys().next().unwrap();
+    let prepared = crate::schema_catalog_file::resolve(
+        &catalog,
+        &crate::schema_mutation_journal::prepared_locator(
+            &catalog,
+            marker.incarnation,
+            transaction,
+        )
+        .unwrap(),
+    );
+    let private = prepared.parent().unwrap();
+    std::fs::create_dir_all(private).unwrap();
+    let unexplained = private.join("unknown-file");
+    std::fs::write(&unexplained, b"preserve this evidence").unwrap();
+    let before = ["catalog", "catalog.mutations", "coordinator"]
+        .map(|name| std::fs::read(root.join(name)).unwrap());
+    assert!(Database::open_catalog(&catalog).is_err());
+    for (name, expected) in ["catalog", "catalog.mutations", "coordinator"]
+        .into_iter()
+        .zip(before)
+    {
+        assert_eq!(std::fs::read(root.join(name)).unwrap(), expected);
+    }
+    assert_eq!(
+        std::fs::read(unexplained).unwrap(),
+        b"preserve this evidence"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_create_crash_child() {
+    let Ok(root) = std::env::var("NETBADB_MIXED_CREATE_CRASH_ROOT") else {
+        return;
+    };
+    let mut database = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
+    database
+        .execute("CREATE TABLE projects (id BIGINT NOT NULL)")
+        .unwrap();
+    panic!("configured mixed create crash point was not reached");
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_second_create_crash_child() {
+    let Ok(root) = std::env::var("NETBADB_MIXED_SECOND_CREATE_ROOT") else {
+        return;
+    };
+    let mut database = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
+    database
+        .execute("CREATE TABLE tasks (id BIGINT NOT NULL)")
+        .unwrap();
+    panic!("configured second create crash point was not reached");
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_second_create_replays_after_a_settled_create_history() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    for (point, committed) in [
+        ("composition-table-reservation-durable", false),
+        ("promotion-partial", true),
+        ("composition-after-winner-resolution", true),
+    ] {
+        let root = root(&format!("mixed-second-create-{point}"));
+        let catalog = root.join("catalog");
+        let mut database = Database::create_catalog(
+            &catalog,
+            vec![TableStorageCreateSpec::lsm(
+                root.join("teams.lsm"),
+                old_table(1, "teams"),
+                ColumnId(1),
+            )],
+            Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+        )
+        .unwrap();
+        database
+            .execute("CREATE TABLE projects (id BIGINT NOT NULL)")
+            .unwrap();
+        database.close().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "schema_mutation_tests::mixed_second_create_crash_child",
+            ])
+            .env("NETBADB_MIXED_SECOND_CREATE_ROOT", &root)
+            .env("NETBADB_CREATE_CRASH_POINT", point)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("second mixed create child timed out at {point}");
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(status.code(), Some(90), "{point}");
+        for _ in 0..2 {
+            let database = Database::open_catalog(&catalog)
+                .unwrap_or_else(|error| panic!("{point}: {error:?}"));
+            assert!(database.schema().table("projects").is_some());
+            assert_eq!(database.schema().table("tasks").is_some(), committed);
+            database.close().unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_legacy_create_crash_child() {
+    let Ok(root) = std::env::var("NETBADB_MIXED_LEGACY_CREATE_ROOT") else {
+        return;
+    };
+    let mut database = Database::open_catalog(Path::new(&root).join("catalog")).unwrap();
+    let mut transaction = database.begin_transaction().unwrap();
+    if std::env::var_os("NETBADB_MIXED_LEGACY_WITH_DML").is_some() {
+        database
+            .execute_in(&mut transaction, "INSERT INTO users (id) VALUES (7)")
+            .unwrap();
+        database
+            .execute_in(&mut transaction, "INSERT INTO teams (id) VALUES (8)")
+            .unwrap();
+    }
+    let name =
+        std::env::var("NETBADB_MIXED_LEGACY_TABLE").unwrap_or_else(|_| "projects".to_owned());
+    database
+        .create_heap_table_legacy_in(&mut transaction, spec(&name))
+        .unwrap();
+    database.commit_transaction(&mut transaction).unwrap();
+    panic!("configured legacy mixed create crash point was not reached");
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_legacy_create_crash_recovery_respects_the_original_decision() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    for (point, committed) in [
+        ("reservation-durable", false),
+        ("intent-durable", false),
+        ("stage-first-file", false),
+        ("stage-synced", false),
+        ("coordinator-durable", true),
+        ("promotion-partial", true),
+        ("before-nbsc-publication", true),
+        ("legacy-after-winner-resolution", true),
+        ("before-memory-publish", true),
+    ] {
+        let root = root(&format!("mixed-legacy-create-{point}"));
+        let catalog = root.join("catalog");
+        Database::create_catalog(
+            &catalog,
+            vec![TableStorageCreateSpec::lsm(
+                root.join("teams.lsm"),
+                old_table(1, "teams"),
+                ColumnId(1),
+            )],
+            Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "schema_mutation_tests::mixed_legacy_create_crash_child",
+            ])
+            .env("NETBADB_MIXED_LEGACY_CREATE_ROOT", &root)
+            .env("NETBADB_CREATE_CRASH_POINT", point)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("mixed legacy create child timed out at {point}");
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(status.code(), Some(90), "{point}");
+        for _ in 0..2 {
+            let database = Database::open_catalog(&catalog)
+                .unwrap_or_else(|error| panic!("{point}: {error:?}"));
+            assert_eq!(database.schema().table("projects").is_some(), committed);
+            database.close().unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_legacy_create_refuses_busy_participants_before_replay_writes() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let root = root("mixed-legacy-busy");
+    let catalog = root.join("catalog");
+    Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::lsm(
+            root.join("teams.lsm"),
+            old_table(1, "teams"),
+            ColumnId(1),
+        )],
+        Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+    )
+    .unwrap()
+    .close()
+    .unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::mixed_legacy_create_crash_child",
+        ])
+        .env("NETBADB_MIXED_LEGACY_CREATE_ROOT", &root)
+        .env("NETBADB_CREATE_CRASH_POINT", "stage-synced")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("mixed legacy busy fixture timed out");
+        }
+        std::thread::yield_now();
+    };
+    assert_eq!(status.code(), Some(90));
+    let snapshot = crate::schema_catalog_file::load(&catalog).unwrap();
+    let journal =
+        crate::schema_mutation_journal::SchemaMutationJournal::open(&catalog, snapshot.incarnation)
+            .unwrap()
+            .unwrap();
+    let reservation = journal.reservations.values().next().unwrap();
+    let stage = crate::schema_catalog_file::resolve(
+        &catalog,
+        &crate::schema_mutation_journal::stage_locator(
+            &catalog,
+            snapshot.incarnation,
+            reservation.transaction,
+            reservation.storage,
+        )
+        .unwrap(),
+    );
+    let before = ["catalog", "catalog.mutations", "coordinator"]
+        .map(|name| std::fs::read(root.join(name)).unwrap());
+    let mut lsm = TableStorage::open_lsm(root.join("teams.lsm"), old_table(1, "teams")).unwrap();
+    assert!(Database::open_catalog(&catalog).is_err());
+    lsm.insert(&[ScalarValue::Int64(8)]).unwrap();
+    lsm.close().unwrap();
+    let heap = netbadb_storage::HeapOwnership::acquire(&stage).unwrap();
+    assert!(Database::open_catalog(&catalog).is_err());
+    drop(heap);
+    for (name, expected) in ["catalog", "catalog.mutations", "coordinator"]
+        .into_iter()
+        .zip(before)
+    {
+        assert_eq!(std::fs::read(root.join(name)).unwrap(), expected);
+    }
+    let mut database = Database::open_catalog(&catalog).unwrap();
+    assert!(database.schema().table("projects").is_none());
+    assert_eq!(
+        database.query("SELECT id FROM teams").unwrap().rows,
+        vec![vec![ScalarValue::Int64(8)]]
+    );
+    database.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_legacy_create_replays_all_heap_lsm_commit_participants() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let root = root("mixed-legacy-create-dml");
+    let catalog = root.join("catalog");
+    Database::create_catalog(
+        &catalog,
+        vec![
+            TableStorageCreateSpec::heap(root.join("users.heap"), old_table(1, "users")),
+            TableStorageCreateSpec::lsm(root.join("teams.lsm"), old_table(2, "teams"), ColumnId(1)),
+        ],
+        Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+    )
+    .unwrap()
+    .close()
+    .unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::mixed_legacy_create_crash_child",
+        ])
+        .env("NETBADB_MIXED_LEGACY_CREATE_ROOT", &root)
+        .env("NETBADB_MIXED_LEGACY_WITH_DML", "1")
+        .env("NETBADB_CREATE_CRASH_POINT", "coordinator-durable")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("mixed legacy DML child timed out");
+        }
+        std::thread::yield_now();
+    };
+    assert_eq!(status.code(), Some(90));
+    for _ in 0..2 {
+        let mut database = Database::open_catalog(&catalog).unwrap();
+        assert!(database.schema().table("projects").is_some());
+        assert_eq!(
+            database.query("SELECT id FROM users").unwrap().rows,
+            vec![vec![ScalarValue::Int64(7)]]
+        );
+        assert_eq!(
+            database.query("SELECT id FROM teams").unwrap().rows,
+            vec![vec![ScalarValue::Int64(8)]]
+        );
+        database.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_create_history_accepts_both_legal_journal_encodings() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    for mode in ["sql-then-legacy", "legacy-then-sql", "legacy-then-legacy"] {
+        let root = root(mode);
+        let catalog = root.join("catalog");
+        let mut database = Database::create_catalog(
+            &catalog,
+            vec![TableStorageCreateSpec::lsm(
+                root.join("teams.lsm"),
+                old_table(1, "teams"),
+                ColumnId(1),
+            )],
+            Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+        )
+        .unwrap();
+        if mode == "sql-then-legacy" {
+            database
+                .execute("CREATE TABLE projects (id BIGINT NOT NULL)")
+                .unwrap();
+        } else {
+            let mut transaction = database.begin_transaction().unwrap();
+            database
+                .create_heap_table_legacy_in(&mut transaction, spec("projects"))
+                .unwrap();
+            database.commit_transaction(&mut transaction).unwrap();
+        }
+        database.close().unwrap();
+        let (child_name, point) = if mode != "legacy-then-sql" {
+            (
+                "schema_mutation_tests::mixed_legacy_create_crash_child",
+                "coordinator-durable",
+            )
+        } else {
+            (
+                "schema_mutation_tests::mixed_second_create_crash_child",
+                "promotion-partial",
+            )
+        };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", child_name])
+            .env("NETBADB_MIXED_SECOND_CREATE_ROOT", &root)
+            .env("NETBADB_MIXED_LEGACY_CREATE_ROOT", &root)
+            .env("NETBADB_MIXED_LEGACY_TABLE", "tasks")
+            .env("NETBADB_CREATE_CRASH_POINT", point)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("mixed cross-encoding child timed out at {mode}");
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(status.code(), Some(90), "{mode}");
+        for _ in 0..2 {
+            let database = Database::open_catalog(&catalog)
+                .unwrap_or_else(|error| panic!("{mode}: {error:?}"));
+            assert!(database.schema().table("projects").is_some());
+            assert!(database.schema().table("tasks").is_some());
+            database.close().unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_create_crash_recovery_respects_the_original_decision() {
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    for (point, committed) in [
+        ("composition-table-reservation-durable", false),
+        ("composition-stage-first-file", false),
+        ("composition-after-target-create-1", false),
+        ("composition-before-nbsc-publication", true),
+        ("promotion-partial", true),
+        ("composition-nbsc-durable", true),
+        ("composition-after-cord-complete", true),
+        ("composition-after-winner-resolution", true),
+    ] {
+        let root = root(&format!("mixed-create-crash-{point}"));
+        Database::create_catalog(
+            root.join("catalog"),
+            vec![TableStorageCreateSpec::lsm(
+                root.join("teams.lsm"),
+                old_table(1, "teams"),
+                ColumnId(1),
+            )],
+            Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+        let carriers = ["catalog.core-owner", "coordinator.core-owner"].map(|name| {
+            let metadata = std::fs::metadata(root.join(name)).unwrap();
+            (metadata.dev(), metadata.ino())
+        });
+        let stderr = std::fs::File::create(root.join("child.stderr")).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "schema_mutation_tests::mixed_create_crash_child",
+                "--nocapture",
+            ])
+            .env("NETBADB_MIXED_CREATE_CRASH_ROOT", &root)
+            .env("NETBADB_CREATE_CRASH_POINT", point)
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("mixed create child timed out at {point}");
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(
+            status.code(),
+            Some(90),
+            "{point}: {}",
+            String::from_utf8_lossy(&std::fs::read(root.join("child.stderr")).unwrap())
+        );
+        for _ in 0..2 {
+            let database = Database::open_catalog(root.join("catalog"))
+                .unwrap_or_else(|error| panic!("{point}: {error:?}"));
+            assert_eq!(
+                database.schema().table("projects").is_some(),
+                committed,
+                "{point}"
+            );
+            database.close().unwrap();
+            for (name, expected) in ["catalog.core-owner", "coordinator.core-owner"]
+                .into_iter()
+                .zip(carriers)
+            {
+                let metadata = std::fs::metadata(root.join(name)).unwrap();
+                assert_eq!((metadata.dev(), metadata.ino()), expected, "{point}");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+fn mixed_create_pending_fixture(name: &str, point: &str) -> (PathBuf, PathBuf) {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let root = root(name);
+    let catalog = root.join("catalog");
+    Database::create_catalog(
+        &catalog,
+        vec![TableStorageCreateSpec::lsm(
+            root.join("teams.lsm"),
+            old_table(1, "teams"),
+            ColumnId(1),
+        )],
+        Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+    )
+    .unwrap()
+    .close()
+    .unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "schema_mutation_tests::mixed_create_crash_child"])
+        .env("NETBADB_MIXED_CREATE_CRASH_ROOT", &root)
+        .env("NETBADB_CREATE_CRASH_POINT", point)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("mixed create fixture timed out");
+        }
+        std::thread::yield_now();
+    };
+    assert_eq!(status.code(), Some(90));
+    (root, catalog)
+}
+
+#[cfg(unix)]
+fn mixed_create_staged_path(catalog: &Path) -> PathBuf {
+    let snapshot = crate::schema_catalog_file::load(catalog).unwrap();
+    let journal =
+        crate::schema_mutation_journal::SchemaMutationJournal::open(catalog, snapshot.incarnation)
+            .unwrap()
+            .unwrap();
+    let composition = journal.compositions.values().next().unwrap();
+    let intent = composition.table_intent.as_ref().unwrap();
+    let storage = match intent.tables.as_slice() {
+        [crate::schema_mutation_journal::SchemaIndexTablePlan::CreateHeap { target, .. }] => {
+            target.storages[0].id
+        }
+        _ => panic!("expected one CreateHeap"),
+    };
+    crate::schema_catalog_file::resolve(
+        catalog,
+        &crate::schema_mutation_journal::stage_locator(
+            catalog,
+            snapshot.incarnation,
+            intent.transaction,
+            storage,
+        )
+        .unwrap(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_create_pending_replay_refuses_busy_lsm_and_staged_heap_without_writes() {
+    let (root, catalog) = mixed_create_pending_fixture(
+        "mixed-create-busy-participants",
+        "composition-after-target-create-1",
+    );
+    let stage = mixed_create_staged_path(&catalog);
+    let before = ["catalog", "catalog.mutations", "coordinator"]
+        .map(|name| std::fs::read(root.join(name)).unwrap());
+    let mut lsm = TableStorage::open_lsm(root.join("teams.lsm"), old_table(1, "teams")).unwrap();
+    assert!(Database::open_catalog(&catalog).is_err());
+    lsm.insert(&[ScalarValue::Int64(7)]).unwrap();
+    lsm.close().unwrap();
+    let heap = netbadb_storage::HeapOwnership::acquire(&stage).unwrap();
+    assert!(Database::open_catalog(&catalog).is_err());
+    drop(heap);
+    for (name, expected) in ["catalog", "catalog.mutations", "coordinator"]
+        .into_iter()
+        .zip(before)
+    {
+        assert_eq!(std::fs::read(root.join(name)).unwrap(), expected);
+    }
+    let database = Database::open_catalog(&catalog).unwrap();
+    assert!(database.schema().table("projects").is_none());
+    let mut database = database;
+    assert_eq!(
+        database.query("SELECT id FROM teams").unwrap().rows,
+        vec![vec![ScalarValue::Int64(7)]]
+    );
+    database.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_create_replay_rejects_wrong_staged_owner_before_recovery_writes() {
+    let (root, catalog) = mixed_create_pending_fixture(
+        "mixed-create-wrong-owner",
+        "composition-after-target-create-1",
+    );
+    let owner = crate::schema_catalog_file::suffix(&mixed_create_staged_path(&catalog), ".owner");
+    let original = std::fs::read(&owner).unwrap();
+    let mut wrong = original.clone();
+    wrong[0] ^= 1;
+    std::fs::write(&owner, &wrong).unwrap();
+    let before = ["catalog", "catalog.mutations", "coordinator"]
+        .map(|name| std::fs::read(root.join(name)).unwrap());
+    assert!(Database::open_catalog(&catalog).is_err());
+    for (name, expected) in ["catalog", "catalog.mutations", "coordinator"]
+        .into_iter()
+        .zip(before)
+    {
+        assert_eq!(std::fs::read(root.join(name)).unwrap(), expected);
+    }
+    assert_eq!(std::fs::read(&owner).unwrap(), wrong);
+    std::fs::write(&owner, original).unwrap();
+    Database::open_catalog(&catalog).unwrap().close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_create_replay_holds_all_owners_between_admission_and_recovery() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let (root, catalog) = mixed_create_pending_fixture(
+        "mixed-create-replay-handoff",
+        "composition-after-target-create-1",
+    );
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::handoff_recovery_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_HEAP_HANDOFF_RECOVERY_ROOT", &root)
+        .env("NETBADB_HEAP_HANDOFF_PAUSE", "mixed-journal-inspected")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut found = false;
+        for line in std::io::BufReader::new(stdout).lines() {
+            let line = line.unwrap_or_default();
+            if !found {
+                if let Some(path) =
+                    line.strip_prefix("NETBADB_HANDOFF_READY:mixed-journal-inspected:")
+                {
+                    let _ = sender.send(Some(PathBuf::from(path)));
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            let _ = sender.send(None);
+        }
+    });
+    let stage = match receiver.recv_timeout(Duration::from_secs(10)) {
+        Ok(Some(path)) => path,
+        _ => {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            reader.join().unwrap();
+            panic!(
+                "mixed replay did not reach admitted pause: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    };
+    assert!(matches!(
+        netbadb_storage::HeapOwnership::acquire(&stage)
+            .map_err(netbadb_storage::StorageError::from),
+        Err(netbadb_storage::StorageError::Io(source))
+            if source.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(matches!(
+        netbadb_storage::LsmOwnership::acquire(root.join("teams.lsm")),
+        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(matches!(
+        crate::metadata_ownership::MetadataOwner::acquire(&catalog),
+        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("mixed replay did not exit after release");
+        }
+        std::thread::yield_now();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    reader.join().unwrap();
+    Database::open_catalog(&catalog).unwrap().close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_create_replay_restarts_after_a_second_crash_during_promotion() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let (root, catalog) =
+        mixed_create_pending_fixture("mixed-create-second-crash", "promotion-partial");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "schema_mutation_tests::handoff_recovery_child"])
+        .env("NETBADB_HEAP_HANDOFF_RECOVERY_ROOT", &root)
+        .env(
+            "NETBADB_CREATE_CRASH_POINT",
+            "recovery-table-object-after-promotion",
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("mixed recovery second crash timed out");
+        }
+        std::thread::yield_now();
+    };
+    assert_eq!(status.code(), Some(90));
+    for _ in 0..2 {
+        let database = Database::open_catalog(&catalog).unwrap();
+        assert!(database.schema().table("projects").is_some());
+        database.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn mixed_handoff_holds_both_engines_before_recovery() {
     use std::io::{BufRead, Write};
     use std::process::Stdio;

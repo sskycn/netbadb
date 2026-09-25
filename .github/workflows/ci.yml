@@ -50,6 +50,17 @@ jobs:
       - name: Run A3 ownership regressions on Linux local storage
         run: |
           cargo test -p netbadb-core --test lsm mixed_admission
+          cargo test -p netbadb-core --test lsm completed_mixed_create_journal_reopens_with_lsm_participant
+          cargo test -p netbadb-core --lib mixed_create_crash_recovery_respects_the_original_decision
+          cargo test -p netbadb-core --lib mixed_create_pending_replay_refuses_busy_lsm_and_staged_heap_without_writes
+          cargo test -p netbadb-core --lib mixed_create_replay_holds_all_owners_between_admission_and_recovery
+          cargo test -p netbadb-core --lib mixed_create_replay_restarts_after_a_second_crash_during_promotion
+          cargo test -p netbadb-core --lib mixed_create_replay_rejects_wrong_staged_owner_before_recovery_writes
+          cargo test -p netbadb-core --lib mixed_second_create_replays_after_a_settled_create_history
+          cargo test -p netbadb-core --lib mixed_legacy_create_crash_recovery_respects_the_original_decision
+          cargo test -p netbadb-core --lib mixed_legacy_create_replays_all_heap_lsm_commit_participants
+          cargo test -p netbadb-core --lib mixed_legacy_create_refuses_busy_participants_before_replay_writes
+          cargo test -p netbadb-core --lib mixed_create_history_accepts_both_legal_journal_encodings
           cargo test -p netbadb-core --test lsm mixed_invalid_participant_rejects_before_coordinator_tail_repair
           cargo test -p netbadb-core --test lsm mixed_without_coordinator_checks_all_recovery_inputs_before_open
           cargo test -p netbadb-core --test lsm shared_catalog_rejects_second_core_with_subset_expectation

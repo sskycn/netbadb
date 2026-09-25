@@ -1113,6 +1113,17 @@ impl TableStorage {
         }
     }
 
+    /// Stops an LSM recovery writer and returns its still-locked root.
+    pub fn stop_lsm_for_recovery(self) -> Result<crate::LsmOwnership, StorageError> {
+        match self {
+            Self::Lsm(storage) => storage.stop_for_recovery().map_err(Into::into),
+            Self::Heap(_) => Err(StorageError::UnsupportedOperation {
+                operation: "LSM recovery handoff",
+                storage_kind: "Heap",
+            }),
+        }
+    }
+
     pub fn inspect_heap_recovery(
         path: impl AsRef<Path>,
         table: &TableDef,

@@ -2051,6 +2051,24 @@ impl LsmStorage {
         Ok(())
     }
 
+    /// Stops a quiescent writer while retaining the same directory lock for
+    /// the next recovery open. The returned capability cannot be cloned.
+    pub fn stop_for_recovery(self) -> Result<crate::LsmOwnership, StorageError> {
+        {
+            let mut shared = self.shared.borrow_mut();
+            ensure_maintenance_safe(&shared)?;
+            shared.change_stream.checkpoint_pending_finalizes()?;
+            if !shared.memtable.is_empty() {
+                flush_memtable(&mut shared)?;
+            }
+            shared.wal.sync()?;
+        }
+        let shared = Rc::try_unwrap(self.shared)
+            .map_err(|_| LsmError::Busy("LSM recovery handoff has retained users"))?
+            .into_inner();
+        Ok(crate::LsmOwnership::from_parts(shared.root, shared.owner))
+    }
+
     pub fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
         self.shared
             .borrow_mut()
@@ -7608,10 +7626,19 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<std::collections::HashSet<_>>();
-        assert!(matches!(
-            LsmStorage::open(&root, table()),
-            Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
-        ));
+        match LsmStorage::open(&root, table()) {
+            Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                let diagnostic = source.to_string();
+                assert!(diagnostic.contains(&root.display().to_string()));
+                assert!(diagnostic.contains("raw_os_error=Some("));
+                let original = source
+                    .get_ref()
+                    .and_then(|context| context.source())
+                    .and_then(|cause| cause.downcast_ref::<std::io::Error>());
+                assert!(original.and_then(std::io::Error::raw_os_error).is_some());
+            }
+            result => panic!("unexpected second-open result: {result:?}"),
+        }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("engine::tests::ownership_child_probe")
@@ -7679,6 +7706,24 @@ mod tests {
         LsmStorage::open(&root, table()).unwrap().close().unwrap();
         assert_eq!(transaction.state(), TransactionState::Committed);
         drop(transaction);
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_handoff_keeps_directory_owned_without_a_second_lock() {
+        let root = root("ownership-recovery-handoff");
+        cleanup(&root);
+        let storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let ownership = storage.stop_for_recovery().unwrap();
+        assert!(matches!(
+            LsmStorage::open(&root, table()),
+            Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        LsmStorage::open_with_ownership(ownership, table(), &[])
+            .unwrap()
+            .close()
+            .unwrap();
         cleanup(&root);
     }
 

@@ -2316,6 +2316,7 @@ impl Database {
                 .borrow_mut()
                 .resolve(reservation.transaction, true)?;
         }
+        crash("legacy-after-winner-resolution");
         cleanup_prepared(&catalog, &reservation, target.incarnation)?;
         crash("before-memory-publish");
         // All validation, I/O and allocation above; exclusive synchronous worker
@@ -3834,6 +3835,31 @@ fn exists_file(path: &Path) -> Result<bool, SchemaMutationError> {
     }
 }
 
+fn inspect_private_create_entries(
+    private: &Path,
+    allowed: &BTreeSet<PathBuf>,
+) -> Result<(), SchemaMutationError> {
+    match std::fs::read_dir(private) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry
+                    .map_err(|error| file::io("inspect private create entry", private, error))?
+                    .path();
+                if !allowed.contains(&path) {
+                    return Err(SchemaMutationError::Corrupt(
+                        "unexplained mixed CreateHeap private entry",
+                    ));
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(file::io("inspect private create directory", private, error).into());
+        }
+    }
+    Ok(())
+}
+
 fn validate_retired_resource(
     catalog: &Path,
     intent: &RetiredHeapIntent,
@@ -4100,9 +4126,21 @@ pub(crate) fn promote(
         catalog,
         &final_locator(catalog, reference.incarnation, reservation.storage)?,
     );
-    let ownership =
-        promote_with_ownership(catalog, reservation, reference, ownerships.remove(&path))?;
-    ownerships.insert(path, ownership);
+    let stage = file::resolve(
+        catalog,
+        &stage_locator(
+            catalog,
+            reference.incarnation,
+            reservation.transaction,
+            reservation.storage,
+        )?,
+    );
+    let owner = ownerships
+        .heap
+        .remove(&path)
+        .or_else(|| ownerships.heap.remove(&stage));
+    let ownership = promote_with_ownership(catalog, reservation, reference, owner)?;
+    ownerships.heap.insert(path, ownership);
     Ok(())
 }
 fn validate_heap_identity(path: &Path, reservation: &Reservation) -> Result<(), DatabaseError> {
@@ -4291,7 +4329,7 @@ fn finish_exact_heap_commit_participants(
             Ok(file::resolve(catalog, authority.locator))
         })
         .collect::<Result<Vec<_>, DatabaseError>>()?;
-    let mut claimed = crate::claim_heap_paths_with_existing(paths, ownerships)?;
+    let mut claimed = crate::claim_heap_paths_with_existing(paths, &mut ownerships.heap)?;
     for participant in &decision.participants {
         let authority = authorities
             .iter()
@@ -4347,7 +4385,7 @@ fn finish_exact_heap_commit_participants(
         )?;
         claimed.insert(path.clone(), storage.stop_heap_for_promotion(&path)?);
     }
-    ownerships.extend(claimed);
+    ownerships.heap.extend(claimed);
     Ok(())
 }
 
@@ -4372,7 +4410,7 @@ fn open_finished_heap_snapshot(
             .storages
             .iter()
             .map(|descriptor| file::resolve(catalog, &descriptor.locator)),
-        ownerships,
+        &mut ownerships.heap,
     )?;
     let mut storages = Vec::with_capacity(snapshot.storages.len());
     for descriptor in &snapshot.storages {
@@ -4405,14 +4443,1238 @@ fn open_finished_heap_snapshot(
 }
 
 /// Resolve schema obligations before strict active NBSC/state pair validation.
-type RecoveryOwners = BTreeMap<PathBuf, netbadb_storage::HeapOwnership>;
+#[derive(Default)]
+pub(crate) struct RecoveryOwners {
+    pub(crate) heap: BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+    pub(crate) lsm: BTreeMap<PathBuf, netbadb_storage::LsmOwnership>,
+}
+
+/// Admit the single CreateHeap table-object journal shape that existing SQL
+/// can produce beside an untouched LSM. No recovery writer is opened here.
+/// Other shapes retain the A3 refusal until their old/staged/retired resources
+/// can be described and claimed with the same precision.
+pub(crate) fn claim_mixed_create_recovery(
+    catalog: &Path,
+    candidate: &SchemaCatalogSnapshot,
+    journal: &SchemaMutationJournal,
+    mut heap: BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+) -> Result<Option<RecoveryOwners>, DatabaseError> {
+    if !journal.drops.is_empty()
+        || !journal.rewrite_reservations.is_empty()
+        || !journal.rewrites.is_empty()
+        || !journal.rewrite_losers.is_empty()
+        || !journal.stage_intents.is_empty()
+        || !journal.finalization_intents.is_empty()
+        || !journal.migration_finalization_intents.is_empty()
+        || !journal.source_backfill_intents.is_empty()
+        || journal.compositions.is_empty()
+    {
+        return Ok(None);
+    }
+    let (&transaction, composition) =
+        journal
+            .compositions
+            .last_key_value()
+            .ok_or(SchemaMutationError::Corrupt(
+                "mixed create composition disappeared",
+            ))?;
+    if journal.compositions.len() > 1 || !journal.reservations.is_empty() {
+        if journal
+            .reservations
+            .keys()
+            .any(|prior| *prior > transaction)
+        {
+            return Ok(None);
+        }
+        let mut settled = journal.clone();
+        settled.compositions.remove(&transaction);
+        if !settled_mixed_create_history(catalog, candidate, &settled)? {
+            return Ok(None);
+        }
+    }
+    let Some(intent) = composition.table_intent.as_ref() else {
+        if composition.intent.is_some()
+            || composition.index_intent.is_some()
+            || composition.resolution.is_some()
+            || composition.table_reservations.is_empty()
+        {
+            return Ok(None);
+        }
+        let prepared = file::resolve(
+            catalog,
+            &prepared_locator(catalog, candidate.incarnation, composition.transaction)?,
+        );
+        validate_resource_path(catalog, &prepared)?;
+        let private = prepared.parent().ok_or(SchemaMutationError::Corrupt(
+            "unmaterialized mixed create has no private directory",
+        ))?;
+        match std::fs::symlink_metadata(private) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(SchemaMutationError::Corrupt(
+                    "unmaterialized mixed create has private resources",
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(file::io("inspect mixed create directory", private, error).into());
+            }
+        }
+        let journal_bytes = file::read(&journal.path)?;
+        let coordinator_path = file::resolve(catalog, &journal.coordinator);
+        let (decisions, checkpoint) = CoordinatorLog::inspect_recovery(&coordinator_path)?;
+        if decisions
+            .iter()
+            .any(|decision| decision.database_txn_id == composition.transaction)
+        {
+            return Err(SchemaMutationError::Corrupt(
+                "unmaterialized mixed create has Commit decision",
+            )
+            .into());
+        }
+        let mut lsm = BTreeMap::new();
+        for descriptor in &candidate.storages {
+            if let CatalogStorageKind::Lsm { .. } = descriptor.kind {
+                let path = file::resolve(catalog, &descriptor.locator);
+                let owner = netbadb_storage::LsmOwnership::acquire(&path)
+                    .map_err(netbadb_storage::StorageError::Io)?;
+                lsm.insert(path, owner);
+            }
+        }
+        let mut inspected = Vec::new();
+        for descriptor in &candidate.storages {
+            let table = candidate
+                .committed
+                .schema
+                .tables()
+                .iter()
+                .find(|table| table.id == descriptor.table_id)
+                .ok_or(SchemaMutationError::Corrupt("mixed storage table absent"))?;
+            let path = file::resolve(catalog, &descriptor.locator);
+            let (storage_id, table_id, fingerprint, prepared_transactions) = match descriptor.kind {
+                CatalogStorageKind::Heap => {
+                    let owner = heap.get(&path).ok_or(SchemaMutationError::Corrupt(
+                        "mixed current Heap is missing",
+                    ))?;
+                    let identity = owner
+                        .inspect_identity()
+                        .map_err(netbadb_storage::StorageError::from)?;
+                    let recovery = owner
+                        .inspect_recovery(table)
+                        .map_err(netbadb_storage::StorageError::from)?;
+                    (
+                        identity.storage_id,
+                        identity.table_id,
+                        identity.schema_fingerprint,
+                        recovery.prepared_transactions,
+                    )
+                }
+                CatalogStorageKind::Lsm { .. } => {
+                    let owner = lsm
+                        .get(&path)
+                        .ok_or(SchemaMutationError::Corrupt("mixed current LSM is missing"))?;
+                    let identity = owner
+                        .inspect_identity()
+                        .map_err(netbadb_storage::StorageError::from)?;
+                    let recovery = owner
+                        .inspect_recovery(table)
+                        .map_err(netbadb_storage::StorageError::from)?;
+                    (
+                        identity.storage_id,
+                        identity.table_id,
+                        identity.schema_fingerprint,
+                        recovery.prepared_transactions,
+                    )
+                }
+            };
+            if storage_id != descriptor.id
+                || table_id != descriptor.table_id
+                || fingerprint != table.fingerprint()?
+            {
+                return Err(SchemaMutationError::Corrupt("mixed current identity changed").into());
+            }
+            inspected.push(crate::GenericInspectedStorage {
+                recovery: crate::GenericRecoveryInspection {
+                    storage_id,
+                    prepared_transactions,
+                },
+            });
+        }
+        crate::validate_generic_coordinator_recovery(&decisions, &inspected, &[])?;
+        match std::fs::symlink_metadata(private) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(SchemaMutationError::Corrupt(
+                    "unmaterialized mixed create acquired private resources",
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(file::io("recheck mixed create directory", private, error).into());
+            }
+        }
+        let (checked_decisions, checked_checkpoint) =
+            CoordinatorLog::inspect_recovery(&coordinator_path)?;
+        if checked_decisions != decisions
+            || checked_checkpoint != checkpoint
+            || file::read(&journal.path)? != journal_bytes
+        {
+            return Err(SchemaCatalogError::InventoryMismatch(
+                "unmaterialized mixed recovery basis changed",
+            )
+            .into());
+        }
+        return Ok(Some(RecoveryOwners { heap, lsm }));
+    };
+    let [SchemaIndexTablePlan::CreateHeap { target, .. }] = intent.tables.as_slice() else {
+        return Ok(None);
+    };
+    if composition.intent.is_some() || composition.index_intent.is_some() {
+        return Ok(None);
+    }
+    let [target_descriptor] = target.storages.as_slice() else {
+        return Err(SchemaMutationError::Corrupt("mixed CreateHeap storage fragment").into());
+    };
+    if !matches!(target_descriptor.kind, CatalogStorageKind::Heap)
+        || target_descriptor.locator
+            != final_locator(catalog, candidate.incarnation, target_descriptor.id)?
+    {
+        return Err(SchemaMutationError::Corrupt("mixed CreateHeap target identity").into());
+    }
+    let [target_table] = target.committed.schema.tables() else {
+        return Err(SchemaMutationError::Corrupt("mixed CreateHeap table fragment").into());
+    };
+    let published = if candidate.epoch == intent.base_epoch
+        && candidate.committed.generation == intent.base_generation
+    {
+        false
+    } else if candidate.epoch == intent.target_epoch
+        && candidate.committed.generation == intent.target_generation
+        && candidate.storages.contains(target_descriptor)
+        && candidate.committed.schema.tables().contains(target_table)
+    {
+        true
+    } else {
+        return Err(SchemaMutationError::Corrupt("mixed CreateHeap catalog epoch").into());
+    };
+    if !published
+        && (candidate
+            .storages
+            .iter()
+            .any(|storage| storage.id == target_descriptor.id)
+            || candidate
+                .committed
+                .schema
+                .tables()
+                .iter()
+                .any(|table| table.id == target_table.id))
+    {
+        return Err(SchemaMutationError::Corrupt("mixed CreateHeap base contains target").into());
+    }
+    let stage = file::resolve(
+        catalog,
+        &stage_locator(
+            catalog,
+            candidate.incarnation,
+            intent.transaction,
+            target_descriptor.id,
+        )?,
+    );
+    let final_path = file::resolve(catalog, &target_descriptor.locator);
+    validate_resource_path(catalog, &stage)?;
+    validate_resource_path(catalog, &final_path)?;
+    let prepared = file::resolve(
+        catalog,
+        &prepared_locator(catalog, candidate.incarnation, intent.transaction)?,
+    );
+    validate_resource_path(catalog, &prepared)?;
+    let journal_bytes = file::read(&journal.path)?;
+    let coordinator_path = file::resolve(catalog, &journal.coordinator);
+    let (decisions, checkpoint) = CoordinatorLog::inspect_recovery(&coordinator_path)?;
+    let decision = decisions
+        .iter()
+        .find(|decision| decision.database_txn_id == intent.transaction);
+    if let Some(decision) = decision {
+        validate_table_object_decision(intent, decision)?;
+        if composition.resolution == Some(CompositionResolution::Loser) {
+            return Err(SchemaMutationError::Corrupt("mixed CreateHeap loser has Commit").into());
+        }
+        if composition.resolution != Some(CompositionResolution::Winner) || exists_file(&prepared)?
+        {
+            let bytes = file::read(&prepared)?;
+            if digest(&bytes) != intent.snapshot_digest {
+                return Err(SchemaMutationError::Corrupt(
+                    "mixed CreateHeap prepared snapshot digest",
+                )
+                .into());
+            }
+            let snapshot = SchemaCatalogSnapshot::decode(&bytes)?;
+            verify_table_object_published(&snapshot, intent, true)?;
+        }
+    } else if composition.resolution == Some(CompositionResolution::Winner) {
+        return Err(SchemaMutationError::Corrupt("mixed CreateHeap winner lacks Commit").into());
+    } else if published {
+        return Err(
+            SchemaMutationError::Corrupt("uncommitted mixed CreateHeap is published").into(),
+        );
+    }
+
+    // The private directory is named by a durable transaction. Unknown entries
+    // are evidence, not cleanup candidates.
+    let private = prepared.parent().ok_or(SchemaMutationError::Corrupt(
+        "mixed CreateHeap prepared path has no parent",
+    ))?;
+    let allowed = components(&stage)
+        .into_iter()
+        .map(|(path, _)| path)
+        .chain([prepared.clone(), file::suffix(&prepared, ".next")])
+        .collect::<BTreeSet<_>>();
+    match std::fs::read_dir(private) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry
+                    .map_err(|error| file::io("inspect private create entry", private, error))?
+                    .path();
+                if !allowed.contains(&path) {
+                    return Err(SchemaMutationError::Corrupt(
+                        "unexplained mixed CreateHeap private entry",
+                    )
+                    .into());
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(file::io("inspect private create directory", private, error).into());
+        }
+    }
+
+    let mut lsm = BTreeMap::new();
+    for descriptor in &candidate.storages {
+        if let CatalogStorageKind::Lsm { .. } = descriptor.kind {
+            let path = file::resolve(catalog, &descriptor.locator);
+            let owner = netbadb_storage::LsmOwnership::acquire(&path)
+                .map_err(netbadb_storage::StorageError::Io)?;
+            lsm.insert(path, owner);
+        }
+    }
+    for path in [&stage, &final_path] {
+        if exists_file(path)? && !heap.contains_key(path) {
+            heap.insert(
+                path.clone(),
+                netbadb_storage::HeapOwnership::acquire(path)
+                    .map_err(netbadb_storage::StorageError::from)?,
+            );
+        }
+    }
+    // Recheck every current authority and the private new Heap while all
+    // tokens are held. A promoted target may already be in the candidate.
+    let mut inspected = Vec::new();
+    for descriptor in &candidate.storages {
+        let table = candidate
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == descriptor.table_id)
+            .ok_or(SchemaMutationError::Corrupt("mixed storage table absent"))?;
+        let path = file::resolve(catalog, &descriptor.locator);
+        let (storage_id, table_id, fingerprint, prepared_transactions) = match descriptor.kind {
+            CatalogStorageKind::Heap => {
+                let owner = heap.get(&path).ok_or(SchemaMutationError::Corrupt(
+                    "mixed current Heap is missing",
+                ))?;
+                let identity = owner
+                    .inspect_identity()
+                    .map_err(netbadb_storage::StorageError::from)?;
+                let recovery = owner
+                    .inspect_recovery(table)
+                    .map_err(netbadb_storage::StorageError::from)?;
+                (
+                    identity.storage_id,
+                    identity.table_id,
+                    identity.schema_fingerprint,
+                    recovery.prepared_transactions,
+                )
+            }
+            CatalogStorageKind::Lsm { .. } => {
+                let owner = lsm
+                    .get(&path)
+                    .ok_or(SchemaMutationError::Corrupt("mixed current LSM is missing"))?;
+                let identity = owner
+                    .inspect_identity()
+                    .map_err(netbadb_storage::StorageError::from)?;
+                let recovery = owner
+                    .inspect_recovery(table)
+                    .map_err(netbadb_storage::StorageError::from)?;
+                (
+                    identity.storage_id,
+                    identity.table_id,
+                    identity.schema_fingerprint,
+                    recovery.prepared_transactions,
+                )
+            }
+        };
+        if storage_id != descriptor.id
+            || table_id != descriptor.table_id
+            || fingerprint != table.fingerprint()?
+        {
+            return Err(SchemaMutationError::Corrupt("mixed current identity changed").into());
+        }
+        inspected.push(crate::GenericInspectedStorage {
+            recovery: crate::GenericRecoveryInspection {
+                storage_id,
+                prepared_transactions,
+            },
+        });
+    }
+    let new_path = if exists_file(&stage)? {
+        Some(&stage)
+    } else if exists_file(&final_path)? {
+        Some(&final_path)
+    } else {
+        None
+    };
+    if let Some(path) = new_path {
+        let owner = heap
+            .get(path)
+            .ok_or(SchemaMutationError::Corrupt("mixed new Heap has no owner"))?;
+        let identity = owner
+            .inspect_identity()
+            .map_err(netbadb_storage::StorageError::from)?;
+        if identity.storage_id != target_descriptor.id
+            || identity.table_id != target_table.id
+            || identity.schema_fingerprint != target_table.fingerprint()?
+        {
+            return Err(SchemaMutationError::Corrupt("mixed new Heap identity changed").into());
+        }
+        if !candidate
+            .storages
+            .iter()
+            .any(|storage| storage.id == target_descriptor.id)
+        {
+            let source_wal = netbadb_storage::wal_path(&stage);
+            let final_wal = netbadb_storage::wal_path(&final_path);
+            let recovery = if path == &stage
+                && decision.is_some()
+                && !exists_file(&source_wal)?
+                && exists_file(&final_wal)?
+            {
+                owner.inspect_recovery_with_wal(target_table, &final_wal)
+            } else {
+                owner.inspect_recovery(target_table)
+            }
+            .map_err(netbadb_storage::StorageError::from)?;
+            inspected.push(crate::GenericInspectedStorage {
+                recovery: crate::GenericRecoveryInspection {
+                    storage_id: identity.storage_id,
+                    prepared_transactions: recovery.prepared_transactions,
+                },
+            });
+        }
+    }
+    let source_owner = file::suffix(&stage, ".owner");
+    let final_owner = file::suffix(&final_path, ".owner");
+    let expected_owner = owner_bytes(
+        candidate.incarnation,
+        intent.transaction,
+        target_table.id,
+        target_descriptor.id,
+        target_table.fingerprint()?,
+    )?;
+    for owner in [&source_owner, &final_owner] {
+        if exists_file(owner)? && file::read(owner)? != expected_owner {
+            return Err(SchemaMutationError::Corrupt("mixed CreateHeap owner mismatch").into());
+        }
+    }
+    if decision.is_some() {
+        if new_path.is_none() {
+            return Err(
+                SchemaMutationError::Corrupt("decided mixed CreateHeap has no data").into(),
+            );
+        }
+        for ((source, required), (destination, _)) in
+            components(&stage).into_iter().zip(components(&final_path))
+        {
+            let source_exists = exists_file(&source)?;
+            let destination_exists = exists_file(&destination)?;
+            if source_exists && destination_exists {
+                return Err(SchemaCatalogError::PathConflict(destination).into());
+            }
+            if required && !source_exists && !destination_exists {
+                return Err(SchemaMutationError::Corrupt(
+                    "decided mixed CreateHeap component missing",
+                )
+                .into());
+            }
+        }
+        if !exists_file(&source_owner)? && !exists_file(&final_owner)? {
+            return Err(SchemaMutationError::Corrupt("mixed CreateHeap owner absent").into());
+        }
+    } else {
+        for (path, _) in components(&final_path) {
+            if exists_file(&path)? {
+                return Err(SchemaMutationError::Corrupt(
+                    "mixed CreateHeap loser has final resource",
+                )
+                .into());
+            }
+        }
+    }
+    crate::validate_generic_coordinator_recovery(&decisions, &inspected, &[])?;
+    inspect_private_create_entries(private, &allowed)?;
+    let (checked_decisions, checked_checkpoint) =
+        CoordinatorLog::inspect_recovery(&coordinator_path)?;
+    if checked_decisions != decisions
+        || checked_checkpoint != checkpoint
+        || file::read(&journal.path)? != journal_bytes
+    {
+        return Err(SchemaCatalogError::InventoryMismatch(
+            "mixed recovery basis changed during admission",
+        )
+        .into());
+    }
+    Ok(Some(RecoveryOwners { heap, lsm }))
+}
+
+/// Admit one legacy CreateHeap reservation beside untouched LSM participants.
+/// The journal/Coordinator are inspected without opening a recovery writer;
+/// every existing data inode is held until the ordinary replay takes over.
+pub(crate) fn claim_mixed_reservation_recovery(
+    catalog: &Path,
+    candidate: &SchemaCatalogSnapshot,
+    journal: &SchemaMutationJournal,
+) -> Result<Option<RecoveryOwners>, DatabaseError> {
+    if journal.reservations.is_empty()
+        || !journal.drops.is_empty()
+        || !journal.rewrite_reservations.is_empty()
+        || !journal.rewrites.is_empty()
+        || !journal.rewrite_losers.is_empty()
+        || !journal.stage_intents.is_empty()
+        || !journal.finalization_intents.is_empty()
+        || !journal.migration_finalization_intents.is_empty()
+        || !journal.source_backfill_intents.is_empty()
+    {
+        return Ok(None);
+    }
+    let (&transaction, reservation) =
+        journal
+            .reservations
+            .last_key_value()
+            .ok_or(SchemaMutationError::Corrupt(
+                "mixed reservation disappeared",
+            ))?;
+    if reservation.resolved == Some(false) {
+        return Ok(None);
+    }
+    if journal.reservations.len() > 1 || !journal.compositions.is_empty() {
+        if journal
+            .compositions
+            .keys()
+            .any(|prior| *prior > transaction)
+        {
+            return Ok(None);
+        }
+        let mut settled = journal.clone();
+        settled.reservations.remove(&transaction);
+        if !settled_mixed_create_history(catalog, candidate, &settled)? {
+            return Ok(None);
+        }
+    }
+    let stage = file::resolve(
+        catalog,
+        &stage_locator(
+            catalog,
+            candidate.incarnation,
+            reservation.transaction,
+            reservation.storage,
+        )?,
+    );
+    let final_path = file::resolve(
+        catalog,
+        &final_locator(catalog, candidate.incarnation, reservation.storage)?,
+    );
+    let prepared = file::resolve(
+        catalog,
+        &prepared_locator(catalog, candidate.incarnation, reservation.transaction)?,
+    );
+    for path in [&stage, &final_path, &prepared] {
+        validate_resource_path(catalog, path)?;
+    }
+    let private = prepared.parent().ok_or(SchemaMutationError::Corrupt(
+        "mixed reservation has no private directory",
+    ))?;
+    let allowed = components(&stage)
+        .into_iter()
+        .map(|(path, _)| path)
+        .chain([prepared.clone(), file::suffix(&prepared, ".next")])
+        .collect::<BTreeSet<_>>();
+    match std::fs::read_dir(private) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry
+                    .map_err(|error| file::io("inspect private reservation", private, error))?
+                    .path();
+                if !allowed.contains(&path) {
+                    return Err(SchemaMutationError::Corrupt(
+                        "unexplained mixed reservation private entry",
+                    )
+                    .into());
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(file::io("inspect reservation directory", private, error).into()),
+    }
+    let journal_bytes = file::read(&journal.path)?;
+    let coordinator_path = file::resolve(catalog, &journal.coordinator);
+    let (decisions, checkpoint) = CoordinatorLog::inspect_recovery(&coordinator_path)?;
+    let decision = decisions
+        .iter()
+        .find(|decision| decision.database_txn_id == reservation.transaction);
+    if reservation.resolved == Some(true) && decision.is_none() {
+        return Err(SchemaMutationError::Corrupt(
+            "resolved mixed reservation lacks Commit decision",
+        )
+        .into());
+    }
+    let target = reservation.intent.as_ref().map(|intent| &intent.fragment);
+    if let Some(target) = target {
+        let [descriptor] = target.storages.as_slice() else {
+            return Err(SchemaMutationError::Corrupt("mixed reservation storage fragment").into());
+        };
+        let [table] = target.committed.schema.tables() else {
+            return Err(SchemaMutationError::Corrupt("mixed reservation table fragment").into());
+        };
+        if descriptor.id != reservation.storage
+            || descriptor.table_id != reservation.table
+            || table.id != reservation.table
+            || !matches!(descriptor.kind, CatalogStorageKind::Heap)
+            || descriptor.locator
+                != final_locator(catalog, candidate.incarnation, reservation.storage)?
+        {
+            return Err(SchemaMutationError::Corrupt("mixed reservation target identity").into());
+        }
+        let published = if candidate.epoch == reservation.base_epoch
+            && candidate.committed.generation == reservation.base_generation
+        {
+            false
+        } else if candidate.epoch == target.epoch
+            && candidate.committed.generation == target.committed.generation
+            && candidate.storages.contains(descriptor)
+            && candidate.committed.schema.tables().contains(table)
+        {
+            true
+        } else {
+            return Err(SchemaMutationError::Corrupt("mixed reservation catalog epoch").into());
+        };
+        if !published
+            && (candidate
+                .storages
+                .iter()
+                .any(|item| item.id == descriptor.id)
+                || candidate
+                    .committed
+                    .schema
+                    .tables()
+                    .iter()
+                    .any(|item| item.id == table.id))
+        {
+            return Err(
+                SchemaMutationError::Corrupt("mixed reservation base contains target").into(),
+            );
+        }
+        if let Some(decision) = decision {
+            let reference = decision
+                .schema
+                .as_ref()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "mixed reservation has storage-only decision",
+                ))?;
+            validate_intent(catalog, reservation, reference)?;
+            if !decision
+                .participants
+                .iter()
+                .any(|participant| participant.storage_id == reservation.storage)
+            {
+                return Err(SchemaMutationError::Corrupt(
+                    "mixed reservation decision omits target",
+                )
+                .into());
+            }
+            if reservation.resolved == Some(true) && !decision.complete {
+                return Err(SchemaMutationError::Corrupt(
+                    "resolved mixed reservation has incomplete decision",
+                )
+                .into());
+            }
+            if reservation.resolved != Some(true) || exists_file(&prepared)? {
+                let bytes = file::read(&prepared)?;
+                if digest(&bytes) != reference.digest {
+                    return Err(SchemaMutationError::Corrupt(
+                        "mixed reservation prepared snapshot digest",
+                    )
+                    .into());
+                }
+                let snapshot = SchemaCatalogSnapshot::decode(&bytes)?;
+                verify_published(&snapshot, reservation)?;
+            }
+        } else if published {
+            return Err(
+                SchemaMutationError::Corrupt("uncommitted mixed reservation is published").into(),
+            );
+        }
+    } else if decision.is_some() {
+        return Err(
+            SchemaMutationError::Corrupt("mixed reservation has decision without intent").into(),
+        );
+    }
+
+    let mut heap = crate::claim_heap_paths_with_existing(
+        candidate
+            .storages
+            .iter()
+            .filter(|storage| matches!(storage.kind, CatalogStorageKind::Heap))
+            .map(|storage| file::resolve(catalog, &storage.locator)),
+        &mut BTreeMap::new(),
+    )?;
+    let mut lsm = BTreeMap::new();
+    for descriptor in &candidate.storages {
+        if let CatalogStorageKind::Lsm { .. } = descriptor.kind {
+            let path = file::resolve(catalog, &descriptor.locator);
+            let owner = netbadb_storage::LsmOwnership::acquire(&path)
+                .map_err(netbadb_storage::StorageError::Io)?;
+            lsm.insert(path, owner);
+        }
+    }
+    for path in [&stage, &final_path] {
+        if exists_file(path)? && !heap.contains_key(path) {
+            heap.insert(
+                path.clone(),
+                netbadb_storage::HeapOwnership::acquire(path)
+                    .map_err(netbadb_storage::StorageError::from)?,
+            );
+        }
+    }
+    let mut inspected = Vec::new();
+    for descriptor in &candidate.storages {
+        let table = candidate
+            .committed
+            .schema
+            .tables()
+            .iter()
+            .find(|table| table.id == descriptor.table_id)
+            .ok_or(SchemaMutationError::Corrupt("mixed storage table absent"))?;
+        let path = file::resolve(catalog, &descriptor.locator);
+        let (storage_id, table_id, fingerprint, prepared_transactions) = match descriptor.kind {
+            CatalogStorageKind::Heap => {
+                let owner = heap.get(&path).ok_or(SchemaMutationError::Corrupt(
+                    "mixed current Heap is missing",
+                ))?;
+                let identity = owner
+                    .inspect_identity()
+                    .map_err(netbadb_storage::StorageError::from)?;
+                let recovery = owner
+                    .inspect_recovery(table)
+                    .map_err(netbadb_storage::StorageError::from)?;
+                (
+                    identity.storage_id,
+                    identity.table_id,
+                    identity.schema_fingerprint,
+                    recovery.prepared_transactions,
+                )
+            }
+            CatalogStorageKind::Lsm { .. } => {
+                let owner = lsm
+                    .get(&path)
+                    .ok_or(SchemaMutationError::Corrupt("mixed current LSM is missing"))?;
+                let identity = owner
+                    .inspect_identity()
+                    .map_err(netbadb_storage::StorageError::from)?;
+                let recovery = owner
+                    .inspect_recovery(table)
+                    .map_err(netbadb_storage::StorageError::from)?;
+                (
+                    identity.storage_id,
+                    identity.table_id,
+                    identity.schema_fingerprint,
+                    recovery.prepared_transactions,
+                )
+            }
+        };
+        if storage_id != descriptor.id
+            || table_id != descriptor.table_id
+            || fingerprint != table.fingerprint()?
+        {
+            return Err(SchemaMutationError::Corrupt("mixed current identity changed").into());
+        }
+        inspected.push(crate::GenericInspectedStorage {
+            recovery: crate::GenericRecoveryInspection {
+                storage_id,
+                prepared_transactions,
+            },
+        });
+    }
+    if let Some(target) = target {
+        let descriptor = &target.storages[0];
+        let table = &target.committed.schema.tables()[0];
+        let new_path = if exists_file(&stage)? {
+            Some(&stage)
+        } else if exists_file(&final_path)? {
+            Some(&final_path)
+        } else {
+            None
+        };
+        if let Some(path) = new_path {
+            let owner = heap
+                .get(path)
+                .ok_or(SchemaMutationError::Corrupt("mixed new Heap has no owner"))?;
+            let identity = owner
+                .inspect_identity()
+                .map_err(netbadb_storage::StorageError::from)?;
+            if identity.storage_id != descriptor.id
+                || identity.table_id != table.id
+                || identity.schema_fingerprint != table.fingerprint()?
+            {
+                return Err(SchemaMutationError::Corrupt("mixed reservation Heap identity").into());
+            }
+            if !candidate
+                .storages
+                .iter()
+                .any(|storage| storage.id == descriptor.id)
+            {
+                let source_wal = netbadb_storage::wal_path(&stage);
+                let final_wal = netbadb_storage::wal_path(&final_path);
+                let recovery = if path == &stage
+                    && decision.is_some()
+                    && !exists_file(&source_wal)?
+                    && exists_file(&final_wal)?
+                {
+                    owner.inspect_recovery_with_wal(table, &final_wal)
+                } else {
+                    owner.inspect_recovery(table)
+                }
+                .map_err(netbadb_storage::StorageError::from)?;
+                inspected.push(crate::GenericInspectedStorage {
+                    recovery: crate::GenericRecoveryInspection {
+                        storage_id: identity.storage_id,
+                        prepared_transactions: recovery.prepared_transactions,
+                    },
+                });
+            }
+        }
+        let expected_owner = owner_bytes(
+            candidate.incarnation,
+            reservation.transaction,
+            reservation.table,
+            reservation.storage,
+            table.fingerprint()?,
+        )?;
+        let source_owner = file::suffix(&stage, ".owner");
+        let final_owner = file::suffix(&final_path, ".owner");
+        for path in [&source_owner, &final_owner] {
+            if exists_file(path)? && file::read(path)? != expected_owner {
+                return Err(
+                    SchemaMutationError::Corrupt("mixed reservation owner mismatch").into(),
+                );
+            }
+        }
+        if decision.is_some() {
+            if new_path.is_none() {
+                return Err(SchemaMutationError::Corrupt("decided reservation has no Heap").into());
+            }
+            for ((source, required), (destination, _)) in
+                components(&stage).into_iter().zip(components(&final_path))
+            {
+                let source_exists = exists_file(&source)?;
+                let destination_exists = exists_file(&destination)?;
+                if source_exists && destination_exists {
+                    return Err(SchemaCatalogError::PathConflict(destination).into());
+                }
+                if required && !source_exists && !destination_exists {
+                    return Err(SchemaMutationError::Corrupt(
+                        "decided reservation component missing",
+                    )
+                    .into());
+                }
+            }
+            if !exists_file(&source_owner)? && !exists_file(&final_owner)? {
+                return Err(SchemaMutationError::Corrupt("mixed reservation owner absent").into());
+            }
+        } else {
+            for (path, _) in components(&final_path) {
+                if exists_file(&path)? {
+                    return Err(SchemaMutationError::Corrupt(
+                        "mixed reservation loser has final resource",
+                    )
+                    .into());
+                }
+            }
+        }
+    } else {
+        if exists_file(&stage)? || exists_file(&final_path)? {
+            return Err(
+                SchemaMutationError::Corrupt("unmaterialized mixed reservation has Heap").into(),
+            );
+        }
+        match std::fs::symlink_metadata(private) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(SchemaMutationError::Corrupt(
+                    "unmaterialized mixed reservation has private resources",
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(file::io("inspect unmaterialized reservation", private, error).into());
+            }
+        }
+    }
+    crate::validate_generic_coordinator_recovery(&decisions, &inspected, &[])?;
+    inspect_private_create_entries(private, &allowed)?;
+    let (checked_decisions, checked_checkpoint) =
+        CoordinatorLog::inspect_recovery(&coordinator_path)?;
+    if checked_decisions != decisions
+        || checked_checkpoint != checkpoint
+        || file::read(&journal.path)? != journal_bytes
+    {
+        return Err(SchemaCatalogError::InventoryMismatch(
+            "mixed reservation recovery basis changed",
+        )
+        .into());
+    }
+    Ok(Some(RecoveryOwners { heap, lsm }))
+}
+
+/// A completed create-only history needs allocator evidence but no replay.
+/// Reject any residual private resource: winner resolution is durable before
+/// prepared-file cleanup, so a terminal journal alone is not enough to skip it.
+pub(crate) fn settled_mixed_create_only_history(
+    catalog: &Path,
+    active: &SchemaCatalogSnapshot,
+    journal: &SchemaMutationJournal,
+) -> Result<bool, DatabaseError> {
+    if !journal.reservations.is_empty()
+        || !journal.drops.is_empty()
+        || !journal.rewrite_reservations.is_empty()
+        || !journal.rewrites.is_empty()
+        || !journal.rewrite_losers.is_empty()
+        || !journal.source_backfill_intents.is_empty()
+        || journal.compositions.is_empty()
+    {
+        return Ok(false);
+    }
+    if !journal.stage_intents.is_empty()
+        || !journal.finalization_intents.is_empty()
+        || !journal.migration_finalization_intents.is_empty()
+    {
+        return Ok(false);
+    }
+    for composition in journal.compositions.values() {
+        if composition.table_intent.is_none()
+            && composition.intent.is_none()
+            && composition.index_intent.is_none()
+            && composition.resolution == Some(CompositionResolution::Loser)
+        {
+            let prepared = file::resolve(
+                catalog,
+                &prepared_locator(catalog, active.incarnation, composition.transaction)?,
+            );
+            validate_resource_path(catalog, &prepared)?;
+            let private = prepared.parent().ok_or(SchemaMutationError::Corrupt(
+                "settled mixed create has no private directory",
+            ))?;
+            match std::fs::symlink_metadata(private) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(_) => return Ok(false),
+                Err(error) => {
+                    return Err(file::io("inspect settled create directory", private, error).into());
+                }
+            }
+        }
+        let Some(intent) = composition.table_intent.as_ref() else {
+            return Ok(false);
+        };
+        if composition.resolution != Some(CompositionResolution::Winner)
+            || composition.intent.is_some()
+            || composition.index_intent.is_some()
+            || intent.tables.len() != 1
+        {
+            return Ok(false);
+        }
+        verify_table_object_published(active, intent, false)?;
+        for plan in &intent.tables {
+            let SchemaIndexTablePlan::CreateHeap { target, .. } = plan else {
+                return Ok(false);
+            };
+            let descriptor = &target.storages[0];
+            if !matches!(descriptor.kind, CatalogStorageKind::Heap)
+                || !active.storages.contains(descriptor)
+                || !active
+                    .committed
+                    .schema
+                    .tables()
+                    .contains(&target.committed.schema.tables()[0])
+                || descriptor.locator != final_locator(catalog, active.incarnation, descriptor.id)?
+            {
+                return Ok(false);
+            }
+            let stage = file::resolve(
+                catalog,
+                &stage_locator(
+                    catalog,
+                    active.incarnation,
+                    intent.transaction,
+                    descriptor.id,
+                )?,
+            );
+            let final_path = file::resolve(catalog, &descriptor.locator);
+            validate_resource_path(catalog, &stage)?;
+            validate_resource_path(catalog, &final_path)?;
+            for (path, _) in components(&stage) {
+                if exists_file(&path)? {
+                    return Ok(false);
+                }
+            }
+            for (path, required) in components(&final_path) {
+                if required && !exists_file(&path)? {
+                    return Ok(false);
+                }
+            }
+            let expected_owner = owner_bytes(
+                active.incarnation,
+                intent.transaction,
+                target.committed.schema.tables()[0].id,
+                descriptor.id,
+                target.placements.tables[0].schema_fingerprint,
+            )?;
+            if file::read(&file::suffix(&final_path, ".owner"))? != expected_owner {
+                return Ok(false);
+            }
+        }
+        let prepared = file::resolve(
+            catalog,
+            &prepared_locator(catalog, active.incarnation, intent.transaction)?,
+        );
+        if exists_file(&prepared)? || exists_file(&file::suffix(&prepared, ".next"))? {
+            return Ok(false);
+        }
+        let private_directory = prepared.parent().ok_or(SchemaMutationError::Corrupt(
+            "prepared create has no private directory",
+        ))?;
+        match std::fs::symlink_metadata(private_directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Ok(false),
+            Err(error) => {
+                return Err(
+                    file::io("inspect private create directory", private_directory, error).into(),
+                );
+            }
+        }
+    }
+    let coordinator_path = file::resolve(catalog, &journal.coordinator);
+    if !CoordinatorLog::inspect_completed(
+        &coordinator_path,
+        journal
+            .compositions
+            .values()
+            .filter(|composition| composition.resolution == Some(CompositionResolution::Winner))
+            .map(|composition| composition.transaction),
+    )? {
+        return Ok(false);
+    }
+    let (decisions, _) = CoordinatorLog::inspect_recovery(&coordinator_path)?;
+    for decision in &decisions {
+        if let Some(composition) = journal.compositions.get(&decision.database_txn_id) {
+            if composition.resolution == Some(CompositionResolution::Loser) {
+                return Ok(false);
+            }
+            let intent = composition
+                .table_intent
+                .as_ref()
+                .ok_or(SchemaMutationError::Corrupt(
+                    "settled create intent disappeared",
+                ))?;
+            validate_table_object_decision(intent, decision)?;
+            if !decision.complete {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn settled_mixed_reservation_history(
+    catalog: &Path,
+    active: &SchemaCatalogSnapshot,
+    journal: &SchemaMutationJournal,
+) -> Result<bool, DatabaseError> {
+    if journal.reservations.is_empty()
+        || !journal.drops.is_empty()
+        || !journal.rewrite_reservations.is_empty()
+        || !journal.rewrites.is_empty()
+        || !journal.rewrite_losers.is_empty()
+        || !journal.compositions.is_empty()
+        || !journal.stage_intents.is_empty()
+        || !journal.finalization_intents.is_empty()
+        || !journal.migration_finalization_intents.is_empty()
+        || !journal.source_backfill_intents.is_empty()
+    {
+        return Ok(false);
+    }
+    let coordinator_path = file::resolve(catalog, &journal.coordinator);
+    let (decisions, _) = CoordinatorLog::inspect_recovery(&coordinator_path)?;
+    if !CoordinatorLog::inspect_completed(
+        &coordinator_path,
+        journal.reservations.values().filter_map(|reservation| {
+            (reservation.resolved == Some(true)).then_some(reservation.transaction)
+        }),
+    )? {
+        return Ok(false);
+    }
+    for reservation in journal.reservations.values() {
+        let Some(winner) = reservation.resolved else {
+            return Ok(false);
+        };
+        let stage = file::resolve(
+            catalog,
+            &stage_locator(
+                catalog,
+                active.incarnation,
+                reservation.transaction,
+                reservation.storage,
+            )?,
+        );
+        let final_path = file::resolve(
+            catalog,
+            &final_locator(catalog, active.incarnation, reservation.storage)?,
+        );
+        let prepared = file::resolve(
+            catalog,
+            &prepared_locator(catalog, active.incarnation, reservation.transaction)?,
+        );
+        for path in [&stage, &final_path, &prepared] {
+            validate_resource_path(catalog, path)?;
+        }
+        for (path, _) in components(&stage) {
+            if exists_file(&path)? {
+                return Ok(false);
+            }
+        }
+        let private = prepared.parent().ok_or(SchemaMutationError::Corrupt(
+            "settled reservation has no private directory",
+        ))?;
+        match std::fs::symlink_metadata(private) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Ok(false),
+            Err(error) => {
+                return Err(file::io("inspect settled reservation", private, error).into());
+            }
+        }
+        let decision = decisions
+            .iter()
+            .find(|decision| decision.database_txn_id == reservation.transaction);
+        if winner {
+            let Some(intent) = reservation.intent.as_ref() else {
+                return Ok(false);
+            };
+            verify_published(active, reservation)?;
+            let [descriptor] = intent.fragment.storages.as_slice() else {
+                return Ok(false);
+            };
+            let [table] = intent.fragment.committed.schema.tables() else {
+                return Ok(false);
+            };
+            if !matches!(descriptor.kind, CatalogStorageKind::Heap)
+                || descriptor.id != reservation.storage
+                || descriptor.table_id != reservation.table
+                || table.id != reservation.table
+                || !active.storages.contains(descriptor)
+            {
+                return Ok(false);
+            }
+            for (path, required) in components(&final_path) {
+                if required && !exists_file(&path)? {
+                    return Ok(false);
+                }
+            }
+            if file::read(&file::suffix(&final_path, ".owner"))?
+                != owner_bytes(
+                    active.incarnation,
+                    reservation.transaction,
+                    reservation.table,
+                    reservation.storage,
+                    table.fingerprint()?,
+                )?
+            {
+                return Ok(false);
+            }
+            if let Some(decision) = decision {
+                let reference = decision
+                    .schema
+                    .as_ref()
+                    .ok_or(SchemaMutationError::Corrupt(
+                        "settled reservation has storage-only decision",
+                    ))?;
+                validate_intent(catalog, reservation, reference)?;
+                if !decision.complete {
+                    return Ok(false);
+                }
+            }
+        } else {
+            if decision.is_some() {
+                return Ok(false);
+            }
+            for (path, _) in components(&final_path) {
+                if exists_file(&path)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Settled create records may use either the legacy reservation or the SQL
+/// table-object encoding. Both histories are checked before one newer record
+/// can enter replay, and neither contributes a new writer by itself.
+pub(crate) fn settled_mixed_create_history(
+    catalog: &Path,
+    active: &SchemaCatalogSnapshot,
+    journal: &SchemaMutationJournal,
+) -> Result<bool, DatabaseError> {
+    if journal.reservations.is_empty() && journal.compositions.is_empty() {
+        return Ok(false);
+    }
+    if !journal.reservations.is_empty() {
+        let mut reservations = journal.clone();
+        reservations.compositions.clear();
+        if !settled_mixed_reservation_history(catalog, active, &reservations)? {
+            return Ok(false);
+        }
+    }
+    if !journal.compositions.is_empty() {
+        let mut compositions = journal.clone();
+        compositions.reservations.clear();
+        if !settled_mixed_create_only_history(catalog, active, &compositions)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 
 fn open_recovery_database(
     catalog: &Path,
     snapshot: &SchemaCatalogSnapshot,
     ownerships: &mut RecoveryOwners,
 ) -> Result<Database, DatabaseError> {
-    crate::schema_catalog_api::recover_physical_with_ownership(catalog, snapshot, &[], ownerships)
+    crate::schema_catalog_api::recover_physical_with_owners(
+        catalog,
+        snapshot,
+        &[],
+        &mut ownerships.heap,
+        &mut ownerships.lsm,
+    )
 }
 
 fn stop_recovery_database(
@@ -4421,14 +5683,22 @@ fn stop_recovery_database(
     snapshot: &SchemaCatalogSnapshot,
     ownerships: &mut RecoveryOwners,
 ) -> Result<(), DatabaseError> {
-    ownerships.extend(database.close_retaining_heap_ownership(catalog, snapshot)?);
+    let returned = database.close_retaining_recovery_ownership(catalog, snapshot)?;
+    ownerships.heap.extend(returned.heap);
+    ownerships.lsm.extend(returned.lsm);
     Ok(())
 }
 
 pub(crate) fn recover(
     catalog: &Path,
 ) -> Result<(Option<SchemaMutationJournal>, RecoveryOwners), DatabaseError> {
-    let mut ownerships = RecoveryOwners::new();
+    recover_with_owners(catalog, RecoveryOwners::default())
+}
+
+pub(crate) fn recover_with_owners(
+    catalog: &Path,
+    mut ownerships: RecoveryOwners,
+) -> Result<(Option<SchemaMutationJournal>, RecoveryOwners), DatabaseError> {
     let marker = file::marker(catalog)?
         .filter(|m| m.initialized)
         .ok_or(SchemaCatalogError::LegacyCatalogRequired)?;
@@ -4827,7 +6097,20 @@ pub(crate) fn recover(
     let mut compositions = journal.compositions.values().cloned().collect::<Vec<_>>();
     compositions
         .sort_by_key(|composition| (composition.resolution.is_some(), composition.transaction));
+    let defer_settled_table_creates = !ownerships.lsm.is_empty()
+        && journal
+            .reservations
+            .values()
+            .any(|reservation| reservation.resolved.is_none());
+    let mut deferred_table_creates = Vec::new();
     for composition in compositions {
+        if defer_settled_table_creates
+            && composition.resolution.is_some()
+            && composition.table_intent.is_some()
+        {
+            deferred_table_creates.push(composition);
+            continue;
+        }
         let txn = composition.transaction;
         let decision = decisions
             .iter()
@@ -5133,6 +6416,23 @@ pub(crate) fn recover(
             }
         }
     }
+    // A settled earlier CreateHeap can reopen the active catalog. Finish a
+    // newer legacy CreateHeap first so its incomplete CORD participant is no
+    // longer absent from that active inventory.
+    for composition in deferred_table_creates {
+        let decision = decisions
+            .iter()
+            .find(|decision| decision.database_txn_id == composition.transaction);
+        recover_table_object_composition(
+            catalog,
+            marker.incarnation,
+            &mut journal,
+            &mut coordinator,
+            &composition,
+            decision,
+            &mut ownerships,
+        )?;
+    }
     let mut rewrite_reservations = journal
         .rewrite_reservations
         .values()
@@ -5358,7 +6658,7 @@ pub(crate) fn recover(
     #[cfg(test)]
     handoff_pause(
         "recovery-retained",
-        ownerships.values().next().map(|owner| owner.path()),
+        ownerships.heap.values().next().map(|owner| owner.path()),
     );
     Ok((Some(journal), ownerships))
 }
@@ -5669,6 +6969,7 @@ fn recover_table_object_composition(
                     reference,
                     ownerships,
                 )?;
+                crash("recovery-table-object-after-promotion");
             }
         }
         for plan in &intent.tables {

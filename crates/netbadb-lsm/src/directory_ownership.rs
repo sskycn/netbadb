@@ -2,6 +2,39 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct LsmLockContention {
+    root: PathBuf,
+    pid: u32,
+    device: u64,
+    inode: u64,
+    source: io::Error,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for LsmLockContention {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "flock LSM root {} (pid {}, device {}, inode {}) failed: {} (raw_os_error={:?})",
+            self.root.display(),
+            self.pid,
+            self.device,
+            self.inode,
+            self.source,
+            self.source.raw_os_error()
+        )
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for LsmLockContention {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// The LSM root directory inode is stable across Manifest and WAL rotation.
 /// Holding this descriptor in shared transaction state keeps ownership alive
 /// until every storage user has finished.
@@ -19,6 +52,10 @@ pub struct LsmOwnership {
 }
 
 impl LsmOwnership {
+    pub(crate) fn from_parts(root: PathBuf, owner: DirectoryOwner) -> Self {
+        Self { root, owner }
+    }
+
     /// Claims the existing root directory inode without waiting. No recovery
     /// files are changed by this call.
     pub fn acquire(root: impl AsRef<Path>) -> io::Result<Self> {
@@ -104,7 +141,13 @@ impl DirectoryOwner {
             if error.kind() == io::ErrorKind::WouldBlock {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    format!("LSM storage {} is already in use", root.display()),
+                    LsmLockContention {
+                        root,
+                        pid: std::process::id(),
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                        source: error,
+                    },
                 ));
             }
             return Err(error);

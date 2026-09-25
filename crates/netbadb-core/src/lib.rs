@@ -1961,9 +1961,11 @@ impl Database {
         expected_ids: &[StorageId],
         committed: CommittedCatalogState,
         ownerships: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+        lsm_existing: &mut BTreeMap<PathBuf, netbadb_storage::LsmOwnership>,
     ) -> Result<Self, DatabaseError> {
         validate_open_specs(&specs)?;
-        let (mut claimed, mut lsm_ownerships) = claim_mixed_participants(&specs, ownerships)?;
+        let (mut claimed, mut lsm_ownerships) =
+            claim_mixed_participants(&specs, ownerships, lsm_existing)?;
         verify_mixed_catalog_identities(&specs, expected_ids, &claimed, &lsm_ownerships)?;
         for spec in &specs {
             let recovery = match spec {
@@ -2027,6 +2029,7 @@ impl Database {
         committed: CommittedCatalogState,
         placements: Option<PartitionCatalog>,
         existing: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+        lsm_existing: &mut BTreeMap<PathBuf, netbadb_storage::LsmOwnership>,
     ) -> Result<Self, DatabaseError> {
         validate_open_specs(&specs)?;
         if specs.iter().any(|spec| spec.path() == config.log_path()) {
@@ -2034,7 +2037,8 @@ impl Database {
                 config.log_path().to_owned(),
             ));
         }
-        let (mut ownerships, mut lsm_ownerships) = claim_mixed_participants(&specs, existing)?;
+        let (mut ownerships, mut lsm_ownerships) =
+            claim_mixed_participants(&specs, existing, lsm_existing)?;
         verify_mixed_catalog_identities(&specs, expected_ids, &ownerships, &lsm_ownerships)?;
         let mut inspected = Vec::with_capacity(specs.len());
         for spec in &specs {
@@ -4982,15 +4986,16 @@ impl Database {
         Ok(())
     }
 
-    /// Recovery may reopen the same Heap inventory before returning to the
-    /// caller. Keep every Heap inode owned between those passes.
-    pub(crate) fn close_retaining_heap_ownership(
+    /// Recovery may reopen the same inventory before returning to the caller.
+    /// Keep both engine owners through every internal pass.
+    pub(crate) fn close_retaining_recovery_ownership(
         self,
         catalog: &Path,
         snapshot: &crate::schema_catalog::SchemaCatalogSnapshot,
-    ) -> Result<BTreeMap<PathBuf, netbadb_storage::HeapOwnership>, DatabaseError> {
+    ) -> Result<crate::schema_mutation::RecoveryOwners, DatabaseError> {
         self.flush()?;
-        let mut owners = BTreeMap::new();
+        let mut heap = BTreeMap::new();
+        let mut lsm = BTreeMap::new();
         for entry in self.registry.into_entries() {
             let descriptor = snapshot
                 .storages
@@ -5001,12 +5006,15 @@ impl Database {
                 crate::schema_catalog::CatalogStorageKind::Heap => {
                     let path = crate::schema_catalog_file::resolve(catalog, &descriptor.locator);
                     let owner = entry.storage.stop_heap_for_promotion(&path)?;
-                    owners.insert(path, owner);
+                    heap.insert(path, owner);
                 }
-                crate::schema_catalog::CatalogStorageKind::Lsm { .. } => entry.storage.close()?,
+                crate::schema_catalog::CatalogStorageKind::Lsm { .. } => {
+                    let path = crate::schema_catalog_file::resolve(catalog, &descriptor.locator);
+                    lsm.insert(path, entry.storage.stop_lsm_for_recovery()?);
+                }
             }
         }
-        Ok(owners)
+        Ok(crate::schema_mutation::RecoveryOwners { heap, lsm })
     }
 
     pub fn query(&mut self, source: &str) -> Result<QueryResult, DatabaseError> {
@@ -7388,14 +7396,14 @@ struct InspectedStorage {
 }
 
 #[derive(Debug)]
-struct GenericRecoveryInspection {
-    storage_id: StorageId,
-    prepared_transactions: Vec<PreparedTransaction>,
+pub(crate) struct GenericRecoveryInspection {
+    pub(crate) storage_id: StorageId,
+    pub(crate) prepared_transactions: Vec<PreparedTransaction>,
 }
 
 #[derive(Debug)]
-struct GenericInspectedStorage {
-    recovery: GenericRecoveryInspection,
+pub(crate) struct GenericInspectedStorage {
+    pub(crate) recovery: GenericRecoveryInspection,
 }
 
 /// Acquire every Heap mutation domain before any participant recovery. The
@@ -7433,6 +7441,7 @@ type MixedOwners = (
 fn claim_mixed_participants(
     specs: &[TableStorageOpenSpec],
     existing: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+    lsm_existing: &mut BTreeMap<PathBuf, netbadb_storage::LsmOwnership>,
 ) -> Result<MixedOwners, DatabaseError> {
     validate_open_specs(specs)?;
     let mut heap = BTreeMap::new();
@@ -7461,8 +7470,14 @@ fn claim_mixed_participants(
                 )
             }
             TableStorageOpenSpec::Lsm { directory, .. } => {
-                let owner =
-                    netbadb_storage::LsmOwnership::acquire(directory).map_err(StorageError::Io)?;
+                let owner = match lsm_existing.remove(directory) {
+                    Some(owner) => {
+                        owner.verify_path().map_err(StorageError::Io)?;
+                        owner
+                    }
+                    None => netbadb_storage::LsmOwnership::acquire(directory)
+                        .map_err(StorageError::Io)?,
+                };
                 let identity = owner.inspect_identity().map_err(StorageError::from)?;
                 lsm.insert(directory.clone(), owner);
                 (
@@ -7725,7 +7740,7 @@ fn resolution_for_recovery_prepared(
     }))
 }
 
-fn validate_generic_coordinator_recovery(
+pub(crate) fn validate_generic_coordinator_recovery(
     decisions: &[CoordinatorDecision],
     storages: &[GenericInspectedStorage],
     retired_storage_ids: &[StorageId],
