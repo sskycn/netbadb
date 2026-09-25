@@ -1,5 +1,6 @@
 //! Synchronous single-writer LSM table engine and durable formats.
 
+mod directory_ownership;
 mod engine;
 mod lsm_source_inspection;
 

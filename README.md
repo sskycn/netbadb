@@ -546,8 +546,9 @@ shapes remain closed.
 Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable
 contract is [`docs/inspection-json-v1.md`](docs/inspection-json-v1.md). Direct
-Heap storage opens now lock the durable data-file inode across processes on
-Unix, but database-wide ownership and LSM ownership are not yet implemented.
+Heap storage opens lock the durable data-file inode, and LSM storage opens lock
+the root directory inode across processes on Unix. Database-wide ownership is
+not yet implemented.
 The [storage ownership audit](docs/optimization-audit.md) records the remaining
 boundary.
 Stop `netbadbd` and every embedded process using the same catalog before

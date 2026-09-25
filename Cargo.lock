@@ -353,6 +353,7 @@ name = "netbadb-lsm"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "libc",
  "netbadb-change-stream",
  "netbadb-index",
  "netbadb-row-codec",

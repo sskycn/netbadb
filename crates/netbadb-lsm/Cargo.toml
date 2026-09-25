@@ -10,6 +10,7 @@ test-hooks = ["netbadb-storage-api/test-hooks", "netbadb-change-stream/test-hook
 
 [dependencies]
 crc32c.workspace = true
+libc.workspace = true
 netbadb-change-stream = { path = "../netbadb-change-stream" }
 netbadb-index = { path = "../netbadb-index" }
 netbadb-row-codec = { path = "../netbadb-row-codec" }

@@ -26,6 +26,7 @@ use crate::change_stream::{
     AuthoritativeOutcome, ChangeFinalizeBatchReport, ChangePrepareBatchReport, ChangeStreamManager,
     PendingChangeSet, PreparedChange,
 };
+use crate::directory_ownership::DirectoryOwner;
 use crate::row_codec::{
     decode_row, decode_row_columns, decode_row_positions, encode_row, resolve_columns, validate_row,
 };
@@ -635,6 +636,7 @@ pub struct LsmLevelInspection {
 #[derive(Debug)]
 struct LsmShared {
     root: PathBuf,
+    owner: DirectoryOwner,
     table: TableDef,
     clustering_position: usize,
     manifest: Manifest,
@@ -961,6 +963,7 @@ impl LsmStorage {
             validate_clustering_column(&table, clustering_column)?;
         let root = root.as_ref().to_path_buf();
         fs::create_dir(&root)?;
+        let (root, owner) = DirectoryOwner::acquire(&root)?;
         let creation = (|| {
             fs::create_dir(root.join(SST_DIR_NAME))?;
             let manifest = Manifest {
@@ -1014,6 +1017,7 @@ impl LsmStorage {
                 table: table.clone(),
                 shared: Rc::new(RefCell::new(LsmShared {
                     root: root.clone(),
+                    owner,
                     table,
                     clustering_position,
                     manifest,
@@ -1049,7 +1053,7 @@ impl LsmStorage {
         resolutions: &[PreparedTxnResolution],
     ) -> Result<Self, StorageError> {
         table.validate()?;
-        let root = root.as_ref().to_path_buf();
+        let (root, owner) = DirectoryOwner::acquire(root.as_ref())?;
         let mut manifest = read_manifest(&root)?;
         validate_manifest_schema(&manifest, &table)?;
         let (clustering_position, key_type) =
@@ -1180,6 +1184,7 @@ impl LsmStorage {
             table: table.clone(),
             shared: Rc::new(RefCell::new(LsmShared {
                 root,
+                owner,
                 table,
                 clustering_position,
                 manifest: manifest.clone(),
@@ -2031,6 +2036,7 @@ impl LsmStorage {
             }
             shared.wal.sync()?;
         }
+        self.shared.borrow().owner.release_after_clean_close()?;
         Ok(())
     }
 
@@ -7551,6 +7557,178 @@ mod tests {
         PreparedDecision, PreparedTransactionState, PreparedTxnResolution, RecoveryError,
         StorageError, TransactionState,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_child_probe() {
+        let Ok(root) = std::env::var("NETBADB_LSM_OWNERSHIP_PROBE") else {
+            return;
+        };
+        assert!(matches!(
+            LsmStorage::open(root, table()),
+            Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_exit_child() {
+        let Ok(root) = std::env::var("NETBADB_LSM_OWNERSHIP_EXIT") else {
+            return;
+        };
+        let mut storage = LsmStorage::open(root, table()).unwrap();
+        storage.insert(&row(1, "committed")).unwrap();
+        let mut transaction = storage.begin_transaction().unwrap();
+        storage
+            .insert_in(&mut transaction, &row(2, "uncommitted"))
+            .unwrap();
+        std::process::exit(42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_rejects_second_instance_without_mutating_files() {
+        let root = root("ownership-reject");
+        cleanup(&root);
+        let storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let manifest = std::fs::read(super::manifest_path(&root)).unwrap();
+        let wal = std::fs::read(super::wal_path(&root, 1)).unwrap();
+        let entries = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(matches!(
+            LsmStorage::open(&root, table()),
+            Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("engine::tests::ownership_child_probe")
+            .env("NETBADB_LSM_OWNERSHIP_PROBE", &root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        LsmStorage::inspect_recovery(&root, &table()).unwrap();
+        assert_eq!(
+            std::fs::read(super::manifest_path(&root)).unwrap(),
+            manifest
+        );
+        assert_eq!(std::fs::read(super::wal_path(&root, 1)).unwrap(), wal);
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::HashSet<_>>(),
+            entries
+        );
+        storage.close().unwrap();
+        LsmStorage::open(&root, table()).unwrap().close().unwrap();
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_survives_storage_drop_while_transaction_is_live() {
+        let root = root("ownership-active-transaction");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let mut transaction = storage.begin_transaction().unwrap();
+        storage
+            .insert_in(&mut transaction, &row(1, "pending"))
+            .unwrap();
+        drop(storage);
+        assert!(matches!(
+            LsmStorage::open(&root, table()),
+            Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        transaction.rollback().unwrap();
+        assert_eq!(std::rc::Rc::strong_count(&transaction.shared), 1);
+        let weak = std::rc::Rc::downgrade(&transaction.shared);
+        drop(transaction);
+        assert!(weak.upgrade().is_none());
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_clean_close_releases_with_completed_transaction_handle() {
+        let root = root("ownership-completed-handle");
+        cleanup(&root);
+        let mut storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        let mut transaction = storage.begin_transaction().unwrap();
+        storage
+            .insert_in(&mut transaction, &row(1, "committed"))
+            .unwrap();
+        transaction.commit().unwrap();
+        storage.close().unwrap();
+        LsmStorage::open(&root, table()).unwrap().close().unwrap();
+        assert_eq!(transaction.state(), TransactionState::Committed);
+        drop(transaction);
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_releases_after_exit_panic_and_failed_open() {
+        let root = root("ownership-abnormal-exit");
+        cleanup(&root);
+        LsmStorage::create(&root, table(), ColumnId(1))
+            .unwrap()
+            .close()
+            .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("engine::tests::ownership_exit_child")
+            .env("NETBADB_LSM_OWNERSHIP_EXIT", &root)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(42));
+        let caught = std::panic::catch_unwind(|| {
+            let mut storage = LsmStorage::open(&root, table()).unwrap();
+            let view = storage.read_view().unwrap();
+            assert_eq!(
+                storage
+                    .scan_columns_with_view(&[ColumnId(1)], &view)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            panic!("simulate unwind");
+        });
+        assert!(caught.is_err());
+        LsmStorage::open(&root, table()).unwrap().close().unwrap();
+
+        let wal = super::wal_path(&root, super::read_manifest(&root).unwrap().wal_generation);
+        let original = std::fs::read(&wal).unwrap();
+        std::fs::write(&wal, b"bad").unwrap();
+        assert!(LsmStorage::open(&root, table()).is_err());
+        std::fs::write(&wal, original).unwrap();
+        LsmStorage::open(&root, table()).unwrap().close().unwrap();
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_directory_alias_resolves_to_the_same_authority() {
+        let root = root("ownership-directory-alias");
+        cleanup(&root);
+        let alias = root.with_extension("alias");
+        let _ = std::fs::remove_file(&alias);
+        let storage = LsmStorage::create(&root, table(), ColumnId(1)).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        assert!(matches!(
+            LsmStorage::open(&alias, table()),
+            Err(StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        storage.close().unwrap();
+        LsmStorage::open(&alias, table()).unwrap().close().unwrap();
+        std::fs::remove_file(alias).unwrap();
+        cleanup(&root);
+    }
 
     #[test]
     fn resource_pending_byte_rejection_is_atomic_and_replacements_release_budget() {
