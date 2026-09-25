@@ -1163,6 +1163,17 @@ impl TableStorage {
             .map_err(Into::into)
     }
 
+    /// Consumes the exclusive lock on the exact LSM root being recovered.
+    pub fn open_lsm_with_ownership(
+        ownership: crate::LsmOwnership,
+        table: TableDef,
+        resolutions: &[PreparedTxnResolution],
+    ) -> Result<Self, StorageError> {
+        LsmStorage::open_with_ownership(ownership, table, resolutions)
+            .map(Self::Lsm)
+            .map_err(Into::into)
+    }
+
     pub fn inspect_lsm_recovery(
         root: impl AsRef<Path>,
         table: &TableDef,

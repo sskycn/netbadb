@@ -47,6 +47,15 @@ jobs:
       - run: cargo check -p netbadb-sdk --no-default-features --features remote
       - run: cargo check -p netbadb-sdk --all-features
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run A3 ownership regressions on Linux local storage
+        run: |
+          cargo test -p netbadb-core --test lsm mixed_admission
+          cargo test -p netbadb-core --test lsm mixed_invalid_participant_rejects_before_coordinator_tail_repair
+          cargo test -p netbadb-core --test lsm mixed_without_coordinator_checks_all_recovery_inputs_before_open
+          cargo test -p netbadb-core --test lsm shared_catalog_rejects_second_core_with_subset_expectation
+          cargo test -p netbadb-core --test lsm metadata_ownership_survives_database_drop_with_live_transaction
+          cargo test -p netbadb-core --lib mixed_handoff_holds_both_engines_before_recovery
+          cargo test -p netbadb-core --lib mixed_lsm_root_replacement_after_discovery_fails_before_recovery
       - run: cargo test --workspace
 
   msrv:

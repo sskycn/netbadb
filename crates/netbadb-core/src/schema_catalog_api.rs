@@ -1,6 +1,7 @@
 //! Bootstrap/expectation adapters around the single persisted schema authority.
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use netbadb_schema::{Schema, TableDef};
 use netbadb_storage::{StorageError, TableStorage};
@@ -110,6 +111,7 @@ impl Database {
             None,
         )?;
         preflight_paths(&path, &snapshot, true)?;
+        let metadata_owners = claim_metadata_for_snapshot(&path, &snapshot)?;
         file::begin(&path, &snapshot, true)?;
         let all_heap = specs
             .iter()
@@ -147,7 +149,9 @@ impl Database {
                 None => Self::physical_create_storages(specs)?,
             }
         };
-        finish_install(database, &path, snapshot)
+        let mut database = finish_install(database, &path, snapshot)?;
+        retain_metadata_owners(&mut database, metadata_owners);
+        Ok(database)
     }
 
     /// Creates an initial range placement catalog at an explicit schema root.
@@ -222,9 +226,12 @@ impl Database {
             Some(config.catalog_path()),
         )?;
         preflight_paths(&path, &snapshot, true)?;
+        let metadata_owners = claim_metadata_for_snapshot(&path, &snapshot)?;
         file::begin(&path, &snapshot, true)?;
         let database = Self::physical_create_with_placements(specs, config)?;
-        finish_install(database, &path, snapshot)
+        let mut database = finish_install(database, &path, snapshot)?;
+        retain_metadata_owners(&mut database, metadata_owners);
+        Ok(database)
     }
 
     /// Reconstructs the entire committed Schema and all physical bindings from
@@ -348,9 +355,12 @@ impl Database {
         // Full identity/fingerprint/placement validation precedes intent publication.
         validate_physical(&path, &snapshot, &[])?;
         validate_partition_evidence(&path, &snapshot)?;
+        let metadata_owners = claim_metadata_for_snapshot(&path, &snapshot)?;
         file::begin(&path, &snapshot, false)?;
         let database = recover_physical(&path, &snapshot, &[])?;
-        finish_install(database, &path, snapshot)
+        let mut database = finish_install(database, &path, snapshot)?;
+        retain_metadata_owners(&mut database, metadata_owners);
+        Ok(database)
     }
 
     #[must_use]
@@ -583,6 +593,34 @@ fn make_snapshot(
     Ok(snapshot)
 }
 
+fn claim_metadata_for_snapshot(
+    path: &Path,
+    snapshot: &SchemaCatalogSnapshot,
+) -> Result<Vec<Rc<crate::metadata_ownership::MetadataOwner>>, DatabaseError> {
+    let mut owners = vec![Rc::new(
+        crate::metadata_ownership::MetadataOwner::acquire(path)
+            .map_err(|e| file::io("claim catalog ownership", path, e))?,
+    )];
+    if let Some(locator) = &snapshot.coordinator {
+        let coordinator_path = file::resolve(path, locator);
+        owners.push(Rc::new(
+            crate::metadata_ownership::MetadataOwner::acquire(&coordinator_path)
+                .map_err(|e| file::io("claim coordinator ownership", &coordinator_path, e))?,
+        ));
+    }
+    Ok(owners)
+}
+
+fn retain_metadata_owners(
+    database: &mut Database,
+    owners: Vec<Rc<crate::metadata_ownership::MetadataOwner>>,
+) {
+    if let Some(coordinator) = &database.coordinator {
+        coordinator.borrow_mut().retain_metadata_owners(&owners);
+    }
+    database.metadata_owners = owners;
+}
+
 fn finish_install(
     mut database: Database,
     path: &Path,
@@ -661,7 +699,111 @@ fn open_authority(
     partition: Option<&Path>,
 ) -> Result<Database, DatabaseError> {
     let path = file::absolute(path)?;
-    let (journal, mut ownerships) = crate::schema_mutation::recover(&path)?;
+    let mut metadata_owners = vec![Rc::new(
+        crate::metadata_ownership::MetadataOwner::acquire(&path)
+            .map_err(|e| file::io("claim catalog ownership", &path, e))?,
+    )];
+    let marker = file::marker(&path)?
+        .filter(|marker| marker.initialized)
+        .ok_or(SchemaCatalogError::LegacyCatalogRequired)?;
+    // A published schema snapshot may precede its marker during a recoverable
+    // crash window. Decode it for discovery; `file::load` after replay remains
+    // the authoritative marker/digest validation.
+    let candidate_bytes = match file::read(&path) {
+        Err(SchemaCatalogError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Err(SchemaCatalogError::SchemaCatalogMissing.into());
+        }
+        result => result?,
+    };
+    let candidate = SchemaCatalogSnapshot::decode(&candidate_bytes)?;
+    let candidate_journal =
+        crate::schema_mutation_journal::SchemaMutationJournal::open(&path, marker.incarnation)?;
+    if let (Some(candidate_coordinator), Some(journal)) =
+        (&candidate.coordinator, &candidate_journal)
+    {
+        if file::resolve(&path, candidate_coordinator) != file::resolve(&path, &journal.coordinator)
+        {
+            return Err(SchemaCatalogError::InventoryMismatch(
+                "journal coordinator differs from candidate catalog",
+            )
+            .into());
+        }
+    }
+    let coordinator_locator = candidate.coordinator.as_ref().or_else(|| {
+        candidate_journal
+            .as_ref()
+            .map(|journal| &journal.coordinator)
+    });
+    if let Some(locator) = coordinator_locator {
+        let coordinator_path = file::resolve(&path, locator);
+        metadata_owners.push(Rc::new(
+            crate::metadata_ownership::MetadataOwner::acquire(&coordinator_path)
+                .map_err(|e| file::io("claim coordinator ownership", &coordinator_path, e))?,
+        ));
+    }
+    // Terminal create history is allocator evidence, not replay work. All
+    // other mixed mutation histories may name staged Heap participants beyond
+    // the published inventory and therefore fail before any recovery write.
+    let mixed = candidate
+        .storages
+        .iter()
+        .any(|storage| matches!(storage.kind, CatalogStorageKind::Lsm { .. }));
+    let mut terminal_create_history = candidate_journal.as_ref().is_some_and(|journal| {
+        !journal.reservations.is_empty()
+            && journal
+                .reservations
+                .values()
+                .all(|record| record.resolved.is_some())
+            && journal.drops.is_empty()
+            && journal.rewrite_reservations.is_empty()
+            && journal.rewrites.is_empty()
+            && journal.rewrite_losers.is_empty()
+            && journal.compositions.is_empty()
+            && journal.stage_intents.is_empty()
+            && journal.finalization_intents.is_empty()
+            && journal.migration_finalization_intents.is_empty()
+            && journal.source_backfill_intents.is_empty()
+    });
+    if mixed && terminal_create_history {
+        let journal = candidate_journal
+            .as_ref()
+            .ok_or(SchemaCatalogError::InventoryMismatch(
+                "settled mixed journal disappeared",
+            ))?;
+        let coordinator_path = file::resolve(&path, &journal.coordinator);
+        terminal_create_history = crate::CoordinatorLog::inspect_completed(
+            &coordinator_path,
+            journal
+                .reservations
+                .values()
+                .filter_map(|record| (record.resolved == Some(true)).then_some(record.transaction)),
+        )?;
+    }
+    let (journal, mut ownerships) = if mixed && terminal_create_history {
+        (candidate_journal, BTreeMap::new())
+    } else if mixed
+        && candidate_journal.as_ref().is_some_and(|journal| {
+            !journal.reservations.is_empty()
+                || !journal.drops.is_empty()
+                || !journal.rewrite_reservations.is_empty()
+                || !journal.rewrites.is_empty()
+                || !journal.rewrite_losers.is_empty()
+                || !journal.compositions.is_empty()
+                || !journal.stage_intents.is_empty()
+                || !journal.finalization_intents.is_empty()
+                || !journal.migration_finalization_intents.is_empty()
+                || !journal.source_backfill_intents.is_empty()
+        })
+    {
+        return Err(SchemaCatalogError::InventoryMismatch(
+            "mixed schema mutation replay requires complete participant admission",
+        )
+        .into());
+    } else {
+        crate::schema_mutation::recover(&path)?
+    };
     let snapshot = file::load(&path)?;
     let incarnation = snapshot.incarnation;
     preflight_paths(&path, &snapshot, false)?;
@@ -699,6 +841,7 @@ fn open_authority(
         recover_physical_with_ownership(&path, &snapshot, overrides, &mut ownerships)?;
     database.committed = snapshot.committed;
     database.catalog_path = Some(path);
+    retain_metadata_owners(&mut database, metadata_owners);
     database.configure_managed_projection_catalog(incarnation)?;
     if let Some(journal) = journal {
         if let Some(id) = journal
@@ -1126,12 +1269,26 @@ pub(crate) fn recover_physical_with_ownership(
     match coordinator {
         Some(config) => Database::physical_open_storages_with_coordinator(
             specs,
+            &snapshot
+                .storages
+                .iter()
+                .map(|storage| storage.id)
+                .collect::<Vec<_>>(),
             config,
             snapshot.committed.clone(),
             Some(snapshot.placements.clone()),
             ownerships,
         ),
-        None => Database::physical_open_storages(specs, snapshot.committed.clone(), ownerships),
+        None => Database::physical_open_storages(
+            specs,
+            &snapshot
+                .storages
+                .iter()
+                .map(|storage| storage.id)
+                .collect::<Vec<_>>(),
+            snapshot.committed.clone(),
+            ownerships,
+        ),
     }
 }
 

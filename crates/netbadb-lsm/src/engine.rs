@@ -1053,7 +1053,18 @@ impl LsmStorage {
         resolutions: &[PreparedTxnResolution],
     ) -> Result<Self, StorageError> {
         table.validate()?;
-        let (root, owner) = DirectoryOwner::acquire(root.as_ref())?;
+        let ownership = crate::directory_ownership::LsmOwnership::acquire(root)?;
+        Self::open_with_ownership(ownership, table, resolutions)
+    }
+
+    /// Opens the exact root protected by a previously acquired directory lock.
+    pub fn open_with_ownership(
+        ownership: crate::directory_ownership::LsmOwnership,
+        table: TableDef,
+        resolutions: &[PreparedTxnResolution],
+    ) -> Result<Self, StorageError> {
+        table.validate()?;
+        let (root, owner) = ownership.into_parts()?;
         let mut manifest = read_manifest(&root)?;
         validate_manifest_schema(&manifest, &table)?;
         let (clustering_position, key_type) =

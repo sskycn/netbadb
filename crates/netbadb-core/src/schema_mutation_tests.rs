@@ -3956,6 +3956,212 @@ fn handoff_recovery_child() {
 
 #[cfg(unix)]
 #[test]
+fn mixed_direct_probe_child() {
+    let Ok(root) = std::env::var("NETBADB_MIXED_PROBE_ROOT") else {
+        return;
+    };
+    let root = Path::new(&root);
+    assert!(matches!(
+        TableStorage::open_heap(root.join("a.heap"), old_table(1, "users")),
+        Err(netbadb_storage::StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(matches!(
+        TableStorage::open_lsm(root.join("z.lsm"), old_table(2, "teams")),
+        Err(netbadb_storage::StorageError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_handoff_holds_both_engines_before_recovery() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let root = root("mixed-handoff-all-locks");
+    std::fs::create_dir_all(&root).unwrap();
+    Database::create_catalog(
+        root.join("catalog"),
+        vec![
+            TableStorageCreateSpec::heap(root.join("a.heap"), old_table(1, "users")),
+            TableStorageCreateSpec::lsm(root.join("z.lsm"), old_table(2, "teams"), ColumnId(1)),
+        ],
+        Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+    )
+    .unwrap()
+    .close()
+    .unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::handoff_recovery_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_HEAP_HANDOFF_RECOVERY_ROOT", &root)
+        .env("NETBADB_HEAP_HANDOFF_PAUSE", "inspected")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut found = false;
+        for line in std::io::BufReader::new(stdout).lines() {
+            if !found
+                && line
+                    .unwrap_or_default()
+                    .contains("NETBADB_HANDOFF_READY:inspected:")
+            {
+                found = true;
+                let _ = sender.send(true);
+            }
+        }
+        if !found {
+            let _ = sender.send(false);
+        }
+    });
+    if receiver.recv_timeout(Duration::from_secs(10)) != Ok(true) {
+        let _ = child.kill();
+        let _ = child.wait();
+        reader.join().unwrap();
+        panic!("mixed Core did not reach locked inspection");
+    }
+    let probe = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "schema_mutation_tests::mixed_direct_probe_child"])
+        .env("NETBADB_MIXED_PROBE_ROOT", &root)
+        .output()
+        .unwrap();
+    assert!(
+        probe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("mixed Core did not exit after release");
+        }
+        std::thread::yield_now();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    reader.join().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_lsm_root_replacement_after_discovery_fails_before_recovery() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let root = root("mixed-root-replacement");
+    std::fs::create_dir_all(&root).unwrap();
+    Database::create_catalog(
+        root.join("catalog"),
+        vec![
+            TableStorageCreateSpec::heap(root.join("a.heap"), old_table(1, "users")),
+            TableStorageCreateSpec::lsm(root.join("z.lsm"), old_table(2, "teams"), ColumnId(1)),
+        ],
+        Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+    )
+    .unwrap()
+    .close()
+    .unwrap();
+    let wal = netbadb_storage::wal_path(root.join("a.heap"));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&wal)
+        .unwrap()
+        .write_all(b"W")
+        .unwrap();
+    let coordinator = root.join("coordinator");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&coordinator)
+        .unwrap()
+        .write_all(b"C")
+        .unwrap();
+    let wal_before = std::fs::read(&wal).unwrap();
+    let coordinator_before = std::fs::read(&coordinator).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::handoff_recovery_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_HEAP_HANDOFF_RECOVERY_ROOT", &root)
+        .env("NETBADB_HEAP_HANDOFF_PAUSE", "validated")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut found = false;
+        for line in std::io::BufReader::new(stdout).lines() {
+            if !found
+                && line
+                    .unwrap_or_default()
+                    .contains("NETBADB_HANDOFF_READY:validated:")
+            {
+                found = true;
+                let _ = sender.send(true);
+            }
+        }
+        if !found {
+            let _ = sender.send(false);
+        }
+    });
+    if receiver.recv_timeout(Duration::from_secs(10)) != Ok(true) {
+        let _ = child.kill();
+        let _ = child.wait();
+        reader.join().unwrap();
+        panic!("mixed Core did not reach catalog validation");
+    }
+    TableStorage::create_lsm_with_storage_id(
+        root.join("replacement.lsm"),
+        old_table(2, "teams"),
+        ColumnId(1),
+        StorageId(999),
+    )
+    .unwrap()
+    .close()
+    .unwrap();
+    std::fs::rename(root.join("z.lsm"), root.join("old.lsm")).unwrap();
+    std::fs::rename(root.join("replacement.lsm"), root.join("z.lsm")).unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("mixed Core did not reject replaced root");
+        }
+        std::thread::yield_now();
+    }
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert_eq!(output.status.code(), Some(101));
+    assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+    assert_eq!(std::fs::read(&coordinator).unwrap(), coordinator_before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn coordinator_inspection_keeps_all_heap_locks_until_recovery_open() {
     use std::io::{BufRead, Read, Write};
     use std::process::Stdio;

@@ -79,9 +79,9 @@ pub use netbadb_lsm::{
     LSM_WAL_FORMAT_VERSION, LsmCompactionPlanInspection, LsmError, LsmIdentityInspection,
     LsmInspection, LsmLevelInspection, LsmMaintenanceAnchor, LsmMaintenanceBoundInspection,
     LsmMaintenanceCostInspection, LsmMaintenanceInspection, LsmMaintenanceSafetyBlocker,
-    LsmPhysicalDesignSourceInspection, LsmReadAmplification, LsmReadView, LsmRecoveryInspection,
-    LsmStorage, LsmTransaction, LsmWriteAmplification, fuzz_lsm_manifest_bytes,
-    fuzz_lsm_sstable_block_bytes, fuzz_lsm_wal_bytes,
+    LsmOwnership, LsmPhysicalDesignSourceInspection, LsmReadAmplification, LsmReadView,
+    LsmRecoveryInspection, LsmStorage, LsmTransaction, LsmWriteAmplification,
+    fuzz_lsm_manifest_bytes, fuzz_lsm_sstable_block_bytes, fuzz_lsm_wal_bytes,
 };
 pub use netbadb_row_codec::CodecError;
 #[cfg(any(test, feature = "test-hooks"))]

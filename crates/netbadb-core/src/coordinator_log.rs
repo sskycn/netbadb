@@ -107,6 +107,7 @@ pub(crate) struct CoordinatorLog {
     last_synced_complete: DatabaseCommitSeq,
     last_checkpoint_error: Option<String>,
     decision_sync_count: u64,
+    metadata_owners: Vec<std::rc::Rc<crate::metadata_ownership::MetadataOwner>>,
     checkpoint_sync_count: u64,
     combined_pipeline_sync_count: u64,
     group_decision_sync_count: u64,
@@ -146,6 +147,7 @@ impl CoordinatorLog {
             last_synced_complete: DatabaseCommitSeq(0),
             last_checkpoint_error: None,
             decision_sync_count: 0,
+            metadata_owners: Vec::new(),
             checkpoint_sync_count: 0,
             combined_pipeline_sync_count: 0,
             group_decision_sync_count: 0,
@@ -203,6 +205,7 @@ impl CoordinatorLog {
             last_synced_complete: last_complete,
             last_checkpoint_error: None,
             decision_sync_count: 0,
+            metadata_owners: Vec::new(),
             checkpoint_sync_count: 0,
             combined_pipeline_sync_count: 0,
             group_decision_sync_count: 0,
@@ -221,8 +224,47 @@ impl CoordinatorLog {
         })
     }
 
+    /// Read-only completion check for settled schema journal history. The
+    /// caller must hold the stable coordinator owner while using this result.
+    pub(crate) fn inspect_completed(
+        path: &Path,
+        transactions: impl IntoIterator<Item = DatabaseTxnId>,
+    ) -> Result<bool, CoordinatorLogError> {
+        let mut file = File::open(path)?;
+        let scan = scan_file(&mut file, true)?;
+        Ok(transactions.into_iter().all(|transaction| {
+            scan.decisions
+                .get(&transaction)
+                .map(|decision| decision.complete)
+                .unwrap_or_else(|| {
+                    scan.checkpoint.as_ref().is_some_and(|checkpoint| {
+                        checkpoint.database_txn_id_high_water >= transaction
+                    })
+                })
+        }))
+    }
+
+    /// Reads recovery decisions without truncating or synchronizing the log.
+    /// The caller must retain the stable coordinator owner through the later
+    /// writable open.
+    pub(crate) fn inspect_recovery(
+        path: &Path,
+    ) -> Result<(Vec<CoordinatorDecision>, Option<CoordinatorCheckpoint>), CoordinatorLogError>
+    {
+        let mut file = File::open(path)?;
+        let scan = scan_file(&mut file, true)?;
+        Ok((scan.decisions.into_values().collect(), scan.checkpoint))
+    }
+
     pub(crate) fn decisions(&self) -> impl Iterator<Item = &CoordinatorDecision> {
         self.decisions.values()
+    }
+
+    pub(crate) fn retain_metadata_owners(
+        &mut self,
+        owners: &[std::rc::Rc<crate::metadata_ownership::MetadataOwner>],
+    ) {
+        self.metadata_owners.extend_from_slice(owners);
     }
 
     pub(crate) fn retained_decision_count(&self) -> usize {

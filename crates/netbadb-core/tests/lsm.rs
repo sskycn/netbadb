@@ -70,6 +70,353 @@ fn contains_index(plan: &PlanNodeInspection) -> bool {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn mixed_admission_holder_child() {
+    use std::io::Read;
+    let Ok(root) = std::env::var("NETBADB_MIXED_HOLDER_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let storage = match std::env::var("NETBADB_MIXED_HOLDER_KIND").unwrap().as_str() {
+        "heap" => {
+            netbadb_storage::TableStorage::open_heap(root.join("a.heap"), table(1, "heap_items"))
+                .unwrap()
+        }
+        "lsm" => netbadb_storage::TableStorage::open_lsm(root.join("z.lsm"), table(2, "lsm_items"))
+            .unwrap(),
+        other => panic!("unknown holder kind {other}"),
+    };
+    std::fs::write(root.join("ready"), b"ready").unwrap();
+    let mut release = [0_u8; 1];
+    std::io::stdin().read_exact(&mut release).unwrap();
+    storage.close().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_admission_rejects_busy_participant_before_recovery() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    for held in ["lsm", "heap"] {
+        let root = std::env::temp_dir().join(format!(
+            "netbadb-mixed-admission-{held}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let heap = root.join("a.heap");
+        let lsm = root.join("z.lsm");
+        let coordinator = root.join("coordinator");
+        let specs = vec![
+            TableStorageCreateSpec::heap(&heap, table(1, "heap_items")),
+            TableStorageCreateSpec::lsm(&lsm, table(2, "lsm_items"), ColumnId(1)),
+        ];
+        Database::create_storages_with_coordinator(
+            specs,
+            DatabaseCoordinatorConfig::new(&coordinator),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "mixed_admission_holder_child", "--nocapture"])
+            .env("NETBADB_MIXED_HOLDER_ROOT", &root)
+            .env("NETBADB_MIXED_HOLDER_KIND", held)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !root.join("ready").exists() {
+            assert!(Instant::now() < deadline, "holder did not become ready");
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "holder exited before readiness"
+            );
+            std::thread::yield_now();
+        }
+        let heap_wal = netbadb_storage::wal_path(&heap);
+        let lsm_wal = lsm.join("wal-00000000000000000001.nblw");
+        let orphan = lsm.join("wal-00000000000000000002.nblw");
+        let orphan_sst = lsm.join("sst").join("sst-00000000000000000999-l0.nbls");
+        if held == "heap" {
+            std::fs::write(&orphan, b"unpublished orphan").unwrap();
+            std::fs::write(&orphan_sst, b"unpublished sstable").unwrap();
+        }
+        let manifest_before = std::fs::read(lsm.join("MANIFEST")).unwrap();
+        let entries_before = std::fs::read_dir(&lsm)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let sst_entries_before = std::fs::read_dir(lsm.join("sst"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let pending = if held == "lsm" { &heap_wal } else { &lsm_wal };
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(pending)
+            .unwrap()
+            .write_all(b"W")
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&coordinator)
+            .unwrap()
+            .write_all(b"C")
+            .unwrap();
+        let pending_before = std::fs::read(pending).unwrap();
+        let coordinator_before = std::fs::read(&coordinator).unwrap();
+        let mut specs = vec![
+            TableStorageOpenSpec::heap(&heap, table(1, "heap_items")),
+            TableStorageOpenSpec::lsm(&lsm, table(2, "lsm_items")),
+        ];
+        if held == "heap" {
+            specs.reverse();
+        }
+        assert!(
+            Database::open_storages_with_coordinator(
+                specs.clone(),
+                DatabaseCoordinatorConfig::new(&coordinator)
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(pending).unwrap(), pending_before);
+        assert_eq!(std::fs::read(&coordinator).unwrap(), coordinator_before);
+        assert_eq!(
+            std::fs::read(lsm.join("MANIFEST")).unwrap(),
+            manifest_before
+        );
+        assert_eq!(
+            std::fs::read_dir(&lsm)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>(),
+            entries_before,
+        );
+        assert_eq!(
+            std::fs::read_dir(lsm.join("sst"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>(),
+            sst_entries_before,
+        );
+        if held == "heap" {
+            assert_eq!(std::fs::read(&orphan).unwrap(), b"unpublished orphan");
+            assert_eq!(std::fs::read(&orphan_sst).unwrap(), b"unpublished sstable");
+        }
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "holder did not exit");
+            std::thread::yield_now();
+        }
+        assert!(child.wait().unwrap().success());
+        Database::open_storages_with_coordinator(
+            specs,
+            DatabaseCoordinatorConfig::new(&coordinator),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(pending).unwrap().len(),
+            pending_before.len() as u64 - 1
+        );
+        assert_eq!(
+            std::fs::metadata(&coordinator).unwrap().len(),
+            coordinator_before.len() as u64 - 1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_invalid_participant_rejects_before_coordinator_tail_repair() {
+    use std::io::{Seek, Write};
+
+    let root = std::env::temp_dir().join(format!(
+        "netbadb-mixed-invalid-recovery-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let heap = root.join("a.heap");
+    let lsm = root.join("z.lsm");
+    let coordinator = root.join("coordinator");
+    Database::create_storages_with_coordinator(
+        vec![
+            TableStorageCreateSpec::heap(&heap, table(1, "heap_items")),
+            TableStorageCreateSpec::lsm(&lsm, table(2, "lsm_items"), ColumnId(1)),
+        ],
+        DatabaseCoordinatorConfig::new(&coordinator),
+    )
+    .unwrap()
+    .close()
+    .unwrap();
+    let lsm_wal = lsm.join("wal-00000000000000000001.nblw");
+    let mut wal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&lsm_wal)
+        .unwrap();
+    wal.rewind().unwrap();
+    wal.write_all(b"X").unwrap();
+    drop(wal);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&coordinator)
+        .unwrap()
+        .write_all(b"C")
+        .unwrap();
+    let coordinator_before = std::fs::read(&coordinator).unwrap();
+    let heap_wal = netbadb_storage::wal_path(&heap);
+    let heap_before = std::fs::read(&heap_wal).unwrap();
+    assert!(
+        Database::open_storages_with_coordinator(
+            vec![
+                TableStorageOpenSpec::heap(&heap, table(1, "heap_items")),
+                TableStorageOpenSpec::lsm(&lsm, table(2, "lsm_items")),
+            ],
+            DatabaseCoordinatorConfig::new(&coordinator),
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&coordinator).unwrap(), coordinator_before);
+    assert_eq!(std::fs::read(&heap_wal).unwrap(), heap_before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_without_coordinator_checks_all_recovery_inputs_before_open() {
+    use std::io::{Seek, Write};
+
+    let root = std::env::temp_dir().join(format!(
+        "netbadb-mixed-no-coordinator-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let heap = root.join("a.heap");
+    let lsm = root.join("z.lsm");
+    Database::create_storages(vec![
+        TableStorageCreateSpec::heap(&heap, table(1, "heap_items")),
+        TableStorageCreateSpec::lsm(&lsm, table(2, "lsm_items"), ColumnId(1)),
+    ])
+    .unwrap()
+    .close()
+    .unwrap();
+    let heap_wal = netbadb_storage::wal_path(&heap);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&heap_wal)
+        .unwrap()
+        .write_all(b"W")
+        .unwrap();
+    let heap_before = std::fs::read(&heap_wal).unwrap();
+    let lsm_wal = lsm.join("wal-00000000000000000001.nblw");
+    let mut wal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&lsm_wal)
+        .unwrap();
+    wal.rewind().unwrap();
+    wal.write_all(b"X").unwrap();
+    drop(wal);
+    let specs = vec![
+        TableStorageOpenSpec::heap(&heap, table(1, "heap_items")),
+        TableStorageOpenSpec::lsm(&lsm, table(2, "lsm_items")),
+    ];
+    assert!(Database::open_storages(specs).is_err());
+    assert_eq!(std::fs::read(&heap_wal).unwrap(), heap_before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_catalog_rejects_second_core_with_subset_expectation() {
+    let root = std::env::temp_dir().join(format!(
+        "netbadb-mixed-metadata-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let catalog = root.join("catalog");
+    let coordinator = root.join("coordinator");
+    let heap = root.join("a.heap");
+    let lsm = root.join("z.lsm");
+    let database = Database::create_catalog(
+        &catalog,
+        vec![
+            TableStorageCreateSpec::heap(&heap, table(1, "heap_items")),
+            TableStorageCreateSpec::lsm(&lsm, table(2, "lsm_items"), ColumnId(1)),
+        ],
+        Some(DatabaseCoordinatorConfig::new(&coordinator)),
+    )
+    .unwrap();
+    let catalog_before = std::fs::read(&catalog).unwrap();
+    let coordinator_before = std::fs::read(&coordinator).unwrap();
+    let error = match Database::open_storages_with_coordinator(
+        vec![TableStorageOpenSpec::lsm(&lsm, table(2, "lsm_items"))],
+        DatabaseCoordinatorConfig::new(&coordinator),
+    ) {
+        Ok(_) => panic!("second Core instance acquired shared metadata"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("claim catalog ownership"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&catalog).unwrap(), catalog_before);
+    assert_eq!(std::fs::read(&coordinator).unwrap(), coordinator_before);
+    database.close().unwrap();
+    Database::open_catalog(&catalog).unwrap().close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_ownership_survives_database_drop_with_live_transaction() {
+    let root = std::env::temp_dir().join(format!(
+        "netbadb-mixed-metadata-lifetime-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let catalog = root.join("catalog");
+    let mut database = Database::create_catalog(
+        &catalog,
+        vec![
+            TableStorageCreateSpec::heap(root.join("a.heap"), table(1, "heap_items")),
+            TableStorageCreateSpec::lsm(root.join("z.lsm"), table(2, "lsm_items"), ColumnId(1)),
+        ],
+        Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
+    )
+    .unwrap();
+    let transaction = database.begin_transaction().unwrap();
+    drop(database);
+    let error = match Database::open_catalog(&catalog) {
+        Ok(_) => panic!("catalog owner was lost while transaction remained live"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("claim catalog ownership"),
+        "{error}"
+    );
+    drop(transaction);
+    Database::open_catalog(&catalog).unwrap().close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn lsm_sql_dml_access_paths_aggregates_and_reopen() {
     let (heap, lsm, coordinator) = paths("sql");

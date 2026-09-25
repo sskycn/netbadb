@@ -41,6 +41,7 @@ mod inspection;
 mod maintenance;
 #[cfg(test)]
 mod maintenance_tests;
+mod metadata_ownership;
 mod partition_catalog;
 mod physical_design;
 #[cfg(test)]
@@ -1431,6 +1432,7 @@ pub struct Database {
     published_visibility: Option<SharedPublishedVisibility>,
     catalog_generation: u64,
     catalog_path: Option<PathBuf>,
+    metadata_owners: Vec<Rc<metadata_ownership::MetadataOwner>>,
     mutation_journal: Option<schema_mutation::SharedMutationJournal>,
     schema_writer: schema_mutation::SchemaWriter,
     maintenance_cursor: Option<maintenance::MaintenanceCursor>,
@@ -1956,17 +1958,41 @@ impl Database {
     /// Any prepared participant is therefore a typed in-doubt error.
     fn physical_open_storages(
         specs: Vec<TableStorageOpenSpec>,
+        expected_ids: &[StorageId],
         committed: CommittedCatalogState,
         ownerships: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
     ) -> Result<Self, DatabaseError> {
         validate_open_specs(&specs)?;
-        let mut claimed = claim_heap_paths_with_existing(
-            specs.iter().filter_map(|spec| match spec {
-                TableStorageOpenSpec::Heap { path, .. } => Some(path.clone()),
-                TableStorageOpenSpec::Lsm { .. } => None,
-            }),
-            ownerships,
-        )?;
+        let (mut claimed, mut lsm_ownerships) = claim_mixed_participants(&specs, ownerships)?;
+        verify_mixed_catalog_identities(&specs, expected_ids, &claimed, &lsm_ownerships)?;
+        for spec in &specs {
+            let recovery = match spec {
+                TableStorageOpenSpec::Heap { path, table } => claimed
+                    .get(path)
+                    .ok_or(DatabaseError::EmptyCatalog)?
+                    .inspect_recovery(table)
+                    .map(|inspection| inspection.prepared_transactions)
+                    .map_err(StorageError::from)?,
+                TableStorageOpenSpec::Lsm { directory, table } => lsm_ownerships
+                    .get(directory)
+                    .ok_or(DatabaseError::EmptyCatalog)?
+                    .inspect_recovery(table)
+                    .map(|inspection| inspection.prepared_transactions)
+                    .map_err(StorageError::from)?,
+            };
+            if let Some(prepared) = recovery
+                .iter()
+                .find(|prepared| prepared.state == PreparedTransactionState::Prepared)
+            {
+                return Err(StorageError::Recovery(
+                    netbadb_storage::RecoveryError::PreparedTransactionRequiresResolution {
+                        database_txn_id: prepared.database_txn_id,
+                        physical_txn_id: prepared.physical_txn_id,
+                    },
+                )
+                .into());
+            }
+        }
         let mut storages = Vec::with_capacity(specs.len());
         for spec in specs {
             storages.push(match spec {
@@ -1978,7 +2004,13 @@ impl Database {
                     )?
                 }
                 TableStorageOpenSpec::Lsm { directory, table } => {
-                    TableStorage::open_lsm(directory, table)?
+                    TableStorage::open_lsm_with_ownership(
+                        lsm_ownerships
+                            .remove(&directory)
+                            .ok_or(DatabaseError::EmptyCatalog)?,
+                        table,
+                        &[],
+                    )?
                 }
             });
         }
@@ -1990,6 +2022,7 @@ impl Database {
     /// the coordinator decision log.
     fn physical_open_storages_with_coordinator(
         specs: Vec<TableStorageOpenSpec>,
+        expected_ids: &[StorageId],
         config: DatabaseCoordinatorConfig,
         committed: CommittedCatalogState,
         placements: Option<PartitionCatalog>,
@@ -2001,20 +2034,8 @@ impl Database {
                 config.log_path().to_owned(),
             ));
         }
-        let mut ownerships = claim_heap_paths_with_existing(
-            specs.iter().filter_map(|spec| match spec {
-                TableStorageOpenSpec::Heap { path, .. } => Some(path.clone()),
-                TableStorageOpenSpec::Lsm { .. } => None,
-            }),
-            existing,
-        )?;
-        let mut coordinator = CoordinatorLog::open(config.log_path())?;
-        let mut decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
-        decisions.sort_by_key(|decision| {
-            decision
-                .commit_seq
-                .map_or((0_u8, 0_u64), |sequence| (1, sequence.0))
-        });
+        let (mut ownerships, mut lsm_ownerships) = claim_mixed_participants(&specs, existing)?;
+        verify_mixed_catalog_identities(&specs, expected_ids, &ownerships, &lsm_ownerships)?;
         let mut inspected = Vec::with_capacity(specs.len());
         for spec in &specs {
             let recovery = match spec {
@@ -2030,7 +2051,11 @@ impl Database {
                     }
                 }
                 TableStorageOpenSpec::Lsm { directory, table } => {
-                    let recovery = TableStorage::inspect_lsm_recovery(directory, table)?;
+                    let recovery = lsm_ownerships
+                        .get(directory)
+                        .ok_or(DatabaseError::EmptyCatalog)?
+                        .inspect_recovery(table)
+                        .map_err(StorageError::from)?;
                     GenericRecoveryInspection {
                         storage_id: recovery.storage_id,
                         prepared_transactions: recovery.prepared_transactions,
@@ -2039,12 +2064,33 @@ impl Database {
             };
             inspected.push(GenericInspectedStorage { recovery });
         }
+        let (mut decisions, inspected_checkpoint) =
+            CoordinatorLog::inspect_recovery(config.log_path())?;
+        decisions.sort_by_key(|decision| {
+            decision
+                .commit_seq
+                .map_or((0_u8, 0_u64), |sequence| (1, sequence.0))
+        });
         validate_generic_coordinator_recovery(&decisions, &inspected, &config.retired_storage_ids)?;
         #[cfg(test)]
         crate::schema_mutation::handoff_pause(
             "inspected",
             ownerships.values().next().map(|owner| owner.path()),
         );
+
+        let mut coordinator = CoordinatorLog::open(config.log_path())?;
+        let mut opened_decisions = coordinator.decisions().cloned().collect::<Vec<_>>();
+        opened_decisions.sort_by_key(|decision| {
+            decision
+                .commit_seq
+                .map_or((0_u8, 0_u64), |sequence| (1, sequence.0))
+        });
+        if opened_decisions != decisions || coordinator.checkpoint() != inspected_checkpoint {
+            return Err(SchemaCatalogError::InventoryMismatch(
+                "coordinator recovery basis changed during admission",
+            )
+            .into());
+        }
 
         let mut maximum_database_txn_id = coordinator.database_txn_id_high_water().0;
         let checkpoint_high_water = coordinator
@@ -2072,8 +2118,10 @@ impl Database {
                     TableStorage::open_heap_with_ownership(ownership, table, Some(&resolutions))?
                 }
                 TableStorageOpenSpec::Lsm { directory, table } => {
-                    TableStorage::open_lsm_with_prepared_resolutions(
-                        directory,
+                    TableStorage::open_lsm_with_ownership(
+                        lsm_ownerships
+                            .remove(&directory)
+                            .ok_or(DatabaseError::EmptyCatalog)?,
                         table,
                         &resolutions,
                     )?
@@ -2541,6 +2589,7 @@ impl Database {
             published_visibility: None,
             catalog_generation: 0,
             catalog_path: None,
+            metadata_owners: Vec::new(),
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
@@ -2577,6 +2626,7 @@ impl Database {
             published_visibility,
             catalog_generation: 0,
             catalog_path: None,
+            metadata_owners: Vec::new(),
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
@@ -2630,6 +2680,7 @@ impl Database {
             published_visibility,
             catalog_generation: 0,
             catalog_path: None,
+            metadata_owners: Vec::new(),
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
@@ -2708,6 +2759,7 @@ impl Database {
             published_visibility,
             catalog_generation: 0,
             catalog_path: None,
+            metadata_owners: Vec::new(),
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,
@@ -4917,6 +4969,15 @@ impl Database {
         crate::coordinator_crash::maybe_crash("database-after-close-flush");
         for entry in self.registry.into_entries() {
             entry.storage.close()?;
+        }
+        for owner in &self.metadata_owners {
+            owner.release_after_clean_close().map_err(|e| {
+                DatabaseError::SchemaCatalog(schema_catalog::SchemaCatalogError::Io {
+                    operation: "release metadata ownership",
+                    path: self.catalog_path.clone().unwrap_or_default(),
+                    source: e,
+                })
+            })?;
         }
         Ok(())
     }
@@ -7362,6 +7423,105 @@ pub(crate) fn claim_heap_paths_with_existing(
     Ok(owners)
 }
 
+/// Claim every explicit mixed participant before opening any recovery writer.
+/// Sorting by pathname makes acquisition bounded and independent of caller order.
+type MixedOwners = (
+    BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+    BTreeMap<PathBuf, netbadb_storage::LsmOwnership>,
+);
+
+fn claim_mixed_participants(
+    specs: &[TableStorageOpenSpec],
+    existing: &mut BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+) -> Result<MixedOwners, DatabaseError> {
+    validate_open_specs(specs)?;
+    let mut heap = BTreeMap::new();
+    let mut lsm = BTreeMap::new();
+    let mut identities = BTreeSet::new();
+    let mut sorted = specs.iter().collect::<Vec<_>>();
+    sorted.sort_by(|a, b| a.path().cmp(b.path()));
+    for spec in sorted {
+        let (storage_id, table_id, fingerprint) = match spec {
+            TableStorageOpenSpec::Heap { path, .. } => {
+                let owner = match existing.remove(path) {
+                    Some(owner) => {
+                        owner.verify_path(path).map_err(StorageError::from)?;
+                        owner
+                    }
+                    None => {
+                        netbadb_storage::HeapOwnership::acquire(path).map_err(StorageError::from)?
+                    }
+                };
+                let identity = owner.inspect_identity().map_err(StorageError::from)?;
+                heap.insert(path.clone(), owner);
+                (
+                    identity.storage_id,
+                    identity.table_id,
+                    identity.schema_fingerprint,
+                )
+            }
+            TableStorageOpenSpec::Lsm { directory, .. } => {
+                let owner =
+                    netbadb_storage::LsmOwnership::acquire(directory).map_err(StorageError::Io)?;
+                let identity = owner.inspect_identity().map_err(StorageError::from)?;
+                lsm.insert(directory.clone(), owner);
+                (
+                    identity.storage_id,
+                    identity.table_id,
+                    identity.schema_fingerprint,
+                )
+            }
+        };
+        let expected = spec.table().fingerprint()?;
+        if table_id != spec.table().id || fingerprint != expected || !identities.insert(storage_id)
+        {
+            return Err(SchemaCatalogError::InventoryMismatch(
+                "mixed participant identity or schema conflict",
+            )
+            .into());
+        }
+    }
+    Ok((heap, lsm))
+}
+
+fn verify_mixed_catalog_identities(
+    specs: &[TableStorageOpenSpec],
+    expected_ids: &[StorageId],
+    heap: &BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+    lsm: &BTreeMap<PathBuf, netbadb_storage::LsmOwnership>,
+) -> Result<(), DatabaseError> {
+    if specs.len() != expected_ids.len() {
+        return Err(
+            SchemaCatalogError::InventoryMismatch("mixed catalog participant count").into(),
+        );
+    }
+    for (spec, expected) in specs.iter().zip(expected_ids) {
+        let actual = match spec {
+            TableStorageOpenSpec::Heap { path, .. } => {
+                heap.get(path)
+                    .ok_or(DatabaseError::EmptyCatalog)?
+                    .inspect_identity()
+                    .map_err(StorageError::from)?
+                    .storage_id
+            }
+            TableStorageOpenSpec::Lsm { directory, .. } => {
+                lsm.get(directory)
+                    .ok_or(DatabaseError::EmptyCatalog)?
+                    .inspect_identity()
+                    .map_err(StorageError::from)?
+                    .storage_id
+            }
+        };
+        if actual != *expected {
+            return Err(SchemaCatalogError::InventoryMismatch(
+                "mixed catalog storage id changed after discovery",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn create_explicit_storages(
     specs: Vec<TableStorageCreateSpec>,
 ) -> Result<(Schema, Vec<TableStorage>), DatabaseError> {
@@ -9187,6 +9347,7 @@ mod tests {
             published_visibility: None,
             catalog_generation: 0,
             catalog_path: None,
+            metadata_owners: Vec::new(),
             mutation_journal: None,
             schema_writer: Rc::new(std::cell::Cell::new(None)),
             maintenance_cursor: None,

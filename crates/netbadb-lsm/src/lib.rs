@@ -4,6 +4,7 @@ mod directory_ownership;
 mod engine;
 mod lsm_source_inspection;
 
+pub use directory_ownership::LsmOwnership;
 pub use engine::*;
 pub use lsm_source_inspection::LsmPhysicalDesignSourceInspection;
 

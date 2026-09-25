@@ -547,8 +547,10 @@ Offline catalog and statement inspection is documented in
 [`cmd/netbadb/README.md`](cmd/netbadb/README.md), and its machine-readable
 contract is [`docs/inspection-json-v1.md`](docs/inspection-json-v1.md). Direct
 Heap storage opens lock the durable data-file inode, and LSM storage opens lock
-the root directory inode across processes on Unix. Database-wide ownership is
-not yet implemented.
+the root directory inode across processes on Unix. Managed Core create/open
+holds stable catalog and coordinator ownership, and ordinary mixed Heap/LSM
+open claims all participants before recovery. Mixed schema mutation replay and
+low-level raw file entry points remain outside that admission boundary.
 The [storage ownership audit](docs/optimization-audit.md) records the remaining
 boundary.
 Stop `netbadbd` and every embedded process using the same catalog before

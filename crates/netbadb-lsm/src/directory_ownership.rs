@@ -10,6 +10,71 @@ pub(crate) struct DirectoryOwner {
     file: File,
 }
 
+/// Exclusive ownership of one existing LSM root, transferable to an LSM writer.
+/// The token is not cloneable and is consumed by `LsmStorage::open_with_ownership`.
+#[derive(Debug)]
+pub struct LsmOwnership {
+    root: PathBuf,
+    owner: DirectoryOwner,
+}
+
+impl LsmOwnership {
+    /// Claims the existing root directory inode without waiting. No recovery
+    /// files are changed by this call.
+    pub fn acquire(root: impl AsRef<Path>) -> io::Result<Self> {
+        let (root, owner) = DirectoryOwner::acquire(root.as_ref())?;
+        Ok(Self { root, owner })
+    }
+
+    /// Reads Manifest identity while the directory owner remains held.
+    pub fn inspect_identity(&self) -> Result<crate::LsmIdentityInspection, crate::LsmStorageError> {
+        self.verify_path()?;
+        let result = crate::LsmStorage::inspect_identity(&self.root)?;
+        self.verify_path()?;
+        Ok(result)
+    }
+
+    /// Reads prepared recovery state without applying it.
+    pub fn inspect_recovery(
+        &self,
+        table: &netbadb_schema::TableDef,
+    ) -> Result<crate::LsmRecoveryInspection, crate::LsmStorageError> {
+        self.verify_path()?;
+        let result = crate::LsmStorage::inspect_recovery(&self.root, table)?;
+        self.verify_path()?;
+        Ok(result)
+    }
+
+    #[cfg(unix)]
+    /// Rejects a root pathname that no longer names the locked inode.
+    pub fn verify_path(&self) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let named = self.root.symlink_metadata()?;
+        let held = self.owner.file.metadata()?;
+        if !named.is_dir() || named.dev() != held.dev() || named.ino() != held.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LSM root changed after ownership acquisition",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    /// Non-Unix platforms cannot verify this ownership capability.
+    pub fn verify_path(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "LSM ownership requires Unix flock",
+        ))
+    }
+
+    pub(crate) fn into_parts(self) -> io::Result<(PathBuf, DirectoryOwner)> {
+        self.verify_path()?;
+        Ok((self.root, self.owner))
+    }
+}
+
 impl DirectoryOwner {
     #[cfg(unix)]
     #[allow(unsafe_code)]
