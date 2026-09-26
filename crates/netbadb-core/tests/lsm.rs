@@ -465,20 +465,34 @@ fn metadata_ownership_survives_database_drop_with_live_transaction() {
         ],
         Some(DatabaseCoordinatorConfig::new(root.join("coordinator"))),
     )
-    .unwrap();
-    let transaction = database.begin_transaction().unwrap();
+    .expect("S1 create database");
+    let catalog_before = std::fs::read(&catalog).unwrap();
+    let coordinator = root.join("coordinator");
+    let coordinator_before = std::fs::read(&coordinator).unwrap();
+    let transaction = database.begin_transaction().expect("S2 begin transaction");
     drop(database);
     let error = match Database::open_catalog(&catalog) {
-        Ok(_) => panic!("catalog owner was lost while transaction remained live"),
+        Ok(_) => panic!("S4 catalog owner was lost while transaction remained live"),
         Err(error) => error,
     };
-    assert!(
-        error.to_string().contains("claim catalog ownership"),
-        "{error}"
-    );
+    match error {
+        netbadb_core::DatabaseError::SchemaCatalog(netbadb_core::SchemaCatalogError::Io {
+            operation: "claim catalog ownership",
+            path,
+            source,
+        }) => {
+            assert_eq!(path, catalog.canonicalize().unwrap());
+            assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(source.raw_os_error(), Some(libc::EWOULDBLOCK));
+        }
+        other => panic!("S4 unexpected ownership error: {other:?}"),
+    }
+    assert_eq!(std::fs::read(&catalog).unwrap(), catalog_before);
+    assert_eq!(std::fs::read(&coordinator).unwrap(), coordinator_before);
     drop(transaction);
-    Database::open_catalog(&catalog).unwrap().close().unwrap();
-    std::fs::remove_dir_all(root).unwrap();
+    let reopened = Database::open_catalog(&catalog).expect("S6 reopen after final transaction");
+    reopened.close().expect("S7 close reopened database");
+    std::fs::remove_dir_all(root).expect("S8 remove test resources");
 }
 
 #[test]
