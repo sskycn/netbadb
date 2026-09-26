@@ -2696,6 +2696,165 @@ fn create_and_drop_runtime_heap(db: &mut Database, name: &str) -> RetiredTableRe
         .unwrap()
 }
 
+// A completed link publication has no shadow. A valid leftover .next file is
+// possible at a publication crash boundary; keep its bytes as real link data.
+fn add_retired_link_shadow(inspection: &crate::RetiredHeapGcInspection) -> PathBuf {
+    let link = inspection
+        .components
+        .iter()
+        .find(|component| component.kind == crate::RetiredHeapGcComponentKind::CatalogLink)
+        .unwrap();
+    let shadow = inspection
+        .components
+        .iter()
+        .find(|component| component.kind == crate::RetiredHeapGcComponentKind::CatalogLinkShadow)
+        .unwrap();
+    assert!(link.present);
+    assert!(!shadow.present);
+    std::fs::copy(&link.path, &shadow.path).unwrap();
+    std::fs::File::open(&shadow.path)
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    crate::schema_catalog_file::sync_parent(&shadow.path).unwrap();
+    shadow.path.clone()
+}
+
+#[test]
+fn retired_heap_gc_processes_present_last_component_and_preserves_carrier_identity() {
+    let root = root("gc-present-link-shadow");
+    let mut db = seed(&root, true);
+    let retired = create_and_drop_runtime_heap(&mut db, "projects");
+    let shadow = add_retired_link_shadow(&db.inspect_retired_heap_gc(&retired).unwrap());
+    let unknown = root.join("unowned-neighbor");
+    std::fs::write(&unknown, b"unowned").unwrap();
+    let before = db.inspect_retired_heap_gc(&retired).unwrap();
+    assert_eq!(before.state, RetiredHeapGcState::Retained);
+    assert!(before.eligible(), "{:?}", before.blockers);
+    assert!(
+        before
+            .components
+            .last()
+            .is_some_and(|item| item.path == shadow && item.present)
+    );
+    let carrier_paths = before
+        .components
+        .iter()
+        .filter(|item| item.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock)
+        .map(|item| item.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(carrier_paths.len(), 2);
+    assert!(carrier_paths.iter().all(|path| path.is_file()));
+    let carrier_bytes = carrier_paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect::<Vec<_>>();
+    #[cfg(unix)]
+    let carrier_identity = {
+        use std::os::unix::fs::MetadataExt;
+        carrier_paths
+            .iter()
+            .map(|path| {
+                let metadata = std::fs::metadata(path).unwrap();
+                (metadata.dev(), metadata.ino())
+            })
+            .collect::<Vec<_>>()
+    };
+    let report = db.gc_retired_heap(&retired).unwrap();
+    assert_eq!(report.state, RetiredHeapGcState::Deleted);
+    assert_eq!(
+        report.files_deleted,
+        before
+            .components
+            .iter()
+            .filter(
+                |item| item.present && item.kind != crate::RetiredHeapGcComponentKind::WalOwnerLock
+            )
+            .count() as u64
+    );
+    assert_eq!(report.bytes_deleted, before.total_present_bytes);
+    assert!(!shadow.exists());
+    assert!(unknown.exists());
+    for item in &before.components {
+        assert_eq!(
+            item.path.exists(),
+            item.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock
+        );
+    }
+    // Each preserved carrier must still admit the ordinary public WAL owner.
+    for kind in [
+        crate::RetiredHeapGcComponentKind::Wal,
+        crate::RetiredHeapGcComponentKind::AlternateWal,
+    ] {
+        let wal = &before
+            .components
+            .iter()
+            .find(|item| item.kind == kind)
+            .unwrap()
+            .path;
+        netbadb_storage::WalManager::create(wal)
+            .unwrap()
+            .close()
+            .unwrap();
+        std::fs::remove_file(wal).unwrap();
+    }
+    crate::schema_catalog_file::sync_parent(&shadow).unwrap();
+    for (index, path) in carrier_paths.iter().enumerate() {
+        assert_eq!(std::fs::read(path).unwrap(), carrier_bytes[index]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(path).unwrap();
+            assert_eq!((metadata.dev(), metadata.ino()), carrier_identity[index]);
+        }
+    }
+    db.close().unwrap();
+    for _ in 0..3 {
+        let db = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(
+            db.inspect_retired_heap_gc(&retired).unwrap().state,
+            RetiredHeapGcState::Deleted
+        );
+        assert!(!shadow.exists());
+        db.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retired_heap_gc_accepts_missing_legacy_optional_alternate_carrier() {
+    let root = root("gc-legacy-missing-alternate-carrier");
+    let mut db = seed(&root, true);
+    let retired = create_and_drop_runtime_heap(&mut db, "projects");
+    let before = db.inspect_retired_heap_gc(&retired).unwrap();
+    let alternate = before
+        .components
+        .iter()
+        .filter(|item| item.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock)
+        .nth(1)
+        .unwrap()
+        .path
+        .clone();
+    assert!(alternate.exists());
+    std::fs::remove_file(&alternate).unwrap();
+    crate::schema_catalog_file::sync_parent(&alternate).unwrap();
+    let sparse = db.inspect_retired_heap_gc(&retired).unwrap();
+    assert_eq!(sparse.state, RetiredHeapGcState::Retained);
+    assert!(sparse.eligible(), "{:?}", sparse.blockers);
+    assert!(!sparse.components[4].present);
+    db.gc_retired_heap(&retired).unwrap();
+    db.close().unwrap();
+    for _ in 0..3 {
+        let db = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(
+            db.inspect_retired_heap_gc(&retired).unwrap().state,
+            RetiredHeapGcState::Deleted
+        );
+        db.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn retired_runtime_heap_gc_is_exact_durable_and_generation_neutral() {
     let root = root("retired-heap-gc");
@@ -3128,6 +3287,28 @@ fn completed_gc_rejects_reappeared_old_component() {
 }
 
 #[test]
+fn completed_gc_rejects_reappeared_link_shadow() {
+    let root = root("retired-heap-gc-reappeared-link-shadow");
+    let mut db = seed(&root, true);
+    let retired = create_and_drop_runtime_heap(&mut db, "projects");
+    let shadow = db
+        .inspect_retired_heap_gc(&retired)
+        .unwrap()
+        .components
+        .into_iter()
+        .find(|component| component.kind == crate::RetiredHeapGcComponentKind::CatalogLinkShadow)
+        .unwrap()
+        .path;
+    db.gc_retired_heap(&retired).unwrap();
+    db.close().unwrap();
+    std::fs::write(&shadow, b"unexpected shadow").unwrap();
+    for _ in 0..3 {
+        assert!(Database::open_catalog(root.join("catalog")).is_err());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn uncertain_gc_intent_sync_is_recovered_without_unexplained_deletion() {
     let root = root("retired-heap-gc-intent-sync");
     let mut db = seed(&root, true);
@@ -3236,6 +3417,14 @@ fn retired_heap_gc_crash_child() {
         .into_iter()
         .max_by_key(|resource| resource.storage_id)
         .unwrap();
+    if std::env::var_os("NETBADB_GC_FAIL_BEFORE_COMPONENT").is_some() {
+        assert!(db.gc_retired_heap(&retired).is_err());
+        assert_eq!(
+            db.inspect_retired_heap_gc(&retired).unwrap().state,
+            RetiredHeapGcState::Deleting
+        );
+        return;
+    }
     db.gc_retired_heap(&retired).unwrap();
     panic!("configured retired Heap GC crash hook was not reached");
 }
@@ -3295,6 +3484,145 @@ fn subprocess_retired_heap_gc_crash_matrix_converges_on_three_reopens() {
         }
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn gc_component_crash_labels_match_processed_file_state() {
+    use crate::RetiredHeapGcComponentKind as Kind;
+
+    let expected = [
+        (Kind::Owner, "gc-after-owner-delete"),
+        (Kind::Main, "gc-after-main-delete"),
+        (Kind::Wal, "gc-after-wal-delete"),
+        (Kind::WalOwnerLock, "gc-after-wal-owner-lock-preserved"),
+        (
+            Kind::WalOwnerLock,
+            "gc-after-alternate-wal-owner-lock-preserved",
+        ),
+        (Kind::TransactionStatus, "gc-after-status-delete"),
+        (Kind::AlternateWal, "gc-after-alternate-delete"),
+        (Kind::ChangeLog, "gc-after-change-log-delete"),
+        (
+            Kind::ChangeStreamGuard,
+            "gc-after-change-stream-guard-delete",
+        ),
+        (Kind::CatalogLink, "gc-after-link-delete"),
+        (Kind::CatalogLinkShadow, "gc-after-link-shadow-delete"),
+    ];
+    for (stopped_at, (_, point)) in expected.iter().enumerate() {
+        let root = root(&format!("gc-semantic-{point}"));
+        let mut db = seed(&root, true);
+        let mut create = db.begin_transaction().unwrap();
+        let table = db
+            .create_heap_table_legacy_in(
+                &mut create,
+                CreateTableSpec::new(
+                    "events",
+                    vec![CreateColumnSpec::new(
+                        "id",
+                        SemanticType::physical(PhysicalType::Int64),
+                        false,
+                    )],
+                ),
+            )
+            .unwrap();
+        db.commit_transaction(&mut create).unwrap();
+        drop(create);
+        db.enable_change_stream(table).unwrap();
+        db.execute("INSERT INTO events VALUES (1)").unwrap();
+        let target = db.resolve_drop_table("events").unwrap();
+        let mut drop_txn = db.begin_transaction().unwrap();
+        db.drop_table_legacy_in(&mut drop_txn, target).unwrap();
+        db.commit_transaction(&mut drop_txn).unwrap();
+        drop(drop_txn);
+        let retired = db
+            .inspect_retired_table_resources()
+            .into_iter()
+            .find(|item| item.table_id == table)
+            .unwrap();
+        add_retired_link_shadow(&db.inspect_retired_heap_gc(&retired).unwrap());
+        let before = db.inspect_retired_heap_gc(&retired).unwrap();
+        let heap = before
+            .components
+            .iter()
+            .find(|component| component.kind == Kind::Main)
+            .unwrap()
+            .path
+            .clone();
+        let actual = before
+            .components
+            .iter()
+            .map(|component| {
+                (
+                    component.kind,
+                    crate::schema_mutation::gc_component_crash_point(component, &heap).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "resource and crash order must agree");
+        assert!(before.components[7].present);
+        assert!(before.components[8].present);
+        assert!(before.components[10].present);
+        db.close().unwrap();
+        spawn_retired_heap_gc(&root, point);
+        for (index, component) in before.components.iter().enumerate() {
+            let remains =
+                component.present && (component.kind == Kind::WalOwnerLock || index > stopped_at);
+            assert_eq!(
+                component.path.exists(),
+                remains,
+                "{point}: {:?}",
+                component.kind
+            );
+        }
+        for _ in 0..3 {
+            let db = Database::open_catalog(root.join("catalog")).unwrap();
+            assert_eq!(
+                db.inspect_retired_heap_gc(&retired).unwrap().state,
+                RetiredHeapGcState::Deleted
+            );
+            db.close().unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn gc_last_component_failure_does_not_record_complete_and_reopens_to_finish() {
+    let root = root("gc-shadow-delete-failure");
+    let mut db = seed(&root, true);
+    let retired = create_and_drop_runtime_heap(&mut db, "projects");
+    let shadow = add_retired_link_shadow(&db.inspect_retired_heap_gc(&retired).unwrap());
+    db.close().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "schema_mutation_tests::retired_heap_gc_crash_child",
+            "--nocapture",
+        ])
+        .env("NETBADB_GC_CHILD_ROOT", &root)
+        .env(
+            "NETBADB_GC_FAIL_BEFORE_COMPONENT",
+            "gc-after-link-shadow-delete",
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(shadow.exists());
+    for _ in 0..3 {
+        let db = Database::open_catalog(root.join("catalog")).unwrap();
+        assert_eq!(
+            db.inspect_retired_heap_gc(&retired).unwrap().state,
+            RetiredHeapGcState::Deleted
+        );
+        assert!(!shadow.exists());
+        db.close().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

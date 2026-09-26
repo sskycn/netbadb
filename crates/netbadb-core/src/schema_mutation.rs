@@ -3800,19 +3800,12 @@ fn resume_gc_intent(
         return Err(SchemaMutationError::Corrupt("retired Heap catalog link mismatch").into());
     }
     crash("gc-before-first-delete");
-    const CRASH_POINTS: [&str; 10] = [
-        "gc-after-owner-delete",
-        "gc-after-main-delete",
-        "gc-after-wal-delete",
-        "gc-after-wal-owner-lock-preserved",
-        "gc-after-status-delete",
-        "gc-after-alternate-delete",
-        "gc-after-change-log-delete",
-        "gc-after-change-stream-guard-delete",
-        "gc-after-link-delete",
-        "gc-after-link-shadow-delete",
-    ];
-    for ((component, exists), crash_point) in components.iter().zip(present).zip(CRASH_POINTS) {
+    for (component, exists) in components.iter().zip(present) {
+        let crash_point = gc_component_crash_point(component, &heap)?;
+        #[cfg(test)]
+        if std::env::var("NETBADB_GC_FAIL_BEFORE_COMPONENT").as_deref() == Ok(crash_point) {
+            return Err(SchemaMutationError::Corrupt("injected GC component failure").into());
+        }
         if exists.is_some() && component.kind != RetiredHeapGcComponentKind::WalOwnerLock {
             std::fs::remove_file(&component.path).map_err(|error| {
                 file::io("delete retired Heap component", &component.path, error)
@@ -3836,6 +3829,35 @@ fn resume_gc_intent(
     }
     crash("gc-complete-durable");
     Ok(())
+}
+
+pub(crate) fn gc_component_crash_point(
+    component: &RetiredHeapGcComponent,
+    heap: &Path,
+) -> Result<&'static str, SchemaMutationError> {
+    Ok(match component.kind {
+        RetiredHeapGcComponentKind::Owner => "gc-after-owner-delete",
+        RetiredHeapGcComponentKind::Main => "gc-after-main-delete",
+        RetiredHeapGcComponentKind::Wal => "gc-after-wal-delete",
+        RetiredHeapGcComponentKind::WalOwnerLock => {
+            let wal = netbadb_storage::wal_path(heap);
+            if component.path == netbadb_storage::wal_owner_path(&wal) {
+                "gc-after-wal-owner-lock-preserved"
+            } else if component.path
+                == netbadb_storage::wal_owner_path(netbadb_storage::wal_alternate_path(&wal))
+            {
+                "gc-after-alternate-wal-owner-lock-preserved"
+            } else {
+                return Err(SchemaMutationError::Corrupt("unknown GC WAL owner carrier"));
+            }
+        }
+        RetiredHeapGcComponentKind::TransactionStatus => "gc-after-status-delete",
+        RetiredHeapGcComponentKind::AlternateWal => "gc-after-alternate-delete",
+        RetiredHeapGcComponentKind::ChangeLog => "gc-after-change-log-delete",
+        RetiredHeapGcComponentKind::ChangeStreamGuard => "gc-after-change-stream-guard-delete",
+        RetiredHeapGcComponentKind::CatalogLink => "gc-after-link-delete",
+        RetiredHeapGcComponentKind::CatalogLinkShadow => "gc-after-link-shadow-delete",
+    })
 }
 
 fn components(heap: &Path) -> Vec<(PathBuf, bool)> {
