@@ -1071,6 +1071,7 @@ mod tests {
     fn cleanup(path: &Path) {
         let _ = std::fs::remove_file(path);
         let wal = wal_path(path);
+        let _ = std::fs::remove_file(crate::wal_owner_path(&wal));
         let _ = std::fs::remove_file(crate::wal_alternate_path(&wal));
         let _ = std::fs::remove_file(wal);
     }
@@ -1589,7 +1590,7 @@ mod tests {
             RecoveryManager::recover(&mut pages, &mut wal, &records, false),
             Err(RecoveryError::Storage(_))
         ));
-        assert_eq!(read_page(&path, PageId(1)), original);
+        assert_eq!(pages.read_page(PageId(1)).unwrap(), original);
         cleanup(&path);
     }
 

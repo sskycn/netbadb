@@ -302,6 +302,7 @@ pub enum RetiredHeapGcComponentKind {
     CatalogLinkShadow = 7,
     ChangeLog = 8,
     ChangeStreamGuard = 9,
+    WalOwnerLock = 10,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1882,16 +1883,33 @@ impl Database {
             }
             crash("gc-intent-durable");
         }
-        let before = gc_components(&catalog, &intent)?
+        let before_components = gc_components(&catalog, &intent)?;
+        let before = before_components
             .into_iter()
             .map(|component| component_metadata(&component.path))
             .collect::<Result<Vec<_>, _>>()?;
-        let files_deleted = before.iter().filter(|bytes| bytes.is_some()).count() as u64;
-        let bytes_deleted = before.iter().try_fold(0_u64, |total, bytes| {
-            total
-                .checked_add(bytes.unwrap_or(0))
-                .ok_or(SchemaMutationError::Corrupt("GC byte count overflow"))
-        })?;
+        let before_components = gc_components(&catalog, &intent)?;
+        let files_deleted = before
+            .iter()
+            .zip(&before_components)
+            .filter(|(bytes, component)| {
+                bytes.is_some() && component.kind != RetiredHeapGcComponentKind::WalOwnerLock
+            })
+            .count() as u64;
+        let bytes_deleted =
+            before
+                .iter()
+                .zip(before_components)
+                .try_fold(0_u64, |total, (bytes, component)| {
+                    let deleted = if component.kind == RetiredHeapGcComponentKind::WalOwnerLock {
+                        0
+                    } else {
+                        bytes.unwrap_or(0)
+                    };
+                    total
+                        .checked_add(deleted)
+                        .ok_or(SchemaMutationError::Corrupt("GC byte count overflow"))
+                })?;
         resume_gc_intent(&catalog, &mut journal.borrow_mut(), &intent, &decisions)?;
         crash("gc-before-api-return");
         let coordinator_horizon = {
@@ -3055,6 +3073,9 @@ fn gc_components(
                     netbadb_storage::HeapResourceComponentKind::Wal => {
                         RetiredHeapGcComponentKind::Wal
                     }
+                    netbadb_storage::HeapResourceComponentKind::WalOwnerLock => {
+                        RetiredHeapGcComponentKind::WalOwnerLock
+                    }
                     netbadb_storage::HeapResourceComponentKind::TransactionStatus => {
                         RetiredHeapGcComponentKind::TransactionStatus
                     }
@@ -3111,7 +3132,9 @@ fn gc_manifest_digest(
     for component in components.iter().filter(|component| {
         !matches!(
             component.kind,
-            RetiredHeapGcComponentKind::ChangeLog | RetiredHeapGcComponentKind::ChangeStreamGuard
+            RetiredHeapGcComponentKind::ChangeLog
+                | RetiredHeapGcComponentKind::ChangeStreamGuard
+                | RetiredHeapGcComponentKind::WalOwnerLock
         )
     }) {
         digest.update([component.kind as u8, u8::from(component.required)]);
@@ -3586,16 +3609,21 @@ fn inspect_gc(
         if let Some(bytes) = component_metadata(&component.path)? {
             component.present = true;
             component.bytes = bytes;
-            total = total
-                .checked_add(bytes)
-                .ok_or(SchemaMutationError::Corrupt("GC byte count overflow"))?;
+            if component.kind != RetiredHeapGcComponentKind::WalOwnerLock {
+                total = total
+                    .checked_add(bytes)
+                    .ok_or(SchemaMutationError::Corrupt("GC byte count overflow"))?;
+            }
         } else if component.required && state == RetiredHeapGcState::Retained {
             blockers.push(RetiredHeapGcBlocker::RequiredComponentMissing {
                 kind: component.kind,
             });
         }
     }
-    if state == RetiredHeapGcState::Deleted && components.iter().any(|component| component.present)
+    if state == RetiredHeapGcState::Deleted
+        && components.iter().any(|component| {
+            component.present && component.kind != RetiredHeapGcComponentKind::WalOwnerLock
+        })
     {
         return Err(SchemaMutationError::Corrupt("deleted Heap component reappeared").into());
     }
@@ -3735,7 +3763,9 @@ fn resume_gc_intent(
         .map(|component| component_metadata(&component.path))
         .collect::<Result<Vec<_>, _>>()?;
     if gc.complete {
-        if present.iter().any(Option::is_some) {
+        if components.iter().zip(&present).any(|(component, present)| {
+            present.is_some() && component.kind != RetiredHeapGcComponentKind::WalOwnerLock
+        }) {
             return Err(SchemaMutationError::Corrupt("deleted Heap component reappeared").into());
         }
         return Ok(());
@@ -3770,10 +3800,11 @@ fn resume_gc_intent(
         return Err(SchemaMutationError::Corrupt("retired Heap catalog link mismatch").into());
     }
     crash("gc-before-first-delete");
-    const CRASH_POINTS: [&str; 9] = [
+    const CRASH_POINTS: [&str; 10] = [
         "gc-after-owner-delete",
         "gc-after-main-delete",
         "gc-after-wal-delete",
+        "gc-after-wal-owner-lock-preserved",
         "gc-after-status-delete",
         "gc-after-alternate-delete",
         "gc-after-change-log-delete",
@@ -3782,7 +3813,7 @@ fn resume_gc_intent(
         "gc-after-link-shadow-delete",
     ];
     for ((component, exists), crash_point) in components.iter().zip(present).zip(CRASH_POINTS) {
-        if exists.is_some() {
+        if exists.is_some() && component.kind != RetiredHeapGcComponentKind::WalOwnerLock {
             std::fs::remove_file(&component.path).map_err(|error| {
                 file::io("delete retired Heap component", &component.path, error)
             })?;
@@ -3813,9 +3844,119 @@ fn components(heap: &Path) -> Vec<(PathBuf, bool)> {
         (file::suffix(heap, ".owner"), true),
         (heap.to_owned(), true),
         (wal.clone(), true),
+        (netbadb_storage::wal_owner_path(&wal), true),
         (netbadb_storage::txn_status_path(heap), true),
         (netbadb_storage::wal_alternate_path(wal), false),
     ]
+}
+
+fn is_wal_owner_carrier(path: &Path, heap: &Path) -> bool {
+    path == netbadb_storage::wal_owner_path(netbadb_storage::wal_path(heap))
+}
+
+fn is_wal_owner_pair(source: &Path, destination: &Path, stage: &Path, final_path: &Path) -> bool {
+    source == netbadb_storage::wal_owner_path(netbadb_storage::wal_path(stage))
+        && destination == netbadb_storage::wal_owner_path(netbadb_storage::wal_path(final_path))
+}
+
+fn same_file_identity(left: &Path, right: &Path) -> Result<bool, SchemaMutationError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let left = std::fs::symlink_metadata(left)
+            .map_err(|error| file::io("inspect WAL owner carrier", left, error))?;
+        let right = std::fs::symlink_metadata(right)
+            .map_err(|error| file::io("inspect WAL owner carrier", right, error))?;
+        Ok(left.is_file()
+            && right.is_file()
+            && !left.file_type().is_symlink()
+            && !right.file_type().is_symlink()
+            && left.dev() == right.dev()
+            && left.ino() == right.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        Err(SchemaMutationError::Corrupt(
+            "WAL owner promotion requires Unix inode identity",
+        ))
+    }
+}
+
+fn recovery_owns_wal_carrier(
+    heap: &BTreeMap<PathBuf, netbadb_storage::HeapOwnership>,
+    stage: &Path,
+    final_path: &Path,
+    carrier: &Path,
+) -> Result<bool, DatabaseError> {
+    for path in [stage, final_path] {
+        if let Some(owner) = heap.get(path) {
+            if owner
+                .owns_wal_owner_path(carrier)
+                .map_err(netbadb_storage::StorageError::from)
+                .map_err(DatabaseError::Storage)?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn recovery_wal_binding(
+    heap: &Path,
+    stage: &Path,
+    final_path: &Path,
+    has_decision: bool,
+) -> Result<Vec<(PathBuf, PathBuf)>, SchemaMutationError> {
+    let staged_wal = netbadb_storage::wal_path(stage);
+    let final_wal = netbadb_storage::wal_path(final_path);
+    let is_target = heap == stage || heap == final_path;
+    let wal_root = if has_decision && is_target && exists_file(&staged_wal)? {
+        staged_wal.clone()
+    } else if has_decision && is_target && exists_file(&final_wal)? {
+        final_wal.clone()
+    } else {
+        netbadb_storage::wal_path(heap)
+    };
+    let staged_owner = netbadb_storage::wal_owner_path(netbadb_storage::wal_path(stage));
+    let final_owner = netbadb_storage::wal_owner_path(netbadb_storage::wal_path(final_path));
+    let default_owner = netbadb_storage::wal_owner_path(&wal_root);
+    let owner_path = if !is_target || exists_file(&default_owner)? {
+        default_owner
+    } else if exists_file(&staged_owner)? {
+        staged_owner
+    } else if exists_file(&final_owner)? {
+        final_owner
+    } else {
+        default_owner
+    };
+    let mut bindings = vec![(wal_root, owner_path)];
+    if is_target {
+        let staged_owner = netbadb_storage::wal_owner_path(&staged_wal);
+        let final_owner = netbadb_storage::wal_owner_path(&final_wal);
+        let staged_present = exists_file(&staged_wal)? || exists_file(&staged_owner)?;
+        let final_present = exists_file(&final_wal)? || exists_file(&final_owner)?;
+        if staged_present {
+            let binding = (staged_wal.clone(), staged_owner.clone());
+            if !bindings.contains(&binding) {
+                bindings.push(binding);
+            }
+        }
+        if final_present {
+            let binding = (final_wal.clone(), final_owner.clone());
+            if !bindings.contains(&binding) {
+                bindings.push(binding);
+            }
+        }
+        if exists_file(&staged_owner)?
+            && exists_file(&final_owner)?
+            && same_file_identity(&staged_owner, &final_owner)?
+        {
+            bindings.retain(|(_, owner)| owner != &staged_owner);
+        }
+    }
+    Ok(bindings)
 }
 
 fn promotion_components(heap: &Path) -> Vec<(PathBuf, bool)> {
@@ -3858,6 +3999,46 @@ fn inspect_private_create_entries(
         }
     }
     Ok(())
+}
+
+fn private_dir_has_only_wal_carriers(
+    catalog: &Path,
+    incarnation: [u8; 16],
+    transaction: DatabaseTxnId,
+    private: &Path,
+) -> Result<bool, SchemaMutationError> {
+    let entries = match std::fs::read_dir(private) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(
+                file::io("inspect retained private schema directory", private, error).into(),
+            );
+        }
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|error| file::io("inspect retained private schema entry", private, error))?
+            .path();
+        let storage = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".heap-wal.owner-lock"))
+            .and_then(|id| id.parse::<u64>().ok())
+            .map(StorageId);
+        let Some(storage) = storage else {
+            return Ok(false);
+        };
+        let stage = file::resolve(
+            catalog,
+            &stage_locator(catalog, incarnation, transaction, storage)?,
+        );
+        let expected = netbadb_storage::wal_owner_path(netbadb_storage::wal_path(&stage));
+        if path != expected || !exists_file(&path)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn validate_retired_resource(
@@ -3989,6 +4170,14 @@ pub(crate) fn promote_with_ownership(
     for ((source, required), (destination, _)) in &components {
         let source_exists = exists_file(source)?;
         let destination_exists = exists_file(destination)?;
+        if is_wal_owner_pair(source, destination, &stage, &final_path) {
+            if !source_exists && !destination_exists {
+                return Err(
+                    SchemaMutationError::Corrupt("winner WAL owner carrier is missing").into(),
+                );
+            }
+            continue;
+        }
         if source_exists && destination_exists {
             return Err(SchemaCatalogError::PathConflict(destination.clone()).into());
         }
@@ -3998,11 +4187,36 @@ pub(crate) fn promote_with_ownership(
             );
         }
     }
-    let ownership = match ownership {
+    ensure_parent(&final_path)?;
+    let mut ownership = match ownership {
         Some(ownership) => ownership,
         None => netbadb_storage::HeapOwnership::acquire(heap)
             .map_err(netbadb_storage::StorageError::from)?,
     };
+    let source_wal = netbadb_storage::wal_path(&stage);
+    let final_wal = netbadb_storage::wal_path(&final_path);
+    let source_wal_owner = netbadb_storage::wal_owner_path(&source_wal);
+    let final_wal_owner = netbadb_storage::wal_owner_path(&final_wal);
+    if exists_file(&source_wal_owner)? {
+        ownership
+            .add_wal_owner_binding(&source_wal, &source_wal_owner)
+            .map_err(netbadb_storage::StorageError::from)?;
+    }
+    if exists_file(&final_wal_owner)? {
+        ownership
+            .add_wal_owner_binding(&final_wal, &final_wal_owner)
+            .map_err(netbadb_storage::StorageError::from)?;
+    }
+    // The two names must exclude writers continuously while WAL and Heap
+    // companions move. When the final carrier is new, a hard link gives both
+    // entry paths the same flock inode before the first rename; an older
+    // distinct final carrier is acquired above and retained unchanged.
+    if exists_file(&source_wal_owner)? && !exists_file(&final_wal_owner)? {
+        std::fs::hard_link(&source_wal_owner, &final_wal_owner).map_err(|error| {
+            file::io("link promoted WAL owner carrier", &final_wal_owner, error)
+        })?;
+        file::sync_parent(&final_wal_owner)?;
+    }
     ownership
         .verify_path(heap)
         .map_err(netbadb_storage::StorageError::from)?;
@@ -4032,14 +4246,18 @@ pub(crate) fn promote_with_ownership(
         return Err(SchemaMutationError::Corrupt("staged owner identity mismatch").into());
     }
     validate_heap_identity(heap, reservation)?;
-    ensure_parent(&final_path)?;
     #[cfg(test)]
     handoff_pause("promotion-preflight", Some(&final_path));
     for (position, ((source, required), (destination, _))) in components.into_iter().enumerate() {
         let source_exists = exists_file(&source)?;
         let destination_exists = exists_file(&destination)?;
+        if is_wal_owner_pair(&source, &destination, &stage, &final_path) {
+            continue;
+        }
         match (source_exists, destination_exists) {
-            (true, true) => return Err(SchemaCatalogError::PathConflict(destination).into()),
+            (true, true) => {
+                return Err(SchemaCatalogError::PathConflict(destination).into());
+            }
             (false, false) if required => {
                 return Err(
                     SchemaMutationError::Corrupt("winner physical component is missing").into(),
@@ -4227,6 +4445,19 @@ pub(crate) fn cleanup_prepared(
         match std::fs::remove_dir(parent) {
             Ok(()) => file::sync_parent(parent)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                // A transaction can stage several Heap storages in this one
+                // directory. Keep their stable WAL carriers and the directory
+                // that names them; every other private entry remains an error.
+                if !private_dir_has_only_wal_carriers(
+                    catalog,
+                    incarnation,
+                    reservation.transaction,
+                    parent,
+                )? {
+                    return Err(file::io("remove private schema directory", parent, e).into());
+                }
+            }
             Err(e) => return Err(file::io("remove private schema directory", parent, e).into()),
         }
     }
@@ -4273,6 +4504,9 @@ pub(crate) fn cleanup_staged_loser(
     );
     validate_resource_path(catalog, &final_path)?;
     for (path, _) in components(&final_path) {
+        if is_wal_owner_carrier(&path, &final_path) {
+            continue;
+        }
         if exists_file(&path)? {
             return Err(SchemaMutationError::Corrupt(
                 "loser has a final physical resource",
@@ -4290,6 +4524,9 @@ pub(crate) fn cleanup_staged_loser(
     );
     validate_resource_path(catalog, &stage)?;
     for (path, _) in components(&stage) {
+        if is_wal_owner_carrier(&path, &stage) {
+            continue;
+        }
         remove_file(&path)?;
     }
     Ok(())
@@ -4508,17 +4745,16 @@ pub(crate) fn claim_mixed_create_recovery(
         let private = prepared.parent().ok_or(SchemaMutationError::Corrupt(
             "unmaterialized mixed create has no private directory",
         ))?;
-        match std::fs::symlink_metadata(private) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => {
-                return Err(SchemaMutationError::Corrupt(
-                    "unmaterialized mixed create has private resources",
-                )
-                .into());
-            }
-            Err(error) => {
-                return Err(file::io("inspect mixed create directory", private, error).into());
-            }
+        if !private_dir_has_only_wal_carriers(
+            catalog,
+            candidate.incarnation,
+            composition.transaction,
+            private,
+        )? {
+            return Err(SchemaMutationError::Corrupt(
+                "unmaterialized mixed create has private resources",
+            )
+            .into());
         }
         let journal_bytes = file::read(&journal.path)?;
         let coordinator_path = file::resolve(catalog, &journal.coordinator);
@@ -4601,17 +4837,16 @@ pub(crate) fn claim_mixed_create_recovery(
             });
         }
         crate::validate_generic_coordinator_recovery(&decisions, &inspected, &[])?;
-        match std::fs::symlink_metadata(private) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => {
-                return Err(SchemaMutationError::Corrupt(
-                    "unmaterialized mixed create acquired private resources",
-                )
-                .into());
-            }
-            Err(error) => {
-                return Err(file::io("recheck mixed create directory", private, error).into());
-            }
+        if !private_dir_has_only_wal_carriers(
+            catalog,
+            candidate.incarnation,
+            composition.transaction,
+            private,
+        )? {
+            return Err(SchemaMutationError::Corrupt(
+                "unmaterialized mixed create acquired private resources",
+            )
+            .into());
         }
         let (checked_decisions, checked_checkpoint) =
             CoordinatorLog::inspect_recovery(&coordinator_path)?;
@@ -4758,11 +4993,34 @@ pub(crate) fn claim_mixed_create_recovery(
             lsm.insert(path, owner);
         }
     }
+    for descriptor in &candidate.storages {
+        if !matches!(descriptor.kind, CatalogStorageKind::Heap) {
+            continue;
+        }
+        let path = file::resolve(catalog, &descriptor.locator);
+        if exists_file(&path)? {
+            let bindings = recovery_wal_binding(&path, &stage, &final_path, decision.is_some())?;
+            if let Some(owner) = heap.get_mut(&path) {
+                for (wal_root, owner_path) in bindings {
+                    owner
+                        .add_wal_owner_binding(wal_root, owner_path)
+                        .map_err(netbadb_storage::StorageError::from)?;
+                }
+            } else {
+                heap.insert(
+                    path.clone(),
+                    netbadb_storage::HeapOwnership::acquire_with_wal_bindings(&path, &bindings)
+                        .map_err(netbadb_storage::StorageError::from)?,
+                );
+            }
+        }
+    }
     for path in [&stage, &final_path] {
         if exists_file(path)? && !heap.contains_key(path) {
+            let bindings = recovery_wal_binding(path, &stage, &final_path, decision.is_some())?;
             heap.insert(
                 path.clone(),
-                netbadb_storage::HeapOwnership::acquire(path)
+                netbadb_storage::HeapOwnership::acquire_with_wal_bindings(path, &bindings)
                     .map_err(netbadb_storage::StorageError::from)?,
             );
         }
@@ -4898,6 +5156,14 @@ pub(crate) fn claim_mixed_create_recovery(
         {
             let source_exists = exists_file(&source)?;
             let destination_exists = exists_file(&destination)?;
+            if is_wal_owner_pair(&source, &destination, &stage, &final_path)
+                && source_exists
+                && destination_exists
+                && (same_file_identity(&source, &destination)?
+                    || recovery_owns_wal_carrier(&heap, &stage, &final_path, &destination)?)
+            {
+                continue;
+            }
             if source_exists && destination_exists {
                 return Err(SchemaCatalogError::PathConflict(destination).into());
             }
@@ -4913,6 +5179,9 @@ pub(crate) fn claim_mixed_create_recovery(
         }
     } else {
         for (path, _) in components(&final_path) {
+            if is_wal_owner_carrier(&path, &final_path) {
+                continue;
+            }
             if exists_file(&path)? {
                 return Err(SchemaMutationError::Corrupt(
                     "mixed CreateHeap loser has final resource",
@@ -5130,13 +5399,28 @@ pub(crate) fn claim_mixed_reservation_recovery(
         );
     }
 
+    let mut existing_heap = BTreeMap::new();
+    for descriptor in &candidate.storages {
+        if !matches!(descriptor.kind, CatalogStorageKind::Heap) {
+            continue;
+        }
+        let path = file::resolve(catalog, &descriptor.locator);
+        if exists_file(&path)? {
+            let bindings = recovery_wal_binding(&path, &stage, &final_path, decision.is_some())?;
+            existing_heap.insert(
+                path.clone(),
+                netbadb_storage::HeapOwnership::acquire_with_wal_bindings(&path, &bindings)
+                    .map_err(netbadb_storage::StorageError::from)?,
+            );
+        }
+    }
     let mut heap = crate::claim_heap_paths_with_existing(
         candidate
             .storages
             .iter()
             .filter(|storage| matches!(storage.kind, CatalogStorageKind::Heap))
             .map(|storage| file::resolve(catalog, &storage.locator)),
-        &mut BTreeMap::new(),
+        &mut existing_heap,
     )?;
     let mut lsm = BTreeMap::new();
     for descriptor in &candidate.storages {
@@ -5149,9 +5433,10 @@ pub(crate) fn claim_mixed_reservation_recovery(
     }
     for path in [&stage, &final_path] {
         if exists_file(path)? && !heap.contains_key(path) {
+            let bindings = recovery_wal_binding(path, &stage, &final_path, decision.is_some())?;
             heap.insert(
                 path.clone(),
-                netbadb_storage::HeapOwnership::acquire(path)
+                netbadb_storage::HeapOwnership::acquire_with_wal_bindings(path, &bindings)
                     .map_err(netbadb_storage::StorageError::from)?,
             );
         }
@@ -5288,6 +5573,14 @@ pub(crate) fn claim_mixed_reservation_recovery(
             {
                 let source_exists = exists_file(&source)?;
                 let destination_exists = exists_file(&destination)?;
+                if is_wal_owner_pair(&source, &destination, &stage, &final_path)
+                    && source_exists
+                    && destination_exists
+                    && (same_file_identity(&source, &destination)?
+                        || recovery_owns_wal_carrier(&heap, &stage, &final_path, &destination)?)
+                {
+                    continue;
+                }
                 if source_exists && destination_exists {
                     return Err(SchemaCatalogError::PathConflict(destination).into());
                 }
@@ -5303,6 +5596,9 @@ pub(crate) fn claim_mixed_reservation_recovery(
             }
         } else {
             for (path, _) in components(&final_path) {
+                if is_wal_owner_carrier(&path, &final_path) {
+                    continue;
+                }
                 if exists_file(&path)? {
                     return Err(SchemaMutationError::Corrupt(
                         "mixed reservation loser has final resource",
@@ -5317,17 +5613,16 @@ pub(crate) fn claim_mixed_reservation_recovery(
                 SchemaMutationError::Corrupt("unmaterialized mixed reservation has Heap").into(),
             );
         }
-        match std::fs::symlink_metadata(private) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => {
-                return Err(SchemaMutationError::Corrupt(
-                    "unmaterialized mixed reservation has private resources",
-                )
-                .into());
-            }
-            Err(error) => {
-                return Err(file::io("inspect unmaterialized reservation", private, error).into());
-            }
+        if !private_dir_has_only_wal_carriers(
+            catalog,
+            candidate.incarnation,
+            reservation.transaction,
+            private,
+        )? {
+            return Err(SchemaMutationError::Corrupt(
+                "unmaterialized mixed reservation has private resources",
+            )
+            .into());
         }
     }
     crate::validate_generic_coordinator_recovery(&decisions, &inspected, &[])?;
@@ -5384,13 +5679,15 @@ pub(crate) fn settled_mixed_create_only_history(
             let private = prepared.parent().ok_or(SchemaMutationError::Corrupt(
                 "settled mixed create has no private directory",
             ))?;
-            match std::fs::symlink_metadata(private) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Ok(_) => return Ok(false),
-                Err(error) => {
-                    return Err(file::io("inspect settled create directory", private, error).into());
-                }
+            if private_dir_has_only_wal_carriers(
+                catalog,
+                active.incarnation,
+                composition.transaction,
+                private,
+            )? {
+                continue;
             }
+            return Ok(false);
         }
         let Some(intent) = composition.table_intent.as_ref() else {
             return Ok(false);
@@ -5432,6 +5729,9 @@ pub(crate) fn settled_mixed_create_only_history(
             validate_resource_path(catalog, &stage)?;
             validate_resource_path(catalog, &final_path)?;
             for (path, _) in components(&stage) {
+                if is_wal_owner_carrier(&path, &stage) {
+                    continue;
+                }
                 if exists_file(&path)? {
                     return Ok(false);
                 }
@@ -5462,14 +5762,13 @@ pub(crate) fn settled_mixed_create_only_history(
         let private_directory = prepared.parent().ok_or(SchemaMutationError::Corrupt(
             "prepared create has no private directory",
         ))?;
-        match std::fs::symlink_metadata(private_directory) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => return Ok(false),
-            Err(error) => {
-                return Err(
-                    file::io("inspect private create directory", private_directory, error).into(),
-                );
-            }
+        if !private_dir_has_only_wal_carriers(
+            catalog,
+            active.incarnation,
+            intent.transaction,
+            private_directory,
+        )? {
+            return Ok(false);
         }
     }
     let coordinator_path = file::resolve(catalog, &journal.coordinator);
@@ -5557,6 +5856,9 @@ fn settled_mixed_reservation_history(
             validate_resource_path(catalog, path)?;
         }
         for (path, _) in components(&stage) {
+            if is_wal_owner_carrier(&path, &stage) {
+                continue;
+            }
             if exists_file(&path)? {
                 return Ok(false);
             }
@@ -5564,12 +5866,13 @@ fn settled_mixed_reservation_history(
         let private = prepared.parent().ok_or(SchemaMutationError::Corrupt(
             "settled reservation has no private directory",
         ))?;
-        match std::fs::symlink_metadata(private) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => return Ok(false),
-            Err(error) => {
-                return Err(file::io("inspect settled reservation", private, error).into());
-            }
+        if !private_dir_has_only_wal_carriers(
+            catalog,
+            active.incarnation,
+            reservation.transaction,
+            private,
+        )? {
+            return Ok(false);
         }
         let decision = decisions
             .iter()
@@ -5626,6 +5929,9 @@ fn settled_mixed_reservation_history(
                 return Ok(false);
             }
             for (path, _) in components(&final_path) {
+                if is_wal_owner_carrier(&path, &final_path) {
+                    continue;
+                }
                 if exists_file(&path)? {
                     return Ok(false);
                 }

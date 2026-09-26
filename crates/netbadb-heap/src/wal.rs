@@ -351,6 +351,9 @@ pub struct WalRecord {
 #[derive(Debug)]
 pub struct WalManager {
     file: File,
+    // Stable across WAL generation replacement. Its adjacent path is moved
+    // with the logical WAL during Heap promotion and is never unlinked.
+    ownership: Option<WalOwnership>,
     root_path: PathBuf,
     path: PathBuf,
     generation: u64,
@@ -375,6 +378,232 @@ pub struct WalManager {
     fail_next_rotation_after: Option<usize>,
 }
 
+/// Exclusive ownership of one logical WAL root, independent of its current
+/// generation inode. This is crate-private so callers cannot bypass Heap's
+/// coordinated data/WAL admission.
+#[derive(Debug)]
+pub(crate) struct WalOwnership {
+    file: File,
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl WalOwnership {
+    #[allow(unsafe_code)]
+    pub(crate) fn acquire(root: &Path) -> Result<Self, WalError> {
+        Self::acquire_with_owner_path(root, &wal_owner_path(root))
+    }
+
+    #[allow(unsafe_code)]
+    pub(crate) fn acquire_with_owner_path(
+        root: &Path,
+        owner_path: &Path,
+    ) -> Result<Self, WalError> {
+        let root = canonical_root_path(root)?;
+        let path = canonical_path(owner_path)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let parent = parent.canonicalize()?;
+        let name = path.file_name().ok_or_else(|| {
+            WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL root has no filename",
+            ))
+        })?;
+        let path = parent.join(name);
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options.open(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "WAL owner must be a regular file",
+                )));
+            }
+            loop {
+                // SAFETY: the live File owns this descriptor; flock retains no Rust pointer.
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if result == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(WalError::Io(error));
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "WAL ownership requires Unix flock",
+        )));
+        Ok(Self { file, root, path })
+    }
+
+    pub(crate) fn duplicate(&self) -> Result<Self, WalError> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            root: self.root.clone(),
+            path: self.path.clone(),
+        })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn names_same_inode(&self, path: &Path) -> Result<bool, WalError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = self.file.metadata()?;
+            let named = match path.symlink_metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(WalError::Io(error)),
+            };
+            Ok(named.is_file()
+                && !named.file_type().is_symlink()
+                && named.dev() == held.dev()
+                && named.ino() == held.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "WAL ownership requires Unix inode identity",
+            )))
+        }
+    }
+
+    pub(crate) fn retire_alias(&self, path: &Path) -> Result<(), WalError> {
+        if !self.names_same_inode(path)? {
+            return Err(WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL owner alias does not name the held owner inode",
+            )));
+        }
+        std::fs::remove_file(path)?;
+        sync_parent_directory(path)
+    }
+
+    pub(crate) fn retire(self) -> Result<(), WalError> {
+        self.verify_current()?;
+        std::fs::remove_file(&self.path)?;
+        sync_parent_directory(&self.path)
+    }
+
+    pub(crate) fn verify_root(&self, root: &Path) -> Result<(), WalError> {
+        if self.root != canonical_root_path(root)? {
+            return Err(WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL owner path does not match the logical WAL root",
+            )));
+        }
+        self.verify_current()
+    }
+
+    pub(crate) fn verify_current(&self) -> Result<(), WalError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = self.file.metadata()?;
+            let named = self.path.symlink_metadata()?;
+            if !named.is_file()
+                || named.file_type().is_symlink()
+                || named.dev() != held.dev()
+                || named.ino() != held.ino()
+            {
+                return Err(WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "WAL owner path does not name the held owner inode",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rebind(mut self, root: &Path) -> Result<Self, WalError> {
+        let next_root = canonical_root_path(root)?;
+        let next = canonical_path(&wal_owner_path(root))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = self.file.metadata()?;
+            let named = next.symlink_metadata()?;
+            if !named.is_file()
+                || named.file_type().is_symlink()
+                || named.dev() != held.dev()
+                || named.ino() != held.ino()
+            {
+                return Err(WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "promoted WAL owner path does not name the held owner inode",
+                )));
+            }
+        }
+        self.root = next_root;
+        self.path = next;
+        Ok(self)
+    }
+
+    #[allow(unsafe_code)]
+    fn unlock(&self) -> Result<(), WalError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: File owns the live descriptor for the duration of this call.
+            let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+            if result != 0 {
+                return Err(WalError::Io(std::io::Error::last_os_error()));
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "WAL ownership requires Unix flock",
+        )));
+        Ok(())
+    }
+}
+
+fn canonical_root_path(root: &Path) -> Result<PathBuf, WalError> {
+    canonical_path(root)
+}
+
+fn canonical_path(path: &Path) -> Result<PathBuf, WalError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .canonicalize()?;
+    let name = path.file_name().ok_or_else(|| {
+        WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "WAL root has no filename",
+        ))
+    })?;
+    Ok(parent.join(name))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalHeader {
     generation: u64,
@@ -386,6 +615,7 @@ struct WalHeader {
 impl WalManager {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, WalError> {
         let root_path = path.as_ref().to_owned();
+        let ownership = WalOwnership::acquire(&root_path)?;
         let alternate_path = wal_alternate_path(&root_path);
         if alternate_path.try_exists()? {
             return Err(WalError::GenerationConflict);
@@ -412,6 +642,7 @@ impl WalManager {
         }
         Self::from_scan(
             file,
+            Some(ownership),
             root_path.clone(),
             root_path,
             header,
@@ -421,19 +652,45 @@ impl WalManager {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let (manager, _, _) = Self::open_selected(path.as_ref(), TailPolicy::Reject, true)?;
+        let ownership = WalOwnership::acquire(path.as_ref())?;
+        let (manager, _, _) =
+            Self::open_selected(path.as_ref(), TailPolicy::Reject, true, Some(ownership))?;
         Ok(manager)
     }
 
+    pub(crate) fn open_for_recovery_with_ownership(
+        path: impl AsRef<Path>,
+        ownership: WalOwnership,
+    ) -> Result<(Self, Vec<WalRecord>, bool), WalError> {
+        ownership.verify_root(path.as_ref())?;
+        Self::open_selected(
+            path.as_ref(),
+            TailPolicy::AllowIncompleteFinalRecord,
+            true,
+            Some(ownership),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn open_for_recovery(
         path: impl AsRef<Path>,
     ) -> Result<(Self, Vec<WalRecord>, bool), WalError> {
-        Self::open_selected(path.as_ref(), TailPolicy::AllowIncompleteFinalRecord, true)
+        let ownership = WalOwnership::acquire(path.as_ref())?;
+        Self::open_selected(
+            path.as_ref(),
+            TailPolicy::AllowIncompleteFinalRecord,
+            true,
+            Some(ownership),
+        )
     }
 
     pub(crate) fn inspect_for_recovery(path: impl AsRef<Path>) -> Result<Vec<WalRecord>, WalError> {
-        let (_, records, _) =
-            Self::open_selected(path.as_ref(), TailPolicy::AllowIncompleteFinalRecord, false)?;
+        let (_, records, _) = Self::open_selected(
+            path.as_ref(),
+            TailPolicy::AllowIncompleteFinalRecord,
+            false,
+            None,
+        )?;
         Ok(records)
     }
 
@@ -441,8 +698,17 @@ impl WalManager {
         root_path: &Path,
         tail_policy: TailPolicy,
         allow_mutation: bool,
+        ownership: Option<WalOwnership>,
     ) -> Result<(Self, Vec<WalRecord>, bool), WalError> {
         let root_path = root_path.to_owned();
+        if let Some(ownership) = &ownership {
+            ownership.verify_root(&root_path)?;
+        } else if allow_mutation {
+            return Err(WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a writable WAL open requires logical WAL ownership",
+            )));
+        }
         let alternate_path = wal_alternate_path(&root_path);
         let mut candidates = Vec::new();
         let mut failures = Vec::new();
@@ -520,12 +786,21 @@ impl WalManager {
             }
         }
         let records = scan.records;
-        let manager = Self::from_scan(file, root_path, path, header, &records, scan.valid_end)?;
+        let manager = Self::from_scan(
+            file,
+            ownership,
+            root_path,
+            path,
+            header,
+            &records,
+            scan.valid_end,
+        )?;
         Ok((manager, records, scan.incomplete_tail))
     }
 
     fn from_scan(
         file: File,
+        ownership: Option<WalOwnership>,
         root_path: PathBuf,
         path: PathBuf,
         header: WalHeader,
@@ -553,6 +828,7 @@ impl WalManager {
         let next_txn_id = TxnId(header.next_txn_id.0.max(records_next_txn_id));
         Ok(Self {
             file,
+            ownership,
             root_path,
             path,
             generation: header.generation,
@@ -841,6 +1117,29 @@ impl WalManager {
         Ok(())
     }
 
+    pub(crate) fn duplicate_ownership(&self) -> Result<WalOwnership, WalError> {
+        self.ownership
+            .as_ref()
+            .ok_or_else(|| {
+                WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "read-only WAL inspection has no mutation ownership",
+                ))
+            })?
+            .duplicate()
+    }
+
+    pub(crate) fn release_ownership_after_clean_close(&mut self) -> Result<(), WalError> {
+        self.ensure_healthy()?;
+        if let Some(written) = self.written_lsn {
+            self.flush_through(written)?;
+        }
+        if let Some(ownership) = self.ownership.take() {
+            ownership.unlock()?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_generation_exhaustion(&mut self) {
         self.next_lsn = Lsn(u64::MAX);
@@ -894,6 +1193,18 @@ pub fn wal_path(database_path: impl AsRef<Path>) -> PathBuf {
 pub fn wal_alternate_path(wal_root_path: impl AsRef<Path>) -> PathBuf {
     let mut path = wal_root_path.as_ref().as_os_str().to_os_string();
     path.push(".next");
+    PathBuf::from(path)
+}
+
+#[must_use]
+/// Returns the stable ownership carrier path for a logical WAL root.
+///
+/// The carrier is separate from WAL generation files so rotation cannot drop
+/// writer exclusion. It is retained across close and removed only as part of
+/// deleting an isolated test/resource namespace after all owners have ended.
+pub fn wal_owner_path(wal_root_path: impl AsRef<Path>) -> PathBuf {
+    let mut path = wal_root_path.as_ref().as_os_str().to_os_string();
+    path.push(".owner-lock");
     PathBuf::from(path)
 }
 

@@ -725,12 +725,10 @@ fn heap_schema_rewrite_preserves_index_and_join_planner_paths() {
         retired.old_storage_id.0, active_storage.0, report.files_deleted, report.bytes_deleted
     );
     assert_eq!(report.bytes_deleted, before_gc.total_present_bytes);
-    assert!(
-        before_gc
-            .components
-            .iter()
-            .all(|component| !component.path.exists())
-    );
+    assert!(before_gc.components.iter().all(|component| {
+        component.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock
+            || !component.path.exists()
+    }));
     assert_eq!(heap_bundle_bytes(&active_path), active_bundle);
     assert_eq!(
         db.indexes(table)
@@ -954,6 +952,7 @@ fn heap_schema_rewrite_all_operations_preserve_logical_id_and_advance_physical_i
             &resource.old_relative_locator,
         );
         let bundle = heap_bundle_bytes(&path);
+        let owner_lock = netbadb_storage::wal_owner_path(netbadb_storage::wal_path(&path));
         let inspection = db.inspect_replacement_retired_heap_gc(resource).unwrap();
         assert!(inspection.eligible(), "{:?}", inspection.blockers);
         let report = db.gc_replacement_retired_heap(resource).unwrap();
@@ -962,7 +961,7 @@ fn heap_schema_rewrite_all_operations_preserve_logical_id_and_advance_physical_i
         assert!(
             heap_bundle_bytes(&path)
                 .iter()
-                .all(|(_, bytes)| bytes.is_none())
+                .all(|(component_path, bytes)| component_path == &owner_lock || bytes.is_none())
         );
     }
     assert_eq!(db.inspect_replacement_retired_heaps().len(), 7);
@@ -2709,6 +2708,14 @@ fn retired_runtime_heap_gc_is_exact_durable_and_generation_neutral() {
     assert!(inspection.components.iter().any(|component| {
         component.kind == crate::RetiredHeapGcComponentKind::Main && component.present
     }));
+    let wal_owner_lock = inspection
+        .components
+        .iter()
+        .find(|component| component.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock)
+        .expect("retired Heap manifest includes stable WAL owner lock")
+        .path
+        .clone();
+    assert!(wal_owner_lock.exists());
     let component_paths = inspection
         .components
         .iter()
@@ -2722,7 +2729,15 @@ fn retired_runtime_heap_gc_is_exact_durable_and_generation_neutral() {
     assert_eq!(report.state, RetiredHeapGcState::Deleted);
     assert!(report.files_deleted >= 5);
     assert!(report.bytes_deleted > 0);
-    assert!(component_paths.iter().all(|path| !path.exists()));
+    assert!(
+        component_paths
+            .iter()
+            .all(|path| path == &wal_owner_lock || !path.exists())
+    );
+    assert!(
+        wal_owner_lock.exists(),
+        "GC preserves the stable owner carrier"
+    );
     assert_eq!(
         (
             db.schema_generation(),
@@ -2746,7 +2761,17 @@ fn retired_runtime_heap_gc_is_exact_durable_and_generation_neutral() {
         let db = Database::open_catalog(root.join("catalog")).unwrap();
         let inspection = db.inspect_retired_heap_gc(&retired).unwrap();
         assert_eq!(inspection.state, RetiredHeapGcState::Deleted);
-        assert_eq!(inspection.total_present_bytes, 0);
+        assert!(wal_owner_lock.exists());
+        assert_eq!(
+            inspection
+                .components
+                .iter()
+                .filter(
+                    |component| component.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock
+                )
+                .count(),
+            1
+        );
         db.close().unwrap();
     }
     std::fs::remove_dir_all(root).unwrap();
@@ -2797,13 +2822,11 @@ fn retired_heap_gc_removes_enabled_change_stream_history_and_guard() {
                 .any(|component| component.kind == kind && component.present)
         );
     }
-    let paths = inspection
-        .components
-        .iter()
-        .map(|component| component.path.clone())
-        .collect::<Vec<_>>();
     db.gc_retired_heap(&retired).unwrap();
-    assert!(paths.iter().all(|path| !path.exists()));
+    assert!(inspection.components.iter().all(|component| {
+        component.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock
+            || !component.path.exists()
+    }));
     db.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -2898,7 +2921,13 @@ fn retired_heap_gc_never_touches_same_name_recreation_with_index() {
     );
     assert_eq!(
         report.files_deleted,
-        before.components.iter().filter(|item| item.present).count() as u64
+        before
+            .components
+            .iter()
+            .filter(|item| {
+                item.present && item.kind != crate::RetiredHeapGcComponentKind::WalOwnerLock
+            })
+            .count() as u64
     );
     assert_eq!(report.bytes_deleted, before.total_present_bytes);
     assert_eq!(db.indexes(replacement).unwrap().len(), 1);
@@ -3053,7 +3082,10 @@ fn retired_heap_gc_waits_for_the_complete_coordinator_horizon() {
     assert_eq!(eligible.coordinator_horizon, Some(horizon));
     assert!(eligible.eligible(), "{:?}", eligible.blockers);
     db.gc_retired_heap(&retired).unwrap();
-    assert!(paths.iter().all(|path| !path.exists()));
+    assert!(eligible.components.iter().all(|component| {
+        component.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock
+            || !component.path.exists()
+    }));
     db.close().unwrap();
     for _ in 0..3 {
         let reopened = Database::open_catalog(root.join("catalog")).unwrap();
@@ -3161,12 +3193,10 @@ fn one_hundred_create_drop_gc_cycles_bound_physical_growth_and_never_reuse_ids()
         previous_storage = retired.storage_id;
         let inspection = db.inspect_retired_heap_gc(&retired).unwrap();
         db.gc_retired_heap(&retired).unwrap();
-        assert!(
-            inspection
-                .components
-                .iter()
-                .all(|component| !component.path.exists())
-        );
+        assert!(inspection.components.iter().all(|component| {
+            component.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock
+                || !component.path.exists()
+        }));
     }
     assert_eq!(previous_storage, StorageId(102));
     assert_eq!(db.next_storage_id(), Some(StorageId(103)));
@@ -3933,13 +3963,14 @@ fn handoff_rival_child() {
         Ok("teams") => old_table(2, "teams"),
         _ => promoted_project_table(),
     };
-    let error = TableStorage::open_heap(path, table)
+    let error = TableStorage::open_heap(&path, table)
         .expect_err("handoff owns the staged or promoted inode");
     assert!(matches!(
         error,
         netbadb_storage::StorageError::Io(source)
             if source.kind() == std::io::ErrorKind::WouldBlock
     ));
+    assert!(netbadb_storage::WalManager::open(netbadb_storage::wal_path(&path)).is_err());
 }
 
 #[cfg(unix)]
@@ -5359,12 +5390,14 @@ fn staged_handoff_rejects_occupied_target_before_moving_any_component() {
         .join("storage")
         .join(stage.file_name().unwrap());
     std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
-    let holder = TableStorage::create_heap_with_storage_id(
-        &final_path,
-        promoted_project_table(),
-        StorageId(999),
-    )
-    .unwrap();
+    // Simulate an out-of-band target arrival after promotion preflight. A
+    // cooperating Heap writer is correctly excluded by the pre-acquired WAL
+    // carrier, so write only the conflicting target bytes for this race test.
+    std::fs::write(&final_path, b"foreign target heap").unwrap();
+    let wal_path = netbadb_storage::wal_path(&final_path);
+    let status_path = netbadb_storage::txn_status_path(&final_path);
+    std::fs::write(&wal_path, b"foreign target wal").unwrap();
+    std::fs::write(&status_path, b"foreign target status").unwrap();
     let before = [
         stage.clone(),
         netbadb_storage::wal_path(&stage),
@@ -5392,12 +5425,7 @@ fn staged_handoff_rejects_occupied_target_before_moving_any_component() {
             .collect::<std::collections::BTreeSet<_>>(),
         stage_entries_before
     );
-    holder.close().unwrap();
-    for path in [
-        final_path.clone(),
-        netbadb_storage::wal_path(&final_path),
-        netbadb_storage::txn_status_path(&final_path),
-    ] {
+    for path in [final_path.clone(), wal_path, status_path] {
         std::fs::remove_file(path).unwrap();
     }
     outcome(&root, true);
@@ -5432,15 +5460,15 @@ fn target_created_after_promotion_preflight_is_never_overwritten() {
         .map(Result::unwrap)
         .find_map(|line| line.strip_prefix(marker).map(PathBuf::from))
         .expect("promotion passed its no-conflict preflight");
-    let holder = TableStorage::create_heap_with_storage_id(
-        &final_path,
-        promoted_project_table(),
-        StorageId(999),
-    )
-    .unwrap();
+    // The preflight barrier already owns the target WAL carrier. Model a
+    // non-cooperating late path arrival with raw bytes so this still exercises
+    // the atomic no-replace rename guard.
+    std::fs::write(&final_path, b"foreign target heap").unwrap();
     let target_before = std::fs::read(&final_path).unwrap();
     let wal_path = netbadb_storage::wal_path(&final_path);
     let status_path = netbadb_storage::txn_status_path(&final_path);
+    std::fs::write(&wal_path, b"foreign target wal").unwrap();
+    std::fs::write(&status_path, b"foreign target status").unwrap();
     let wal_before = std::fs::read(&wal_path).unwrap();
     let status_before = std::fs::read(&status_path).unwrap();
     child.stdin.take().unwrap().write_all(b"x").unwrap();
@@ -5449,7 +5477,6 @@ fn target_created_after_promotion_preflight_is_never_overwritten() {
     assert_eq!(std::fs::read(&final_path).unwrap(), target_before);
     assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
     assert_eq!(std::fs::read(&status_path).unwrap(), status_before);
-    holder.close().unwrap();
     for path in [final_path, wal_path, status_path] {
         std::fs::remove_file(path).unwrap();
     }
@@ -5882,12 +5909,10 @@ fn rewrite_crash_recovery_does_not_require_a_deleted_ancestor() {
                 .inspect_replacement_retired_heap_gc(&deleted)
                 .unwrap();
             assert_eq!(inspection.state, RetiredHeapGcState::Deleted);
-            assert!(
-                inspection
-                    .components
-                    .iter()
-                    .all(|component| !component.present)
-            );
+            assert!(inspection.components.iter().all(|component| {
+                component.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock
+                    || !component.present
+            }));
             reopened.close().unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();

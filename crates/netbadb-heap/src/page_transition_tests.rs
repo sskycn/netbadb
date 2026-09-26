@@ -815,8 +815,10 @@ fn transition_cached_claim_rejects_changed_disk_identity() {
     // The remaining candidate was fully scanned and cached; change only its
     // physical incarnation, with a valid CRC, to exercise local revalidation.
     let id = PageId(4);
-    let mut disk = PageManager::open(&path).unwrap();
-    let before = disk.read_page(id).unwrap();
+    let before = PageManager::inspect_read_only(&path)
+        .unwrap()
+        .read_page(id)
+        .unwrap();
     let payload = netbadb_index::encode_leaf_generation(
         &netbadb_index::IndexSpec {
             data_type: netbadb_types::SemanticType::physical(PhysicalType::UInt64),
@@ -833,16 +835,27 @@ fn transition_cached_claim_rejects_changed_disk_identity() {
     changed
         .initialize_single_payload(PageType::BTreeLeaf, &payload)
         .unwrap();
-    disk.write_page(&changed).unwrap();
-    disk.sync().unwrap();
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut disk = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        disk.seek(SeekFrom::Start(id.0 * crate::PAGE_SIZE as u64))
+            .unwrap();
+        disk.write_all(changed.bytes()).unwrap();
+        disk.sync_all().unwrap();
+    }
     assert!(
         storage
             .claim_reusable_btree_page(&mut tx, active.id)
             .is_err()
     );
-    disk.write_page(&before).unwrap();
-    disk.sync().unwrap();
-    drop(disk);
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut disk = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        disk.seek(SeekFrom::Start(id.0 * crate::PAGE_SIZE as u64))
+            .unwrap();
+        disk.write_all(before.bytes()).unwrap();
+        disk.sync_all().unwrap();
+    }
     tx.rollback().unwrap();
     drop(tx);
     storage.close().unwrap();

@@ -61,7 +61,7 @@ pub use transaction::Transaction;
 pub use txn_status::{TxnStatus, TxnStatusError, txn_status_path};
 pub use wal::{
     WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager, WalRecord,
-    WalRecordKind, wal_alternate_path, wal_path,
+    WalRecordKind, wal_alternate_path, wal_owner_path, wal_path,
 };
 /// Thread-local production-path instrumentation for deterministic Index writer
 /// bound tests. It is absent unless tests or the explicit test-hooks feature

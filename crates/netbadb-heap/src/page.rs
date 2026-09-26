@@ -828,8 +828,11 @@ pub struct PageManager {
 }
 
 impl PageManager {
+    /// Creates a page file and retains exclusive mutation ownership until the
+    /// manager is dropped. Another Heap or writable page manager cannot open
+    /// the same file concurrently.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::create_internal(path.as_ref(), false)
+        Self::create_internal(path.as_ref(), true)
     }
 
     pub(crate) fn create_owned(path: impl AsRef<Path>) -> Result<Self, StorageError> {
@@ -874,8 +877,10 @@ impl PageManager {
         })
     }
 
+    /// Opens a writable page file after acquiring exclusive inode ownership.
+    /// Use Heap recovery inspection for read-only observation of a live Heap.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_internal(path.as_ref(), true, false)
+        Self::open_internal(path.as_ref(), true, true)
     }
 
     pub(crate) fn open_owned(path: impl AsRef<Path>) -> Result<Self, StorageError> {

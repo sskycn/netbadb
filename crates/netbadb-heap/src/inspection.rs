@@ -23,6 +23,7 @@ pub struct HeapRewriteIndexes {
 pub enum HeapResourceComponentKind {
     Main,
     Wal,
+    WalOwnerLock,
     TransactionStatus,
     AlternateWal,
     ChangeLog,
@@ -54,6 +55,11 @@ pub fn heap_resource_components(path: impl AsRef<Path>) -> Vec<HeapResourceCompo
             kind: HeapResourceComponentKind::Wal,
             path: wal.clone(),
             required: true,
+        },
+        HeapResourceComponent {
+            kind: HeapResourceComponentKind::WalOwnerLock,
+            path: crate::wal_owner_path(&wal),
+            required: false,
         },
         HeapResourceComponent {
             kind: HeapResourceComponentKind::TransactionStatus,

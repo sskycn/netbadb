@@ -775,8 +775,19 @@ fn open_authority(
         terminal_create_history =
             crate::schema_mutation::settled_mixed_create_history(&path, &candidate, journal)?;
     }
-    // A settled-history proof reads Heap owner companions. Retain those data
-    // inode locks through the later ordinary mixed participant installation.
+    let terminal_table_create_history = if mixed && !terminal_create_history {
+        match candidate_journal.as_ref() {
+            Some(journal) => {
+                crate::schema_mutation::settled_mixed_create_history(&path, &candidate, journal)?
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    // Settled-history proofs and unmaterialized mixed compositions inspect
+    // current Heap participants. Pending target Heaps receive their additional
+    // staged/final WAL carriers in the exact recovery plan below.
     let mut settled_heap_owners = if mixed
         && candidate_journal
             .as_ref()
@@ -792,16 +803,6 @@ fn open_authority(
         )?
     } else {
         BTreeMap::new()
-    };
-    let terminal_table_create_history = if mixed && !terminal_create_history {
-        match candidate_journal.as_ref() {
-            Some(journal) => {
-                crate::schema_mutation::settled_mixed_create_history(&path, &candidate, journal)?
-            }
-            None => false,
-        }
-    } else {
-        false
     };
     let mixed_create_owners = if mixed && !terminal_create_history && !terminal_table_create_history
     {

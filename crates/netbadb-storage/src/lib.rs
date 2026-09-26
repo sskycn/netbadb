@@ -22,7 +22,7 @@ pub use netbadb_heap::{
     ReusablePageInspection, SLOT_SIZE, Slot, SlotRef, SlotState, Transaction, TxnStatus,
     TxnStatusError, WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAX_RECORD_SIZE, WalError, WalManager,
     WalRecord, WalRecordKind, heap_resource_components, txn_status_path, wal_alternate_path,
-    wal_path,
+    wal_owner_path, wal_path,
 };
 
 /// Computes the initial Columnar artifact bound from a fresh authoritative

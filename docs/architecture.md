@@ -610,12 +610,15 @@ serde-free.
 Future runtime-inspection tooling, including MCP, consumes those DTOs directly
 rather than spawning the CLI. The diagnostics-only LSP does not use this path.
 
-Local inspection requires exclusive process ownership because persistent files
-have no cross-process lock. `Database::open_tables` performs normal recovery,
-so opening after a crash may redo or undo WAL state before inspection. Output
-is fully rendered and the database successfully closed before stdout is
-written; inspected SQL, including DML, is compiled and planned but never
-executed.
+Current Heap, LSM, and Core engine entry points use cooperative OS advisory
+ownership for their participating storage and metadata paths. Public raw page
+and WAL writers also claim the corresponding owner. This does not protect
+against older binaries, arbitrary file edits, or every low-level metadata file
+tool, so local inspection still requires stopping other processes. `Database::open_tables`
+performs normal recovery, so opening after a crash may redo or undo WAL state
+before inspection. Output is fully rendered and the database successfully
+closed before stdout is written; inspected SQL, including DML, is compiled and
+planned but never executed.
 
 ## Canonical Schema IR
 

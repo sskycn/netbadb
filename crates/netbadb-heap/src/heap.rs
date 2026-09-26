@@ -22,6 +22,7 @@ use crate::mvcc::{TupleHeader, decode_tuple, encode_tuple, is_dead_before, is_vi
 use crate::recovery::{RecoveryManager, inspect_prepared_transactions};
 use crate::transaction::TransactionManager;
 use crate::txn_status::{SharedTxnStatus, TxnStatusStore, txn_status_path};
+use crate::wal::WalOwnership;
 use crate::{
     BufferPool, CodecError, DEFAULT_BUFFER_POOL_SIZE, HeapRewriteIndex, HeapRewriteIndexes,
     IsolationLevel, MetadataError, PAGE_HEADER_SIZE, PAGE_SIZE, Page, PageError, PageManager,
@@ -164,6 +165,7 @@ pub struct HeapIdentityInspection {
 #[derive(Debug)]
 pub struct HeapOwnership {
     pages: PageManager,
+    wal: Vec<WalOwnership>,
     path: PathBuf,
 }
 
@@ -171,8 +173,47 @@ impl HeapOwnership {
     /// Claims an existing Heap data inode before any recovery-capable open.
     pub fn acquire(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = authority_path(path.as_ref())?;
+        Self::acquire_with_wal(&path, wal_path(&path))
+    }
+
+    /// Claims a Heap data inode and the exact logical WAL root selected by a
+    /// recovery plan. Core uses this when a journaled, partially promoted Heap
+    /// still has its data file at the staged name while its WAL is at final.
+    pub fn acquire_with_wal(
+        path: impl AsRef<Path>,
+        wal_root: impl AsRef<Path>,
+    ) -> Result<Self, StorageError> {
+        let wal_root = wal_root.as_ref();
+        Self::acquire_with_wal_owner(path, wal_root, crate::wal_owner_path(wal_root))
+    }
+
+    /// Claims a Heap inode and an exact WAL root using a carrier path selected
+    /// by a durable recovery plan. This supports the crash window between the
+    /// WAL generation rename and its stable owner-carrier rename.
+    pub fn acquire_with_wal_owner(
+        path: impl AsRef<Path>,
+        wal_root: impl AsRef<Path>,
+        owner_path: impl AsRef<Path>,
+    ) -> Result<Self, StorageError> {
+        let binding = (wal_root.as_ref().to_owned(), owner_path.as_ref().to_owned());
+        Self::acquire_with_wal_bindings(path, &[binding])
+    }
+
+    /// Claims a Heap inode and every logical WAL/carrier binding required by a
+    /// durable recovery plan. Bindings are acquired in carrier-path order.
+    pub fn acquire_with_wal_bindings(
+        path: impl AsRef<Path>,
+        bindings: &[(PathBuf, PathBuf)],
+    ) -> Result<Self, StorageError> {
+        let path = authority_path(path.as_ref())?;
         let pages = PageManager::open_owned(&path)?;
-        Ok(Self { pages, path })
+        let mut bindings = bindings.to_vec();
+        bindings.sort_by(|left, right| left.1.cmp(&right.1));
+        let mut wal = Vec::with_capacity(bindings.len());
+        for (root, owner) in bindings {
+            wal.push(WalOwnership::acquire_with_owner_path(&root, &owner)?);
+        }
+        Ok(Self { pages, wal, path })
     }
 
     #[must_use]
@@ -183,14 +224,50 @@ impl HeapOwnership {
     /// Confirms that `path` still names the locked, single-link regular file.
     pub fn verify_path(&self, path: impl AsRef<Path>) -> Result<(), StorageError> {
         let path = authority_path(path.as_ref())?;
-        self.pages.verify_owned_path(&path)
+        self.pages.verify_owned_path(&path)?;
+        for wal in &self.wal {
+            wal.verify_current()?;
+        }
+        Ok(())
     }
 
-    /// Moves the token's path binding after a same-inode rename. Rejects
-    /// path-bound change-stream sidecars whose migration is not represented
-    /// by this token.
+    /// Reports whether this admission owns the carrier named by a recovery
+    /// plan, including a distinct pre-existing target carrier.
+    pub fn owns_wal_owner_path(&self, path: impl AsRef<Path>) -> Result<bool, StorageError> {
+        let path = authority_path(path.as_ref())?;
+        for wal in &self.wal {
+            if wal.path() == path || wal.names_same_inode(&path)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Adds another stable carrier from a recovery plan without releasing any
+    /// owner already held. Acquisition is nonblocking, so contention fails
+    /// immediately and the existing admission remains valid until dropped.
+    pub fn add_wal_owner_binding(
+        &mut self,
+        wal_root: impl AsRef<Path>,
+        owner_path: impl AsRef<Path>,
+    ) -> Result<(), StorageError> {
+        let owner_path = authority_path(owner_path.as_ref())?;
+        if self.owns_wal_owner_path(&owner_path)? {
+            return Ok(());
+        }
+        self.wal.push(WalOwnership::acquire_with_owner_path(
+            wal_root.as_ref(),
+            &owner_path,
+        )?);
+        Ok(())
+    }
+
+    /// Moves the token's path binding after a same-inode rename and retires
+    /// only its now-obsolete staging WAL carrier. Rejects path-bound
+    /// change-stream sidecars whose migration is not represented by this token.
     pub fn rebind(mut self, path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = authority_path(path.as_ref())?;
+        let source_owner_path = authority_path(&crate::wal_owner_path(wal_path(&self.path)))?;
         self.pages.verify_owned_path(&path)?;
         if path != self.path {
             // Change-stream files are path-bound and this token carries only
@@ -212,8 +289,57 @@ impl HeapOwnership {
                 }
             }
         }
+        let owner_path = crate::wal_owner_path(wal_path(&path));
+        let owner_path = authority_path(&owner_path)?;
+        let mut selected = None;
+        for (index, wal) in self.wal.iter().enumerate() {
+            if wal.path() == owner_path || wal.names_same_inode(&owner_path)? {
+                selected = Some(index);
+                break;
+            }
+        }
+        let selected = selected.ok_or_else(|| {
+            StorageError::Wal(crate::WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "recovery ownership has no carrier for the promoted WAL root",
+            )))
+        })?;
+        let wal = self.wal.remove(selected).rebind(&wal_path(&path))?;
+        self.wal.insert(selected, wal);
+        if source_owner_path != owner_path {
+            let target = self.wal.get(selected).ok_or_else(|| {
+                StorageError::Wal(crate::WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "rebound WAL ownership token index is invalid",
+                )))
+            })?;
+            if target.names_same_inode(&source_owner_path)? {
+                target.retire_alias(&source_owner_path)?;
+            } else if let Some(source_index) = self
+                .wal
+                .iter()
+                .position(|wal| wal.path() == source_owner_path)
+            {
+                self.wal.remove(source_index).retire()?;
+            }
+        }
         self.path = path;
         Ok(self)
+    }
+
+    fn take_wal_ownership(&mut self, root: &Path) -> Result<WalOwnership, StorageError> {
+        let root = authority_path(root)?;
+        let index = self
+            .wal
+            .iter()
+            .position(|wal| wal.root() == root)
+            .ok_or_else(|| {
+                StorageError::Wal(crate::WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "recovery ownership has no token for the logical WAL root",
+                )))
+            })?;
+        Ok(self.wal.swap_remove(index))
     }
 
     /// Reads recovery evidence while retaining the writer-exclusion lock.
@@ -703,11 +829,14 @@ impl HeapStorage {
         BufferPool::validate_capacity(buffer_pool_size)?;
         let authority = authority_path(path.as_ref())?;
         let path = authority.as_path();
-        let mut pages = if let Some(ownership) = ownership {
+        let (mut pages, wal_ownership) = if let Some(mut ownership) = ownership {
             ownership.verify_path(path)?;
-            ownership.pages
+            let wal = ownership.take_wal_ownership(&wal_path(path))?;
+            (ownership.pages, wal)
         } else {
-            PageManager::open_owned(path)?
+            let pages = PageManager::open_owned(path)?;
+            let wal = WalOwnership::acquire(&wal_path(path))?;
+            (pages, wal)
         };
         if pages.page_count() < 3 {
             return Err(crate::invalid_format("heap file has no data page"));
@@ -716,7 +845,7 @@ impl HeapStorage {
             validate_heap_metadata(pages.read_page(HEADER_PAGE)?.bytes(), &table, fingerprint)?;
         validate_catalog_root_bounds(catalog_root, pages.page_count())?;
         let (mut wal_manager, records, truncated_wal_tail) =
-            WalManager::open_for_recovery(wal_path(path))?;
+            WalManager::open_for_recovery_with_ownership(wal_path(path), wal_ownership)?;
         let statuses = Rc::new(RefCell::new(TxnStatusStore::open_for_recovery(
             txn_status_path(path),
             &records,
@@ -3538,6 +3667,11 @@ impl HeapStorage {
         // Completed transaction handles may still own BufferPool clones. They
         // cannot issue storage I/O; close has checked there is no live writer
         // or outstanding transaction and has synchronized the files.
+        self.transactions
+            .wal()
+            .try_borrow_mut()
+            .map_err(|_| TransactionError::WalBusy)?
+            .release_ownership_after_clean_close()?;
         self.closed = true;
         self.buffer.release_ownership_after_clean_close()?;
         Ok(())
@@ -3553,8 +3687,18 @@ impl HeapStorage {
         self.flush()?;
         let path = authority_path(path.as_ref())?;
         let pages = self.buffer.duplicate_owned_page_manager(&path)?;
+        let wal = self
+            .transactions
+            .wal()
+            .try_borrow()
+            .map_err(|_| TransactionError::WalBusy)?
+            .duplicate_ownership()?;
         self.closed = true;
-        Ok(HeapOwnership { pages, path })
+        Ok(HeapOwnership {
+            pages,
+            wal: vec![wal],
+            path,
+        })
     }
 
     pub fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
@@ -4344,6 +4488,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(txn_status_path(path));
         let wal = wal_path(path);
+        let _ = std::fs::remove_file(crate::wal_owner_path(&wal));
         let _ = std::fs::remove_file(wal_alternate_path(&wal));
         let _ = std::fs::remove_file(wal);
     }
@@ -4551,6 +4696,11 @@ mod tests {
         cleanup(&target);
         let storage = HeapStorage::create(&source, table()).unwrap();
         let owner = storage.stop_for_promotion(&source).unwrap();
+        std::fs::rename(
+            crate::wal_owner_path(wal_path(&source)),
+            crate::wal_owner_path(wal_path(&target)),
+        )
+        .unwrap();
         std::fs::rename(wal_path(&source), wal_path(&target)).unwrap();
         std::fs::rename(txn_status_path(&source), txn_status_path(&target)).unwrap();
         std::fs::rename(&source, &target).unwrap();
@@ -9176,12 +9326,15 @@ mod tests {
                 .write_page(&header)
                 .expect("write old metadata version");
             pages.sync().expect("sync old metadata version");
+            drop(pages);
             assert!(matches!(
                 HeapStorage::open(&path, table()),
                 Err(StorageError::Metadata(
                     crate::MetadataError::UnsupportedVersion(version)
                 )) if version == old_version
             ));
+            pages = PageManager::open(&path).expect("reopen page manager");
+            header = pages.read_page(PageId(0)).expect("reread metadata page");
         }
         drop(pages);
         cleanup(&path);
@@ -9196,7 +9349,7 @@ mod tests {
             .expect("insert row");
         assert!(storage.durable_lsn().expect("durable LSN").is_some());
 
-        let mut disk = PageManager::open(&path).expect("open page file");
+        let mut disk = PageManager::inspect_read_only(&path).expect("inspect page file");
         assert_eq!(
             disk.read_page(FIRST_HEAP_PAGE)
                 .expect("read data page")

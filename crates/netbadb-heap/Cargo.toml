@@ -21,6 +21,8 @@ netbadb-types = { path = "../netbadb-types" }
 [dev-dependencies]
 netbadb-change-stream = { path = "../netbadb-change-stream", features = ["test-hooks"] }
 netbadb-storage-api = { path = "../netbadb-storage-api", features = ["test-hooks"] }
+netbadb-schema = { path = "../netbadb-schema" }
+netbadb-types = { path = "../netbadb-types" }
 
 [lints]
 workspace = true
