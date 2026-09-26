@@ -461,6 +461,25 @@ impl WalOwnership {
         })
     }
 
+    /// Bind another name of this already locked inode without taking a second
+    /// flock on the same carrier. Promotion can leave staged and final names
+    /// as hard links to one stable owner inode.
+    pub(crate) fn duplicate_for_binding(&self, root: &Path, path: &Path) -> Result<Self, WalError> {
+        let root = canonical_root_path(root)?;
+        let path = canonical_path(path)?;
+        if !self.names_same_inode(&path)? {
+            return Err(WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL owner alias does not name the held owner inode",
+            )));
+        }
+        Ok(Self {
+            file: self.file.try_clone()?,
+            root,
+            path,
+        })
+    }
+
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }

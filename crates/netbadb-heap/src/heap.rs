@@ -188,8 +188,8 @@ impl HeapOwnership {
     }
 
     /// Claims a Heap inode and an exact WAL root using a carrier path selected
-    /// by a durable recovery plan. This supports the crash window between the
-    /// WAL generation rename and its stable owner-carrier rename.
+    /// by a durable recovery plan. The logical root's default carrier is also
+    /// claimed, so a public standalone writer always shares its lock domain.
     pub fn acquire_with_wal_owner(
         path: impl AsRef<Path>,
         wal_root: impl AsRef<Path>,
@@ -200,20 +200,47 @@ impl HeapOwnership {
     }
 
     /// Claims a Heap inode and every logical WAL/carrier binding required by a
-    /// durable recovery plan. Bindings are acquired in carrier-path order.
+    /// durable recovery plan. Each root's default carrier is also acquired;
+    /// names of one already locked inode share that lock without a second flock.
     pub fn acquire_with_wal_bindings(
         path: impl AsRef<Path>,
         bindings: &[(PathBuf, PathBuf)],
     ) -> Result<Self, StorageError> {
         let path = authority_path(path.as_ref())?;
         let pages = PageManager::open_owned(&path)?;
-        let mut bindings = bindings.to_vec();
-        bindings.sort_by(|left, right| left.1.cmp(&right.1));
-        let mut wal = Vec::with_capacity(bindings.len());
+        let mut carrier_bindings = Vec::new();
         for (root, owner) in bindings {
-            wal.push(WalOwnership::acquire_with_owner_path(&root, &owner)?);
+            let root = authority_path(root)?;
+            carrier_bindings.push((root.clone(), authority_path(owner)?));
+            carrier_bindings.push((root.clone(), authority_path(&crate::wal_owner_path(&root))?));
+        }
+        carrier_bindings.sort_by(|left, right| left.1.cmp(&right.1));
+        let mut wal = Vec::with_capacity(carrier_bindings.len());
+        for (root, owner) in carrier_bindings {
+            Self::claim_wal_binding(&mut wal, &root, &owner)?;
         }
         Ok(Self { pages, wal, path })
+    }
+
+    fn claim_wal_binding(
+        wal: &mut Vec<WalOwnership>,
+        root: &Path,
+        owner: &Path,
+    ) -> Result<(), StorageError> {
+        if wal
+            .iter()
+            .any(|held| held.root() == root && held.path() == owner)
+        {
+            return Ok(());
+        }
+        for held in wal.iter() {
+            if held.names_same_inode(owner)? {
+                wal.push(held.duplicate_for_binding(root, owner)?);
+                return Ok(());
+            }
+        }
+        wal.push(WalOwnership::acquire_with_owner_path(root, owner)?);
+        Ok(())
     }
 
     #[must_use]
@@ -243,22 +270,22 @@ impl HeapOwnership {
         Ok(false)
     }
 
-    /// Adds another stable carrier from a recovery plan without releasing any
-    /// owner already held. Acquisition is nonblocking, so contention fails
-    /// immediately and the existing admission remains valid until dropped.
+    /// Adds another stable carrier and its root's default carrier without
+    /// releasing any owner already held. Acquisition is nonblocking, so
+    /// contention fails immediately and existing admission remains valid.
     pub fn add_wal_owner_binding(
         &mut self,
         wal_root: impl AsRef<Path>,
         owner_path: impl AsRef<Path>,
     ) -> Result<(), StorageError> {
-        let owner_path = authority_path(owner_path.as_ref())?;
-        if self.owns_wal_owner_path(&owner_path)? {
-            return Ok(());
+        let root = authority_path(wal_root.as_ref())?;
+        let owner = authority_path(owner_path.as_ref())?;
+        let default = authority_path(&crate::wal_owner_path(&root))?;
+        let mut paths = [owner, default];
+        paths.sort();
+        for path in paths {
+            Self::claim_wal_binding(&mut self.wal, &root, &path)?;
         }
-        self.wal.push(WalOwnership::acquire_with_owner_path(
-            wal_root.as_ref(),
-            &owner_path,
-        )?);
         Ok(())
     }
 
@@ -314,13 +341,33 @@ impl HeapOwnership {
                 )))
             })?;
             if target.names_same_inode(&source_owner_path)? {
+                // Admission may carry both path roles through duplicates of
+                // one locked descriptor. Retiring the staged alias must not
+                // leave a token bound to the now-absent pathname.
+                self.wal.retain(|wal| wal.path() != source_owner_path);
+                let target = self
+                    .wal
+                    .iter()
+                    .find(|wal| wal.path() == owner_path)
+                    .ok_or_else(|| {
+                        StorageError::Wal(crate::WalError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "promoted WAL ownership lost its final carrier",
+                        )))
+                    })?;
                 target.retire_alias(&source_owner_path)?;
-            } else if let Some(source_index) = self
-                .wal
-                .iter()
-                .position(|wal| wal.path() == source_owner_path)
-            {
-                self.wal.remove(source_index).retire()?;
+            } else {
+                let mut source = None;
+                while let Some(source_index) = self
+                    .wal
+                    .iter()
+                    .position(|wal| wal.path() == source_owner_path)
+                {
+                    source = Some(self.wal.remove(source_index));
+                }
+                if let Some(source) = source {
+                    source.retire()?;
+                }
             }
         }
         self.path = path;
@@ -329,10 +376,11 @@ impl HeapOwnership {
 
     fn take_wal_ownership(&mut self, root: &Path) -> Result<WalOwnership, StorageError> {
         let root = authority_path(root)?;
+        let default = authority_path(&crate::wal_owner_path(&root))?;
         let index = self
             .wal
             .iter()
-            .position(|wal| wal.root() == root)
+            .position(|wal| wal.root() == root && wal.path() == default)
             .ok_or_else(|| {
                 StorageError::Wal(crate::WalError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,

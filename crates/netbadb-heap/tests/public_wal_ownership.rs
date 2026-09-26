@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use netbadb_heap::{HeapStorage, PageManager, WalManager, wal_path};
+use netbadb_heap::{
+    HeapOwnership, HeapStorage, HeapStorageError, PageManager, WalError, WalManager, WalRecordKind,
+    wal_path,
+};
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
 
@@ -148,5 +151,161 @@ fn standalone_public_wal_writer_blocks_heap_recovery_without_mutation() {
         .unwrap()
         .close()
         .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn claim_with_unrelated_carrier(
+    heap: &Path,
+    carrier: &Path,
+    entry: &str,
+) -> Result<HeapOwnership, HeapStorageError> {
+    let wal = wal_path(heap);
+    match entry {
+        "single" => HeapOwnership::acquire_with_wal_owner(heap, wal, carrier),
+        "batch" => HeapOwnership::acquire_with_wal_bindings(heap, &[(wal, carrier.to_path_buf())]),
+        "incremental" => {
+            // First hold the Heap with a different logical root. The actual
+            // WAL root is introduced only through the incremental API.
+            let mut owner =
+                HeapOwnership::acquire_with_wal(heap, carrier.with_extension("unrelated-wal"))?;
+            owner.add_wal_owner_binding(&wal, carrier)?;
+            Ok(owner)
+        }
+        _ => panic!("unknown ownership entry"),
+    }
+}
+
+#[cfg(unix)]
+fn assert_unrelated_carrier_excluded(entry: &str, test_name: &str) {
+    if let Some(heap) = std::env::var_os("NETBADB_UNRELATED_CARRIER_HEAP") {
+        let heap = PathBuf::from(heap);
+        let carrier = PathBuf::from(std::env::var_os("NETBADB_UNRELATED_CARRIER").unwrap());
+        let error = match claim_with_unrelated_carrier(&heap, &carrier, entry) {
+            Ok(owner) => match HeapStorage::open_with_ownership(owner, table(), None) {
+                Ok(_) => panic!("second writable Heap opened through {entry}"),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, HeapStorageError::Wal(WalError::Io(ref source))
+                if source.kind() == std::io::ErrorKind::WouldBlock),
+            "{entry}: expected contention on the real WAL carrier, got {error:?}"
+        );
+        return;
+    }
+
+    let dir = temp_dir(entry);
+    let heap = dir.join("data.heap");
+    HeapStorage::create(&heap, table())
+        .unwrap()
+        .close()
+        .unwrap();
+    let wal = wal_path(&heap);
+    let carrier = dir.join("unrelated.owner-lock");
+    std::fs::write(&carrier, []).unwrap();
+    if entry == "incremental" {
+        std::fs::write(
+            netbadb_heap::wal_owner_path(carrier.with_extension("unrelated-wal")),
+            [],
+        )
+        .unwrap();
+    }
+    let mut writer = WalManager::open(&wal).unwrap();
+    let before = directory_snapshot(&dir);
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--nocapture")
+        .env("NETBADB_UNRELATED_CARRIER_HEAP", &heap)
+        .env("NETBADB_UNRELATED_CARRIER", &carrier)
+        .spawn()
+        .unwrap();
+    assert!(wait_with_timeout(&mut child).success(), "entry {entry}");
+    assert_eq!(directory_snapshot(&dir), before, "entry {entry}");
+    let txn = writer.next_txn_id();
+    let begin = writer.append(txn, None, WalRecordKind::Begin).unwrap();
+    let abort = writer
+        .append(txn, Some(begin), WalRecordKind::Abort)
+        .unwrap();
+    let complete = writer
+        .append(txn, Some(abort), WalRecordKind::RollbackComplete)
+        .unwrap();
+    writer.flush_through(complete).unwrap();
+    writer.close().unwrap();
+    HeapStorage::open(&heap, table()).unwrap().close().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn unrelated_carrier_single_binding_rejects_raw_writer() {
+    assert_unrelated_carrier_excluded(
+        "single",
+        "unrelated_carrier_single_binding_rejects_raw_writer",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unrelated_carrier_batch_binding_rejects_raw_writer() {
+    assert_unrelated_carrier_excluded(
+        "batch",
+        "unrelated_carrier_batch_binding_rejects_raw_writer",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unrelated_carrier_incremental_binding_rejects_raw_writer() {
+    assert_unrelated_carrier_excluded(
+        "incremental",
+        "unrelated_carrier_incremental_binding_rejects_raw_writer",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unrelated_carrier_without_competitor_uses_real_wal_protection() {
+    let dir = temp_dir("uncontended-unrelated");
+    let heap = dir.join("data.heap");
+    HeapStorage::create(&heap, table())
+        .unwrap()
+        .close()
+        .unwrap();
+    let carrier = dir.join("unrelated.owner-lock");
+    let owner = claim_with_unrelated_carrier(&heap, &carrier, "single").unwrap();
+    let storage = HeapStorage::open_with_ownership(owner, table(), None).unwrap();
+    let error = WalManager::open(wal_path(&heap)).unwrap_err();
+    assert!(
+        matches!(error, WalError::Io(source) if source.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    storage.close().unwrap();
+    WalManager::open(wal_path(&heap)).unwrap().close().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn same_inode_carrier_alias_reopens_without_self_contention() {
+    let dir = temp_dir("carrier-alias");
+    let heap = dir.join("data.heap");
+    HeapStorage::create(&heap, table())
+        .unwrap()
+        .close()
+        .unwrap();
+    let wal = wal_path(&heap);
+    let alias = dir.join("staged.owner-lock");
+    std::fs::hard_link(netbadb_heap::wal_owner_path(&wal), &alias).unwrap();
+
+    let owner = HeapOwnership::acquire_with_wal_owner(&heap, &wal, &alias).unwrap();
+    let storage = HeapStorage::open_with_ownership(owner, table(), None).unwrap();
+    assert!(matches!(
+        WalManager::open(&wal),
+        Err(WalError::Io(source)) if source.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    storage.close().unwrap();
+    WalManager::open(&wal).unwrap().close().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
