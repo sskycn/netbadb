@@ -952,7 +952,11 @@ fn heap_schema_rewrite_all_operations_preserve_logical_id_and_advance_physical_i
             &resource.old_relative_locator,
         );
         let bundle = heap_bundle_bytes(&path);
-        let owner_lock = netbadb_storage::wal_owner_path(netbadb_storage::wal_path(&path));
+        let wal = netbadb_storage::wal_path(&path);
+        let owner_locks = [
+            netbadb_storage::wal_owner_path(&wal),
+            netbadb_storage::wal_owner_path(netbadb_storage::wal_alternate_path(&wal)),
+        ];
         let inspection = db.inspect_replacement_retired_heap_gc(resource).unwrap();
         assert!(inspection.eligible(), "{:?}", inspection.blockers);
         let report = db.gc_replacement_retired_heap(resource).unwrap();
@@ -961,7 +965,10 @@ fn heap_schema_rewrite_all_operations_preserve_logical_id_and_advance_physical_i
         assert!(
             heap_bundle_bytes(&path)
                 .iter()
-                .all(|(component_path, bytes)| component_path == &owner_lock || bytes.is_none())
+                .all(
+                    |(component_path, bytes)| owner_locks.contains(component_path)
+                        || bytes.is_none()
+                )
         );
     }
     assert_eq!(db.inspect_replacement_retired_heaps().len(), 7);
@@ -2708,14 +2715,14 @@ fn retired_runtime_heap_gc_is_exact_durable_and_generation_neutral() {
     assert!(inspection.components.iter().any(|component| {
         component.kind == crate::RetiredHeapGcComponentKind::Main && component.present
     }));
-    let wal_owner_lock = inspection
+    let wal_owner_locks = inspection
         .components
         .iter()
-        .find(|component| component.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock)
-        .expect("retired Heap manifest includes stable WAL owner lock")
-        .path
-        .clone();
-    assert!(wal_owner_lock.exists());
+        .filter(|component| component.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock)
+        .map(|component| component.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(wal_owner_locks.len(), 2);
+    assert!(wal_owner_locks.iter().all(|path| path.exists()));
     let component_paths = inspection
         .components
         .iter()
@@ -2732,11 +2739,11 @@ fn retired_runtime_heap_gc_is_exact_durable_and_generation_neutral() {
     assert!(
         component_paths
             .iter()
-            .all(|path| path == &wal_owner_lock || !path.exists())
+            .all(|path| wal_owner_locks.contains(path) || !path.exists())
     );
     assert!(
-        wal_owner_lock.exists(),
-        "GC preserves the stable owner carrier"
+        wal_owner_locks.iter().all(|path| path.exists()),
+        "GC preserves both stable owner carriers"
     );
     assert_eq!(
         (
@@ -2761,7 +2768,7 @@ fn retired_runtime_heap_gc_is_exact_durable_and_generation_neutral() {
         let db = Database::open_catalog(root.join("catalog")).unwrap();
         let inspection = db.inspect_retired_heap_gc(&retired).unwrap();
         assert_eq!(inspection.state, RetiredHeapGcState::Deleted);
-        assert!(wal_owner_lock.exists());
+        assert!(wal_owner_locks.iter().all(|path| path.exists()));
         assert_eq!(
             inspection
                 .components
@@ -2770,7 +2777,7 @@ fn retired_runtime_heap_gc_is_exact_durable_and_generation_neutral() {
                     |component| component.kind == crate::RetiredHeapGcComponentKind::WalOwnerLock
                 )
                 .count(),
-            1
+            2
         );
         db.close().unwrap();
     }

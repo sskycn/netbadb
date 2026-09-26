@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use netbadb_heap::{
     HeapOwnership, HeapStorage, HeapStorageError, PageManager, WalError, WalManager, WalRecordKind,
-    wal_path,
+    wal_alternate_path, wal_path,
 };
 use netbadb_schema::{ColumnDef, TableDef, TypeSpec};
 use netbadb_types::{ColumnId, PhysicalType, TableId};
@@ -65,6 +65,378 @@ fn directory_snapshot(path: &Path) -> Vec<(String, Vec<u8>)> {
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     entries
+}
+
+#[cfg(all(unix, feature = "test-hooks"))]
+fn file_identity(path: &Path) -> Option<(u64, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    match path.symlink_metadata() {
+        Ok(metadata) => Some((metadata.dev(), metadata.ino(), metadata.len())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("cannot inspect {}: {error}", path.display()),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn active_alternate_and_reserved_slot_reject_public_writers() {
+    if let Some(path) = std::env::var_os("NETBADB_R02_OPEN") {
+        let error = WalManager::open(PathBuf::from(path)).unwrap_err();
+        assert!(
+            matches!(error, WalError::Io(ref source) if source.kind() == std::io::ErrorKind::WouldBlock),
+            "{error:?}"
+        );
+        return;
+    }
+    if let Some(path) = std::env::var_os("NETBADB_R02_CREATE") {
+        let error = WalManager::create(PathBuf::from(path)).unwrap_err();
+        assert!(
+            matches!(error, WalError::Io(ref source) if source.kind() == std::io::ErrorKind::WouldBlock),
+            "{error:?}"
+        );
+        return;
+    }
+
+    let dir = temp_dir("r02-generation-slot");
+    let heap = dir.join("data.heap");
+    let mut storage = HeapStorage::create(&heap, table()).unwrap();
+    let root = wal_path(&heap);
+    let next = wal_alternate_path(&root);
+    assert!(!next.exists());
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "active_alternate_and_reserved_slot_reject_public_writers",
+            "--nocapture",
+        ])
+        .env("NETBADB_R02_CREATE", &next)
+        .spawn()
+        .unwrap();
+    assert!(wait_with_timeout(&mut child).success());
+    assert!(
+        !next.exists(),
+        "rejected create must not initialize the target WAL"
+    );
+    storage.checkpoint().unwrap();
+    assert!(next.exists());
+    let before = directory_snapshot(&dir);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "active_alternate_and_reserved_slot_reject_public_writers",
+            "--nocapture",
+        ])
+        .env("NETBADB_R02_OPEN", &next)
+        .spawn()
+        .unwrap();
+    assert!(wait_with_timeout(&mut child).success());
+    assert_eq!(directory_snapshot(&dir), before);
+    assert!(
+        !root.exists(),
+        "the first checkpoint retired the root generation"
+    );
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "active_alternate_and_reserved_slot_reject_public_writers",
+            "--nocapture",
+        ])
+        .env("NETBADB_R02_CREATE", &root)
+        .spawn()
+        .unwrap();
+    assert!(wait_with_timeout(&mut child).success());
+    assert!(!root.exists());
+    storage.checkpoint().unwrap();
+    assert!(root.exists());
+    assert!(!next.exists());
+    storage.close().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn active_alternate_public_open_cannot_preempt_heap_recovery() {
+    if let Some(path) = std::env::var_os("NETBADB_R02_ACTIVE_ALTERNATE") {
+        let error = WalManager::open(PathBuf::from(path)).unwrap_err();
+        assert!(
+            matches!(error, WalError::Io(ref source) if source.kind() == std::io::ErrorKind::WouldBlock),
+            "{error:?}"
+        );
+        return;
+    }
+    let dir = temp_dir("r02-active-alternate");
+    let heap = dir.join("data.heap");
+    let mut storage = HeapStorage::create(&heap, table()).unwrap();
+    storage.checkpoint().unwrap();
+    let alternate = wal_alternate_path(wal_path(&heap));
+    assert!(alternate.exists());
+    let before = std::fs::read(&alternate).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "active_alternate_public_open_cannot_preempt_heap_recovery",
+            "--nocapture",
+        ])
+        .env("NETBADB_R02_ACTIVE_ALTERNATE", &alternate)
+        .spawn()
+        .unwrap();
+    assert!(wait_with_timeout(&mut child).success());
+    assert_eq!(std::fs::read(&alternate).unwrap(), before);
+    storage.close().unwrap();
+    let raw = WalManager::open(&alternate).unwrap();
+    let error = HeapStorage::open(&heap, table()).unwrap_err();
+    assert!(
+        matches!(error, HeapStorageError::Wal(WalError::Io(ref source)) if source.kind() == std::io::ErrorKind::WouldBlock),
+        "{error:?}"
+    );
+    raw.close().unwrap();
+    HeapStorage::open(&heap, table()).unwrap().close().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn independent_next_name_and_disjoint_wals_remain_usable() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("r02-independent-next");
+    let named_next = dir.join("independent.next");
+    let other = dir.join("unrelated.wal");
+    let first = WalManager::create(&named_next).unwrap();
+    let second = WalManager::create(&other).unwrap();
+    let parent_alias = dir.with_extension("directory-alias");
+    symlink(&dir, &parent_alias).unwrap();
+    let alias = parent_alias.join("independent.next");
+    let error = WalManager::open(&alias).unwrap_err();
+    assert!(
+        matches!(error, WalError::Io(ref source) if source.kind() == std::io::ErrorKind::WouldBlock),
+        "{error:?}"
+    );
+    assert_eq!(first.path(), named_next.canonicalize().unwrap());
+    assert!(named_next.exists());
+    assert!(other.exists());
+    first.close().unwrap();
+    second.close().unwrap();
+    WalManager::open(&named_next).unwrap().close().unwrap();
+    std::fs::remove_file(parent_alias).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(all(unix, feature = "test-hooks"))]
+#[test]
+fn rotation_slot_is_exclusive_at_each_mutation_window() {
+    use netbadb_heap::{WalRotationTestPoint, set_wal_rotation_test_hook};
+    use std::sync::mpsc;
+
+    if let Some(path) = std::env::var_os("NETBADB_R02_ROTATION_PROBE") {
+        let path = PathBuf::from(path);
+        let result = if std::env::var_os("NETBADB_R02_ROTATION_CREATE").is_some() {
+            WalManager::create(&path)
+        } else {
+            WalManager::open(&path)
+        };
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, WalError::Io(ref source) if source.kind() == std::io::ErrorKind::WouldBlock),
+            "{error:?}"
+        );
+        return;
+    }
+
+    let dir = temp_dir("r02-rotation-windows");
+    let heap = dir.join("data.heap");
+    let root = wal_path(&heap);
+    let next = wal_alternate_path(&root);
+    // The standalone probe claims its own second carrier before it reaches
+    // the shared slot. Keep lock-infrastructure creation outside snapshots.
+    std::fs::write(netbadb_heap::wal_owner_path(wal_alternate_path(&next)), []).unwrap();
+    let (phase_send, phase_recv) = mpsc::channel();
+    let (resume_send, resume_recv) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut storage = HeapStorage::create(&heap, table()).unwrap();
+        set_wal_rotation_test_hook(move |point| {
+            phase_send.send(point).unwrap();
+            resume_recv.recv().unwrap();
+        });
+        storage.checkpoint().unwrap();
+        storage.close().unwrap();
+    });
+    for expected in [
+        WalRotationTestPoint::BeforeTargetCreation,
+        WalRotationTestPoint::AfterTargetCreated,
+        WalRotationTestPoint::AfterTargetDirectorySync,
+        WalRotationTestPoint::AfterRuntimeSwitch,
+        WalRotationTestPoint::AfterOldGenerationRemoved,
+    ] {
+        let observed = phase_recv.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(observed, expected);
+        let (path, create) = match observed {
+            WalRotationTestPoint::BeforeTargetCreation => (&next, true),
+            WalRotationTestPoint::AfterTargetCreated
+            | WalRotationTestPoint::AfterTargetDirectorySync => (&next, false),
+            WalRotationTestPoint::AfterRuntimeSwitch => (&root, false),
+            WalRotationTestPoint::AfterOldGenerationRemoved => (&root, true),
+        };
+        assert_eq!(path.exists(), !create);
+        let before = directory_snapshot(&dir);
+        let root_identity = file_identity(&root);
+        let next_identity = file_identity(&next);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "rotation_slot_is_exclusive_at_each_mutation_window",
+                "--nocapture",
+            ])
+            .env("NETBADB_R02_ROTATION_PROBE", path);
+        if create {
+            command.env("NETBADB_R02_ROTATION_CREATE", "1");
+        }
+        let mut child = command.spawn().unwrap();
+        assert!(
+            wait_with_timeout(&mut child).success(),
+            "rotation probe at {observed:?}"
+        );
+        assert_eq!(directory_snapshot(&dir), before);
+        assert_eq!(file_identity(&root), root_identity);
+        assert_eq!(file_identity(&next), next_identity);
+        resume_send.send(()).unwrap();
+    }
+    worker.join().unwrap();
+    assert!(next.exists());
+    assert!(!root.exists());
+    HeapStorage::open(dir.join("data.heap"), table())
+        .unwrap()
+        .close()
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn wal_data_aliases_cannot_become_writers() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    let dir = temp_dir("r02-data-alias");
+    let root = dir.join("standalone.wal");
+    let writer = WalManager::create(&root).unwrap();
+    let link = dir.join("symlink.wal");
+    symlink(&root, &link).unwrap();
+    assert_eq!(
+        std::fs::metadata(&root).unwrap().ino(),
+        std::fs::metadata(&link).unwrap().ino()
+    );
+    let error = WalManager::open(&link).unwrap_err();
+    assert!(
+        matches!(error, WalError::Io(ref source) if source.kind() == std::io::ErrorKind::InvalidInput),
+        "{error:?}"
+    );
+    let hard = dir.join("hardlink.wal");
+    std::fs::hard_link(&root, &hard).unwrap();
+    assert_eq!(
+        std::fs::metadata(&root).unwrap().ino(),
+        std::fs::metadata(&hard).unwrap().ino()
+    );
+    let error = WalManager::open(&hard).unwrap_err();
+    assert!(
+        matches!(error, WalError::Io(ref source) if source.kind() == std::io::ErrorKind::InvalidInput),
+        "{error:?}"
+    );
+    drop(writer);
+    std::fs::remove_file(&link).unwrap();
+    std::fs::remove_file(&hard).unwrap();
+    WalManager::open(&root).unwrap().close().unwrap();
+
+    let heap = dir.join("data.heap");
+    let mut storage = HeapStorage::create(&heap, table()).unwrap();
+    storage.checkpoint().unwrap();
+    let alternate = wal_alternate_path(wal_path(&heap));
+    let alternate_link = dir.join("active-alternate-link.wal");
+    symlink(&alternate, &alternate_link).unwrap();
+    assert_eq!(
+        std::fs::metadata(&alternate).unwrap().ino(),
+        std::fs::metadata(&alternate_link).unwrap().ino()
+    );
+    let error = WalManager::open(&alternate_link).unwrap_err();
+    assert!(
+        matches!(error, WalError::Io(ref source) if source.kind() == std::io::ErrorKind::InvalidInput),
+        "{error:?}"
+    );
+    std::fs::remove_file(&alternate_link).unwrap();
+    let alternate_hard = dir.join("active-alternate-hard.wal");
+    std::fs::hard_link(&alternate, &alternate_hard).unwrap();
+    let error = WalManager::open(&alternate_hard).unwrap_err();
+    assert!(
+        matches!(error, WalError::Io(ref source) if source.kind() == std::io::ErrorKind::InvalidInput),
+        "{error:?}"
+    );
+    std::fs::remove_file(&alternate_hard).unwrap();
+    storage.close().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn wal_data_hardlink_alone_cannot_claim_another_carrier() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = temp_dir("r02-hardlink-alone");
+    let root = dir.join("source.wal");
+    let alias = dir.join("alias.wal");
+    let writer = WalManager::create(&root).unwrap();
+    std::fs::hard_link(&root, &alias).unwrap();
+    assert_eq!(
+        std::fs::metadata(&root).unwrap().ino(),
+        std::fs::metadata(&alias).unwrap().ino()
+    );
+    let original = std::fs::read(&root).unwrap();
+    let error = WalManager::open(&alias).unwrap_err();
+    assert!(
+        matches!(error, WalError::Io(ref source) if source.kind() == std::io::ErrorKind::InvalidInput),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read(&root).unwrap(), original);
+    assert_eq!(std::fs::read(&alias).unwrap(), original);
+    std::fs::remove_file(alias).unwrap();
+    writer.close().unwrap();
+    WalManager::open(&root).unwrap().close().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_incremental_admission_releases_only_new_carriers() {
+    let dir = temp_dir("r02-failed-incremental");
+    let heap = dir.join("data.heap");
+    HeapStorage::create(&heap, table())
+        .unwrap()
+        .close()
+        .unwrap();
+    let unrelated = dir.join("middle.wal");
+    let contested = dir.join("z-contested.wal");
+    let temporary = dir.join("a-temporary.wal");
+    let mut owner = HeapOwnership::acquire_with_wal(&heap, &unrelated).unwrap();
+    let raw = WalManager::create(&contested).unwrap();
+    let error = owner
+        .add_wal_owner_binding(&contested, netbadb_heap::wal_owner_path(&temporary))
+        .unwrap_err();
+    assert!(
+        matches!(error, HeapStorageError::Wal(WalError::Io(ref source)) if source.kind() == std::io::ErrorKind::WouldBlock),
+        "{error:?}"
+    );
+    // The first, temporary carrier was acquired before contention and must
+    // no longer be locked. The original Heap admission is still retained.
+    WalManager::create(&temporary).unwrap().close().unwrap();
+    let error = WalManager::create(&unrelated).unwrap_err();
+    assert!(
+        matches!(error, WalError::Io(ref source) if source.kind() == std::io::ErrorKind::WouldBlock),
+        "{error:?}"
+    );
+    drop(owner);
+    WalManager::create(&unrelated).unwrap().close().unwrap();
+    raw.close().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -205,11 +577,10 @@ fn assert_unrelated_carrier_excluded(entry: &str, test_name: &str) {
     let carrier = dir.join("unrelated.owner-lock");
     std::fs::write(&carrier, []).unwrap();
     if entry == "incremental" {
-        std::fs::write(
-            netbadb_heap::wal_owner_path(carrier.with_extension("unrelated-wal")),
-            [],
-        )
-        .unwrap();
+        let unrelated = carrier.with_extension("unrelated-wal");
+        for root in [&unrelated, &wal_alternate_path(&unrelated)] {
+            std::fs::write(netbadb_heap::wal_owner_path(root), []).unwrap();
+        }
     }
     let mut writer = WalManager::open(&wal).unwrap();
     let before = directory_snapshot(&dir);

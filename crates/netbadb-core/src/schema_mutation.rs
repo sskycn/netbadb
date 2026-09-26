@@ -3845,18 +3845,30 @@ fn components(heap: &Path) -> Vec<(PathBuf, bool)> {
         (heap.to_owned(), true),
         (wal.clone(), true),
         (netbadb_storage::wal_owner_path(&wal), true),
+        (
+            netbadb_storage::wal_owner_path(netbadb_storage::wal_alternate_path(&wal)),
+            false,
+        ),
         (netbadb_storage::txn_status_path(heap), true),
         (netbadb_storage::wal_alternate_path(wal), false),
     ]
 }
 
 fn is_wal_owner_carrier(path: &Path, heap: &Path) -> bool {
-    path == netbadb_storage::wal_owner_path(netbadb_storage::wal_path(heap))
+    let wal = netbadb_storage::wal_path(heap);
+    path == netbadb_storage::wal_owner_path(&wal)
+        || path == netbadb_storage::wal_owner_path(netbadb_storage::wal_alternate_path(wal))
 }
 
 fn is_wal_owner_pair(source: &Path, destination: &Path, stage: &Path, final_path: &Path) -> bool {
-    source == netbadb_storage::wal_owner_path(netbadb_storage::wal_path(stage))
-        && destination == netbadb_storage::wal_owner_path(netbadb_storage::wal_path(final_path))
+    let source_wal = netbadb_storage::wal_path(stage);
+    let final_wal = netbadb_storage::wal_path(final_path);
+    (source == netbadb_storage::wal_owner_path(&source_wal)
+        && destination == netbadb_storage::wal_owner_path(&final_wal))
+        || (source
+            == netbadb_storage::wal_owner_path(netbadb_storage::wal_alternate_path(source_wal))
+            && destination
+                == netbadb_storage::wal_owner_path(netbadb_storage::wal_alternate_path(final_wal)))
 }
 
 fn same_file_identity(left: &Path, right: &Path) -> Result<bool, SchemaMutationError> {
@@ -4023,7 +4035,10 @@ fn private_dir_has_only_wal_carriers(
         let storage = path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_suffix(".heap-wal.owner-lock"))
+            .and_then(|name| {
+                name.strip_suffix(".heap-wal.owner-lock")
+                    .or_else(|| name.strip_suffix(".heap-wal.next.owner-lock"))
+            })
             .and_then(|id| id.parse::<u64>().ok())
             .map(StorageId);
         let Some(storage) = storage else {
@@ -4033,8 +4048,7 @@ fn private_dir_has_only_wal_carriers(
             catalog,
             &stage_locator(catalog, incarnation, transaction, storage)?,
         );
-        let expected = netbadb_storage::wal_owner_path(netbadb_storage::wal_path(&stage));
-        if path != expected || !exists_file(&path)? {
+        if !is_wal_owner_carrier(&path, &stage) || !exists_file(&path)? {
             return Ok(false);
         }
     }
@@ -4171,7 +4185,7 @@ pub(crate) fn promote_with_ownership(
         let source_exists = exists_file(source)?;
         let destination_exists = exists_file(destination)?;
         if is_wal_owner_pair(source, destination, &stage, &final_path) {
-            if !source_exists && !destination_exists {
+            if *required && !source_exists && !destination_exists {
                 return Err(
                     SchemaMutationError::Corrupt("winner WAL owner carrier is missing").into(),
                 );
@@ -4217,6 +4231,9 @@ pub(crate) fn promote_with_ownership(
         })?;
         file::sync_parent(&final_wal_owner)?;
     }
+    ownership
+        .add_wal_owner_binding(&final_wal, &final_wal_owner)
+        .map_err(netbadb_storage::StorageError::from)?;
     ownership
         .verify_path(heap)
         .map_err(netbadb_storage::StorageError::from)?;

@@ -24,6 +24,44 @@ pub const WAL_FORMAT_VERSION: u16 = 4;
 pub const WAL_HEADER_SIZE: usize = 48;
 pub const WAL_MAX_RECORD_SIZE: usize = RECORD_HEADER_SIZE + PAGE_UPDATE_PAYLOAD_SIZE;
 
+/// Timing observation points for external rotation regressions.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalRotationTestPoint {
+    BeforeTargetCreation,
+    AfterTargetCreated,
+    AfterTargetDirectorySync,
+    AfterRuntimeSwitch,
+    AfterOldGenerationRemoved,
+}
+
+#[cfg(feature = "test-hooks")]
+type WalRotationTestHook = Box<dyn FnMut(WalRotationTestPoint)>;
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    static WAL_ROTATION_TEST_HOOK: std::cell::RefCell<Option<WalRotationTestHook>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Install a thread-local timing hook; the callback may block the rotating
+/// thread while a separate public client probes its ownership domain.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn set_wal_rotation_test_hook(hook: impl FnMut(WalRotationTestPoint) + 'static) {
+    WAL_ROTATION_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(feature = "test-hooks")]
+fn observe_rotation(point: WalRotationTestPoint) {
+    WAL_ROTATION_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(point);
+        }
+    });
+}
+
 const INITIAL_GENERATION: u64 = 1;
 const INITIAL_BASE_LSN: Lsn = Lsn(1);
 const INITIAL_NEXT_TXN_ID: TxnId = TxnId(1);
@@ -351,9 +389,9 @@ pub struct WalRecord {
 #[derive(Debug)]
 pub struct WalManager {
     file: File,
-    // Stable across WAL generation replacement. Its adjacent path is moved
-    // with the logical WAL during Heap promotion and is never unlinked.
-    ownership: Option<WalOwnership>,
+    // Stable carrier locks for the root and its alternate slot outlive every
+    // generation inode. The root carrier can be hard-linked during promotion.
+    ownership: Vec<WalOwnership>,
     root_path: PathBuf,
     path: PathBuf,
     generation: u64,
@@ -389,9 +427,41 @@ pub(crate) struct WalOwnership {
 }
 
 impl WalOwnership {
-    #[allow(unsafe_code)]
-    pub(crate) fn acquire(root: &Path) -> Result<Self, WalError> {
-        Self::acquire_with_owner_path(root, &wal_owner_path(root))
+    /// Claim exactly the root and its one rotation target. Both names are
+    /// stable carriers even when the corresponding WAL generation is absent.
+    pub(crate) fn acquire_domain(root: &Path) -> Result<Vec<Self>, WalError> {
+        let root = canonical_root_path(root)?;
+        let mut paths = [
+            wal_owner_path(&root),
+            wal_owner_path(wal_alternate_path(&root)),
+        ];
+        paths.sort();
+        let mut held = Vec::with_capacity(2);
+        for path in paths {
+            Self::claim_binding(&mut held, &root, &path)?;
+        }
+        Ok(held)
+    }
+
+    pub(crate) fn claim_binding(
+        held: &mut Vec<Self>,
+        root: &Path,
+        path: &Path,
+    ) -> Result<(), WalError> {
+        if held
+            .iter()
+            .any(|token| token.root() == root && token.path() == path)
+        {
+            return Ok(());
+        }
+        for token in held.iter() {
+            if token.names_same_inode(path)? {
+                held.push(token.duplicate_for_binding(root, path)?);
+                return Ok(());
+            }
+        }
+        held.push(Self::acquire_with_owner_path(root, path)?);
+        Ok(())
     }
 
     #[allow(unsafe_code)]
@@ -530,16 +600,6 @@ impl WalOwnership {
         sync_parent_directory(&self.path)
     }
 
-    pub(crate) fn verify_root(&self, root: &Path) -> Result<(), WalError> {
-        if self.root != canonical_root_path(root)? {
-            return Err(WalError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "WAL owner path does not match the logical WAL root",
-            )));
-        }
-        self.verify_current()
-    }
-
     pub(crate) fn verify_current(&self) -> Result<(), WalError> {
         #[cfg(unix)]
         {
@@ -623,6 +683,107 @@ fn canonical_path(path: &Path) -> Result<PathBuf, WalError> {
     Ok(parent.join(name))
 }
 
+fn verify_domain_ownership(root: &Path, ownership: &[WalOwnership]) -> Result<(), WalError> {
+    let root = canonical_root_path(root)?;
+    let expected = [
+        wal_owner_path(&root),
+        wal_owner_path(wal_alternate_path(&root)),
+    ];
+    for path in expected {
+        let token = ownership
+            .iter()
+            .find(|token| token.root() == root && token.path() == path)
+            .ok_or_else(|| {
+                WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "writable WAL requires both generation-slot carriers",
+                ))
+            })?;
+        token.verify_current()?;
+    }
+    Ok(())
+}
+
+fn validate_generation_metadata(path: &Path) -> Result<(), WalError> {
+    let metadata = path.symlink_metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "WAL generation must be a regular file, not a symbolic link",
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL generation data file must have exactly one name",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn path_exists_without_following(path: &Path) -> Result<bool, WalError> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn verify_generation_file(path: &Path, file: &File) -> Result<(), WalError> {
+    validate_generation_metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let named = path.symlink_metadata()?;
+        let opened = file.metadata()?;
+        if named.dev() != opened.dev() || named.ino() != opened.ino() || opened.nlink() != 1 {
+            return Err(WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL generation path changed after opening",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn open_generation_file(path: &Path, writable: bool) -> Result<Option<File>, WalError> {
+    match path.symlink_metadata() {
+        Ok(_) => validate_generation_metadata(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(test)]
+    OPEN_GENERATION_AFTER_PREFLIGHT.with(|hook| {
+        let callback = hook.borrow_mut().take();
+        if let Some(callback) = callback {
+            callback(path);
+        }
+    });
+    let mut options = OpenOptions::new();
+    options.read(true).write(writable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    verify_generation_file(path, &file)?;
+    Ok(Some(file))
+}
+
+#[cfg(test)]
+type OpenGenerationPreflightHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static OPEN_GENERATION_AFTER_PREFLIGHT: std::cell::RefCell<Option<OpenGenerationPreflightHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalHeader {
     generation: u64,
@@ -633,10 +794,10 @@ struct WalHeader {
 
 impl WalManager {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let root_path = path.as_ref().to_owned();
-        let ownership = WalOwnership::acquire(&root_path)?;
+        let root_path = canonical_root_path(path.as_ref())?;
+        let ownership = WalOwnership::acquire_domain(&root_path)?;
         let alternate_path = wal_alternate_path(&root_path);
-        if alternate_path.try_exists()? {
+        if path_exists_without_following(&alternate_path)? {
             return Err(WalError::GenerationConflict);
         }
         let header = WalHeader {
@@ -648,20 +809,23 @@ impl WalManager {
         let file = match create_generation_file(&root_path, header, None) {
             Ok(file) => file,
             Err(failure) => {
-                if failure.file_created {
-                    let _ = std::fs::remove_file(&root_path);
+                if let Some(created) = failure.created_file {
+                    if verify_generation_file(&root_path, &created).is_ok() {
+                        let _ = std::fs::remove_file(&root_path);
+                    }
                 }
                 return Err(failure.error);
             }
         };
         if let Err(error) = sync_parent_directory(&root_path) {
-            drop(file);
-            let _ = std::fs::remove_file(&root_path);
+            if verify_generation_file(&root_path, &file).is_ok() {
+                let _ = std::fs::remove_file(&root_path);
+            }
             return Err(error);
         }
         Self::from_scan(
             file,
-            Some(ownership),
+            ownership,
             root_path.clone(),
             root_path,
             header,
@@ -671,22 +835,22 @@ impl WalManager {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
-        let ownership = WalOwnership::acquire(path.as_ref())?;
+        let ownership = WalOwnership::acquire_domain(path.as_ref())?;
         let (manager, _, _) =
-            Self::open_selected(path.as_ref(), TailPolicy::Reject, true, Some(ownership))?;
+            Self::open_selected(path.as_ref(), TailPolicy::Reject, true, ownership)?;
         Ok(manager)
     }
 
     pub(crate) fn open_for_recovery_with_ownership(
         path: impl AsRef<Path>,
-        ownership: WalOwnership,
+        ownership: Vec<WalOwnership>,
     ) -> Result<(Self, Vec<WalRecord>, bool), WalError> {
-        ownership.verify_root(path.as_ref())?;
+        verify_domain_ownership(path.as_ref(), &ownership)?;
         Self::open_selected(
             path.as_ref(),
             TailPolicy::AllowIncompleteFinalRecord,
             true,
-            Some(ownership),
+            ownership,
         )
     }
 
@@ -694,12 +858,12 @@ impl WalManager {
     pub(crate) fn open_for_recovery(
         path: impl AsRef<Path>,
     ) -> Result<(Self, Vec<WalRecord>, bool), WalError> {
-        let ownership = WalOwnership::acquire(path.as_ref())?;
+        let ownership = WalOwnership::acquire_domain(path.as_ref())?;
         Self::open_selected(
             path.as_ref(),
             TailPolicy::AllowIncompleteFinalRecord,
             true,
-            Some(ownership),
+            ownership,
         )
     }
 
@@ -708,7 +872,7 @@ impl WalManager {
             path.as_ref(),
             TailPolicy::AllowIncompleteFinalRecord,
             false,
-            None,
+            Vec::new(),
         )?;
         Ok(records)
     }
@@ -717,49 +881,46 @@ impl WalManager {
         root_path: &Path,
         tail_policy: TailPolicy,
         allow_mutation: bool,
-        ownership: Option<WalOwnership>,
+        ownership: Vec<WalOwnership>,
     ) -> Result<(Self, Vec<WalRecord>, bool), WalError> {
-        let root_path = root_path.to_owned();
-        if let Some(ownership) = &ownership {
-            ownership.verify_root(&root_path)?;
-        } else if allow_mutation {
+        let root_path = canonical_root_path(root_path)?;
+        if allow_mutation {
+            verify_domain_ownership(&root_path, &ownership)?;
+        } else if !ownership.is_empty() {
             return Err(WalError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "a writable WAL open requires logical WAL ownership",
+                "read-only WAL inspection cannot consume writer ownership",
             )));
         }
         let alternate_path = wal_alternate_path(&root_path);
         let mut candidates = Vec::new();
         let mut failures = Vec::new();
         for path in [&root_path, &alternate_path] {
-            if !path.try_exists()? {
+            let Some(mut file) = open_generation_file(path, allow_mutation)? else {
+                continue;
+            };
+            if file.metadata()?.len() < WAL_HEADER_SIZE as u64 {
+                failures.push((path.to_owned(), None, WalError::TruncatedHeader, file));
                 continue;
             }
-            let length = std::fs::metadata(path)?.len();
-            if length < WAL_HEADER_SIZE as u64 {
-                failures.push((path.to_owned(), None, WalError::TruncatedHeader));
-                continue;
-            }
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(allow_mutation)
-                .open(path)?;
             let header = match read_header(&mut file) {
                 Ok(header) => header,
                 Err(error) => {
-                    failures.push((path.to_owned(), None, error));
+                    failures.push((path.to_owned(), None, error, file));
                     continue;
                 }
             };
             match scan_file(&mut file, tail_policy) {
                 Ok(scan) => candidates.push((path.to_owned(), file, header, scan)),
-                Err(error) => failures.push((path.to_owned(), Some(header.generation), error)),
+                Err(error) => {
+                    failures.push((path.to_owned(), Some(header.generation), error, file))
+                }
             }
         }
         if candidates.is_empty() {
             return Err(failures.into_iter().next().map_or_else(
                 || WalError::Io(std::io::Error::from(std::io::ErrorKind::NotFound)),
-                |(_, _, error)| error,
+                |(_, _, error, _)| error,
             ));
         }
         candidates.sort_unstable_by_key(|(_, _, header, _)| header.generation);
@@ -768,8 +929,8 @@ impl WalManager {
             .last()
             .map(|(_, _, header, _)| header.generation)
             .ok_or(WalError::GenerationConflict)?;
-        let mut ignored_failure_paths = Vec::new();
-        for (path, generation, error) in failures {
+        let mut ignored_failures = Vec::new();
+        for (path, generation, error, file) in failures {
             let blocks_open = match generation {
                 Some(generation) => generation >= selected_generation,
                 None => !matches!(error, WalError::TruncatedHeader),
@@ -777,15 +938,18 @@ impl WalManager {
             if blocks_open {
                 return Err(error);
             }
-            ignored_failure_paths.push(path);
+            ignored_failures.push((path, file));
         }
         let (path, file, header, scan) = candidates.pop().ok_or(WalError::GenerationConflict)?;
-        let mut superseded_paths = candidates
-            .iter()
-            .map(|(path, _, _, _)| path.clone())
+        let mut superseded_files = candidates
+            .into_iter()
+            .map(|(path, file, _, _)| (path, file))
             .collect::<Vec<_>>();
-        superseded_paths.extend(ignored_failure_paths);
-        drop(candidates);
+        superseded_files.extend(ignored_failures);
+        for (superseded, candidate) in &superseded_files {
+            verify_generation_file(superseded, candidate)?;
+        }
+        verify_generation_file(&path, &file)?;
         if scan.incomplete_tail && allow_mutation {
             file.set_len(scan.valid_end)?;
         }
@@ -799,7 +963,9 @@ impl WalManager {
             #[cfg(test)]
             fail_open_authority_sync(true)?;
             sync_parent_directory(&path)?;
-            for superseded in superseded_paths {
+            verify_generation_file(&path, &file)?;
+            for (superseded, candidate) in superseded_files {
+                verify_generation_file(&superseded, &candidate)?;
                 std::fs::remove_file(&superseded)?;
                 sync_parent_directory(&superseded)?;
             }
@@ -819,7 +985,7 @@ impl WalManager {
 
     fn from_scan(
         file: File,
-        ownership: Option<WalOwnership>,
+        ownership: Vec<WalOwnership>,
         root_path: PathBuf,
         path: PathBuf,
         header: WalHeader,
@@ -1074,9 +1240,14 @@ impl WalManager {
         } else {
             self.root_path.clone()
         };
-        if target.try_exists()? {
-            std::fs::remove_file(&target)?;
-            sync_parent_directory(&target)?;
+        #[cfg(feature = "test-hooks")]
+        observe_rotation(WalRotationTestPoint::BeforeTargetCreation);
+        if open_generation_file(&target, true)?.is_some() {
+            // A healthy manager starts with only its selected generation:
+            // recovery cleaned an older candidate before installation, and
+            // prior rotations removed their old slot. A newly occupied target
+            // therefore has no proven ownership and must not be replaced.
+            return Err(WalError::GenerationConflict);
         }
         #[cfg(test)]
         let failure_after = self.fail_next_rotation_after.take();
@@ -1089,10 +1260,14 @@ impl WalManager {
                 return Err(failure.error);
             }
         };
+        #[cfg(feature = "test-hooks")]
+        observe_rotation(WalRotationTestPoint::AfterTargetCreated);
         if let Err(error) = sync_parent_directory(&target) {
             self.poisoned = true;
             return Err(error);
         }
+        #[cfg(feature = "test-hooks")]
+        observe_rotation(WalRotationTestPoint::AfterTargetDirectorySync);
         #[cfg(test)]
         crate::crash_test::maybe_crash(
             crate::crash_test::TestCrashPoint::CheckpointAfterNewGenerationDurable,
@@ -1112,11 +1287,18 @@ impl WalManager {
         self.last_by_txn.clear();
         self.txn_states.clear();
         self.reservations.clear();
-        drop(old_file);
+        #[cfg(feature = "test-hooks")]
+        observe_rotation(WalRotationTestPoint::AfterRuntimeSwitch);
+        if let Err(error) = verify_generation_file(&old_path, &old_file) {
+            self.poisoned = true;
+            return Err(error);
+        }
         if let Err(error) = std::fs::remove_file(&old_path) {
             self.poisoned = true;
             return Err(error.into());
         }
+        #[cfg(feature = "test-hooks")]
+        observe_rotation(WalRotationTestPoint::AfterOldGenerationRemoved);
         #[cfg(test)]
         crate::crash_test::maybe_crash(
             crate::crash_test::TestCrashPoint::CheckpointAfterOldGenerationRemoved,
@@ -1136,16 +1318,14 @@ impl WalManager {
         Ok(())
     }
 
-    pub(crate) fn duplicate_ownership(&self) -> Result<WalOwnership, WalError> {
-        self.ownership
-            .as_ref()
-            .ok_or_else(|| {
-                WalError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "read-only WAL inspection has no mutation ownership",
-                ))
-            })?
-            .duplicate()
+    pub(crate) fn duplicate_ownership(&self) -> Result<Vec<WalOwnership>, WalError> {
+        if self.ownership.is_empty() {
+            return Err(WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "read-only WAL inspection has no mutation ownership",
+            )));
+        }
+        self.ownership.iter().map(WalOwnership::duplicate).collect()
     }
 
     pub(crate) fn release_ownership_after_clean_close(&mut self) -> Result<(), WalError> {
@@ -1153,7 +1333,7 @@ impl WalManager {
         if let Some(written) = self.written_lsn {
             self.flush_through(written)?;
         }
-        if let Some(ownership) = self.ownership.take() {
+        for ownership in std::mem::take(&mut self.ownership) {
             ownership.unlock()?;
         }
         Ok(())
@@ -1197,6 +1377,10 @@ impl WalManager {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
+        if !self.ownership.is_empty() {
+            verify_domain_ownership(&self.root_path, &self.ownership)?;
+        }
+        verify_generation_file(&self.path, &self.file)?;
         Ok(())
     }
 }
@@ -1310,7 +1494,7 @@ fn validate_header(header: WalHeader) -> Result<(), WalError> {
 
 struct GenerationCreateFailure {
     error: WalError,
-    file_created: bool,
+    created_file: Option<File>,
 }
 
 fn create_generation_file(
@@ -1320,43 +1504,65 @@ fn create_generation_file(
 ) -> Result<File, GenerationCreateFailure> {
     let bytes = encode_header(header).map_err(|error| GenerationCreateFailure {
         error,
-        file_created: false,
+        created_file: None,
     })?;
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
+    let mut options = OpenOptions::new();
+    options.create_new(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options
         .open(path)
         .map_err(|error| GenerationCreateFailure {
             error: error.into(),
-            file_created: false,
+            created_file: None,
         })?;
+    if let Err(error) = verify_generation_file(path, &file) {
+        return Err(GenerationCreateFailure {
+            error,
+            created_file: Some(file),
+        });
+    }
     if let Some(prefix_len) = fail_after {
-        file.write_all(&bytes[..prefix_len.min(bytes.len())])
-            .map_err(|error| GenerationCreateFailure {
+        if let Err(error) = file.write_all(&bytes[..prefix_len.min(bytes.len())]) {
+            return Err(GenerationCreateFailure {
                 error: error.into(),
-                file_created: true,
-            })?;
-        file.sync_all().map_err(|error| GenerationCreateFailure {
-            error: error.into(),
-            file_created: true,
-        })?;
+                created_file: Some(file),
+            });
+        }
+        if let Err(error) = file.sync_all() {
+            return Err(GenerationCreateFailure {
+                error: error.into(),
+                created_file: Some(file),
+            });
+        }
         return Err(GenerationCreateFailure {
             error: WalError::Io(std::io::Error::other(
                 "injected partial WAL generation creation failure",
             )),
-            file_created: true,
+            created_file: Some(file),
         });
     }
-    file.write_all(&bytes)
-        .map_err(|error| GenerationCreateFailure {
+    if let Err(error) = file.write_all(&bytes) {
+        return Err(GenerationCreateFailure {
             error: error.into(),
-            file_created: true,
-        })?;
-    file.sync_all().map_err(|error| GenerationCreateFailure {
-        error: error.into(),
-        file_created: true,
-    })?;
+            created_file: Some(file),
+        });
+    }
+    if let Err(error) = file.sync_all() {
+        return Err(GenerationCreateFailure {
+            error: error.into(),
+            created_file: Some(file),
+        });
+    }
+    if let Err(error) = verify_generation_file(path, &file) {
+        return Err(GenerationCreateFailure {
+            error,
+            created_file: Some(file),
+        });
+    }
     Ok(file)
 }
 
@@ -2034,6 +2240,37 @@ mod tests {
 
     use super::{WAL_HEADER_SIZE, WalError, WalManager, WalRecord, WalRecordKind};
     use crate::{Page, PageType};
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_data_symlink_swapped_after_preflight() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_path("r02-swap-after-preflight");
+        let other = test_path("r02-swap-target");
+        let saved = test_path("r02-swap-saved");
+        drop(WalManager::create(&root).expect("create original"));
+        drop(WalManager::create(&other).expect("create other"));
+        let original = std::fs::read(&root).expect("original bytes");
+        let other_bytes = std::fs::read(&other).expect("other bytes");
+        let expected_root = super::canonical_root_path(&root).expect("canonical WAL root");
+        let target = other.clone();
+        let saved_path = saved.clone();
+        super::OPEN_GENERATION_AFTER_PREFLIGHT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                assert_eq!(path, expected_root);
+                std::fs::rename(path, &saved_path).expect("move inspected inode");
+                symlink(&target, path).expect("replace name with data alias");
+            }));
+        });
+        let error = WalManager::open(&root).expect_err("symlink swap must fail");
+        assert!(matches!(error, WalError::Io(_)), "{error:?}");
+        assert_eq!(std::fs::read(&saved).expect("saved bytes"), original);
+        assert_eq!(std::fs::read(&other).expect("target bytes"), other_bytes);
+        std::fs::remove_file(root).expect("remove alias");
+        std::fs::remove_file(saved).expect("remove saved inode");
+        std::fs::remove_file(other).expect("remove target");
+    }
 
     fn test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("netbadb-{name}-{}-wal", std::process::id()))
@@ -2764,6 +3001,30 @@ mod tests {
             WalManager::open(&path),
             Err(WalError::HeaderChecksumMismatch { .. })
         ));
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(alternate);
+    }
+
+    #[test]
+    fn rotation_preserves_an_unexpected_target() {
+        let path = test_path("wal-unexpected-rotation-target");
+        let mut wal = WalManager::create(&path).expect("create WAL");
+        let alternate = super::wal_alternate_path(&path);
+        std::fs::copy(&path, &alternate).expect("place a distinct target inode");
+        let before = std::fs::read(&alternate).expect("read unexpected target");
+
+        assert!(matches!(
+            wal.rotate(TxnId(1)),
+            Err(WalError::GenerationConflict)
+        ));
+        assert_eq!(
+            std::fs::read(&alternate).expect("read retained target"),
+            before
+        );
+        wal.append(TxnId(1), None, WalRecordKind::Begin)
+            .expect("original writer remains usable");
+
+        drop(wal);
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(alternate);
     }

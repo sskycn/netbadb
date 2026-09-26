@@ -188,8 +188,8 @@ impl HeapOwnership {
     }
 
     /// Claims a Heap inode and an exact WAL root using a carrier path selected
-    /// by a durable recovery plan. The logical root's default carrier is also
-    /// claimed, so a public standalone writer always shares its lock domain.
+    /// by a durable recovery plan. The logical root and its rotation target
+    /// carriers are also claimed, so public writers share its lock domain.
     pub fn acquire_with_wal_owner(
         path: impl AsRef<Path>,
         wal_root: impl AsRef<Path>,
@@ -200,7 +200,7 @@ impl HeapOwnership {
     }
 
     /// Claims a Heap inode and every logical WAL/carrier binding required by a
-    /// durable recovery plan. Each root's default carrier is also acquired;
+    /// durable recovery plan. Each root and alternate carrier are also acquired;
     /// names of one already locked inode share that lock without a second flock.
     pub fn acquire_with_wal_bindings(
         path: impl AsRef<Path>,
@@ -213,6 +213,10 @@ impl HeapOwnership {
             let root = authority_path(root)?;
             carrier_bindings.push((root.clone(), authority_path(owner)?));
             carrier_bindings.push((root.clone(), authority_path(&crate::wal_owner_path(&root))?));
+            carrier_bindings.push((
+                root.clone(),
+                authority_path(&crate::wal_owner_path(wal_alternate_path(&root)))?,
+            ));
         }
         carrier_bindings.sort_by(|left, right| left.1.cmp(&right.1));
         let mut wal = Vec::with_capacity(carrier_bindings.len());
@@ -227,19 +231,7 @@ impl HeapOwnership {
         root: &Path,
         owner: &Path,
     ) -> Result<(), StorageError> {
-        if wal
-            .iter()
-            .any(|held| held.root() == root && held.path() == owner)
-        {
-            return Ok(());
-        }
-        for held in wal.iter() {
-            if held.names_same_inode(owner)? {
-                wal.push(held.duplicate_for_binding(root, owner)?);
-                return Ok(());
-            }
-        }
-        wal.push(WalOwnership::acquire_with_owner_path(root, owner)?);
+        WalOwnership::claim_binding(wal, root, owner)?;
         Ok(())
     }
 
@@ -270,7 +262,7 @@ impl HeapOwnership {
         Ok(false)
     }
 
-    /// Adds another stable carrier and its root's default carrier without
+    /// Adds another stable carrier plus both generation-slot carriers without
     /// releasing any owner already held. Acquisition is nonblocking, so
     /// contention fails immediately and existing admission remains valid.
     pub fn add_wal_owner_binding(
@@ -281,10 +273,15 @@ impl HeapOwnership {
         let root = authority_path(wal_root.as_ref())?;
         let owner = authority_path(owner_path.as_ref())?;
         let default = authority_path(&crate::wal_owner_path(&root))?;
-        let mut paths = [owner, default];
+        let next = authority_path(&crate::wal_owner_path(wal_alternate_path(&root)))?;
+        let mut paths = [owner, default, next];
         paths.sort();
+        let retained = self.wal.len();
         for path in paths {
-            Self::claim_wal_binding(&mut self.wal, &root, &path)?;
+            if let Err(error) = Self::claim_wal_binding(&mut self.wal, &root, &path) {
+                self.wal.truncate(retained);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -374,20 +371,24 @@ impl HeapOwnership {
         Ok(self)
     }
 
-    fn take_wal_ownership(&mut self, root: &Path) -> Result<WalOwnership, StorageError> {
+    fn take_wal_ownership(&mut self, root: &Path) -> Result<Vec<WalOwnership>, StorageError> {
         let root = authority_path(root)?;
-        let default = authority_path(&crate::wal_owner_path(&root))?;
-        let index = self
-            .wal
-            .iter()
-            .position(|wal| wal.root() == root && wal.path() == default)
-            .ok_or_else(|| {
-                StorageError::Wal(crate::WalError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "recovery ownership has no token for the logical WAL root",
-                )))
-            })?;
-        Ok(self.wal.swap_remove(index))
+        let mut selected = Vec::with_capacity(2);
+        for path in [root.clone(), wal_alternate_path(&root)] {
+            let carrier = authority_path(&crate::wal_owner_path(path))?;
+            let index = self
+                .wal
+                .iter()
+                .position(|wal| wal.root() == root && wal.path() == carrier)
+                .ok_or_else(|| {
+                    StorageError::Wal(crate::WalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "recovery ownership lacks a WAL generation-slot carrier",
+                    )))
+                })?;
+            selected.push(self.wal.swap_remove(index));
+        }
+        Ok(selected)
     }
 
     /// Reads recovery evidence while retaining the writer-exclusion lock.
@@ -883,7 +884,7 @@ impl HeapStorage {
             (ownership.pages, wal)
         } else {
             let pages = PageManager::open_owned(path)?;
-            let wal = WalOwnership::acquire(&wal_path(path))?;
+            let wal = WalOwnership::acquire_domain(&wal_path(path))?;
             (pages, wal)
         };
         if pages.page_count() < 3 {
@@ -3742,11 +3743,7 @@ impl HeapStorage {
             .map_err(|_| TransactionError::WalBusy)?
             .duplicate_ownership()?;
         self.closed = true;
-        Ok(HeapOwnership {
-            pages,
-            wal: vec![wal],
-            path,
-        })
+        Ok(HeapOwnership { pages, wal, path })
     }
 
     pub fn flush_change_stream_checkpoints(&self) -> Result<u64, StorageError> {
@@ -4537,6 +4534,7 @@ mod tests {
         let _ = std::fs::remove_file(txn_status_path(path));
         let wal = wal_path(path);
         let _ = std::fs::remove_file(crate::wal_owner_path(&wal));
+        let _ = std::fs::remove_file(crate::wal_owner_path(wal_alternate_path(&wal)));
         let _ = std::fs::remove_file(wal_alternate_path(&wal));
         let _ = std::fs::remove_file(wal);
     }
@@ -4743,7 +4741,7 @@ mod tests {
         cleanup(&source);
         cleanup(&target);
         let storage = HeapStorage::create(&source, table()).unwrap();
-        let owner = storage.stop_for_promotion(&source).unwrap();
+        let mut owner = storage.stop_for_promotion(&source).unwrap();
         std::fs::rename(
             crate::wal_owner_path(wal_path(&source)),
             crate::wal_owner_path(wal_path(&target)),
@@ -4752,6 +4750,9 @@ mod tests {
         std::fs::rename(wal_path(&source), wal_path(&target)).unwrap();
         std::fs::rename(txn_status_path(&source), txn_status_path(&target)).unwrap();
         std::fs::rename(&source, &target).unwrap();
+        owner
+            .add_wal_owner_binding(wal_path(&target), crate::wal_owner_path(wal_path(&target)))
+            .unwrap();
         let owner = owner.rebind(&target).unwrap();
         let mut reopened = HeapStorage::open_with_ownership(owner, table(), None).unwrap();
         let mut source_reused = HeapStorage::create(&source, table()).unwrap();

@@ -62,6 +62,11 @@ pub fn heap_resource_components(path: impl AsRef<Path>) -> Vec<HeapResourceCompo
             required: false,
         },
         HeapResourceComponent {
+            kind: HeapResourceComponentKind::WalOwnerLock,
+            path: crate::wal_owner_path(crate::wal_alternate_path(&wal)),
+            required: false,
+        },
+        HeapResourceComponent {
             kind: HeapResourceComponentKind::TransactionStatus,
             path: crate::txn_status_path(main),
             required: true,
